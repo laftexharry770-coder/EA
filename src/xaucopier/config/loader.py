@@ -27,6 +27,9 @@ def _assert_no_points_keys(node: Any, trail: str = "") -> None:
                     "all thresholds must be USD (see spec section 3)"
                 )
             _assert_no_points_keys(value, path)
+    elif isinstance(node, list):
+        for item in node:
+            _assert_no_points_keys(item, trail)
 
 
 def load_policy_dict(path: Path) -> dict[str, Any]:

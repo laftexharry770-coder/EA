@@ -20,3 +20,17 @@ def test_rejects_nested_points_key(tmp_path: Path):
     p.write_text("[accounts.fxpro]\nsl_buffer_points = 30\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="_points"):
         load_policy_dict(p)
+
+def test_rejects_points_key_in_array_of_tables(tmp_path: Path):
+    """Array-of-tables (TOML [[table]]) must also reject _points keys."""
+    p = tmp_path / "policy.toml"
+    p.write_text("[[accounts]]\nname = \"fxpro\"\nsl_buffer_points = 30\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="_points"):
+        load_policy_dict(p)
+
+def test_rejects_points_key_in_three_level_nested_table(tmp_path: Path):
+    """Three-level nested tables must also reject _points keys."""
+    p = tmp_path / "policy.toml"
+    p.write_text("[accounts.fxpro.stops]\nsl_buffer_points = 30\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="_points"):
+        load_policy_dict(p)
