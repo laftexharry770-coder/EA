@@ -830,13 +830,15 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ### Task 5: MARKET MASTERY HUB parser
 
 **Files:**
-- Create: `src/xaucopier/parsing/result.py`, `src/xaucopier/parsing/channel_mmh.py`, `src/xaucopier/parsing/registry.py`
+- Create: `src/xaucopier/parsing/result.py`, `src/xaucopier/parsing/channel_mmh.py`
 - Create: `tests/fixtures/messages/mmh_buy_4tp.json`
 - Test: `tests/test_parser_mmh.py`
 
 **Interfaces:**
 - Consumes: `normalize()` (Task 4), `Signal`, `Side`, `EntryZone` (Task 3), `RejectReason` (Task 3)
-- Produces: `ParseResult(ok: bool, signal: Signal | None, reason: RejectReason | None, detail: str)`, `parse(text, channel_id, message_id, posted_at_utc) -> ParseResult`, `parser_for(channel_id) -> Callable`
+- Produces: `ParseResult(ok: bool, signal: Signal | None, reason: RejectReason | None, detail: str)` and `parse(text, *, channel_id, message_id, posted_at_utc, source="live") -> ParseResult`. Note `parse`'s arguments after `text` are keyword-only.
+
+> A channel→parser registry is deliberately **not** built here. Nothing in this plan dispatches by channel, so it would be dead code; Plan 2's listener introduces it at the point of first use.
 
 - [ ] **Step 1: Save the real message as a fixture**
 
@@ -1065,38 +1067,12 @@ def parse(
     return ParseResult(ok=True, signal=signal)
 ```
 
-- [ ] **Step 6: Write `registry.py`**
-
-```python
-# src/xaucopier/parsing/registry.py
-"""Maps a numeric channel id to its parser. Numeric ids only — a username
-can be re-pointed at a different channel, an id cannot.
-"""
-from __future__ import annotations
-
-from typing import Callable
-
-from xaucopier.parsing import channel_mmh
-from xaucopier.parsing.result import ParseResult
-
-_PARSERS: dict[str, Callable[..., ParseResult]] = {
-    "mmh": channel_mmh.parse,
-}
-
-
-def parser_for(name: str) -> Callable[..., ParseResult]:
-    try:
-        return _PARSERS[name]
-    except KeyError:
-        raise KeyError(f"no parser registered under {name!r}") from None
-```
-
-- [ ] **Step 7: Run test to verify it passes**
+- [ ] **Step 6: Run test to verify it passes**
 
 Run: `python -m pytest tests/test_parser_mmh.py -v`
 Expected: 12 passed
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/xaucopier/parsing tests/test_parser_mmh.py tests/fixtures
@@ -1250,7 +1226,7 @@ def parse_followup(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest tests/test_followup_parse.py -v`
-Expected: 15 passed
+Expected: 16 passed (10 parametrised cases plus 6 single tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1365,7 +1341,9 @@ def test_chase_gate_allows_small_overshoot():
     assert gates.chase_gate(sig(), SPEC, snap(bid=4485.4, ask=4485.5), POLICY).ok
 
 def test_stops_distance_rejects_rather_than_widens():
-    tight = SymbolSpec("XAUUSD", 2, 0.01, 0.01, 0.01, 100.0, 0.01, 600, 0)
+    # The sl sits 12.10 from the ask, so stops_level must exceed that to
+    # reject: 1500 points x 0.01 = 15.00 USD minimum distance.
+    tight = SymbolSpec("XAUUSD", 2, 0.01, 0.01, 0.01, 100.0, 0.01, 1500, 0)
     r = gates.stops_distance_gate(sig(), tight, snap(), POLICY)
     assert not r.ok and r.reason is RejectReason.STOPS_TOO_TIGHT
 
@@ -1585,6 +1563,12 @@ EXNESS = SymbolSpec("XAUUSDm", 3, 0.001, 0.001, 0.01, 100.0, 0.01, 0, 0)
 ACCT = AccountSpec("ic_demo", "XAUUSD", fixed_lot=0.01, magic_base=77001)
 POLICY = Policy()
 
+# Price cannot run past a take profit without also running far past the entry
+# zone, so under the default policy the chase gate fires first and masks the
+# TP-dropping path. The two behaviours are independent; a permissive chase
+# budget is the only way to exercise the second one in isolation.
+PERMISSIVE = Policy(chase_floor_usd=50.0)
+
 def snap(bid, ask, spread=0.10, median=0.10):
     return MarketSnapshot(bid=bid, ask=ask, tick_time_utc=NOW,
                           spread_usd=spread, median_spread_usd=median, now_utc=NOW)
@@ -1634,13 +1618,20 @@ def test_market_legs_carry_no_expiry():
     assert plan.legs[0].expires_at_utc is None
 
 def test_passed_tps_are_dropped_as_legs():
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
+    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), PERMISSIVE)
     assert [leg.tp for leg in plan.legs] == [4500.0, 4505.0]
 
 def test_rejected_when_no_tp_survives():
-    plan = plan_entry(sig(tps=(4490.0,)), ACCT, SPEC, snap(4499.0, 4499.10), POLICY)
+    plan = plan_entry(sig(tps=(4490.0,)), ACCT, SPEC, snap(4499.0, 4499.10), PERMISSIVE)
     assert not plan.accepted
     assert plan.reason is RejectReason.ALL_TPS_BEHIND
+
+def test_chase_gate_still_rejects_a_runaway_under_default_policy():
+    # The companion to the two tests above: with the real policy, price this
+    # far past the zone must be refused outright, not traded on fewer legs.
+    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
+    assert not plan.accepted
+    assert plan.reason is RejectReason.CHASE_EXCEEDED
 
 def test_leg_index_is_in_the_comment():
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
@@ -1794,7 +1785,7 @@ def _entry_for(sig: Signal, snap: MarketSnapshot, pol: Policy, price: float):
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest tests/test_planner.py -v`
-Expected: 16 passed
+Expected: 17 passed
 
 - [ ] **Step 5: Commit**
 
