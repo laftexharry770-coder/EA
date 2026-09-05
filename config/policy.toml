@@ -1,0 +1,12 @@
+max_signal_age_seconds   = 120
+tick_freshness_seconds   = 15
+max_spread_usd           = 0.50
+spread_median_multiple   = 3.0
+magnitude_band_pct       = 3.0
+chase_floor_usd          = 1.00
+chase_tp1_fraction       = 0.25
+stops_distance_spread_multiple = 3.0
+be_buffer_usd            = 0.10
+max_slippage_usd         = 0.20
+pending_max_age_hours    = 4
+pending_at               = "favourable"
