@@ -30,3 +30,29 @@ def test_folds_fullwidth_digits():
 
 def test_drops_blank_lines():
     assert normalize("A\n\n\nB") == "A\nB"
+
+# --- Regression tests: comma disambiguation by whole-token shape, not by
+# per-comma trailing-digit count. See task-4 review finding: the original
+# implementation classified a comma as "thousands" whenever exactly 3
+# digits followed it, which silently corrupted 3-decimal gold prices
+# (e.g. Exness XAUUSDm) by a factor of ~1000.
+
+def test_three_decimal_comma_on_gold_feed_is_decimal_not_thousands():
+    # The reported defect: normalize("4480,255") used to yield "4480255".
+    assert normalize("SL: 4480,255") == "SL: 4480.255"
+
+def test_multiple_grouped_thousands_separators_collapse():
+    assert normalize("1,234,567") == "1234567"
+
+def test_malformed_grouping_is_left_unchanged():
+    # "4,4805" is neither a properly grouped thousands run (the group
+    # after the comma is 4 digits, not 3) nor a plausible price decimal
+    # (this bot's domain only sees 1-3 fractional digits). Left alone
+    # rather than silently reinterpreted as the valid-looking "4.4805".
+    assert normalize("4,4805") == "4,4805"
+
+def test_comma_in_prose_is_untouched():
+    assert normalize("hello, world") == "hello, world"
+
+def test_trailing_comma_after_digit_is_untouched():
+    assert normalize("SL: 4470,") == "SL: 4470,"
