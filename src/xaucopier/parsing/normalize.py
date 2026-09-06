@@ -2,22 +2,36 @@
 
 Runs before every parser. Deliberately conservative: it removes decoration
 and normalises separators, and changes nothing that could alter a number's
-value except the two separator rules, which are anchored on digit context.
+value except the comma-disambiguation rule, which is anchored on digit
+context.
 
-Comma disambiguation is done in two ordered passes, by the shape of the
-*whole numeric token* rather than by counting digits around one comma:
+Comma disambiguation is a single pass over each whole numeric run (a
+maximal stretch of digits and commas, e.g. the "4,480,25" in "SL: 4,480,25"),
+classified by the shape of that *entire run* before anything is rewritten.
+This matters because a real numeric run can mix a thousands separator and a
+decimal comma in the same token (e.g. "4,480,25" -- gold trades in exactly
+this range), which neither "always thousands" nor "always decimal" handles
+correctly on its own. In order, the first matching rule wins:
 
-1. A comma is a thousands separator only when the entire numeric run is
-   properly grouped: one to three leading digits, then one or more groups
-   of exactly three digits (e.g. "4,480" or "1,234,567"). Only commas
-   inside such a fully-grouped run are stripped.
-2. Anything left over: a comma still sitting between digits is a decimal
-   comma *if* it is followed by a plausible number of fractional digits
-   (1-3 -- this bot only ever sees 1-3 decimal gold prices). A comma
-   followed by 4+ digits that also failed rule 1 is neither a valid
-   grouping nor a plausible decimal (e.g. "4,4805") and is left alone
-   rather than silently reinterpreted as a different, valid-looking
-   number.
+1. Pure grouping -- one to three leading digits, then one or more groups of
+   exactly three digits, and nothing else (e.g. "4,480" or "1,234,567").
+   Every comma is removed. Checked first: "1,234,567" also has the shape
+   "grouping + a trailing 1-3-digit group" (rule 2), so grouping must win
+   before rule 2 gets a chance to misread the last group as a decimal tail.
+2. Grouping plus a decimal tail -- the same grouped shape as rule 1, but
+   followed by one more comma and 1-3 trailing digits (e.g. "4,480,25" or
+   "12,345,6"). All commas except the last are removed; the last becomes
+   the decimal point.
+3. A single decimal comma -- any run of digits, one comma, then 1-3 digits
+   (e.g. "4480,25" or "4480,255" -- this bot only ever sees 1-3 decimal
+   gold prices). The comma becomes the decimal point.
+4. Anything else is left unchanged. A run like "4,4805" is neither a valid
+   grouping nor a plausible 1-3-digit decimal, so rewriting it either way
+   would invent a different, valid-looking number -- it is left alone
+   rather than silently reinterpreted.
+
+Everything outside a numeric run (prose commas, a trailing comma with no
+digit after it) is never touched, so it is safe by construction.
 """
 from __future__ import annotations
 
@@ -28,9 +42,28 @@ import unicodedata
 # (zero-width joiners, variation selectors, direction marks).
 _DECORATION = {"So", "Cf"}
 
-_THOUSANDS_GROUP = re.compile(r"\b\d{1,3}(?:,\d{3})+(?![\d,])")
-_DECIMAL_COMMA = re.compile(r"(?<=\d),(?=\d{1,3}(?!\d))")
+# A maximal run of digits and commas, anchored on digits at both ends so a
+# trailing bare comma (e.g. "4470,") is never swept in.
+_NUMERIC_RUN = re.compile(r"\d[\d,]*\d|\d")
+
+_PURE_GROUPING = re.compile(r"^\d{1,3}(?:,\d{3})+$")
+_GROUPING_WITH_DECIMAL_TAIL = re.compile(r"^\d{1,3}(?:,\d{3})+,\d{1,3}$")
+_SINGLE_DECIMAL = re.compile(r"^\d+,\d{1,3}$")
+
 _WS_RUN = re.compile(r"[ \t]+")
+
+
+def _rewrite_numeric_run(match: re.Match[str]) -> str:
+    run = match.group(0)
+    if _PURE_GROUPING.match(run):
+        return run.replace(",", "")
+    if _GROUPING_WITH_DECIMAL_TAIL.match(run):
+        head, _, tail = run.rpartition(",")
+        return head.replace(",", "") + "." + tail
+    if _SINGLE_DECIMAL.match(run):
+        head, _, tail = run.rpartition(",")
+        return head + "." + tail
+    return run
 
 
 def normalize(text: str) -> str:
@@ -41,14 +74,9 @@ def normalize(text: str) -> str:
         for ch in text
         if unicodedata.category(ch) not in _DECORATION
     )
-    # Grouped-thousands first (whole-token shape): 4,480 -> 4480,
-    # 1,234,567 -> 1234567. Only commas inside a fully-grouped run are
-    # stripped, so a malformed run like "4,4805" is untouched here.
-    text = _THOUSANDS_GROUP.sub(lambda m: m.group(0).replace(",", ""), text)
-    # Then decimal, for whatever comma is left between digits with a
-    # plausible (1-3 digit) fractional tail: 4480,25 -> 4480.25,
-    # 4480,255 -> 4480.255. "4,4805" still fails here (4-digit tail).
-    text = _DECIMAL_COMMA.sub(".", text)
+    # One pass, classifying each whole numeric run before rewriting it --
+    # see the module docstring for the four rules and their order.
+    text = _NUMERIC_RUN.sub(_rewrite_numeric_run, text)
 
     lines = []
     for raw_line in text.splitlines():
