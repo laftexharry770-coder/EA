@@ -2,6 +2,14 @@
 
 Order matters: the first matching rule wins, and SL_TO_BE is tested before
 AMEND_SL so that "SL to BE" is never read as an amend with a missing price.
+
+Safety: a negated message (containing "don't", "do not", "never", or "hold
+off") never dispatches an op -- parse_followup returns None regardless of
+what else the message contains. Follow-up messages are short, and the
+governing principle here is loud failure over wrong action: a poster typing
+"don't close all yet" must never result in the position being closed, so
+the safe outcome is "no operation, deferred to a human," not a best-effort
+guess at the intended op.
 """
 from __future__ import annotations
 
@@ -16,7 +24,12 @@ NUM = r"\d+(?:\.\d+)?"
 # A message that looks like a full entry signal is never a follow-up.
 _IS_SIGNAL = re.compile(r"\bSIGNAL\b", re.I)
 
-_RULES: list[tuple[FollowUpOp, re.Pattern[str]]] = [
+# normalize() does not fold curly punctuation, so "don't" may arrive with
+# either an ASCII apostrophe or U+2019; "dont" with no apostrophe at all is
+# also common. Any of these anywhere in the message blanks the whole parse.
+_NEGATION = re.compile(r"\b(?:do\s*n['\u2019]?t|do\s+not|never|hold\s+off)\b", re.I)
+
+_RULES: tuple[tuple[FollowUpOp, re.Pattern[str]], ...] = (
     (FollowUpOp.SL_TO_BE, re.compile(
         r"\b(?:sl|stop)\b[^\n]{0,20}\b(?:be|breakeven|break\s*even|entry)\b"
         r"|\bbreak\s*even\b", re.I)),
@@ -29,8 +42,8 @@ _RULES: list[tuple[FollowUpOp, re.Pattern[str]]] = [
     (FollowUpOp.AMEND_SL, re.compile(
         rf"\b(?:sl|stop\s*loss)\b\s*(?:to|:|=|@)?\s*({NUM})", re.I)),
     (FollowUpOp.AMEND_TP, re.compile(
-        rf"\btp\s*\d*\b\s*(?:to|:|=|@)\s*({NUM})", re.I)),
-]
+        rf"\btp\s*(\d*)\b\s*(?:to|:|=|@)\s*({NUM})", re.I)),
+)
 
 
 def parse_followup(
@@ -42,6 +55,8 @@ def parse_followup(
     reply_to_message_id: int | None = None,
 ) -> FollowUp | None:
     clean = normalize(text)
+    if _NEGATION.search(clean):
+        return None
     if _IS_SIGNAL.search(clean):
         return None
 
@@ -50,7 +65,12 @@ def parse_followup(
         if match is None:
             continue
         price = None
-        if op in (FollowUpOp.AMEND_SL, FollowUpOp.AMEND_TP) and match.groups():
+        tp_index = None
+        if op is FollowUpOp.AMEND_TP:
+            idx_str = match.group(1)
+            tp_index = int(idx_str) if idx_str else None
+            price = float(match.group(2))
+        elif op is FollowUpOp.AMEND_SL and match.groups():
             price = float(match.group(1))
         return FollowUp(
             channel_id=channel_id,
@@ -59,6 +79,7 @@ def parse_followup(
             posted_at_utc=posted_at_utc,
             reply_to_message_id=reply_to_message_id,
             price_hint=price,
+            tp_index_hint=tp_index,
             raw=clean,
         )
     return None

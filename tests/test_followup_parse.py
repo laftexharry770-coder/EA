@@ -55,3 +55,39 @@ def test_unrelated_chatter_returns_none():
 def test_a_full_signal_is_not_a_followup():
     text = "XAUUSD | BUY SIGNAL\n4480-4485\nSL: 4470\nTP1: 4490"
     assert _p(text) is None
+
+
+@pytest.mark.parametrize("text", [
+    "don't close all",
+    "do not close all",
+    "never close all",
+    "please dont close all yet",
+    "don't cancel the pending order",
+    "don't move sl to be",
+    "don\u2019t close half",
+])
+def test_negated_instruction_returns_none(text):
+    # A negated instruction must never be executed as if it were an order:
+    # loud failure (defer to a human) beats guessing wrong on live money.
+    assert _p(text) is None
+
+
+def test_amend_tp_captures_index_and_price():
+    f = _p("TP2: 4550")
+    assert f.op is FollowUpOp.AMEND_TP
+    assert f.price_hint == 4550.0
+    assert f.tp_index_hint == 2
+
+
+def test_amend_tp_move_variant_captures_index():
+    f = _p("move TP1 to 4500")
+    assert f.op is FollowUpOp.AMEND_TP
+    assert f.price_hint == 4500.0
+    assert f.tp_index_hint == 1
+
+
+def test_amend_tp_without_index_leaves_hint_none():
+    f = _p("tp to 4500")
+    assert f.op is FollowUpOp.AMEND_TP
+    assert f.price_hint == 4500.0
+    assert f.tp_index_hint is None
