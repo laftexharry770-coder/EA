@@ -75,3 +75,51 @@ def test_content_hash_changes_when_sl_changes():
     a = _parse("XAUUSD | BUY SIGNAL\n4480-4485\nSL: 4470\nTP1: 4490").signal
     b = _parse("XAUUSD | BUY SIGNAL\n4480-4485\nSL: 4460\nTP1: 4490").signal
     assert a.content_hash != b.content_hash
+
+def test_duplicate_sl_is_hard_reject():
+    text = "XAUUSD | BUY SIGNAL\n4480-4485\nOld SL: 4470 -- update below\nNew SL: 4475\nTP1: 4490"
+    r = _parse(text)
+    assert r.ok is False
+
+def test_duplicate_header_is_hard_reject():
+    text = (
+        "XAUUSD | BUY SIGNAL\n4480-4485\nSL: 4470\nTP1: 4490\n"
+        "XAUUSD | SELL SIGNAL\n4500-4505\nSL: 4510\nTP1: 4520"
+    )
+    r = _parse(text)
+    assert r.ok is False
+
+def test_duplicate_entry_zone_is_hard_reject():
+    text = "XAUUSD | BUY SIGNAL\n4480-4485\n4500-4505\nSL: 4470\nTP1: 4490"
+    r = _parse(text)
+    assert r.ok is False
+
+def test_duplicate_tp_index_is_hard_reject():
+    text = "XAUUSD | BUY SIGNAL\n4480-4485\nSL: 4470\nTP1: 4490\nTP1: 4491\nTP3: 4500"
+    r = _parse(text)
+    assert r.ok is False
+
+def test_gapped_tp_indices_is_hard_reject():
+    text = "XAUUSD | BUY SIGNAL\n4480-4485\nSL: 4470\nTP1: 4490\nTP3: 4500"
+    r = _parse(text)
+    assert r.ok is False
+
+def test_tp_indices_not_starting_at_one_is_hard_reject():
+    text = "XAUUSD | BUY SIGNAL\n4480-4485\nSL: 4470\nTP2: 4490\nTP3: 4500"
+    r = _parse(text)
+    assert r.ok is False
+
+def test_two_concatenated_signal_blocks_is_hard_reject():
+    text = (
+        "XAUUSD | BUY SIGNAL\n"
+        "4480-4485\n"
+        "SL: 4470\n"
+        "TP1: 4490\n"
+        "TP2: 4495\n"
+        "XAUUSD | SELL SIGNAL\n"
+        "4500-4505\n"
+        "SL: 4510\n"
+        "TP1: 4520"
+    )
+    r = _parse(text)
+    assert r.ok is False

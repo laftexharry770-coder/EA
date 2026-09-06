@@ -12,6 +12,14 @@ Observed format (2026-09-05):
 A partial match is a hard reject. This parser never returns a best-effort
 Signal: a template change must surface as a loud parse failure, never as a
 trade with a missing leg.
+
+Ambiguity is also a hard reject, not just absence. The header, entry zone
+and stop loss must each match exactly once in the message -- two matches
+(a stale value re-stated, or two signal blocks concatenated together) is
+rejected rather than silently resolved by "first match wins". Take profit
+indices must be unique and form a contiguous run starting at 1 (1..N) --
+a duplicate index, a gap, or a run that skips TP1 is rejected rather than
+assembled into a plausible-looking but wrong ladder.
 """
 from __future__ import annotations
 
@@ -57,27 +65,42 @@ def parse(
 ) -> ParseResult:
     clean = normalize(text)
 
-    head = _HEAD.search(clean)
-    if head is None:
+    heads = list(_HEAD.finditer(clean))
+    if not heads:
         return ParseResult.fail("no 'SYMBOL | SIDE SIGNAL' header")
+    if len(heads) > 1:
+        return ParseResult.fail("ambiguous message: multiple headers found")
+    head = heads[0]
     alias = head.group(1).upper()
     if alias not in GOLD_ALIASES:
         return ParseResult.fail(f"symbol {alias!r} is not gold")
     side = Side.BUY if head.group(2).upper() == "BUY" else Side.SELL
 
-    zone_match = _ZONE.search(clean)
-    if zone_match is None:
+    zone_matches = list(_ZONE.finditer(clean))
+    if not zone_matches:
         return ParseResult.fail("no entry zone line")
+    if len(zone_matches) > 1:
+        return ParseResult.fail("ambiguous message: multiple entry zone lines found")
+    zone_match = zone_matches[0]
     zone = EntryZone(float(zone_match.group(1)), float(zone_match.group(2)))
 
-    sl_match = _SL.search(clean)
-    if sl_match is None:
+    sl_matches = list(_SL.finditer(clean))
+    if not sl_matches:
         return ParseResult.fail("no stop loss")
-    sl = float(sl_match.group(1))
+    if len(sl_matches) > 1:
+        return ParseResult.fail("ambiguous message: multiple stop losses found")
+    sl = float(sl_matches[0].group(1))
 
     tp_pairs = [(int(i), float(v)) for i, v in _TP.findall(clean)]
     if not tp_pairs:
         return ParseResult.fail("no take profits")
+    indices = [i for i, _ in tp_pairs]
+    if len(set(indices)) != len(indices):
+        return ParseResult.fail("ambiguous message: duplicate take profit index")
+    if sorted(indices) != list(range(1, len(indices) + 1)):
+        return ParseResult.fail(
+            "ambiguous message: take profit indices are not a contiguous run starting at 1"
+        )
     tps = tuple(value for _, value in sorted(tp_pairs, key=lambda pair: pair[0]))
 
     signal = Signal(
