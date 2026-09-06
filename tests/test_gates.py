@@ -63,6 +63,46 @@ def test_geometry_gate_rejects_sl_on_wrong_side():
     r = gates.geometry_gate(sig(sl=4499.0), SPEC, snap(), POLICY)
     assert not r.ok and r.reason is RejectReason.GEOMETRY_CONFLICT
 
+def test_geometry_gate_rejects_buy_sl_inside_zone():
+    # Reviewer's reproduction: sl sits inside the entry zone (past the
+    # midpoint check but still on the wrong side of the far edge). A BUY
+    # LIMIT filling at the favourable edge (4470) would have its "stop"
+    # above entry -- inverted risk.
+    r = gates.geometry_gate(
+        sig(side=Side.BUY, zone=(4470.0, 4485.0), sl=4475.0, tps=(4490.0, 4495.0)),
+        SPEC, snap(), POLICY)
+    assert not r.ok and r.reason is RejectReason.GEOMETRY_CONFLICT
+
+def test_geometry_gate_rejects_buy_sl_at_zone_lo():
+    r = gates.geometry_gate(
+        sig(side=Side.BUY, zone=(4480.0, 4485.0), sl=4480.0, tps=(4490.0, 4495.0)),
+        SPEC, snap(), POLICY)
+    assert not r.ok and r.reason is RejectReason.GEOMETRY_CONFLICT
+
+def test_geometry_gate_accepts_buy_sl_just_below_zone_lo():
+    r = gates.geometry_gate(
+        sig(side=Side.BUY, zone=(4480.0, 4485.0), sl=4479.0, tps=(4490.0, 4495.0)),
+        SPEC, snap(), POLICY)
+    assert r.ok
+
+def test_geometry_gate_rejects_sell_sl_inside_zone():
+    r = gates.geometry_gate(
+        sig(side=Side.SELL, zone=(4470.0, 4485.0), sl=4480.0, tps=(4460.0, 4455.0)),
+        SPEC, snap(), POLICY)
+    assert not r.ok and r.reason is RejectReason.GEOMETRY_CONFLICT
+
+def test_geometry_gate_rejects_sell_sl_at_zone_hi():
+    r = gates.geometry_gate(
+        sig(side=Side.SELL, zone=(4480.0, 4485.0), sl=4485.0, tps=(4470.0, 4465.0)),
+        SPEC, snap(), POLICY)
+    assert not r.ok and r.reason is RejectReason.GEOMETRY_CONFLICT
+
+def test_geometry_gate_accepts_sell_sl_just_above_zone_hi():
+    r = gates.geometry_gate(
+        sig(side=Side.SELL, zone=(4480.0, 4485.0), sl=4486.0, tps=(4470.0, 4465.0)),
+        SPEC, snap(), POLICY)
+    assert r.ok
+
 def test_magnitude_gate_rejects_absurd_level():
     r = gates.magnitude_gate(sig(sl=100.0), SPEC, snap(), POLICY)
     assert not r.ok and r.reason is RejectReason.MAGNITUDE_BAND

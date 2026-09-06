@@ -58,7 +58,6 @@ def geometry_gate(sig: Signal, spec: SymbolSpec, snap: MarketSnapshot, pol: Poli
     A poster who writes BUY above sell levels must produce a hard reject,
     never a coin flip.
     """
-    mid_zone = (sig.zone.lo + sig.zone.hi) / 2.0
     tps_above = all(tp > sig.zone.hi for tp in sig.tps)
     tps_below = all(tp < sig.zone.lo for tp in sig.tps)
     if not (tps_above or tps_below):
@@ -67,9 +66,9 @@ def geometry_gate(sig: Signal, spec: SymbolSpec, snap: MarketSnapshot, pol: Poli
     if derived is not sig.side:
         return _no(RejectReason.GEOMETRY_CONFLICT,
                    f"levels imply {derived.value}, message says {sig.side.value}")
-    if derived is Side.BUY and sig.sl >= mid_zone:
+    if derived is Side.BUY and sig.sl >= sig.zone.lo:
         return _no(RejectReason.GEOMETRY_CONFLICT, "buy stop is not below entry")
-    if derived is Side.SELL and sig.sl <= mid_zone:
+    if derived is Side.SELL and sig.sl <= sig.zone.hi:
         return _no(RejectReason.GEOMETRY_CONFLICT, "sell stop is not above entry")
     return _OK
 
