@@ -61,6 +61,13 @@ def plan_entry(
     if not surviving:
         return Plan.rejected(RejectReason.ALL_TPS_BEHIND, ("no take profit ahead of price",))
 
+    # gates.surviving_tps is the single source of truth for which targets
+    # survive; here we only re-pair each survivor with its original position
+    # in sig.tps, so leg_index (and the comment) names the real TP, not its
+    # position in the filtered list.
+    survived = set(surviving)
+    surviving_indexed = tuple((i, tp) for i, tp in enumerate(sig.tps) if tp in survived)
+
     price = snap.ask if sig.side is Side.BUY else snap.bid
     kind, entry_price, expires = _entry_for(sig, snap, pol, price)
 
@@ -80,10 +87,10 @@ def plan_entry(
             deviation_points=usd_to_points(pol.max_slippage_usd, spec),
             expires_at_utc=expires,
         )
-        for index, tp in enumerate(surviving)
+        for index, tp in surviving_indexed
     )
-    notes = (f"{len(sig.tps) - len(surviving)} take profit(s) already passed",) \
-        if len(surviving) != len(sig.tps) else ()
+    notes = (f"{len(sig.tps) - len(surviving_indexed)} take profit(s) already passed",) \
+        if len(surviving_indexed) != len(sig.tps) else ()
     return Plan.accept(legs, notes)
 
 

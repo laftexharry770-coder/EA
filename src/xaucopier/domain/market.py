@@ -49,6 +49,13 @@ class Policy:
     pending_max_age_hours: int = 4
     pending_at: str = "favourable"
 
+    def __post_init__(self) -> None:
+        if self.pending_at not in ("favourable", "near"):
+            raise ValueError(
+                f"pending_at={self.pending_at!r} is not valid; "
+                'expected "favourable" or "near"'
+            )
+
     @classmethod
     def from_dict(cls, data: dict) -> "Policy":
         """Build from a loaded TOML dict, ignoring keys this version does not

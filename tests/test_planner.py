@@ -1,6 +1,8 @@
 # tests/test_planner.py
 from datetime import datetime, timedelta, UTC
 
+import pytest
+
 from xaucopier.domain.errors import RejectReason
 from xaucopier.domain.intent import OrderKind
 from xaucopier.domain.market import AccountSpec, MarketSnapshot, Policy
@@ -28,6 +30,12 @@ def sig(tps=(4490.0, 4495.0, 4500.0, 4505.0)):
     return Signal(channel_id=-1, message_id=4001, side=Side.BUY,
                   symbol_alias="XAUUSD", zone=EntryZone(4480.0, 4485.0),
                   sl=4470.0, tps=tps, posted_at_utc=NOW - timedelta(seconds=5),
+                  content_hash="h")
+
+def sell_sig(tps=(4470.0, 4465.0)):
+    return Signal(channel_id=-1, message_id=4002, side=Side.SELL,
+                  symbol_alias="XAUUSD", zone=EntryZone(4480.0, 4485.0),
+                  sl=4495.0, tps=tps, posted_at_utc=NOW - timedelta(seconds=5),
                   content_hash="h")
 
 def test_one_leg_per_tp():
@@ -114,3 +122,69 @@ def test_stale_signal_is_rejected_before_planning():
 def test_wide_spread_is_rejected():
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4483.0, spread=1.0), POLICY)
     assert not plan.accepted and plan.reason is RejectReason.SPREAD_WIDE
+
+
+# --- Item 1: leg_index must reflect the position in the original sig.tps,
+# not the position in the filtered/surviving list. ---
+
+def test_leg_index_reflects_original_tp_position_when_earlier_tps_have_passed():
+    # Price has run past TP1 and TP2; only TP3 and TP4 survive. Those legs
+    # must be labelled 2 and 3 (their real position in sig.tps), not 0 and 1
+    # (their position in the surviving subset) — reconciliation depends on
+    # the comment's leg index to tell legs of the same signal apart.
+    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), PERMISSIVE)
+    assert [leg.tp for leg in plan.legs] == [4500.0, 4505.0]
+    assert [leg.leg_index for leg in plan.legs] == [2, 3]
+    assert plan.legs[0].comment.endswith("-2")
+    assert plan.legs[1].comment.endswith("-3")
+
+def test_leg_index_is_unchanged_when_no_tp_has_passed():
+    plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
+    assert [leg.leg_index for leg in plan.legs] == [0, 1, 2, 3]
+
+
+# --- Item 2: Policy.pending_at must be validated, not left as a free string
+# that silently falls through to the near edge on a typo. ---
+
+def test_pending_at_rejects_a_typo():
+    with pytest.raises(ValueError):
+        Policy(pending_at="favorable")
+
+def test_pending_at_rejects_wrong_case():
+    with pytest.raises(ValueError):
+        Policy(pending_at="Favourable")
+
+def test_pending_at_accepts_the_two_known_values():
+    Policy(pending_at="near")
+    Policy(pending_at="favourable")
+
+def test_policy_default_still_constructs():
+    Policy()
+
+
+# --- Item 3: SELL coverage. Take profits below the zone, stop above it, so
+# the geometry gate's independently-derived side agrees with the keyword. ---
+
+def test_sell_all_legs_market_when_bid_inside_zone():
+    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
+    assert plan.accepted
+    assert len(plan.legs) == 2
+    assert all(leg.kind is OrderKind.MARKET for leg in plan.legs)
+    assert {leg.sl for leg in plan.legs} == {4495.0}
+
+def test_sell_limit_at_favourable_high_edge_when_bid_below_zone():
+    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4479.5, 4479.60), POLICY)
+    assert plan.accepted
+    assert all(leg.kind is OrderKind.LIMIT for leg in plan.legs)
+    assert plan.legs[0].price == 4485.0  # favourable edge for a sell is the high side
+
+def test_sell_market_when_bid_above_zone():
+    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4490.0, 4490.10), POLICY)
+    assert plan.accepted
+    assert all(leg.kind is OrderKind.MARKET for leg in plan.legs)
+
+def test_sell_limit_at_near_edge_when_policy_says_so():
+    pol = Policy(pending_at="near")
+    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4479.5, 4479.60), pol)
+    assert plan.accepted
+    assert plan.legs[0].price == 4480.0  # near edge for a sell is the low side
