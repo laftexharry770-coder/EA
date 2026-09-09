@@ -1,0 +1,15 @@
+[
+  {
+    "message_id": 4001,
+    "accepted": true,
+    "reason": null,
+    "leg_count": 4,
+    "entry_kind": "market",
+    "prices": [
+      4490.0,
+      4495.0,
+      4500.0,
+      4505.0
+    ]
+  }
+]
