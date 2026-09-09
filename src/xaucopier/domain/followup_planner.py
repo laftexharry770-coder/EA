@@ -103,7 +103,11 @@ def plan_followup(
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing open",))
         count = math.ceil(len(open_legs) / 2)
         # Furthest take profits first: keep the legs nearest to paying out.
-        ordered = sorted(open_legs, key=lambda leg: leg.tp, reverse=True)
+        # "Furthest" is direction-dependent -- the highest tp for a buy, the
+        # LOWEST for a sell. Multiplying by side.sign folds both into one
+        # descending sort; sorting on the raw tp would close a sell's two
+        # nearest legs and keep the long-shots (spec 8.2, inverted).
+        ordered = sorted(open_legs, key=lambda leg: leg.tp * leg.side.sign, reverse=True)
         chosen = ordered[:count]
         return FollowUpPlan(tuple(
             CloseIntent(account_id="", position_ticket=leg.position_ticket,
@@ -138,10 +142,30 @@ def plan_followup(
             return FollowUpPlan((), RejectReason.AMBIGUOUS_TARGET, ("amend without a price",))
         if not open_legs:
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing open to amend",))
+        # An SL amend reaches every open leg: one signal has one shared stop.
+        # A TP amend does not -- each leg owns its own target, so the poster
+        # must say which one. "TP2 to 4550" names leg_index 1 (the hint is
+        # 1-based, leg_index is 0-based); a bare "tp to 4550" names nothing,
+        # and writing one price across a four-leg ladder is never what was
+        # meant, so it fails loudly instead.
+        targets = open_legs
+        if fu.op is FollowUpOp.AMEND_TP:
+            if fu.tp_index_hint is None:
+                return FollowUpPlan((), RejectReason.AMBIGUOUS_TARGET, (
+                    "tp amend without an index: one price across a ladder "
+                    "flattens every target",
+                ))
+            wanted = fu.tp_index_hint - 1
+            targets = tuple(leg for leg in open_legs if leg.leg_index == wanted)
+            if not targets:
+                return FollowUpPlan((), RejectReason.AMBIGUOUS_TARGET, (
+                    f"no open leg for TP{fu.tp_index_hint} (leg_index {wanted})",
+                ))
+
         new = round_price(fu.price_hint, spec)
         min_dist = _min_stop_distance(spec, snap, pol)
         intents = []
-        for leg in open_legs:
+        for leg in targets:
             if fu.op is FollowUpOp.AMEND_SL:
                 # Exit-side reference: an SL for a BUY closes at bid, a SELL
                 # at ask.
