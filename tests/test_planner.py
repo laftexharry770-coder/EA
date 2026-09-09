@@ -16,11 +16,10 @@ EXNESS = SymbolSpec("XAUUSDm", 3, 0.001, 0.001, 0.01, 100.0, 0.01, 0, 0)
 ACCT = AccountSpec("ic_demo", "XAUUSD", fixed_lot=0.01, magic_base=77001)
 POLICY = Policy()
 
-# Price cannot run past a take profit without also running far past the entry
-# zone, so under the default policy the chase gate fires first and masks the
-# TP-dropping path. The two behaviours are independent; a permissive chase
-# budget is the only way to exercise the second one in isolation.
-PERMISSIVE = Policy(chase_floor_usd=50.0)
+# I2: the chase gate no longer runs on the pending path, so price far past
+# the zone is a limit order at the favourable edge, not a rejection. That
+# makes these TP-dropping cases reachable under the real default policy --
+# the permissive-chase escape hatch they used to need is gone.
 
 def snap(bid, ask, spread=0.10, median=0.10):
     return MarketSnapshot(bid=bid, ask=ask, tick_time_utc=NOW,
@@ -77,20 +76,53 @@ def test_market_legs_carry_no_expiry():
     assert plan.legs[0].expires_at_utc is None
 
 def test_passed_tps_are_dropped_as_legs():
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), PERMISSIVE)
+    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
     assert [leg.tp for leg in plan.legs] == [4500.0, 4505.0]
 
 def test_rejected_when_no_tp_survives():
-    plan = plan_entry(sig(tps=(4490.0,)), ACCT, SPEC, snap(4499.0, 4499.10), PERMISSIVE)
+    plan = plan_entry(sig(tps=(4490.0,)), ACCT, SPEC, snap(4499.0, 4499.10), POLICY)
     assert not plan.accepted
     assert plan.reason is RejectReason.ALL_TPS_BEHIND
 
-def test_chase_gate_still_rejects_a_runaway_under_default_policy():
-    # The companion to the two tests above: with the real policy, price this
-    # far past the zone must be refused outright, not traded on fewer legs.
+def test_a_runaway_becomes_a_limit_at_the_favourable_edge():
+    # Replaces test_chase_gate_still_rejects_a_runaway_under_default_policy.
+    # A limit fills at a fixed price no matter how far price has run, so
+    # there is nothing to chase: rejecting here killed the pending path that
+    # spec 7.1 commits to. Price 11 USD past the zone must still rest an
+    # order at 4480, not refuse the signal.
     plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
+    assert plan.accepted
+    assert plan.reason is None
+    assert all(leg.kind is OrderKind.LIMIT for leg in plan.legs)
+    assert {leg.price for leg in plan.legs} == {4480.0}
+
+def test_a_runaway_sell_becomes_a_limit_at_the_favourable_edge():
+    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4469.0, 4469.10), POLICY)
+    assert plan.accepted
+    assert all(leg.kind is OrderKind.LIMIT for leg in plan.legs)
+    assert {leg.price for leg in plan.legs} == {4485.0}
+
+def test_a_runaway_limit_still_carries_an_expiry():
+    # The pending path's staleness bound is the expiry, not the chase gate.
+    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
+    assert all(leg.expires_at_utc is not None for leg in plan.legs)
+
+def test_a_runaway_past_every_tp_is_still_rejected():
+    # invalidation_gate, not chase_gate, is what bounds a stale limit: once
+    # price is past every target the signal is dead however it would fill.
+    plan = plan_entry(sig(), ACCT, SPEC, snap(4510.0, 4510.10), POLICY)
     assert not plan.accepted
-    assert plan.reason is RejectReason.CHASE_EXCEEDED
+    assert plan.reason is RejectReason.ALL_TPS_BEHIND
+
+def test_a_runaway_through_the_stop_is_still_rejected():
+    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
+    assert not plan.accepted
+    assert plan.reason is RejectReason.SL_BREACHED
+
+def test_market_entries_are_unaffected_by_the_move():
+    plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
+    assert plan.accepted
+    assert all(leg.kind is OrderKind.MARKET for leg in plan.legs)
 
 def test_leg_index_is_in_the_comment():
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
@@ -132,7 +164,7 @@ def test_leg_index_reflects_original_tp_position_when_earlier_tps_have_passed():
     # must be labelled 2 and 3 (their real position in sig.tps), not 0 and 1
     # (their position in the surviving subset) — reconciliation depends on
     # the comment's leg index to tell legs of the same signal apart.
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), PERMISSIVE)
+    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
     assert [leg.tp for leg in plan.legs] == [4500.0, 4505.0]
     assert [leg.leg_index for leg in plan.legs] == [2, 3]
     assert plan.legs[0].comment.endswith("-2")

@@ -15,6 +15,12 @@ from xaucopier.domain.market import AccountSpec, MarketSnapshot, Policy
 from xaucopier.domain.money import SymbolSpec, round_price, usd_to_points
 from xaucopier.domain.signal import Side, Signal
 
+# chase_gate is deliberately absent: it applies to the market path only, and
+# is run below once the entry kind is known. Chasing is a market-order
+# problem -- a limit fills at a fixed price however far price has run, so
+# rejecting a signal on overshoot killed the pending path outright. On the
+# real sample the budget is max(1.00, 0.25 x (4490 - 4485)) = 1.25 USD, a
+# distance gold covers in seconds.
 _SIGNAL_GATES = (
     gates.age_gate,
     gates.tick_freshness_gate,
@@ -22,7 +28,6 @@ _SIGNAL_GATES = (
     gates.geometry_gate,
     gates.magnitude_gate,
     gates.invalidation_gate,
-    gates.chase_gate,
     gates.stops_distance_gate,
 )
 
@@ -70,6 +75,22 @@ def plan_entry(
 
     price = snap.ask if sig.side is Side.BUY else snap.bid
     kind, entry_price, expires = _entry_for(sig, snap, pol, price)
+
+    # Chase only applies to a market fill, so it runs after the entry kind is
+    # known. Be honest about the consequence: _entry_for picks MARKET only
+    # when price is already at-or-better than the zone, which is exactly when
+    # chase_gate's overshoot is <= 0, so as the rule stands today this gate
+    # cannot reject anything. It is kept as defence in depth for a future
+    # change to the entry-kind rule (e.g. a market fill some distance past
+    # the zone), where it would immediately have teeth again.
+    #
+    # The limit path is not left unbounded: its staleness risk is carried by
+    # pending_max_age_hours (the order expires) and by invalidation_gate
+    # (SL breached, or every take profit already behind price).
+    if kind is OrderKind.MARKET:
+        chase = gates.chase_gate(sig, spec, snap, pol)
+        if not chase.ok:
+            return Plan.rejected(chase.reason, (chase.detail,))
 
     legs = tuple(
         OrderIntent(

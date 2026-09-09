@@ -56,11 +56,36 @@ def test_non_gold_symbol_is_skipped():
     text = "US30 | BUY SIGNAL\n44800-44850\nSL: 44700\nTP1: 44900"
     r = _parse(text)
     assert r.ok is False
+    # I1: a well-formed index signal is not a broken gold template. It is
+    # skipped (spec 6.2), so it must not feed consecutive_parse_failures.
+    assert r.reason is RejectReason.NOT_A_SIGNAL
 
 def test_chatter_is_rejected_without_raising():
     r = _parse("Good morning traders, be patient today")
     assert r.ok is False
+    # I1: ordinary channel chatter is certain and constant. Reporting it as
+    # PARSE_FAILED trips the three-strike PAUSE_NEW safety stop on noise and
+    # teaches the operator to ignore the one detector for a real template
+    # change.
+    assert r.reason is RejectReason.NOT_A_SIGNAL
+
+def test_gold_header_with_no_sl_is_a_real_parse_failure():
+    # I1's other side: the header matched, so this IS our template, and the
+    # structure is broken. That must still count toward the failure streak.
+    r = _parse("XAUUSD | BUY SIGNAL\n4480-4485\nTP1: 4490")
+    assert r.ok is False
     assert r.reason is RejectReason.PARSE_FAILED
+
+def test_gold_header_with_no_zone_is_a_real_parse_failure():
+    r = _parse("XAUUSD | BUY SIGNAL\nSL: 4470\nTP1: 4490")
+    assert r.reason is RejectReason.PARSE_FAILED
+
+def test_gold_header_with_no_tps_is_a_real_parse_failure():
+    r = _parse("XAUUSD | BUY SIGNAL\n4480-4485\nSL: 4470")
+    assert r.reason is RejectReason.PARSE_FAILED
+
+def test_an_empty_message_is_skipped_not_failed():
+    assert _parse("").reason is RejectReason.NOT_A_SIGNAL
 
 def test_en_dash_zone_is_accepted():
     text = "XAUUSD | BUY SIGNAL\n4480–4485\nSL: 4470\nTP1: 4490"

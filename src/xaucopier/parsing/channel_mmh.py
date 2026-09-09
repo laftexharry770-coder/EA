@@ -13,6 +13,14 @@ A partial match is a hard reject. This parser never returns a best-effort
 Signal: a template change must surface as a loud parse failure, never as a
 trade with a missing leg.
 
+Rejection comes in two flavours, and the difference is load-bearing. A
+message that never claimed to be this template -- chatter, or a signal for
+another symbol -- is *skipped* (NOT_A_SIGNAL). Only a message whose header
+matched and whose structure then failed is a *failure* (PARSE_FAILED),
+because that is what the caller's consecutive-failure counter watches, and
+three of those trip PAUSE_NEW (spec 6.2). Counting chatter there would trip
+the safety stop on noise and train the operator to ignore it.
+
 Ambiguity is also a hard reject, not just absence. The header, entry zone
 and stop loss must each match exactly once in the message -- two matches
 (a stale value re-stated, or two signal blocks concatenated together) is
@@ -66,14 +74,18 @@ def parse(
     clean = normalize(text)
 
     heads = list(_HEAD.finditer(clean))
+    # No header and a non-gold alias are both "not addressed to us", not a
+    # broken template: they skip. Only a message that announced itself as
+    # this channel's gold format and then failed to hold it is a parse
+    # failure, because that is the streak that trips PAUSE_NEW.
     if not heads:
-        return ParseResult.fail("no 'SYMBOL | SIDE SIGNAL' header")
+        return ParseResult.skip("no 'SYMBOL | SIDE SIGNAL' header")
     if len(heads) > 1:
         return ParseResult.fail("ambiguous message: multiple headers found")
     head = heads[0]
     alias = head.group(1).upper()
     if alias not in GOLD_ALIASES:
-        return ParseResult.fail(f"symbol {alias!r} is not gold")
+        return ParseResult.skip(f"symbol {alias!r} is not gold")
     side = Side.BUY if head.group(2).upper() == "BUY" else Side.SELL
 
     zone_matches = list(_ZONE.finditer(clean))

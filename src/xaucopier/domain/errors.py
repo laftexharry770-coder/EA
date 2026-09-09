@@ -18,5 +18,6 @@ class RejectReason(str, Enum):
     MARKET_SHUT = "market_shut"
     DUPLICATE_SIGNAL = "duplicate_signal"
     PARSE_FAILED = "parse_failed"
+    NOT_A_SIGNAL = "not_a_signal"
     NOT_APPLICABLE = "not_applicable"
     AMBIGUOUS_TARGET = "ambiguous_target"
