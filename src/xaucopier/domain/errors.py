@@ -21,3 +21,4 @@ class RejectReason(str, Enum):
     NOT_A_SIGNAL = "not_a_signal"
     NOT_APPLICABLE = "not_applicable"
     AMBIGUOUS_TARGET = "ambiguous_target"
+    PENDING_ONLY = "pending_only"

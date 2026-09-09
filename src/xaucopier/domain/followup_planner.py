@@ -141,6 +141,17 @@ def plan_followup(
         if fu.price_hint is None:
             return FollowUpPlan((), RejectReason.AMBIGUOUS_TARGET, ("amend without a price",))
         if not open_legs:
+            if pending_legs:
+                # A distinct "modify pending order" intent belongs to Plan 3
+                # (a different broker operation from modifying a position);
+                # out of scope here. Until it exists, the honest move is to
+                # refuse loudly rather than silently do nothing -- these
+                # orders will fill carrying a stop the poster explicitly
+                # moved, a directly wrong dollar risk under fixed-lot sizing.
+                return FollowUpPlan((), RejectReason.PENDING_ONLY, (
+                    f"{len(pending_legs)} pending leg(s) still carry the stale "
+                    "stop -- amend the pending order(s) at the broker directly",
+                ))
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing open to amend",))
         # An SL amend reaches every open leg: one signal has one shared stop.
         # A TP amend does not -- each leg owns its own target, so the poster

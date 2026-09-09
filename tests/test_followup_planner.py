@@ -273,17 +273,41 @@ _ALL_PENDING = (
             price_open=0.0, sl=4470.0, tp=4500.0, is_pending=True),
 )
 
-def test_amend_sl_with_open_legs_empty_is_not_applicable():
+# I8 note: these two cases are pending-only, so they now report
+# PENDING_ONLY rather than NOT_APPLICABLE. The substance is unchanged --
+# still no intents, still a note -- but the reason no longer reads as
+# "nothing to do" for a case where a human must look. The genuinely-empty
+# case below keeps NOT_APPLICABLE.
+
+def test_amend_sl_against_pending_only_legs_is_pending_only():
     plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=4480.0), _ALL_PENDING, SPEC, SNAP, POLICY)
     assert plan.intents == ()
-    assert plan.reason is RejectReason.NOT_APPLICABLE
+    assert plan.reason is RejectReason.PENDING_ONLY
+    assert plan.notes
+    assert "1" in plan.notes[0]
+
+def test_amend_tp_against_pending_only_legs_is_pending_only():
+    plan = plan_followup(fu(FollowUpOp.AMEND_TP, price_hint=4500.0, tp_index_hint=1),
+                         _ALL_PENDING, SPEC, SNAP, POLICY)
+    assert plan.intents == ()
+    assert plan.reason is RejectReason.PENDING_ONLY
     assert plan.notes
 
-def test_amend_tp_with_open_legs_empty_is_not_applicable():
-    plan = plan_followup(fu(FollowUpOp.AMEND_TP, price_hint=4500.0), _ALL_PENDING, SPEC, SNAP, POLICY)
+def test_amend_note_counts_every_pending_leg_carrying_the_stale_stop():
+    four_pending = tuple(
+        LegView(position_ticket=5000 + i, leg_index=i, side=Side.BUY, volume=0.01,
+                price_open=0.0, sl=4470.0, tp=4490.0 + 5 * i, is_pending=True)
+        for i in range(4)
+    )
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=4480.0),
+                         four_pending, SPEC, SNAP, POLICY)
+    assert plan.reason is RejectReason.PENDING_ONLY
+    assert "4" in plan.notes[0]
+
+def test_amend_with_no_legs_at_all_is_still_not_applicable():
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=4480.0), (), SPEC, SNAP, POLICY)
     assert plan.intents == ()
     assert plan.reason is RejectReason.NOT_APPLICABLE
-    assert plan.notes
 
 def test_sl_to_be_all_legs_pending_is_not_applicable():
     plan = plan_followup(fu(FollowUpOp.SL_TO_BE), _ALL_PENDING, SPEC, SNAP, POLICY)
