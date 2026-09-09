@@ -16,6 +16,7 @@ from typing import Callable
 from xaucopier.domain.market import AccountSpec, MarketSnapshot, Policy
 from xaucopier.domain.money import SymbolSpec
 from xaucopier.domain.planner import plan_entry
+from xaucopier.domain.signal import Signal
 from xaucopier.parsing.channel_mmh import parse
 
 
@@ -26,10 +27,14 @@ class Decision:
     reason: str | None
     leg_count: int
     entry_kind: str | None
+    entry_price: float | None
+    sl: float | None
+    leg_indices: tuple[int, ...]
     prices: tuple[float, ...]
 
     def as_dict(self) -> dict:
         data = asdict(self)
+        data["leg_indices"] = list(self.leg_indices)
         data["prices"] = list(self.prices)
         return data
 
@@ -39,8 +44,12 @@ def replay(
     account: AccountSpec,
     spec: SymbolSpec,
     policy: Policy,
-    snapshot_for: Callable[[datetime], MarketSnapshot],
+    snapshot_for: Callable[[Signal], MarketSnapshot],
 ) -> list[Decision]:
+    """snapshot_for takes the parsed Signal (not just its timestamp) so the
+    synthetic market can be derived from the message's OWN levels -- see
+    Item I6. A hard-coded price silently turns any fixture whose zone sits
+    far from that price into a baked-in magnitude_band rejection."""
     decisions: list[Decision] = []
     for fixture in fixtures:
         posted = datetime.fromisoformat(fixture["posted_at_utc"])
@@ -51,18 +60,28 @@ def replay(
             posted_at_utc=posted,
         )
         if not result.ok:
-            decisions.append(Decision(fixture["message_id"], False,
-                                      result.reason.value, 0, None, ()))
-            continue
-        plan = plan_entry(result.signal, account, spec, snapshot_for(posted), policy)
-        decisions.append(Decision(
-            message_id=fixture["message_id"],
-            accepted=plan.accepted,
-            reason=plan.reason.value if plan.reason else None,
-            leg_count=len(plan.legs),
-            entry_kind=plan.legs[0].kind.value if plan.legs else None,
-            prices=tuple(leg.tp for leg in plan.legs),
-        ))
+            decision = Decision(fixture["message_id"], False, result.reason.value,
+                                0, None, None, None, (), ())
+        else:
+            plan = plan_entry(result.signal, account, spec, snapshot_for(result.signal), policy)
+            decision = Decision(
+                message_id=fixture["message_id"],
+                accepted=plan.accepted,
+                reason=plan.reason.value if plan.reason else None,
+                leg_count=len(plan.legs),
+                entry_kind=plan.legs[0].kind.value if plan.legs else None,
+                entry_price=plan.legs[0].price if plan.legs else None,
+                sl=plan.legs[0].sl if plan.legs else None,
+                leg_indices=tuple(leg.leg_index for leg in plan.legs),
+                prices=tuple(leg.tp for leg in plan.legs),
+            )
+        if "expect" in fixture:
+            want_accept = fixture["expect"] == "accept"
+            assert decision.accepted is want_accept, (
+                f"fixture {fixture['message_id']} declared expect={fixture['expect']!r} "
+                f"but decided accepted={decision.accepted}"
+            )
+        decisions.append(decision)
     return decisions
 
 
@@ -78,10 +97,17 @@ def _main() -> None:
     spec = SymbolSpec("XAUUSD", 2, 0.01, 0.01, 0.01, 100.0, 0.01, 0, 0)
     account = AccountSpec("ic_demo", "XAUUSD", fixed_lot=0.01, magic_base=77001)
 
-    def snapshot_for(posted: datetime) -> MarketSnapshot:
-        return MarketSnapshot(bid=4482.0, ask=4482.10, tick_time_utc=posted,
-                              spread_usd=0.10, median_spread_usd=0.10,
-                              now_utc=posted + timedelta(seconds=5))
+    def snapshot_for(signal: Signal) -> MarketSnapshot:
+        # A pure function of the fixture's own signal, not a wall clock and
+        # not a hard-coded price -- the mid tracks the entry zone the poster
+        # actually quoted, so a new fixture at a different gold level does
+        # not replay as a baked-in magnitude_band rejection (Item I6).
+        spread = 0.10
+        mid = (signal.zone.lo + signal.zone.hi) / 2.0
+        return MarketSnapshot(bid=mid - spread / 2, ask=mid + spread / 2,
+                              tick_time_utc=signal.posted_at_utc,
+                              spread_usd=spread, median_spread_usd=spread,
+                              now_utc=signal.posted_at_utc + timedelta(seconds=5))
 
     decisions = replay(fixtures, account, spec, Policy(), snapshot_for)
     payload = json.dumps([d.as_dict() for d in decisions], indent=2)

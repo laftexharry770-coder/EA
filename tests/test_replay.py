@@ -1,9 +1,10 @@
 import json
-from datetime import datetime, timedelta, UTC
+from datetime import timedelta
 from pathlib import Path
 
 from xaucopier.domain.market import AccountSpec, MarketSnapshot, Policy
 from xaucopier.domain.money import SymbolSpec
+from xaucopier.domain.signal import Signal
 from xaucopier.replay.harness import replay, Decision
 
 FIXDIR = Path(__file__).parent / "fixtures/messages"
@@ -11,11 +12,16 @@ GOLDEN = Path(__file__).parent / "fixtures/expected_decisions.json"
 SPEC = SymbolSpec("XAUUSD", 2, 0.01, 0.01, 0.01, 100.0, 0.01, 0, 0)
 ACCT = AccountSpec("ic_demo", "XAUUSD", fixed_lot=0.01, magic_base=77001)
 
-def _snap_for(posted: datetime) -> MarketSnapshot:
-    """Deterministic synthetic market: price sits inside the zone."""
-    return MarketSnapshot(bid=4482.0, ask=4482.10, tick_time_utc=posted,
-                          spread_usd=0.10, median_spread_usd=0.10,
-                          now_utc=posted + timedelta(seconds=5))
+def _snap_for(signal: Signal) -> MarketSnapshot:
+    """Deterministic synthetic market derived from the signal's own entry
+    zone (mid), not a hard-coded price -- must stay consistent with the
+    harness's own snapshot_for (see Item I6)."""
+    spread = 0.10
+    mid = (signal.zone.lo + signal.zone.hi) / 2.0
+    return MarketSnapshot(bid=mid - spread / 2, ask=mid + spread / 2,
+                          tick_time_utc=signal.posted_at_utc,
+                          spread_usd=spread, median_spread_usd=spread,
+                          now_utc=signal.posted_at_utc + timedelta(seconds=5))
 
 def _fixtures():
     return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(FIXDIR.glob("*.json"))]

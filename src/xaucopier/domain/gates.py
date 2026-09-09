@@ -120,6 +120,13 @@ def chase_gate(sig: Signal, spec: SymbolSpec, snap: MarketSnapshot, pol: Policy)
     return _OK
 
 
+def min_stop_distance_usd(spec: SymbolSpec, snap: MarketSnapshot, pol: Policy) -> float:
+    """Minimum distance a stop may sit from live price, in USD. Shared by
+    stops_distance_gate (entry side) and followup_planner (amend side) --
+    one formula, not a twin that can drift out of sync."""
+    return max(spec.stops_level_usd, pol.stops_distance_spread_multiple * snap.spread_usd)
+
+
 def stops_distance_gate(sig: Signal, spec: SymbolSpec, snap: MarketSnapshot, pol: Policy) -> GateResult:
     """Reject a stop the broker will not accept. Never widen it.
 
@@ -128,7 +135,7 @@ def stops_distance_gate(sig: Signal, spec: SymbolSpec, snap: MarketSnapshot, pol
     the trade. Take profits may be clamped; the stop may not.
     """
     price = snap.ask if sig.side is Side.BUY else snap.bid
-    min_dist = max(spec.stops_level_usd, pol.stops_distance_spread_multiple * snap.spread_usd)
+    min_dist = min_stop_distance_usd(spec, snap, pol)
     if abs(price - sig.sl) < min_dist:
         return _no(RejectReason.STOPS_TOO_TIGHT,
                    f"sl {abs(price - sig.sl):.2f} from price, min {min_dist:.2f}")

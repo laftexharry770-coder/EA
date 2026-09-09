@@ -33,9 +33,14 @@ _SIGNAL_GATES = (
 
 
 def _comment(sig: Signal, leg_index: int) -> str:
-    """base36(message_id)-leg. The leg index is mandatory: without it the
-    legs of one signal are indistinguishable at the broker, and reconciliation
-    cannot tell which position is which."""
+    """base36(message_id)-leg, capped to the broker's 20-char comment limit.
+
+    The leg index is mandatory: without it the legs of one signal are
+    indistinguishable at the broker, and reconciliation cannot tell which
+    position is which. So the base36 prefix is what gets truncated when the
+    two together would overflow 20 chars -- never the suffix, or a large
+    enough message_id would silently drop the one field that must survive.
+    """
     digits = "0123456789abcdefghijklmnopqrstuvwxyz"
     n, out = sig.message_id, ""
     while True:
@@ -43,7 +48,9 @@ def _comment(sig: Signal, leg_index: int) -> str:
         out = digits[rem] + out
         if n == 0:
             break
-    return f"{out}-{leg_index}"[:20]
+    suffix = f"-{leg_index}"
+    prefix_budget = max(0, 20 - len(suffix))
+    return f"{out[:prefix_budget]}{suffix}"[:20]
 
 
 def plan_entry(

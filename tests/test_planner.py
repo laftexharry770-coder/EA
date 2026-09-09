@@ -134,6 +134,21 @@ def test_comment_fits_broker_limit():
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
     assert all(len(leg.comment) <= 20 for leg in plan.legs)
 
+def test_leg_index_survives_an_absurdly_large_message_id():
+    # A base36 prefix this long (36**25 has 26 base36 digits) plus "-{leg}"
+    # overflows the 20-char broker limit on its own. The leg index is the
+    # one mandatory field -- truncation must eat the prefix, not the leg
+    # index, or the comment stops disambiguating which leg is which.
+    huge = Signal(channel_id=-1, message_id=36 ** 25, side=Side.BUY,
+                  symbol_alias="XAUUSD", zone=EntryZone(4480.0, 4485.0),
+                  sl=4470.0, tps=(4490.0, 4495.0, 4500.0, 4505.0),
+                  posted_at_utc=NOW - timedelta(seconds=5), content_hash="h")
+    plan = plan_entry(huge, ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
+    assert plan.accepted
+    for leg in plan.legs:
+        assert leg.comment.endswith(f"-{leg.leg_index}")
+        assert len(leg.comment) <= 20
+
 def test_magic_is_constant_across_legs():
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
     assert {leg.magic for leg in plan.legs} == {77001}

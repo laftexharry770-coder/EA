@@ -9,6 +9,7 @@ import math
 from dataclasses import dataclass
 
 from xaucopier.domain.errors import RejectReason
+from xaucopier.domain.gates import min_stop_distance_usd
 from xaucopier.domain.intent import CancelIntent, CloseIntent, ModifyIntent
 from xaucopier.domain.market import MarketSnapshot, Policy
 from xaucopier.domain.money import SymbolSpec, round_price
@@ -30,7 +31,10 @@ class LegView:
 
 @dataclass(frozen=True, slots=True)
 class FollowUpPlan:
-    intents: tuple
+    # CLOSE_ALL is the one op that mixes kinds: open legs close as
+    # CloseIntent, pending legs cancel as CancelIntent. Every other op
+    # emits a single-type tuple, a subset of this same union.
+    intents: tuple[ModifyIntent | CloseIntent | CancelIntent, ...]
     reason: RejectReason | None = None
     notes: tuple[str, ...] = ()
 
@@ -44,14 +48,6 @@ def _breakeven_price(leg: LegView, snap: MarketSnapshot, pol: Policy, spec: Symb
     offset = snap.spread_usd + pol.be_buffer_usd
     raw = leg.price_open + offset if leg.side is Side.BUY else leg.price_open - offset
     return round_price(raw, spec)
-
-
-def _min_stop_distance(spec: SymbolSpec, snap: MarketSnapshot, pol: Policy) -> float:
-    """Minimum distance a stop may sit from live price, in USD. This is the
-    entry-side formula from gates.stops_distance_gate, duplicated here (not
-    imported) to keep this module's dependency surface small — if that
-    formula changes, update this twin too."""
-    return max(spec.stops_level_usd, pol.stops_distance_spread_multiple * snap.spread_usd)
 
 
 def plan_followup(
@@ -70,7 +66,7 @@ def plan_followup(
     if fu.op is FollowUpOp.SL_TO_BE:
         if not open_legs:
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing open for breakeven",))
-        min_dist = _min_stop_distance(spec, snap, pol)
+        min_dist = min_stop_distance_usd(spec, snap, pol)
         intents = []
         skipped_wrong_side = 0
         skipped_too_tight = 0
@@ -174,7 +170,7 @@ def plan_followup(
                 ))
 
         new = round_price(fu.price_hint, spec)
-        min_dist = _min_stop_distance(spec, snap, pol)
+        min_dist = min_stop_distance_usd(spec, snap, pol)
         intents = []
         for leg in targets:
             if fu.op is FollowUpOp.AMEND_SL:

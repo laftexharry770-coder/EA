@@ -5,6 +5,14 @@
     "reason": null,
     "leg_count": 4,
     "entry_kind": "market",
+    "entry_price": 4482.55,
+    "sl": 4470.0,
+    "leg_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
     "prices": [
       4490.0,
       4495.0,
