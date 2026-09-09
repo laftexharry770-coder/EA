@@ -22,7 +22,34 @@ from xaucopier.parsing.normalize import normalize
 NUM = r"\d+(?:\.\d+)?"
 
 # A message that looks like a full entry signal is never a follow-up.
-_IS_SIGNAL = re.compile(r"\bSIGNAL\b", re.I)
+#
+# The word "SIGNAL" alone is too thin a guard: an entry that drops that one
+# word is rejected by channel_mmh.parse and then reads here as
+# "AMEND_SL price_hint=<the entry's stop>". Under the obvious "try parse,
+# fall back to parse_followup" routing, a template change would move a live
+# trade's stop to a brand-new signal's level. So the test is structural --
+# entry *shape*, not entry vocabulary:
+#
+#   _ZONE_LINE   a line that is nothing but NUM-NUM (mirrors channel_mmh's
+#                _ZONE, the one line-anchored pattern an entry always has)
+#   _SL_VALUE + _INDEXED_TP   a stop written as a value together with at
+#                least one numbered target -- the rest of an entry's body
+#
+# Note what does NOT trip this: "TP2 to 4550" has an indexed target but no
+# SL value, and "SL to 4461" has neither (a bare "to" is not a value), so
+# both still parse as the amends they are.
+_HAS_SIGNAL_WORD = re.compile(r"\bSIGNAL\b", re.I)
+_ZONE_LINE = re.compile(rf"^{NUM}\s*[-–—]\s*{NUM}$", re.M)
+_SL_VALUE = re.compile(rf"\bSL\b\s*:?\s*{NUM}", re.I)
+_INDEXED_TP = re.compile(rf"\bTP\s*\d+\s*:?\s*{NUM}", re.I)
+
+
+def _looks_like_an_entry_signal(clean: str) -> bool:
+    if _HAS_SIGNAL_WORD.search(clean):
+        return True
+    if _ZONE_LINE.search(clean):
+        return True
+    return bool(_SL_VALUE.search(clean) and _INDEXED_TP.search(clean))
 
 # normalize() does not fold curly punctuation, so "don't" may arrive with
 # either an ASCII apostrophe or U+2019; "dont" with no apostrophe at all is
@@ -57,7 +84,7 @@ def parse_followup(
     clean = normalize(text)
     if _NEGATION.search(clean):
         return None
-    if _IS_SIGNAL.search(clean):
+    if _looks_like_an_entry_signal(clean):
         return None
 
     for op, pattern in _RULES:

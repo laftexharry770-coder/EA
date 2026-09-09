@@ -73,3 +73,42 @@ def test_grouped_thousands_with_two_digit_decimal_tail_alt():
 
 def test_grouped_thousands_with_one_digit_decimal_tail():
     assert normalize("12,345,6") == "12345.6"
+
+# --- I4: variation selectors and Unicode space separators.
+#
+# _DECORATION claimed Cf covered variation selectors. It does not: VS-16
+# (U+FE0F) is category Mn and the combining enclosing keycap (U+20E3) is Me,
+# so both survived. _ZONE is the only line-anchored regex (^...$), so a bare
+# U+FE0F left on the entry-zone line -- which .strip() does not remove --
+# breaks the anchor and hard-rejects a valid signal.
+
+def test_vs16_after_an_emoji_is_stripped_from_a_zone_line():
+    assert normalize("\U0001F4CD️ 4480-4485") == "4480-4485"
+
+def test_vs16_warning_emoji_leaves_no_residue():
+    # The fixture's own last line: the normalized output still carried a
+    # bare ️ from the warning sign.
+    out = normalize("⚠️ Manage your risk.")
+    assert "️" not in out
+    assert out == "Manage your risk."
+
+def test_keycap_enclosing_mark_is_stripped():
+    # U+20E3 is category Me, not Cf.
+    assert normalize("1️⃣ TP1: 4490") == "1 TP1: 4490"
+
+def test_thin_space_becomes_a_plain_space():
+    assert normalize("TP1: 4490") == "TP1: 4490"
+
+def test_en_space_becomes_a_plain_space():
+    assert normalize("TP1: 4490") == "TP1: 4490"
+
+def test_ideographic_space_becomes_a_plain_space():
+    assert normalize("TP1:　4490") == "TP1: 4490"
+
+def test_ogham_space_mark_becomes_a_plain_space():
+    # The Zs separator NFKC does NOT fold to U+0020, which is why the rule
+    # must be "any Zs" rather than a hand-kept list of characters.
+    assert normalize("TP1:  4490") == "TP1: 4490"
+
+def test_a_run_of_mixed_unicode_spaces_collapses_to_one():
+    assert normalize("TP4 　 :4505") == "TP4 :4505"

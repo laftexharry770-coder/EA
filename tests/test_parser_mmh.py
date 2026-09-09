@@ -148,3 +148,17 @@ def test_two_concatenated_signal_blocks_is_hard_reject():
     )
     r = _parse(text)
     assert r.ok is False
+
+def test_zone_line_with_a_variation_selector_still_parses():
+    # I4: _ZONE is the only line-anchored regex. A VS-16 left behind by the
+    # decoration strip is non-whitespace, so .strip() cannot remove it, the
+    # ^...$ anchor fails, and a perfectly valid signal is hard-rejected.
+    text = "XAUUSD | BUY SIGNAL\n\U0001F4CD️ 4480-4485\nSL: 4470\nTP1: 4490"
+    r = _parse(text)
+    assert r.ok is True, r.detail
+    assert (r.signal.zone.lo, r.signal.zone.hi) == (4480.0, 4485.0)
+
+def test_a_vs16_signal_hashes_the_same_as_its_plain_twin():
+    a = _parse("XAUUSD | BUY SIGNAL\n4480-4485\nSL: 4470\nTP1: 4490").signal
+    b = _parse("XAUUSD | BUY SIGNAL\n\U0001F4CD️ 4480-4485\n⚠️ SL: 4470\nTP1: 4490").signal
+    assert a.content_hash == b.content_hash

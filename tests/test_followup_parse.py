@@ -91,3 +91,52 @@ def test_amend_tp_without_index_leaves_hint_none():
     assert f.op is FollowUpOp.AMEND_TP
     assert f.price_hint == 4500.0
     assert f.tp_index_hint is None
+
+
+# --- I5: the entry-signal guard must be structural, not the literal word
+# "SIGNAL". A template that drops that one word produced a message which
+# channel_mmh rejects and parse_followup then reads as an AMEND_SL against
+# whatever trade is live -- under the obvious "try parse, fall back to
+# parse_followup" routing, a brand-new entry becomes "move the live stop".
+
+def test_a_signal_missing_the_word_signal_is_not_a_followup():
+    text = "XAUUSD | BUY\n4480-4485\nSL: 4470\nTP1: 4490\nTP2: 4495"
+    assert _p(text) is None
+
+def test_a_bare_entry_zone_line_blocks_the_parse():
+    text = "BUY\n4480-4485\nSL: 4470"
+    assert _p(text) is None
+
+def test_an_sl_value_plus_an_indexed_tp_blocks_the_parse():
+    # No zone line at all, but the SL-value + indexed-TP pair is entry
+    # structure, not a follow-up command.
+    text = "GOLD BUY\nSL: 4470\nTP1: 4490\nTP2: 4495"
+    assert _p(text) is None
+
+def test_an_en_dash_entry_zone_line_blocks_the_parse():
+    text = "XAUUSD | BUY\n4480–4485\nSL: 4470\nTP1: 4490"
+    assert _p(text) is None
+
+def test_real_amend_sl_still_parses():
+    f = _p("SL to 4461")
+    assert f.op is FollowUpOp.AMEND_SL
+    assert f.price_hint == 4461.0
+
+def test_close_all_still_parses():
+    assert _p("close all").op is FollowUpOp.CLOSE_ALL
+
+def test_amend_tp_with_an_index_is_not_swallowed_by_the_guard():
+    # The important false-positive control: one indexed TP, no SL value, so
+    # this is NOT entry structure and must still reach AMEND_TP.
+    f = _p("TP2 to 4550")
+    assert f is not None
+    assert f.op is FollowUpOp.AMEND_TP
+    assert f.tp_index_hint == 2
+    assert f.price_hint == 4550.0
+
+def test_colon_form_amend_tp_is_not_swallowed_by_the_guard():
+    f = _p("TP2: 4550")
+    assert f is not None and f.op is FollowUpOp.AMEND_TP
+
+def test_breakeven_still_parses():
+    assert _p("SL to BE").op is FollowUpOp.SL_TO_BE

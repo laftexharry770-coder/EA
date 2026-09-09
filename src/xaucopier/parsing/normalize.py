@@ -38,9 +38,19 @@ from __future__ import annotations
 import re
 import unicodedata
 
-# Unicode categories: So = symbol/other (most emoji), Cf = format
-# (zero-width joiners, variation selectors, direction marks).
-_DECORATION = {"So", "Cf"}
+# Unicode categories stripped as decoration:
+#   So = symbol/other (most emoji)
+#   Cf = format (zero-width joiner, BOM, direction marks)
+#   Mn = non-spacing mark -- this is where VARIATION SELECTOR-16 (U+FE0F)
+#        actually lives, not Cf. The whole VS-16 emoji family arrives with
+#        one of these trailing every glyph.
+#   Me = enclosing mark -- COMBINING ENCLOSING KEYCAP (U+20E3), the tail of
+#        the keycap digits.
+# The two mark categories matter more than they look: _ZONE is the only
+# line-anchored regex (^...$), and a leftover U+FE0F is non-whitespace, so
+# .strip() will not remove it, the anchor fails, and a valid signal is hard
+# rejected on decoration alone.
+_DECORATION = {"So", "Cf", "Mn", "Me"}
 
 # A maximal run of digits and commas, anchored on digits at both ends so a
 # trailing bare comma (e.g. "4470,") is never swept in.
@@ -69,8 +79,13 @@ def _rewrite_numeric_run(match: re.Match[str]) -> str:
 def normalize(text: str) -> str:
     # NFKC folds full-width digits and compatibility forms to ASCII.
     text = unicodedata.normalize("NFKC", text)
+    # One pass: drop decoration, and fold every Unicode space separator
+    # (Zs) to a plain space so the whitespace collapse below sees them.
+    # NFKC already folds most Zs characters, but not all -- U+1680 OGHAM
+    # SPACE MARK has no compatibility decomposition -- so the rule is the
+    # category itself, never a hand-kept list of code points.
     text = "".join(
-        " " if ch in "   " else ch
+        " " if unicodedata.category(ch) == "Zs" else ch
         for ch in text
         if unicodedata.category(ch) not in _DECORATION
     )
