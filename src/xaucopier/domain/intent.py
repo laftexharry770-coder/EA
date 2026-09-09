@@ -49,6 +49,17 @@ class CloseIntent:
 
 
 @dataclass(frozen=True, slots=True)
+class CancelIntent:
+    """Remove a resting pending order. Distinct from CloseIntent: at the
+    broker, closing a filled position is a deal, while removing a pending
+    order is TRADE_ACTION_REMOVE — different operations, so a pending
+    order's ticket is named order_ticket, not position_ticket."""
+    account_id: str
+    order_ticket: int
+    leg_index: int
+
+
+@dataclass(frozen=True, slots=True)
 class Plan:
     accepted: bool
     reason: RejectReason | None

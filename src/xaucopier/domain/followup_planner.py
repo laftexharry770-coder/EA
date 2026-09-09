@@ -9,7 +9,7 @@ import math
 from dataclasses import dataclass
 
 from xaucopier.domain.errors import RejectReason
-from xaucopier.domain.intent import CloseIntent, ModifyIntent
+from xaucopier.domain.intent import CancelIntent, CloseIntent, ModifyIntent
 from xaucopier.domain.market import MarketSnapshot, Policy
 from xaucopier.domain.money import SymbolSpec, round_price
 from xaucopier.domain.signal import FollowUp, FollowUpOp, Side
@@ -38,9 +38,20 @@ class FollowUpPlan:
 def _breakeven_price(leg: LegView, snap: MarketSnapshot, pol: Policy, spec: SymbolSpec) -> float:
     """Breakeven is the leg's OWN fill plus costs, never the signal's quoted
     entry — each broker filled somewhere different."""
+    # be_buffer_usd is expected to absorb round-turn commission until Plan 3
+    # models commission properly from broker-supplied per-lot/contract data;
+    # see the "explicitly out of scope" note in the task-9 review.
     offset = snap.spread_usd + pol.be_buffer_usd
     raw = leg.price_open + offset if leg.side is Side.BUY else leg.price_open - offset
     return round_price(raw, spec)
+
+
+def _min_stop_distance(spec: SymbolSpec, snap: MarketSnapshot, pol: Policy) -> float:
+    """Minimum distance a stop may sit from live price, in USD. This is the
+    entry-side formula from gates.stops_distance_gate, duplicated here (not
+    imported) to keep this module's dependency surface small — if that
+    formula changes, update this twin too."""
+    return max(spec.stops_level_usd, pol.stops_distance_spread_multiple * snap.spread_usd)
 
 
 def plan_followup(
@@ -57,17 +68,34 @@ def plan_followup(
         return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("no legs for this signal",))
 
     if fu.op is FollowUpOp.SL_TO_BE:
+        if not open_legs:
+            return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing open for breakeven",))
+        min_dist = _min_stop_distance(spec, snap, pol)
         intents = []
+        skipped_wrong_side = 0
+        skipped_too_tight = 0
         for leg in open_legs:
             be = _breakeven_price(leg, snap, pol, spec)
             price = snap.bid if leg.side is Side.BUY else snap.ask
             # Refuse a stop that is already on the wrong side of the market.
             if leg.side is Side.BUY and be >= price:
+                skipped_wrong_side += 1
                 continue
             if leg.side is Side.SELL and be <= price:
+                skipped_wrong_side += 1
+                continue
+            # Refuse a stop the broker will reject as too close to price.
+            if abs(price - be) < min_dist:
+                skipped_too_tight += 1
                 continue
             intents.append(ModifyIntent(account_id="", position_ticket=leg.position_ticket,
                                         sl=be, tp=leg.tp, leg_index=leg.leg_index))
+        if not intents:
+            total = skipped_wrong_side + skipped_too_tight
+            return FollowUpPlan((), RejectReason.NOT_APPLICABLE, (
+                f"{total} leg(s) skipped for breakeven "
+                f"({skipped_wrong_side} wrong side, {skipped_too_tight} too tight)",
+            ))
         return FollowUpPlan(tuple(intents))
 
     if fu.op is FollowUpOp.CLOSE_HALF:
@@ -84,37 +112,63 @@ def plan_followup(
         ))
 
     if fu.op is FollowUpOp.CLOSE_ALL:
-        return FollowUpPlan(tuple(
+        # Open legs close as positions; pending legs cancel as orders — the
+        # broker needs a different operation for each (Item 1).
+        close_intents = tuple(
             CloseIntent(account_id="", position_ticket=leg.position_ticket,
                         volume=leg.volume, leg_index=leg.leg_index)
-            for leg in legs
-        ))
+            for leg in open_legs
+        )
+        cancel_intents = tuple(
+            CancelIntent(account_id="", order_ticket=leg.position_ticket, leg_index=leg.leg_index)
+            for leg in pending_legs
+        )
+        return FollowUpPlan(close_intents + cancel_intents)
 
     if fu.op is FollowUpOp.CANCEL_PENDING:
         if not pending_legs:
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing pending",))
         return FollowUpPlan(tuple(
-            CloseIntent(account_id="", position_ticket=leg.position_ticket,
-                        volume=leg.volume, leg_index=leg.leg_index)
+            CancelIntent(account_id="", order_ticket=leg.position_ticket, leg_index=leg.leg_index)
             for leg in pending_legs
         ))
 
     if fu.op in (FollowUpOp.AMEND_SL, FollowUpOp.AMEND_TP):
         if fu.price_hint is None:
             return FollowUpPlan((), RejectReason.AMBIGUOUS_TARGET, ("amend without a price",))
+        if not open_legs:
+            return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing open to amend",))
         new = round_price(fu.price_hint, spec)
-        price = snap.bid if open_legs and open_legs[0].side is Side.BUY else snap.ask
+        min_dist = _min_stop_distance(spec, snap, pol)
         intents = []
         for leg in open_legs:
             if fu.op is FollowUpOp.AMEND_SL:
+                # Exit-side reference: an SL for a BUY closes at bid, a SELL
+                # at ask.
+                price = snap.bid if leg.side is Side.BUY else snap.ask
                 if leg.side is Side.BUY and new >= price:
                     return FollowUpPlan((), RejectReason.GEOMETRY_CONFLICT,
                                         (f"amended buy stop {new} is at/above price {price}",))
                 if leg.side is Side.SELL and new <= price:
                     return FollowUpPlan((), RejectReason.GEOMETRY_CONFLICT,
                                         (f"amended sell stop {new} is at/below price {price}",))
+                dist = abs(price - new)
+                if dist < min_dist:
+                    return FollowUpPlan((), RejectReason.STOPS_TOO_TIGHT,
+                                        (f"amended stop {dist:.2f} from price, min {min_dist:.2f}",))
                 intents.append(ModifyIntent("", leg.position_ticket, new, leg.tp, leg.leg_index))
             else:
+                # Entry-side reference: a TP is a target price must still
+                # travel to reach, same side as where a fresh entry fills.
+                price = snap.ask if leg.side is Side.BUY else snap.bid
+                if leg.side is Side.BUY and (new <= price or new <= leg.sl):
+                    return FollowUpPlan((), RejectReason.GEOMETRY_CONFLICT,
+                                        (f"amended buy tp {new} is not above "
+                                         f"price {price} and sl {leg.sl}",))
+                if leg.side is Side.SELL and (new >= price or new >= leg.sl):
+                    return FollowUpPlan((), RejectReason.GEOMETRY_CONFLICT,
+                                        (f"amended sell tp {new} is not below "
+                                         f"price {price} and sl {leg.sl}",))
                 intents.append(ModifyIntent("", leg.position_ticket, leg.sl, new, leg.leg_index))
         return FollowUpPlan(tuple(intents))
 
