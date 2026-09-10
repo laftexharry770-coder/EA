@@ -61,8 +61,14 @@ def load_channels(path: Path) -> tuple[ChannelCfg, ...]:
 
         # ordinal is explicit and operator-assigned, never derived from
         # list position: magic numbers on live positions are built from
-        # it, and reordering the file must never reassign them.
+        # it, and reordering the file must never reassign them. bool is a
+        # subclass of int in Python, so `ordinal = true` is excluded
+        # explicitly rather than slipping through `isinstance(x, int)`.
         ordinal = _field(entry, "ordinal", index)
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+            raise ConfigError(
+                f"channel {name!r}: ordinal must be an integer, got {ordinal!r}"
+            )
         if ordinal in seen_ordinals:
             raise ConfigError(
                 f"channel {name!r}: ordinal {ordinal} is already used by "

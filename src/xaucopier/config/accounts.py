@@ -54,8 +54,13 @@ def load_accounts(path: Path) -> tuple[AccountCfg, ...]:
 
         # ordinal is explicit and operator-assigned, never derived from
         # list position -- see channels.py for why (magic numbers on live
-        # positions are built from it).
+        # positions are built from it). bool is a subclass of int in
+        # Python, so `ordinal = true` is excluded explicitly.
         ordinal = _field(entry, "ordinal", index)
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+            raise ConfigError(
+                f"account {account_id!r}: ordinal must be an integer, got {ordinal!r}"
+            )
         if ordinal in seen_ordinals:
             raise ConfigError(
                 f"account {account_id!r}: ordinal {ordinal} is already used by "
@@ -65,8 +70,14 @@ def load_accounts(path: Path) -> tuple[AccountCfg, ...]:
 
         # magic_base identifies this account's positions on the broker
         # side; two accounts sharing one would make reconciliation
-        # misattribute open positions between them.
+        # misattribute open positions between them. A silent `True` (== 1)
+        # here is a real ownership hazard, not just a config nuisance, so
+        # bool is excluded explicitly as above.
         magic_base = _field(entry, "magic_base", index)
+        if isinstance(magic_base, bool) or not isinstance(magic_base, int):
+            raise ConfigError(
+                f"account {account_id!r}: magic_base must be an integer, got {magic_base!r}"
+            )
         if magic_base in seen_magic_bases:
             raise ConfigError(
                 f"account {account_id!r}: magic_base {magic_base} is already used by "

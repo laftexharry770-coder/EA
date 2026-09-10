@@ -240,6 +240,26 @@ def test_channel_missing_ordinal_is_a_load_error(tmp_path: Path):
         load_channels(p)
 
 
+def test_channel_ordinal_bool_is_rejected(tmp_path: Path):
+    # bool is a subclass of int in Python; `ordinal = true` must not
+    # silently load as ordinal 1 -- magic numbers on live positions are
+    # built from this value.
+    p = _write(
+        tmp_path,
+        "channels.toml",
+        """
+        [[channels]]
+        channel_id = 1
+        name       = "a"
+        parser     = "mmh"
+        ordinal    = true
+        enabled    = true
+        """,
+    )
+    with pytest.raises(ConfigError, match="ordinal"):
+        load_channels(p)
+
+
 # ---------------------------------------------------------------------------
 # accounts.toml
 # ---------------------------------------------------------------------------
@@ -442,6 +462,54 @@ def test_account_missing_ordinal_is_a_load_error(tmp_path: Path):
         """,
     )
     with pytest.raises(ConfigError, match="ordinal"):
+        load_accounts(p)
+
+
+def test_account_ordinal_bool_is_rejected(tmp_path: Path):
+    # bool is a subclass of int in Python; `ordinal = true` must not
+    # silently load as ordinal 1.
+    p = _write(
+        tmp_path,
+        "accounts.toml",
+        """
+        [[accounts]]
+        account_id    = "a"
+        broker        = "ICMarkets"
+        terminal_path = "C:\\\\a.exe"
+        login         = 1
+        server        = "s1"
+        symbol        = "XAUUSD"
+        fixed_lot     = 0.01
+        magic_base    = 1
+        ordinal       = true
+        enabled       = true
+        """,
+    )
+    with pytest.raises(ConfigError, match="ordinal"):
+        load_accounts(p)
+
+
+def test_account_magic_base_bool_is_rejected(tmp_path: Path):
+    # magic_base identifies live broker positions -- a silent `True` (== 1)
+    # here is a real ownership hazard, not just a config nuisance.
+    p = _write(
+        tmp_path,
+        "accounts.toml",
+        """
+        [[accounts]]
+        account_id    = "a"
+        broker        = "ICMarkets"
+        terminal_path = "C:\\\\a.exe"
+        login         = 1
+        server        = "s1"
+        symbol        = "XAUUSD"
+        fixed_lot     = 0.01
+        magic_base    = true
+        ordinal       = 1
+        enabled       = true
+        """,
+    )
+    with pytest.raises(ConfigError, match="magic_base"):
         load_accounts(p)
 
 
