@@ -183,3 +183,30 @@ def test_clock_and_randomness_modules_are_forbidden(name):
 def test_pure_core_has_files_to_check():
     # Guards against the parametrize silently collecting nothing.
     assert len(list(_pure_files())) >= 8
+
+
+# `ingest/` and `cli/` are not part of the pure core -- they do real I/O
+# (Telethon, DPAPI, argparse/input()) -- but they must never import the
+# MetaTrader5 SDK directly. Execution (Plan 3) owns that boundary; a
+# listener or CLI command reaching straight into MT5 would let a signal
+# get acted on outside the store/outbox path this design relies on for
+# idempotency and reconciliation.
+INGEST_CLI_DIRS = ["ingest", "cli"]
+
+def _ingest_cli_files():
+    for name in INGEST_CLI_DIRS:
+        directory = ROOT / name
+        if directory.exists():
+            yield from sorted(directory.rglob("*.py"))
+
+@pytest.mark.parametrize("path", list(_ingest_cli_files()), ids=lambda p: p.name)
+def test_ingest_and_cli_never_import_mt5(path: Path):
+    offending = _imported_roots(path) & {"MetaTrader5"}
+    assert not offending, (
+        f"{path.name} imports MetaTrader5; ingest/ and cli/ must never "
+        "touch the MT5 SDK directly"
+    )
+
+def test_ingest_and_cli_have_files_to_check():
+    # Guards against the parametrize silently collecting nothing.
+    assert len(list(_ingest_cli_files())) >= 2
