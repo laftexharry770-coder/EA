@@ -1,4 +1,4 @@
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
   channel_id      INTEGER NOT NULL,
   message_id      INTEGER NOT NULL,
   kind            TEXT    NOT NULL,   -- signal | followup | skip | parse_failed
@@ -10,7 +10,7 @@ CREATE TABLE messages (
   source          TEXT    NOT NULL,   -- live | backfill | poll
   PRIMARY KEY (channel_id, message_id)
 );
-CREATE TABLE signals (
+CREATE TABLE IF NOT EXISTS signals (
   signal_id   INTEGER PRIMARY KEY,
   channel_id  INTEGER NOT NULL,
   message_id  INTEGER NOT NULL,
@@ -21,8 +21,8 @@ CREATE TABLE signals (
   UNIQUE (channel_id, message_id),
   FOREIGN KEY (channel_id, message_id) REFERENCES messages(channel_id, message_id)
 );
-CREATE INDEX idx_signals_trade_hash ON signals(trade_hash);
-CREATE TABLE followups (
+CREATE INDEX IF NOT EXISTS idx_signals_trade_hash ON signals(trade_hash);
+CREATE TABLE IF NOT EXISTS followups (
   followup_id         INTEGER PRIMARY KEY,
   channel_id          INTEGER NOT NULL,
   message_id          INTEGER NOT NULL,
@@ -33,7 +33,7 @@ CREATE TABLE followups (
   resolution_path     TEXT,
   UNIQUE (channel_id, message_id)
 );
-CREATE TABLE outbox (
+CREATE TABLE IF NOT EXISTS outbox (
   outbox_id     INTEGER PRIMARY KEY,
   account_id    TEXT    NOT NULL,
   kind          TEXT    NOT NULL,   -- ENTRY | FOLLOWUP
@@ -45,13 +45,13 @@ CREATE TABLE outbox (
   claimed_by_pid INTEGER,
   attempts      INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX idx_outbox_claim ON outbox(account_id, state, outbox_id);
-CREATE TABLE channel_state (
+CREATE INDEX IF NOT EXISTS idx_outbox_claim ON outbox(account_id, state, outbox_id);
+CREATE TABLE IF NOT EXISTS channel_state (
   channel_id                INTEGER PRIMARY KEY,
   last_processed_message_id INTEGER NOT NULL DEFAULT 0,
   consecutive_parse_failures INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE metrics (
+CREATE TABLE IF NOT EXISTS metrics (
   day_key TEXT NOT NULL, name TEXT NOT NULL, value INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day_key, name)
 );

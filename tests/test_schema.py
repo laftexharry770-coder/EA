@@ -199,3 +199,138 @@ def test_followups_duplicate_channel_message_rejected(tmp_path):
     with pytest.raises(sqlite3.IntegrityError):
         _insert_followup(conn)
     conn.close()
+
+
+# -- migrate() must be crash-safe: DDL + user_version is one transaction -
+
+def test_migrate_recovers_from_partial_prior_application(tmp_path):
+    """Reproduces the reviewer's crash-window scenario: a process dies
+    between `executescript()` finishing (already durable -- DDL commits
+    itself statement-by-statement in autocommit mode) and the
+    `PRAGMA user_version = 1` write that was meant to follow it. On disk
+    that leaves some tables present but `user_version` still 0.
+
+    Before the fix, `migrate()` trusted `user_version == 0` to mean "no
+    tables exist" and re-ran the full script from scratch, raising
+    `sqlite3.OperationalError: table messages already exists` -- and
+    every subsequent call would fail the same way, permanently bricking
+    the database. The fix must tolerate (and complete) this partial
+    state instead.
+    """
+    db_path = tmp_path / "store.db"
+
+    # Simulate a migrate() that got through the first couple of
+    # statements and then died before writing user_version.
+    partial_conn = sqlite3.connect(db_path)
+    partial_conn.executescript(
+        """
+        CREATE TABLE messages (
+          channel_id      INTEGER NOT NULL,
+          message_id      INTEGER NOT NULL,
+          kind            TEXT    NOT NULL,
+          content_hash    TEXT,
+          raw_text        TEXT    NOT NULL,
+          edit_date_utc   TEXT,
+          received_at_utc TEXT    NOT NULL,
+          posted_at_utc   TEXT    NOT NULL,
+          source          TEXT    NOT NULL,
+          PRIMARY KEY (channel_id, message_id)
+        );
+        CREATE TABLE signals (
+          signal_id   INTEGER PRIMARY KEY,
+          channel_id  INTEGER NOT NULL,
+          message_id  INTEGER NOT NULL,
+          parsed_json TEXT    NOT NULL,
+          trade_hash  TEXT    NOT NULL,
+          state       TEXT    NOT NULL,
+          version     INTEGER NOT NULL DEFAULT 1,
+          UNIQUE (channel_id, message_id),
+          FOREIGN KEY (channel_id, message_id) REFERENCES messages(channel_id, message_id)
+        );
+        CREATE INDEX idx_signals_trade_hash ON signals(trade_hash);
+        """
+    )
+    # Deliberately no `PRAGMA user_version = 1`; close without setting it,
+    # matching a process that died mid-migrate.
+    partial_conn.close()
+
+    # Confirm the simulated crash state: tables exist, version is still 0.
+    check_conn = sqlite3.connect(db_path)
+    (version,) = check_conn.execute("PRAGMA user_version").fetchone()
+    assert version == 0
+    existing = {
+        row[0]
+        for row in check_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert "messages" in existing
+    check_conn.close()
+
+    # A fresh connection's migrate() call must recover, not brick.
+    conn = sqlite3.connect(db_path)
+    migrate(conn)  # must not raise sqlite3.OperationalError
+
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == CURRENT_VERSION
+
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert tables == EXPECTED_TABLES
+    conn.close()
+
+
+def test_migrate_rolls_back_cleanly_on_mid_ddl_failure(tmp_path, monkeypatch):
+    """If migrate() is interrupted partway through applying the DDL, the
+    whole attempt must roll back: `user_version` stays 0 and no tables
+    are left behind, so the next call starts from a clean slate rather
+    than the crash-window brick this task fixes.
+
+    `sqlite3.Connection` is an immutable C type -- its `execute` method
+    cannot be monkeypatched directly -- so the failure is injected the
+    way the task brief's fallback suggests: by appending a deliberately
+    invalid statement onto the real schema text. Everything before it
+    (all six real tables) executes fine inside the transaction; the
+    broken statement then raises, and that must undo the valid work
+    that came before it too, proving the whole DDL application plus the
+    user_version write is one atomic unit.
+    """
+    import xaucopier.store.migrations as migrations_module
+
+    db_path = tmp_path / "store.db"
+
+    real_schema_sql = migrations_module._schema_sql
+
+    def broken_schema_sql() -> str:
+        return real_schema_sql() + "\nCREATE TABLE this is not valid sql;\n"
+
+    monkeypatch.setattr(migrations_module, "_schema_sql", broken_schema_sql)
+
+    conn = sqlite3.connect(db_path)
+    with pytest.raises(sqlite3.OperationalError):
+        migrations_module.migrate(conn)
+
+    monkeypatch.undo()
+
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 0
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert tables == set()
+    conn.close()
+
+    # And a subsequent, unpatched migrate() call on the same file
+    # succeeds cleanly.
+    conn2 = sqlite3.connect(db_path)
+    migrate(conn2)
+    (version,) = conn2.execute("PRAGMA user_version").fetchone()
+    assert version == CURRENT_VERSION
+    conn2.close()
