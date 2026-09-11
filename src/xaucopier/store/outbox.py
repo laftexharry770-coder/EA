@@ -48,6 +48,31 @@ in ``messages_repo.ingest()`` this matters concretely -- it is called
 injected exception) between the insert and the fan-out leaves neither
 row behind once the Writer (or a test) rolls back. See
 ``messages_repo.py``'s call site.
+
+**Precondition, enforced, not assumed.** Because :func:`claim` and
+:func:`sweep_expired` open their own transaction, they require the
+connection to have no transaction already pending -- and this is checked
+up front via ``conn.in_transaction`` and raised as ``RuntimeError``, not
+merely documented. The first cut of this module got that precondition
+wrong in a dangerous direction: it assumed a connection already
+mid-transaction would make ``conn.execute("BEGIN IMMEDIATE")`` raise
+``OperationalError: cannot start a transaction within a transaction``,
+which reads as "loud failure, safe". Task 6 review round 1 found that is
+not what actually happens: assigning ``conn.isolation_level = None`` --
+which both functions did unconditionally, before ever touching
+``BEGIN`` -- is itself a CPython ``sqlite3`` operation that implicitly
+*commits* any pending transaction on that connection as a side effect of
+switching transaction-control modes. A connection handed in in the
+middle of unrelated, deliberately-uncommitted work (exactly the shape
+Plan 3's worker loop will have if it ever calls these from inside
+``Writer.submit()``) would have that work silently committed with no
+exception and no signal -- the opposite of loud failure. The explicit
+``conn.in_transaction`` check below runs *before* ``isolation_level`` is
+touched at all, so the precondition violation is now a clean raise with
+nothing committed. See ``test_claim_raises_if_connection_has_pending_transaction``
+and ``test_sweep_expired_raises_if_connection_has_pending_transaction``
+in tests/test_outbox.py, which assert both the raise and (from a second,
+independent connection) that the pending write never became visible.
 """
 from __future__ import annotations
 
@@ -103,6 +128,42 @@ def _row_to_outbox(row: sqlite3.Row) -> OutboxRow:
     )
 
 
+def _bump_metric(conn: sqlite3.Connection, *, day_key: str, name: str, value: int) -> None:
+    """Shared metrics upsert: adds `value` to `metrics(day_key, name)`,
+    creating the row if needed. Extracted to its own function (rather than
+    inlined in sweep_expired()) specifically so a test can monkeypatch it
+    to simulate a crash between the reset UPDATE and the metric write, and
+    prove the pairing really is atomic rather than merely reading that way.
+    """
+    conn.execute(
+        "INSERT INTO metrics (day_key, name, value) VALUES (?, ?, ?) "
+        "ON CONFLICT(day_key, name) DO UPDATE SET value = value + excluded.value",
+        (day_key, name, value),
+    )
+
+
+def _require_no_pending_transaction(conn: sqlite3.Connection, *, caller: str) -> None:
+    """claim() and sweep_expired() both drive their own explicit
+    transaction by setting `conn.isolation_level = None` before issuing
+    `BEGIN IMMEDIATE`. That assignment is not inert: CPython's sqlite3
+    module implicitly commits any transaction already pending on the
+    connection as a side effect of switching isolation_level. Checking
+    `in_transaction` up front -- before isolation_level is touched at all
+    -- turns a precondition violation into a clean, loud RuntimeError
+    with nothing committed, instead of a silent commit of whatever
+    unrelated work the caller had pending. See the module docstring.
+    """
+    if conn.in_transaction:
+        raise RuntimeError(
+            f"{caller}() must be called on a connection with no pending "
+            "transaction -- it drives its own BEGIN IMMEDIATE, and doing "
+            "that via conn.isolation_level = None on a connection with "
+            "uncommitted work would silently commit that work first "
+            "rather than raise. Commit or roll back whatever is pending "
+            f"before calling {caller}()."
+        )
+
+
 def fan_out(
     conn: sqlite3.Connection,
     *,
@@ -156,7 +217,12 @@ def claim(
     Manages its own BEGIN IMMEDIATE / COMMIT / ROLLBACK -- see the module
     docstring for why a bare UPDATE ... RETURNING is not enough to avoid
     a "database is locked" race between two concurrent claimants.
+
+    Raises RuntimeError if `conn` already has a transaction pending --
+    see `_require_no_pending_transaction` and the module docstring.
     """
+    _require_no_pending_transaction(conn, caller="claim")
+
     cutoff_iso = (now_utc - timedelta(seconds=lease_seconds)).isoformat()
     now_iso = now_utc.isoformat()
 
@@ -236,7 +302,12 @@ def sweep_expired(
     A fresh (non-expired) claim is left alone: this only reclaims rows
     whose owner has had more than `lease_seconds` to make its first
     durable write and still hasn't.
+
+    Raises RuntimeError if `conn` already has a transaction pending --
+    see `_require_no_pending_transaction` and the module docstring.
     """
+    _require_no_pending_transaction(conn, caller="sweep_expired")
+
     cutoff_iso = (now_utc - timedelta(seconds=lease_seconds)).isoformat()
     day_key = now_utc.date().isoformat()
 
@@ -253,13 +324,7 @@ def sweep_expired(
             )
             reclaimed = cursor.rowcount
             if reclaimed > 0:
-                conn.execute(
-                    "INSERT INTO metrics (day_key, name, value) "
-                    "VALUES (?, 'outbox_lease_reclaimed', ?) "
-                    "ON CONFLICT(day_key, name) DO UPDATE SET "
-                    "value = value + excluded.value",
-                    (day_key, reclaimed),
-                )
+                _bump_metric(conn, day_key=day_key, name="outbox_lease_reclaimed", value=reclaimed)
         except BaseException:
             conn.execute("ROLLBACK")
             raise

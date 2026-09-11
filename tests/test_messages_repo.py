@@ -75,8 +75,16 @@ def _ingest(
     reply_to_message_id: int | None = None,
     source: str = "live",
     now_utc: datetime = NOW,
+    accounts: tuple = (),
     relay_window_seconds: int = 900,
 ):
+    # accounts=() explicitly: these tests are the spec for ingest()'s
+    # dedup/routing behaviour and deliberately don't care about the
+    # outbox (that's tests/test_outbox.py's job) -- but ingest() no
+    # longer defaults accounts on its own (Task 6 review round 1: a
+    # silent default there is exactly the silently-dropped-signal
+    # failure mode the lease design exists to prevent), so every call
+    # site, including this one, must say so on purpose.
     return ingest(
         conn,
         channel_cfg=channel_cfg,
@@ -87,6 +95,7 @@ def _ingest(
         reply_to_message_id=reply_to_message_id,
         source=source,
         now_utc=now_utc,
+        accounts=accounts,
         relay_window_seconds=relay_window_seconds,
     )
 

@@ -45,11 +45,19 @@ import outbox`, not `from ... import fan_out`) so a test can monkeypatch
 `outbox.fan_out` to simulate a crash between the insert and the fan-out
 and prove the whole thing rolls back atomically -- see
 tests/test_outbox.py's atomicity tests, which own that guarantee.
-`accounts` defaults to `()` (fan out to nobody) rather than being
-required, purely so Task 5's already-landed tests/test_messages_repo.py
--- which predates the outbox and is being reviewed read-only in parallel
-with this task -- keeps passing unmodified; every real caller always
-passes the live account list.
+
+`accounts` is a **required** keyword argument, deliberately with no
+default. Task 6 review round 1 flagged the original `accounts=()`
+default as a silent no-op: a caller that simply forgot to pass `accounts`
+got a fully successful "new" outcome -- signal inserted, no exception, no
+log, no metric, zero outbox rows -- which is exactly the
+silently-dropped-signal failure mode the lease design exists to prevent,
+just moved one layer up, out of the outbox and into ingest() itself.
+Every call site (including tests/test_messages_repo.py, which does not
+care about the outbox) now passes `accounts=` explicitly; passing `()`
+on purpose is fine and still supported, but it must be a choice, not an
+oversight -- and `_ingest_new` below still makes that choice visible via
+the `ingest_new_no_accounts` metric rather than silent.
 """
 from __future__ import annotations
 
@@ -144,6 +152,58 @@ def _insert_message(
     )
 
 
+def _record_metric(conn: sqlite3.Connection, *, now_utc: datetime, name: str, value: int = 1) -> None:
+    day_key = now_utc.date().isoformat()
+    conn.execute(
+        "INSERT INTO metrics (day_key, name, value) VALUES (?, ?, ?) "
+        "ON CONFLICT(day_key, name) DO UPDATE SET value = value + excluded.value",
+        (day_key, name, value),
+    )
+
+
+def _fan_out_and_guard(
+    conn: sqlite3.Connection,
+    *,
+    kind: Literal["ENTRY", "FOLLOWUP"],
+    signal_id: int | None,
+    followup_id: int | None,
+    accounts: tuple[_AccountCfgLike, ...],
+    now_utc: datetime,
+) -> None:
+    """Wraps outbox.fan_out() with the two guards Task 6 review round 1
+    added against the silent-no-op-fan-out failure mode:
+
+    - Zero `accounts` passed at all is a legitimate call shape (tests that
+      don't care about the outbox use it on purpose), but it must never be
+      *invisible* -- it is exactly the shape a caller who forgot `accounts`
+      would also produce. Record it as a metric so it shows up somewhere,
+      whichever reason produced it.
+    - If at least one *enabled* account was passed, fan_out()'s own
+      contract guarantees one QUEUED row per enabled account -- so
+      fan_out() returning 0 in that case is a contradiction, not a valid
+      outcome. Raise rather than let a signal (or follow-up) that was
+      just durably inserted silently end up with no worker ever assigned
+      to act on it.
+    """
+    fanout_count = outbox.fan_out(
+        conn, kind=kind, signal_id=signal_id, followup_id=followup_id, accounts=accounts
+    )
+
+    if not accounts:
+        _record_metric(conn, now_utc=now_utc, name="ingest_new_no_accounts")
+        return
+
+    enabled_count = sum(1 for account in accounts if account.enabled)
+    if enabled_count > 0 and fanout_count == 0:
+        raise RuntimeError(
+            f"fan_out(kind={kind!r}) wrote 0 outbox rows despite "
+            f"{enabled_count} enabled account(s) among the accounts passed "
+            "to ingest() -- fan_out() guarantees one row per enabled "
+            "account, so this should be impossible. Refusing to let this "
+            "signal/follow-up silently end up with no worker assigned."
+        )
+
+
 def _update_message_edit(
     conn: sqlite3.Connection,
     *,
@@ -171,7 +231,7 @@ def ingest(
     reply_to_message_id: int | None,
     source: str,
     now_utc: datetime,
-    accounts: tuple[_AccountCfgLike, ...] = (),
+    accounts: tuple[_AccountCfgLike, ...],
     relay_window_seconds: int = 900,
 ) -> IngestResult:
     channel_id = channel_cfg.channel_id
@@ -263,9 +323,6 @@ def _ingest_new(
     accounts: tuple[_AccountCfgLike, ...],
     relay_window_seconds: int,
 ) -> IngestResult:
-    # accounts is required at this internal call boundary; ingest() is the
-    # only caller and supplies whatever it received (possibly the `()`
-    # default -- see ingest()'s signature).
     kind = route_result.kind
 
     # raw_text is stored verbatim for every outcome, including skip and
@@ -304,8 +361,13 @@ def _ingest_new(
         )
         # Same transaction as the followup insert above -- see the module
         # docstring and tests/test_outbox.py's atomicity tests.
-        outbox.fan_out(
-            conn, kind="FOLLOWUP", signal_id=None, followup_id=followup_id, accounts=accounts
+        _fan_out_and_guard(
+            conn,
+            kind="FOLLOWUP",
+            signal_id=None,
+            followup_id=followup_id,
+            accounts=accounts,
+            now_utc=now_utc,
         )
         return IngestResult(
             outcome="new", signal_id=None, followup_id=followup_id, kind=kind, detail=route_result.detail
@@ -335,7 +397,14 @@ def _ingest_new(
     )
     # Same transaction as the signal insert above -- see the module
     # docstring and tests/test_outbox.py's atomicity tests.
-    outbox.fan_out(conn, kind="ENTRY", signal_id=signal_id, followup_id=None, accounts=accounts)
+    _fan_out_and_guard(
+        conn,
+        kind="ENTRY",
+        signal_id=signal_id,
+        followup_id=None,
+        accounts=accounts,
+        now_utc=now_utc,
+    )
     return IngestResult(
         outcome="new", signal_id=signal_id, followup_id=None, kind=kind, detail=route_result.detail
     )

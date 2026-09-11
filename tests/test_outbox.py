@@ -258,6 +258,30 @@ def test_fresh_claim_is_not_reclaimable(conn):
     assert result is None
 
 
+def test_claim_exact_lease_boundary_is_not_reclaimable(conn):
+    """`claimed_at_utc < now - lease` is strict: a claim exactly
+    `lease_seconds` old must NOT be reclaimable -- `<` (not `<=`) is what
+    protects a worker that is still legitimately inside its lease window
+    down to the last second.
+    """
+    boundary_time = (NOW - timedelta(seconds=90)).isoformat()
+    _insert_outbox_row(
+        conn, account_id="acct-1", state="CLAIMED", claimed_at_utc=boundary_time, attempts=1
+    )
+    result = outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW, lease_seconds=90)
+    assert result is None
+
+
+def test_claim_one_second_past_lease_boundary_is_reclaimable(conn):
+    past_boundary_time = (NOW - timedelta(seconds=91)).isoformat()
+    outbox_id = _insert_outbox_row(
+        conn, account_id="acct-1", state="CLAIMED", claimed_at_utc=past_boundary_time, attempts=1
+    )
+    result = outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW, lease_seconds=90)
+    assert result is not None
+    assert result.outbox_id == outbox_id
+
+
 def test_claim_takes_oldest_outbox_id_first(conn):
     first_id = _insert_outbox_row(conn, account_id="acct-1", signal_id=1)
     second_id = _insert_outbox_row(conn, account_id="acct-1", signal_id=2)
@@ -271,6 +295,49 @@ def test_claim_ignores_other_accounts(conn):
     _insert_outbox_row(conn, account_id="acct-other", state="QUEUED")
     result = outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW)
     assert result is None
+
+
+def test_claim_raises_if_connection_has_pending_transaction(tmp_path: Path):
+    """Task 6 review round 1: the first cut of claim() wrongly predicted
+    that calling it on a connection already mid-transaction would make its
+    own `BEGIN IMMEDIATE` raise a loud `OperationalError`. It doesn't --
+    `conn.isolation_level = None` (which claim() sets unconditionally,
+    before ever issuing BEGIN) is itself a CPython sqlite3 operation that
+    implicitly *commits* whatever was pending, silently. claim() must
+    instead check `conn.in_transaction` up front, before isolation_level
+    is touched at all, and refuse -- so the caller's pending work is
+    neither committed nor lost, just left exactly as it was.
+    """
+    db_path = tmp_path / "store.db"
+    conn = db.connect(db_path, role="writer")
+    try:
+        conn.execute(
+            "INSERT INTO channel_state (channel_id, last_processed_message_id) "
+            "VALUES (?, ?)",
+            (999, 1),
+        )
+        assert conn.in_transaction
+
+        with pytest.raises(RuntimeError):
+            outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW)
+
+        # claim() must not have touched the caller's pending transaction
+        # at all -- still open, on this same connection.
+        assert conn.in_transaction
+
+        # And, decisively: a second, independent connection must not see
+        # the pending write as committed.
+        other = db.connect(db_path, role="reader")
+        try:
+            row = other.execute(
+                "SELECT 1 FROM channel_state WHERE channel_id = 999"
+            ).fetchone()
+            assert row is None
+        finally:
+            other.close()
+    finally:
+        conn.rollback()
+        conn.close()
 
 
 # -- sweep_expired() ------------------------------------------------------
@@ -316,6 +383,85 @@ def test_sweep_expired_resets_stale_claim_and_counts_metric(conn):
         "SELECT value FROM metrics WHERE name = 'outbox_lease_reclaimed'"
     ).fetchone()
     assert metric_row["value"] == 1
+
+
+def test_sweep_expired_exact_lease_boundary_resets_nothing(conn):
+    boundary_time = (NOW - timedelta(seconds=90)).isoformat()
+    _insert_outbox_row(
+        conn, account_id="acct-1", state="CLAIMED", claimed_at_utc=boundary_time, attempts=1
+    )
+    assert outbox.sweep_expired(conn, now_utc=NOW, lease_seconds=90) == 0
+
+
+def test_sweep_expired_one_second_past_lease_boundary_resets_one(conn):
+    past_boundary_time = (NOW - timedelta(seconds=91)).isoformat()
+    _insert_outbox_row(
+        conn, account_id="acct-1", state="CLAIMED", claimed_at_utc=past_boundary_time, attempts=1
+    )
+    assert outbox.sweep_expired(conn, now_utc=NOW, lease_seconds=90) == 1
+
+
+def test_sweep_expired_rolls_back_reset_if_metric_write_fails(conn, monkeypatch):
+    """Companion to claim()'s thread-contention test and ingest()'s
+    monkeypatch atomicity tests: sweep_expired()'s reset+metric pairing
+    had only been verified by reading the code, never by injecting a
+    crash between the two statements. Monkeypatching `_bump_metric`
+    specifically (not the whole function) lets the reset UPDATE genuinely
+    run first and then fail, proving the UPDATE itself rolls back rather
+    than landing alone while the metric is missed.
+    """
+    stale_time = (NOW - timedelta(seconds=200)).isoformat()
+    stale_id = _insert_outbox_row(
+        conn, account_id="acct-1", state="CLAIMED", claimed_at_utc=stale_time, attempts=1
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash between reset UPDATE and metric write")
+
+    monkeypatch.setattr(outbox, "_bump_metric", boom)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        outbox.sweep_expired(conn, now_utc=NOW, lease_seconds=90)
+
+    row = conn.execute(
+        "SELECT state, claimed_at_utc FROM outbox WHERE outbox_id = ?", (stale_id,)
+    ).fetchone()
+    assert row["state"] == "CLAIMED"  # the reset itself rolled back
+    assert row["claimed_at_utc"] == stale_time
+
+    metric_row = conn.execute(
+        "SELECT value FROM metrics WHERE name = 'outbox_lease_reclaimed'"
+    ).fetchone()
+    assert metric_row is None
+
+
+def test_sweep_expired_raises_if_connection_has_pending_transaction(tmp_path: Path):
+    db_path = tmp_path / "store.db"
+    conn = db.connect(db_path, role="writer")
+    try:
+        conn.execute(
+            "INSERT INTO channel_state (channel_id, last_processed_message_id) "
+            "VALUES (?, ?)",
+            (998, 1),
+        )
+        assert conn.in_transaction
+
+        with pytest.raises(RuntimeError):
+            outbox.sweep_expired(conn, now_utc=NOW)
+
+        assert conn.in_transaction
+
+        other = db.connect(db_path, role="reader")
+        try:
+            row = other.execute(
+                "SELECT 1 FROM channel_state WHERE channel_id = 998"
+            ).fetchone()
+            assert row is None
+        finally:
+            other.close()
+    finally:
+        conn.rollback()
+        conn.close()
 
 
 def test_sweep_expired_accumulates_metric_across_calls(conn):
@@ -476,3 +622,52 @@ def test_ingest_followup_atomic_with_fan_out(conn, monkeypatch):
     assert _count(conn, "followups") == 0
     assert _count(conn, "outbox") == 0
     assert _count(conn, "messages") == 0
+
+
+# -- ingest(): accounts is required, and a zero-account fan-out is visible --
+
+
+def test_ingest_new_signal_with_zero_accounts_records_visibility_metric(conn):
+    """`accounts=()` is a legitimate, explicit choice (this whole test
+    file makes it via `_ingest`'s default) -- but Task 6 review round 1
+    flagged that a *forgotten* `accounts` argument used to produce the
+    exact same shape silently. Now that `accounts` is required, `()` is
+    always a deliberate choice, and _ingest_new records it as a metric
+    either way so the condition is visible regardless of which reason
+    produced it.
+    """
+    result = _ingest(conn, accounts=())
+    assert result.outcome == "new"
+    assert _count(conn, "outbox") == 0
+
+    metric_row = conn.execute(
+        "SELECT value FROM metrics WHERE name = 'ingest_new_no_accounts'"
+    ).fetchone()
+    assert metric_row["value"] == 1
+
+
+def test_ingest_new_followup_with_zero_accounts_records_visibility_metric(conn):
+    result = _ingest(
+        conn, message_id=9201, text="close all", reply_to_message_id=4001, accounts=()
+    )
+    assert result.outcome == "new"
+    assert _count(conn, "outbox") == 0
+
+    metric_row = conn.execute(
+        "SELECT value FROM metrics WHERE name = 'ingest_new_no_accounts'"
+    ).fetchone()
+    assert metric_row["value"] == 1
+
+
+def test_ingest_new_signal_raises_if_fan_out_contract_is_violated(conn, monkeypatch):
+    """Defense in depth, not a reachable case in normal operation:
+    fan_out() guarantees one QUEUED row per enabled account, so it
+    returning 0 while an enabled account was passed is a contradiction.
+    If that contract were ever violated (a bug in fan_out(), a future
+    refactor), ingest() must not let a signal it just durably inserted
+    silently end up with zero workers ever assigned to it.
+    """
+    monkeypatch.setattr(outbox, "fan_out", lambda *args, **kwargs: 0)
+
+    with pytest.raises(RuntimeError, match="should be impossible"):
+        _ingest(conn, accounts=(ACCOUNT_1,))
