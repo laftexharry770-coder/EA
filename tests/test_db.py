@@ -12,12 +12,13 @@ drive it, so a lock wait blocks the writer thread and never the loop.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 import asyncio
 import pytest
 
-from xaucopier.store.db import Writer, connect
+from xaucopier.store.db import Writer, WriterMisuseError, connect
 
 EXPECTED_TABLES = {
     "messages", "signals", "followups", "outbox",
@@ -227,5 +228,186 @@ def test_concurrent_submits_serialise_without_database_locked(tmp_path: Path):
     try:
         (count,) = reader.execute("SELECT COUNT(*) FROM metrics").fetchone()
         assert count == 50
+    finally:
+        reader.close()
+
+
+# -- Writer: cancellation, stop/submit races, transaction misuse -------------
+
+
+def test_cancelling_before_pickup_prevents_the_write_from_landing(tmp_path: Path):
+    """Reproduces the reviewer's finding: without
+    `set_running_or_notify_cancel()`, a future cancelled while its job is
+    still sitting in the queue used to have its write land anyway -- the
+    caller sees CancelledError but the row was written regardless. `block`
+    holds the writer thread on a `threading.Event` so the second job is
+    guaranteed to still be queued (never picked up) when it is cancelled;
+    only then is the blocking job released.
+    """
+    db_path = tmp_path / "store.db"
+    writer = Writer(db_path)
+    writer.start()
+
+    release = threading.Event()
+
+    def block(conn: sqlite3.Connection) -> None:
+        assert release.wait(timeout=5.0), "release was never set"
+
+    blocking_future = writer.submit(block)
+
+    # The writer thread is now blocked inside `block`, waiting on
+    # `release` -- it cannot possibly have reached this second job yet.
+    second_future = writer.submit(
+        lambda conn: _insert_channel_state(conn, channel_id=3, last_id=99)
+    )
+    cancelled = second_future.cancel()
+
+    release.set()
+    blocking_future.result(timeout=5.0)
+    writer.stop(timeout=5.0)
+
+    assert cancelled is True
+    assert second_future.cancelled() is True
+
+    reader = connect(db_path, role="reader")
+    try:
+        row = reader.execute(
+            "SELECT last_processed_message_id FROM channel_state WHERE channel_id = 3"
+        ).fetchone()
+        assert row is None
+    finally:
+        reader.close()
+
+
+def test_submit_after_stop_raises(tmp_path: Path):
+    db_path = tmp_path / "store.db"
+    writer = Writer(db_path)
+    writer.start()
+    writer.stop(timeout=5.0)
+
+    with pytest.raises(RuntimeError):
+        writer.submit(lambda conn: None)
+
+
+def test_submit_racing_stop_never_hangs(tmp_path: Path):
+    """Reproduces the reviewer's finding: submit()'s check-and-enqueue
+    and stop()'s set-and-sentinel were not atomic with each other, so a
+    submit() could pass the `_stopped` check, then have stop() run to
+    completion, then enqueue its job behind a sentinel nothing will ever
+    drain -- the future never resolves. Hammers submit() from many real
+    OS threads concurrently with a single stop() and asserts every
+    submit() either raised RuntimeError or its future completed --
+    never silently hung.
+    """
+    db_path = tmp_path / "store.db"
+    writer = Writer(db_path)
+    writer.start()
+
+    outcomes: list[str] = []
+    outcomes_lock = threading.Lock()
+
+    def racer(i: int) -> None:
+        try:
+            future = writer.submit(
+                lambda conn: _insert_channel_state(
+                    conn, channel_id=100 + i, last_id=i
+                )
+            )
+        except RuntimeError:
+            with outcomes_lock:
+                outcomes.append("raised")
+            return
+        try:
+            future.result(timeout=5.0)
+        except Exception as exc:  # anything other than a clean result is a bug
+            with outcomes_lock:
+                outcomes.append(f"error:{exc!r}")
+            return
+        with outcomes_lock:
+            outcomes.append("completed")
+
+    racers = [threading.Thread(target=racer, args=(i,)) for i in range(20)]
+    stopper = threading.Thread(target=lambda: writer.stop(timeout=5.0))
+
+    for t in racers:
+        t.start()
+    stopper.start()
+
+    for t in racers:
+        t.join(timeout=10.0)
+    stopper.join(timeout=10.0)
+
+    assert all(not t.is_alive() for t in racers), "a submit() call hung"
+    assert not stopper.is_alive(), "stop() hung"
+    assert len(outcomes) == 20
+    assert set(outcomes) <= {"raised", "completed"}, outcomes
+
+
+def test_fn_that_commits_then_raises_is_flagged_as_misuse(tmp_path: Path):
+    """Reproduces the reviewer's finding: a `fn` that calls `commit()`
+    itself and then raises used to have the exception surface normally
+    while the row it wrote stayed durably committed -- `_rollback_quietly`
+    has nothing left to undo by that point, so the caller is misled into
+    thinking the write never happened. The Writer must instead detect
+    that `fn` managed its own transaction and say so explicitly.
+    """
+    db_path = tmp_path / "store.db"
+    writer = Writer(db_path)
+    writer.start()
+
+    def naughty(conn: sqlite3.Connection) -> None:
+        _insert_channel_state(conn, channel_id=4, last_id=1)
+        conn.commit()
+        raise ValueError("boom after self-commit")
+
+    async def go():
+        future = writer.submit(naughty)
+        with pytest.raises(WriterMisuseError):
+            await asyncio.wrap_future(future)
+
+    try:
+        asyncio.run(go())
+    finally:
+        writer.stop(timeout=5.0)
+
+    reader = connect(db_path, role="reader")
+    try:
+        # fn committed for real before raising -- the Writer's job is to
+        # make the caller distrust its own result, not to un-commit a
+        # write it never controlled in the first place.
+        row = reader.execute(
+            "SELECT last_processed_message_id FROM channel_state WHERE channel_id = 4"
+        ).fetchone()
+        assert row is not None
+    finally:
+        reader.close()
+
+
+def test_well_behaved_fn_still_commits_normally(tmp_path: Path):
+    """Companion to the misuse test above: a `fn` that leaves the
+    transaction for the Writer to commit, as documented, must still work
+    exactly as before the misuse check was added.
+    """
+    db_path = tmp_path / "store.db"
+    writer = Writer(db_path)
+    writer.start()
+
+    async def go():
+        future = writer.submit(
+            lambda conn: _insert_channel_state(conn, channel_id=5, last_id=55)
+        )
+        await asyncio.wrap_future(future)
+
+    try:
+        asyncio.run(go())
+    finally:
+        writer.stop(timeout=5.0)
+
+    reader = connect(db_path, role="reader")
+    try:
+        row = reader.execute(
+            "SELECT last_processed_message_id FROM channel_state WHERE channel_id = 5"
+        ).fetchone()
+        assert row["last_processed_message_id"] == 55
     finally:
         reader.close()

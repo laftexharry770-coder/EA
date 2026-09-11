@@ -17,17 +17,24 @@ Design decisions (the brief specifies the interface, not the body):
   (SQLite serialises writers at the file level regardless), so a pool
   would add complexity for zero throughput gain.
 - Each submitted ``fn`` runs inside its own transaction: a normal return
-  commits it, any exception rolls it back. This is what makes the
-  brief's rollback constraint watertight -- there is no path where a
-  *successful* ``fn`` that forgot to call ``commit()`` itself could leave
-  the connection sitting in an open transaction for the next caller
-  either. ``submit()`` is therefore "one job, one all-or-nothing write",
-  which is the unit the listener actually wants.
+  commits it, any exception rolls it back. ``fn`` must never call
+  ``commit()``/``rollback()`` itself -- see ``Writer.submit``'s
+  docstring and ``WriterMisuseError``. ``submit()`` is therefore "one
+  job, one all-or-nothing write", which is the unit the listener
+  actually wants.
 - ``stop()`` pushes a sentinel onto the queue rather than signalling the
   thread out-of-band. Because ``queue.Queue`` is FIFO, the sentinel is
   only ever processed after every job submitted before ``stop()`` was
-  called, so drains happen for free from the queue's own ordering
-  guarantee -- there is no separate "flush" step to get wrong.
+  called returns -- but ``submit()``'s check-and-enqueue and ``stop()``'s
+  set-and-sentinel share a lock, because FIFO ordering alone does not
+  make "check `_stopped`, then enqueue" atomic with respect to a
+  concurrent ``stop()`` landing in between those two steps.
+- A future is only allowed to start running ``fn`` if
+  ``set_running_or_notify_cancel()`` says so. A bare
+  ``concurrent.futures.Future`` has no built-in link between "the caller
+  cancelled it" and "the thread should not run the job" -- without this
+  call, a cancelled future can still have its write silently land, while
+  the caller believes ``CancelledError`` means nothing happened.
 """
 from __future__ import annotations
 
@@ -73,6 +80,24 @@ def connect(path: Path, *, role: Role) -> sqlite3.Connection:
     return conn
 
 
+class WriterMisuseError(RuntimeError):
+    """Raised (via the future, not as a live exception) when a submitted
+    `fn` calls `commit()` or `rollback()` on the connection itself,
+    instead of letting the `Writer` own the transaction boundary for the
+    whole job.
+
+    Detected by comparing `conn.total_changes` and `conn.in_transaction`
+    from just before `fn` runs to just after: if `fn` made at least one
+    write (`total_changes` moved) but left no open transaction behind,
+    the only way that can happen is `fn` called `commit()` or
+    `rollback()` on its own -- the Writer never calls either until after
+    this check. Whatever `fn` already did to the database at that point
+    is final; there is nothing left to roll back, and the caller must
+    not be left trusting `fn`'s own result or exception as the whole
+    story.
+    """
+
+
 class Writer:
     """Owns the only write connection to the store.
 
@@ -83,13 +108,19 @@ class Writer:
     exception is caught, the transaction is rolled back, and the thread
     loops back to `queue.get()` for the next job.
 
-    Not thread-safe to call `start()` / `stop()` concurrently from
-    multiple threads; `submit()` is safe to call from anywhere
-    (`queue.Queue` is the synchronisation point), which is the only
-    concurrency this class actually needs to support -- the listener's
-    asyncio coroutines all run on one event-loop thread, but a coroutine
-    that has handed a submit to `run_in_executor` or similar could in
-    principle call from elsewhere too.
+    A future cancelled before the writer thread reaches it prevents `fn`
+    from running at all (see `submit`); once `fn` has started, it always
+    runs to completion and cancellation requests are refused, matching
+    the standard `concurrent.futures.Future` contract.
+
+    `start()` / `stop()` are not meant to be called concurrently with
+    each other from multiple threads. `submit()` is safe to call from
+    anywhere, including concurrently with `stop()`: both share a lock
+    around their queue-mutating critical sections, so a `submit()`
+    racing a `stop()` either lands ahead of the stop sentinel and runs
+    normally, or observes the writer already stopped and raises
+    `RuntimeError` -- it can never be silently enqueued behind a
+    sentinel nothing will ever drain.
     """
 
     def __init__(self, path: Path) -> None:
@@ -97,6 +128,14 @@ class Writer:
         self._queue: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stopped = threading.Event()
+        # Guards the two critical sections that must not interleave:
+        # submit()'s "check _stopped, then enqueue" and stop()'s "set
+        # _stopped, then enqueue the sentinel". Without this lock, a
+        # submit() that checks _stopped just before stop() sets it can
+        # still enqueue its job just after stop() has already pushed the
+        # sentinel -- orphaning that job behind a queue nothing will ever
+        # drain again, and its future never resolves.
+        self._lifecycle_lock = threading.Lock()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -113,11 +152,27 @@ class Writer:
         `concurrent.futures.Future` that resolves with `fn`'s return
         value (or its exception). The listener awaits this with
         `await asyncio.wrap_future(writer.submit(fn))`.
+
+        `fn` MUST NOT call `commit()` or `rollback()` on the connection
+        it is given -- the Writer owns the transaction boundary for the
+        whole job: a normal return commits, an exception rolls back. A
+        self-managed `fn` is detected and resolves the future with
+        `WriterMisuseError` instead of `fn`'s own result/exception (see
+        that class's docstring for why).
+
+        If the returned future is cancelled before the writer thread
+        reaches it, `fn` is never invoked -- no statement it would have
+        run ever touches the connection. Cancelling after the writer
+        thread has already started `fn` has no effect; the job always
+        runs to completion in that case.
+
+        Raises `RuntimeError` if the writer has already been `stop()`ped.
         """
-        if self._stopped.is_set():
-            raise RuntimeError("Writer is stopped; cannot submit new work")
-        future: concurrent.futures.Future[T] = concurrent.futures.Future()
-        self._queue.put((fn, future))
+        with self._lifecycle_lock:
+            if self._stopped.is_set():
+                raise RuntimeError("Writer is stopped; cannot submit new work")
+            future: concurrent.futures.Future[T] = concurrent.futures.Future()
+            self._queue.put((fn, future))
         return future
 
     def stop(self, timeout: float) -> None:
@@ -127,8 +182,9 @@ class Writer:
         """
         if self._thread is None:
             return
-        self._stopped.set()
-        self._queue.put(None)
+        with self._lifecycle_lock:
+            self._stopped.set()
+            self._queue.put(None)
         self._thread.join(timeout)
 
     def _run(self) -> None:
@@ -149,24 +205,49 @@ class Writer:
         fn: Callable[[sqlite3.Connection], object],
         future: concurrent.futures.Future,
     ) -> None:
+        if not future.set_running_or_notify_cancel():
+            # The caller cancelled this job before the writer thread
+            # reached it. fn was never invoked, so no statement ever ran
+            # against conn -- nothing to roll back, just move on.
+            return
+
+        before_changes = conn.total_changes
+        fn_exc: Exception | None = None
+        result: object = None
         try:
             result = fn(conn)
         except Exception as exc:  # noqa: BLE001 -- must reach the future, never kill the thread
+            fn_exc = exc
+
+        if conn.total_changes != before_changes and not conn.in_transaction:
+            # fn wrote something (total_changes moved) yet left no open
+            # transaction behind, even though the Writer has not called
+            # commit()/rollback() yet at this point. The only way that
+            # combination happens is fn called one of them itself.
+            misuse = WriterMisuseError(
+                "fn called commit()/rollback() itself; the Writer owns "
+                "the transaction for the whole submitted job -- fn must "
+                "only execute statements and let the Writer commit or "
+                "roll back."
+            )
+            if fn_exc is not None:
+                misuse.__cause__ = fn_exc
+            future.set_exception(misuse)
+            return
+
+        if fn_exc is not None:
             Writer._rollback_quietly(conn)
-            if not future.cancelled():
-                future.set_exception(exc)
+            future.set_exception(fn_exc)
             return
 
         try:
             conn.commit()
         except Exception as exc:  # noqa: BLE001 -- same contract as above
             Writer._rollback_quietly(conn)
-            if not future.cancelled():
-                future.set_exception(exc)
+            future.set_exception(exc)
             return
 
-        if not future.cancelled():
-            future.set_result(result)
+        future.set_result(result)
 
     @staticmethod
     def _rollback_quietly(conn: sqlite3.Connection) -> None:
