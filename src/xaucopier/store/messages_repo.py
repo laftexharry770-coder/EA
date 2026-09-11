@@ -36,6 +36,20 @@ VIP channel, so the identical trade legitimately shows up twice.
 the wall clock, mirroring the pure core's rule that "now" always comes
 from outside (controller ruling on this task's brief) -- it is what makes
 the relay-dedup window testable at all.
+
+Task 6 controller ruling: fan-out into the outbox rides in the *same*
+transaction as the signal/followup insert, for outcome "new" only --
+never for duplicate/edited/relay_duplicate, which touch no new trade
+work at all. `outbox` is imported as a module (`from xaucopier.store
+import outbox`, not `from ... import fan_out`) so a test can monkeypatch
+`outbox.fan_out` to simulate a crash between the insert and the fan-out
+and prove the whole thing rolls back atomically -- see
+tests/test_outbox.py's atomicity tests, which own that guarantee.
+`accounts` defaults to `()` (fan out to nobody) rather than being
+required, purely so Task 5's already-landed tests/test_messages_repo.py
+-- which predates the outbox and is being reviewed read-only in parallel
+with this task -- keeps passing unmodified; every real caller always
+passes the live account list.
 """
 from __future__ import annotations
 
@@ -47,7 +61,7 @@ from typing import Literal, Protocol
 
 from xaucopier.parsing.normalize import normalize
 from xaucopier.parsing.router import RouteResult, route
-from xaucopier.store import signals_repo
+from xaucopier.store import outbox, signals_repo
 
 IngestOutcome = Literal["new", "duplicate", "edited", "relay_duplicate"]
 
@@ -60,6 +74,16 @@ class _ChannelCfgLike(Protocol):
 
     channel_id: int
     parser: str
+
+
+class _AccountCfgLike(Protocol):
+    """The two fields fan_out() needs from an account config -- same
+    structural-not-nominal rationale as _ChannelCfgLike above, and
+    mirrors store/outbox.py's own identical protocol.
+    """
+
+    account_id: str
+    enabled: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +171,7 @@ def ingest(
     reply_to_message_id: int | None,
     source: str,
     now_utc: datetime,
+    accounts: tuple[_AccountCfgLike, ...] = (),
     relay_window_seconds: int = 900,
 ) -> IngestResult:
     channel_id = channel_cfg.channel_id
@@ -177,6 +202,7 @@ def ingest(
             edit_date_utc=edit_date_utc,
             source=source,
             now_utc=now_utc,
+            accounts=accounts,
             relay_window_seconds=relay_window_seconds,
         )
 
@@ -234,8 +260,12 @@ def _ingest_new(
     edit_date_utc: datetime | None,
     source: str,
     now_utc: datetime,
+    accounts: tuple[_AccountCfgLike, ...],
     relay_window_seconds: int,
 ) -> IngestResult:
+    # accounts is required at this internal call boundary; ingest() is the
+    # only caller and supplies whatever it received (possibly the `()`
+    # default -- see ingest()'s signature).
     kind = route_result.kind
 
     # raw_text is stored verbatim for every outcome, including skip and
@@ -272,6 +302,11 @@ def _ingest_new(
         followup_id = signals_repo.insert_followup(
             conn, channel_id=channel_id, message_id=message_id, followup=route_result.followup
         )
+        # Same transaction as the followup insert above -- see the module
+        # docstring and tests/test_outbox.py's atomicity tests.
+        outbox.fan_out(
+            conn, kind="FOLLOWUP", signal_id=None, followup_id=followup_id, accounts=accounts
+        )
         return IngestResult(
             outcome="new", signal_id=None, followup_id=followup_id, kind=kind, detail=route_result.detail
         )
@@ -298,6 +333,9 @@ def _ingest_new(
     signal_id = signals_repo.insert_signal(
         conn, channel_id=channel_id, message_id=message_id, signal=signal
     )
+    # Same transaction as the signal insert above -- see the module
+    # docstring and tests/test_outbox.py's atomicity tests.
+    outbox.fan_out(conn, kind="ENTRY", signal_id=signal_id, followup_id=None, accounts=accounts)
     return IngestResult(
         outcome="new", signal_id=signal_id, followup_id=None, kind=kind, detail=route_result.detail
     )

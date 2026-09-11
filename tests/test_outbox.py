@@ -1,15 +1,17 @@
 """Tests for store/outbox.py: fan_out(), claim()'s leased-claim rule,
-mark(), and sweep_expired().
+mark(), sweep_expired(), and the fan-out wiring into messages_repo.ingest().
 
 The lease is the whole point (see outbox.py's module docstring and the
 task-6 brief): a plain `UPDATE ... SET state='CLAIMED'` is a one-way door
 that can strand a row forever if the claimant dies before its first
 durable write. These tests pin down that a dead claimant's row becomes
-claimable again after the lease expires, and that two live claimants can
-never both take the same row.
+claimable again after the lease expires, that two live claimants can
+never both take the same row, and that fan-out is atomic with the
+signal/followup insert it rides alongside inside ingest().
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -18,7 +20,23 @@ from pathlib import Path
 
 import pytest
 
+from xaucopier.config.channels import ChannelCfg
 from xaucopier.store import db, outbox
+from xaucopier.store.messages_repo import ingest
+
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json"
+_FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+SIGNAL_TEXT = _FIXTURE["text"]
+SIGNAL_MESSAGE_ID = _FIXTURE["message_id"]
+POSTED = datetime.fromisoformat(_FIXTURE["posted_at_utc"])
+
+CHANNEL_A = ChannelCfg(
+    channel_id=_FIXTURE["channel_id"],
+    name="Channel A (source)",
+    parser="mmh",
+    ordinal=1,
+    enabled=True,
+)
 
 NOW = datetime(2026, 9, 5, 11, 0, tzinfo=UTC)
 
@@ -83,6 +101,33 @@ def _insert_outbox_row(
     )
     conn.commit()
     return cursor.lastrowid
+
+
+def _ingest(
+    conn: sqlite3.Connection,
+    *,
+    channel_cfg: ChannelCfg = CHANNEL_A,
+    message_id: int = SIGNAL_MESSAGE_ID,
+    text: str = SIGNAL_TEXT,
+    posted_at_utc: datetime = POSTED,
+    edit_date_utc: datetime | None = None,
+    reply_to_message_id: int | None = None,
+    source: str = "live",
+    now_utc: datetime = NOW,
+    accounts: tuple = (ACCOUNT_1, ACCOUNT_2),
+):
+    return ingest(
+        conn,
+        channel_cfg=channel_cfg,
+        message_id=message_id,
+        text=text,
+        posted_at_utc=posted_at_utc,
+        edit_date_utc=edit_date_utc,
+        reply_to_message_id=reply_to_message_id,
+        source=source,
+        now_utc=now_utc,
+        accounts=accounts,
+    )
 
 
 # -- fan_out() -----------------------------------------------------------
@@ -321,3 +366,113 @@ def test_mark_raises_when_row_is_not_claimed(conn):
         "SELECT state FROM outbox WHERE outbox_id = ?", (outbox_id,)
     ).fetchone()
     assert row["state"] == "QUEUED"  # untouched
+
+
+# -- ingest() wiring: fan-out fires only for "new", atomically -----------
+
+
+def test_ingest_new_signal_fans_out_entry_rows_for_enabled_accounts(conn):
+    result = _ingest(conn, accounts=(ACCOUNT_1, ACCOUNT_2, ACCOUNT_DISABLED))
+    assert result.outcome == "new"
+    assert result.kind == "signal"
+
+    assert _count(conn, "signals") == 1
+    rows = conn.execute(
+        "SELECT account_id, kind, signal_id, followup_id FROM outbox ORDER BY account_id"
+    ).fetchall()
+    assert [dict(r) for r in rows] == [
+        {"account_id": "acct-1", "kind": "ENTRY", "signal_id": result.signal_id, "followup_id": None},
+        {"account_id": "acct-2", "kind": "ENTRY", "signal_id": result.signal_id, "followup_id": None},
+    ]
+
+
+def test_ingest_followup_fans_out_followup_rows(conn):
+    result = _ingest(
+        conn,
+        message_id=9201,
+        text="close all",
+        reply_to_message_id=4001,
+        accounts=(ACCOUNT_1,),
+    )
+    assert result.outcome == "new"
+    assert result.kind == "followup"
+    assert result.followup_id is not None
+
+    row = conn.execute(
+        "SELECT account_id, kind, signal_id, followup_id FROM outbox"
+    ).fetchone()
+    assert row["account_id"] == "acct-1"
+    assert row["kind"] == "FOLLOWUP"
+    assert row["signal_id"] is None
+    assert row["followup_id"] == result.followup_id
+
+
+def test_ingest_duplicate_edited_relay_duplicate_produce_no_outbox_rows(conn):
+    first = _ingest(conn)
+    assert first.outcome == "new"
+    assert _count(conn, "outbox") == 2  # two accounts
+
+    duplicate = _ingest(conn)
+    assert duplicate.outcome == "duplicate"
+    assert _count(conn, "outbox") == 2  # unchanged
+
+    assert SIGNAL_TEXT.count("4470") == 1
+    edited_text = SIGNAL_TEXT.replace("4470", "4460")
+    edited = _ingest(conn, text=edited_text, edit_date_utc=POSTED + timedelta(minutes=2))
+    assert edited.outcome == "edited"
+    assert _count(conn, "outbox") == 2  # unchanged
+
+    # Relay against the *current* trade identity -- the edit above already
+    # moved the signal's trade_hash on to edited_text's, so a relay of the
+    # original (pre-edit) text would no longer match anything. The window
+    # compares against the *original* message's posted_at_utc (edits never
+    # touch that column -- see _update_message_edit), so POSTED + 30s is
+    # still well inside relay_window_seconds=900.
+    relay = _ingest(
+        conn,
+        message_id=6001,
+        text=edited_text,
+        posted_at_utc=POSTED + timedelta(seconds=30),
+    )
+    assert relay.outcome == "relay_duplicate"
+    assert _count(conn, "outbox") == 2  # unchanged
+
+
+def test_ingest_new_signal_atomic_with_fan_out(conn, monkeypatch):
+    """The load-bearing atomicity test the controller ruling calls out by
+    name: kill the transaction between the signal insert and fan_out(),
+    and assert neither the signals row nor any outbox rows survive.
+    """
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash between signal insert and fan-out")
+
+    monkeypatch.setattr(outbox, "fan_out", boom)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _ingest(conn)
+
+    # Nothing committed yet on this connection -- roll back exactly as the
+    # Writer would on an exception from a submitted job, then verify on
+    # the same connection that neither row is left behind.
+    conn.rollback()
+
+    assert _count(conn, "signals") == 0
+    assert _count(conn, "outbox") == 0
+    assert _count(conn, "messages") == 0
+
+
+def test_ingest_followup_atomic_with_fan_out(conn, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash between followup insert and fan-out")
+
+    monkeypatch.setattr(outbox, "fan_out", boom)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _ingest(conn, message_id=9201, text="close all", reply_to_message_id=4001)
+
+    conn.rollback()
+
+    assert _count(conn, "followups") == 0
+    assert _count(conn, "outbox") == 0
+    assert _count(conn, "messages") == 0
