@@ -54,10 +54,19 @@ log, no metric, zero outbox rows -- which is exactly the
 silently-dropped-signal failure mode the lease design exists to prevent,
 just moved one layer up, out of the outbox and into ingest() itself.
 Every call site (including tests/test_messages_repo.py, which does not
-care about the outbox) now passes `accounts=` explicitly; passing `()`
-on purpose is fine and still supported, but it must be a choice, not an
-oversight -- and `_ingest_new` below still makes that choice visible via
-the `ingest_new_no_accounts` metric rather than silent.
+care about the outbox) now passes `accounts=` explicitly.
+
+Round 2 found a second, more likely door to that same silent shape: an
+`accounts` tuple that is non-empty but every account in it is disabled
+-- a realistic operator misconfiguration (someone flips every account
+off in accounts.toml), not just a forgotten argument. `_fan_out_and_guard`
+below therefore checks `fan_out()`'s actual *return value*
+(`fanout_count == 0`) rather than guessing from the *input* (`not
+accounts`), so the `ingest_new_no_accounts` metric fires for every route
+to a zero-row fan-out, whichever one produced it -- and a `fanout_count`
+that doesn't match the number of enabled accounts passed (0 when some
+were expected, or any other mismatch) raises instead of silently
+under- or over-fanning-out.
 """
 from __future__ import annotations
 
@@ -170,37 +179,41 @@ def _fan_out_and_guard(
     accounts: tuple[_AccountCfgLike, ...],
     now_utc: datetime,
 ) -> None:
-    """Wraps outbox.fan_out() with the two guards Task 6 review round 1
-    added against the silent-no-op-fan-out failure mode:
+    """Wraps outbox.fan_out() with the two guards against the
+    silent-no-op-fan-out failure mode:
 
-    - Zero `accounts` passed at all is a legitimate call shape (tests that
-      don't care about the outbox use it on purpose), but it must never be
-      *invisible* -- it is exactly the shape a caller who forgot `accounts`
-      would also produce. Record it as a metric so it shows up somewhere,
-      whichever reason produced it.
-    - If at least one *enabled* account was passed, fan_out()'s own
-      contract guarantees one QUEUED row per enabled account -- so
-      fan_out() returning 0 in that case is a contradiction, not a valid
-      outcome. Raise rather than let a signal (or follow-up) that was
-      just durably inserted silently end up with no worker ever assigned
-      to act on it.
+    - `fanout_count == 0` -- for *any* reason -- records the
+      `ingest_new_no_accounts` metric. Task 6 review round 1 only checked
+      `not accounts`, which missed the more likely door review round 2
+      found: an `accounts` tuple that is non-empty but every account in
+      it is disabled (a realistic operator misconfiguration, unlike a
+      forgotten `accounts` argument, which is a TypeError at the call
+      site now that it's required). Checking the actual output
+      (`fanout_count`) rather than guessing from the input
+      (`not accounts`) catches every route to the same silent shape.
+    - `fanout_count != enabled_count` -- any mismatch, not just "0 when
+      some were expected" -- is a contradiction of fan_out()'s own
+      one-row-per-enabled-account contract and raises. The narrower
+      `enabled_count > 0 and fanout_count == 0` check from round 1 would
+      have missed a subtler bug shape ("2 written when 3 expected");
+      comparing the counts directly catches any discrepancy.
     """
     fanout_count = outbox.fan_out(
         conn, kind=kind, signal_id=signal_id, followup_id=followup_id, accounts=accounts
     )
-
-    if not accounts:
-        _record_metric(conn, now_utc=now_utc, name="ingest_new_no_accounts")
-        return
-
     enabled_count = sum(1 for account in accounts if account.enabled)
-    if enabled_count > 0 and fanout_count == 0:
+
+    if fanout_count == 0:
+        _record_metric(conn, now_utc=now_utc, name="ingest_new_no_accounts")
+
+    if fanout_count != enabled_count:
         raise RuntimeError(
-            f"fan_out(kind={kind!r}) wrote 0 outbox rows despite "
-            f"{enabled_count} enabled account(s) among the accounts passed "
-            "to ingest() -- fan_out() guarantees one row per enabled "
-            "account, so this should be impossible. Refusing to let this "
-            "signal/follow-up silently end up with no worker assigned."
+            f"fan_out(kind={kind!r}) wrote {fanout_count} outbox row(s) but "
+            f"{enabled_count} of the accounts passed to ingest() were "
+            "enabled -- fan_out() guarantees exactly one row per enabled "
+            "account, so this mismatch should be impossible. Refusing to "
+            "let this signal/follow-up silently end up with the wrong "
+            "number of workers assigned."
         )
 
 

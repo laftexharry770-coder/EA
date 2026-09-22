@@ -62,17 +62,43 @@ not what actually happens: assigning ``conn.isolation_level = None`` --
 which both functions did unconditionally, before ever touching
 ``BEGIN`` -- is itself a CPython ``sqlite3`` operation that implicitly
 *commits* any pending transaction on that connection as a side effect of
-switching transaction-control modes. A connection handed in in the
-middle of unrelated, deliberately-uncommitted work (exactly the shape
-Plan 3's worker loop will have if it ever calls these from inside
-``Writer.submit()``) would have that work silently committed with no
-exception and no signal -- the opposite of loud failure. The explicit
-``conn.in_transaction`` check below runs *before* ``isolation_level`` is
-touched at all, so the precondition violation is now a clean raise with
-nothing committed. See ``test_claim_raises_if_connection_has_pending_transaction``
-and ``test_sweep_expired_raises_if_connection_has_pending_transaction``
-in tests/test_outbox.py, which assert both the raise and (from a second,
+switching transaction-control modes. A connection handed in with
+unrelated, deliberately-uncommitted work already pending would have that
+work silently committed with no exception and no signal -- the opposite
+of loud failure. The explicit ``conn.in_transaction`` check below runs
+*before* ``isolation_level`` is touched at all, so the precondition
+violation is now a clean raise with nothing committed. See
+``test_claim_raises_if_connection_has_pending_transaction`` and
+``test_sweep_expired_raises_if_connection_has_pending_transaction`` in
+tests/test_outbox.py, which assert both the raise and (from a second,
 independent connection) that the pending write never became visible.
+
+**claim() and sweep_expired() are not Writer work -- call them on their
+own connection, never the Writer's.** ``store/db.py``'s ``Writer`` exists
+for exactly one reason: to keep SQLite's synchronous ``commit()`` off the
+asyncio event loop in the *listener*, by handing every write to one
+dedicated thread whose ``fn`` never manages its own transaction (a normal
+return commits, an exception rolls back -- see ``Writer.submit``'s
+docstring). :func:`claim` and :func:`sweep_expired` are the opposite
+shape on purpose: they manage their *own* ``BEGIN IMMEDIATE`` transaction
+internally, because that is what makes the claim atomic (see "Why BEGIN
+IMMEDIATE" above) -- a self-managed transaction is precisely what
+``Writer`` detects and rejects as misuse. Submitting either function
+through a real ``Writer`` (``writer.submit(lambda c: outbox.claim(c,
+...))``) does not fail cleanly: the future resolves with
+``WriterMisuseError``, but by the time ``Writer`` notices, ``claim()``
+has already called ``COMMIT`` itself and the row is durably ``CLAIMED``
+on disk -- a worker that took the ``WriterMisuseError`` at face value
+("no work happened") would be wrong, and that claimed row would sit
+invisible until the next ``sweep_expired()`` lease sweep. This is
+deliberate and pinned by test, not an oversight to be "fixed" by removing
+:func:`claim`'s internal transaction (which would break the atomic-claim
+guarantee the whole lease design rests on): Plan 3's execution worker is
+a separate blocking process with its own ``db.connect(role="writer")``
+connection and has no need of ``Writer`` at all -- ``Writer`` belongs to
+the listener alone. See ``test_claim_through_writer_raises_writer_misuse_error_but_lands_durably``
+(pins the rejected pattern) and ``test_claim_on_its_own_connection_succeeds``
+(pins the correct one) in tests/test_outbox.py.
 """
 from __future__ import annotations
 

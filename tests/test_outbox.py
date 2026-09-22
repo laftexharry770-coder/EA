@@ -11,6 +11,7 @@ signal/followup insert it rides alongside inside ingest().
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import threading
@@ -671,3 +672,115 @@ def test_ingest_new_signal_raises_if_fan_out_contract_is_violated(conn, monkeypa
 
     with pytest.raises(RuntimeError, match="should be impossible"):
         _ingest(conn, accounts=(ACCOUNT_1,))
+
+
+def test_ingest_new_signal_with_all_accounts_disabled_records_visibility_metric(conn):
+    """Task 6 review round 2, finding 1: an `accounts` tuple that is
+    non-empty but every account in it is disabled used to defeat both
+    guards -- `if not accounts` was False (the tuple is non-empty) and
+    `enabled_count > 0` was False (nothing enabled), so control fell off
+    the end silently: a fully successful "new" outcome, zero outbox
+    rows, no metric, no raise. This is a *more* realistic
+    misconfiguration than a forgotten `accounts` argument (which is now
+    a TypeError at the call site), so it must produce the same
+    visibility as accounts=() -- checking `fanout_count == 0` (the
+    actual output) rather than `not accounts` (a guess from the input)
+    catches this route too.
+    """
+    result = _ingest(conn, accounts=(ACCOUNT_DISABLED,))
+    assert result.outcome == "new"
+    assert _count(conn, "outbox") == 0
+
+    metric_row = conn.execute(
+        "SELECT value FROM metrics WHERE name = 'ingest_new_no_accounts'"
+    ).fetchone()
+    assert metric_row["value"] == 1
+
+
+def test_ingest_new_signal_raises_if_fan_out_count_mismatches_enabled_count(conn, monkeypatch):
+    """Round 2 strengthened the guard from `enabled_count > 0 and
+    fanout_count == 0` to a direct count comparison: the narrower check
+    only caught "0 when some expected", not the more plausible shape of
+    a real fan_out() bug -- "2 written when 1 expected". Comparing the
+    counts directly catches any mismatch, not just zero.
+    """
+    monkeypatch.setattr(outbox, "fan_out", lambda *args, **kwargs: 2)
+
+    with pytest.raises(RuntimeError, match="should be impossible"):
+        _ingest(conn, accounts=(ACCOUNT_1,))  # 1 enabled; fan_out lies and says 2
+
+
+# -- claim() is not Writer work: pin the rejected pattern and the correct one --
+
+
+def test_claim_through_writer_raises_writer_misuse_error_but_lands_durably(tmp_path: Path):
+    """Task 6 review round 2, finding 3 (controller ruling): claim() and
+    sweep_expired() manage their own BEGIN IMMEDIATE transaction --
+    that's what makes the claim atomic -- so they are deliberately not
+    Writer work. Submitting claim() through a real Writer does not fail
+    cleanly: claim() calls COMMIT itself, so by the time Writer's own
+    self-managed-fn misuse detector notices (total_changes moved while
+    in_transaction is False) and resolves the future with
+    WriterMisuseError, the claim has already landed durably on disk. A
+    worker that took the WriterMisuseError at face value ("no work
+    happened") would be wrong -- the row is CLAIMED and invisible to
+    everyone until the next lease sweep. This pins that failure mode as
+    known-and-rejected, not an untested surprise: Plan 3 must never
+    route claim()/sweep_expired() through a Writer.
+    """
+    db_path = tmp_path / "store.db"
+    setup_conn = db.connect(db_path, role="writer")
+    outbox_id = _insert_outbox_row(setup_conn, account_id="acct-1", state="QUEUED")
+    setup_conn.close()
+
+    writer = db.Writer(db_path)
+    writer.start()
+
+    async def go():
+        future = writer.submit(
+            lambda c: outbox.claim(c, account_id="acct-1", pid=1, now_utc=NOW)
+        )
+        with pytest.raises(db.WriterMisuseError):
+            await asyncio.wrap_future(future)
+
+    try:
+        asyncio.run(go())
+    finally:
+        writer.stop(timeout=5.0)
+
+    # The claim landed durably anyway -- exactly the hazard this test
+    # pins down.
+    reader = db.connect(db_path, role="reader")
+    try:
+        row = reader.execute(
+            "SELECT state, attempts, claimed_by_pid FROM outbox WHERE outbox_id = ?",
+            (outbox_id,),
+        ).fetchone()
+        assert row["state"] == "CLAIMED"
+        assert row["attempts"] == 1
+        assert row["claimed_by_pid"] == 1
+    finally:
+        reader.close()
+
+
+def test_claim_on_its_own_connection_succeeds(tmp_path: Path):
+    """The correct pattern, as a positive control for the test above:
+    claim() on its own dedicated db.connect(role="writer") connection --
+    never routed through a Writer -- succeeds normally and returns the
+    claimed row.
+    """
+    db_path = tmp_path / "store.db"
+    setup_conn = db.connect(db_path, role="writer")
+    outbox_id = _insert_outbox_row(setup_conn, account_id="acct-1", state="QUEUED")
+    setup_conn.close()
+
+    worker_conn = db.connect(db_path, role="writer")
+    try:
+        result = outbox.claim(worker_conn, account_id="acct-1", pid=1, now_utc=NOW)
+        assert result is not None
+        assert result.outbox_id == outbox_id
+        assert result.state == "CLAIMED"
+        assert result.claimed_by_pid == 1
+        assert result.attempts == 1
+    finally:
+        worker_conn.close()
