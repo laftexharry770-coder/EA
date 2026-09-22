@@ -29,7 +29,12 @@ never makes an RPC on the update path.
    primed state.
 3. **Backfill** each enabled channel from
    `channel_state.last_processed_message_id`, so a restart does not lose
-   whatever was posted while the process was down. Backfill runs
+   whatever was posted while the process was down. A pointer of 0 means
+   this channel has never been read: rather than ingest the channel's
+   *oldest* messages (which is what `get_messages(min_id=0,
+   reverse=True)` returns -- possibly years-old signals, each queuing
+   ENTRY outbox rows), the first run seeds the pointer from the newest
+   message and ingests nothing historical. Backfill runs
    *before* handlers are registered, so a message can never be ingested
    by backfill and the update stream at the same instant (and even if it
    were, `ingest()`'s dedup would make the second one a no-op).
@@ -41,6 +46,10 @@ never makes an RPC on the update path.
    listener that returns cleanly has still stopped listening: for the
    supervisor there is no such thing as a successful exit here, so the
    return is turned into `ListenerStopped` / `EXIT_LISTENER_STOPPED`.
+   The poll task is watched alongside it: the poll is the safety net
+   for everything the update stream drops, so a poll that raises (or
+   returns) is a stopped listener too, not a background failure nobody
+   sees.
 
 **The handler does exactly four things: normalise, route, submit,
 return.** No `get_entity`, no `get_reply_message`, no RPC of any kind --
@@ -220,7 +229,8 @@ def _advance_last_processed(
     backwards.
 
     **Only a history read may call this** -- startup backfill and
-    (Task 9) the poll, i.e. the sources in `HISTORY_SOURCES`. A history
+    (Task 9) the poll, i.e. the sources in `HISTORY_SOURCES`, plus the
+    first-run seed, which reads the channel's newest message. A history
     read walks `get_messages(min_id=pointer, reverse=True)` in ascending
     id order, so when it advances the pointer to N it has already seen
     every id between the old pointer and N. The live update stream has
@@ -295,6 +305,11 @@ class Listener:
         }
         self._reader: Connection = None
         self._handler_errors: list[HandlerError] = []
+        # Channels whose pointer this process has established -- read as
+        # non-zero, or seeded (even to 0, for an empty channel). Only a
+        # channel *not* in here may be seeded: re-seeding an empty
+        # channel on the next read would jump past its first post.
+        self._pointer_seeded: set[int] = set()
         self._started = False
         self._closed = False
 
@@ -449,18 +464,52 @@ class Listener:
         pointer stops at the last id read and the next call continues
         from there.
 
+        A pointer of 0 on a channel this process has not yet seeded
+        means the channel has never been read. Reading from 0 would
+        return its *oldest* messages, so this call instead seeds the
+        pointer from the newest message and ingests nothing (returns
+        `()`). If that seed fails at startup, the next call -- the poll's
+        -- seeds instead, never reads from 0.
+
         RPC errors propagate; the caller decides whether to retry.
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError(f"limit must be a positive int, got {limit!r}")
         channel_id = channel_cfg.channel_id
         pointer = self.read_last_processed_message_id(channel_id)
+        if pointer == 0 and channel_id not in self._pointer_seeded:
+            await self._seed_pointer_from_newest(channel_cfg)
+            return ()
+        self._pointer_seeded.add(channel_id)
         messages = await self.client.get_messages(
             channel_id, limit=limit, min_id=pointer, reverse=True
         )
         return await self.ingest_history(
             channel_cfg, messages, min_id=pointer, source=source
         )
+
+    async def _seed_pointer_from_newest(self, channel_cfg: ChannelCfg) -> int:
+        """First run for this channel: point it at the newest message, so
+        only what is posted from now on is ingested. One RPC, newest
+        first (`limit=1`, not reversed)."""
+        channel_id = channel_cfg.channel_id
+        newest = await self.client.get_messages(channel_id, limit=1)
+        newest_id = max((message.id for message in newest), default=0)
+        if newest_id:
+
+            def seed(conn: Connection) -> None:
+                _advance_last_processed(conn, channel_id=channel_id, message_id=newest_id)
+
+            await asyncio.wrap_future(self.writer.submit(seed))
+        self._pointer_seeded.add(channel_id)
+        logger.warning(
+            "first run for channel %s (%s): pointer seeded at message_id %s; "
+            "nothing posted before it will be ingested",
+            channel_id,
+            channel_cfg.name,
+            newest_id,
+        )
+        return newest_id
 
     # -- startup ------------------------------------------------------------
 
@@ -583,14 +632,61 @@ class Listener:
     # -- running and stopping ------------------------------------------------
 
     async def wait_until_stopped(self) -> NoReturn:
-        """Step 6. Any return from `run_until_disconnected()` -- clean or
-        not -- means this process is no longer receiving updates, so it
-        is turned into an exception the supervisor can act on."""
-        await self.client.run_until_disconnected()
+        """Step 6. Wait on `run_until_disconnected()` *and* the poll
+        task; whichever finishes first ends the listener.
+
+        Any return from `run_until_disconnected()` -- clean or not --
+        means this process is no longer receiving updates, so it is
+        turned into `ListenerStopped` (an exception it raised, such as a
+        terminal auth error, propagates as itself so `run_listener()` can
+        classify it). The poll finishing -- raising, returning, or being
+        cancelled -- is `ListenerStopped` too: without it, a blackout's
+        worth of messages is silently lost while the process looks
+        healthy, so the supervisor must restart it.
+        """
+        run_task: asyncio.Future[Any] = asyncio.ensure_future(
+            self.client.run_until_disconnected()
+        )
+        watched: set[asyncio.Future[Any]] = {run_task}
+        if self.poll_task is not None:
+            watched.add(self.poll_task)
+        try:
+            done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+
+        # Decided on what finished *first* (`done`), not on task state
+        # after the cancel above, so the poll's own failure is what gets
+        # reported when the poll is what stopped.
+        if run_task in done:
+            if not run_task.cancelled():
+                run_task.result()  # re-raises whatever run_until_disconnected() raised
+            raise ListenerStopped(
+                "run_until_disconnected() returned: the listener is no longer "
+                "receiving Telegram updates. A listener that has stopped "
+                "listening is never a successful exit."
+            )
+
+        # Only two things are watched, so the poll task finished first.
+        poll_task = self.poll_task
+        if poll_task is None:  # pragma: no cover -- unreachable, see above
+            raise ListenerStopped("the listener stopped for an unknown reason")
+        if poll_task.cancelled():
+            raise ListenerStopped(
+                "the poll task was cancelled: nothing is recovering messages "
+                "the update stream drops"
+            )
+        poll_error = poll_task.exception()
+        if poll_error is not None:
+            raise ListenerStopped(
+                f"the poll task died ({type(poll_error).__name__}: {poll_error}): "
+                "nothing is recovering messages the update stream drops"
+            ) from poll_error
         raise ListenerStopped(
-            "run_until_disconnected() returned: the listener is no longer "
-            "receiving Telegram updates. A listener that has stopped "
-            "listening is never a successful exit."
+            "the poll task returned: nothing is recovering messages the update "
+            "stream drops"
         )
 
     async def run(self) -> NoReturn:

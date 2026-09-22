@@ -54,6 +54,14 @@ from telethon import events
 
 DeliveryRoute = Literal["event", "history"]
 
+#: `get_messages()` keyword arguments the fake implements. Every other
+#: Telethon keyword (`offset_id`, `ids`, `search`, `filter`, ...) changes
+#: what Telethon returns, so the fake refuses it rather than silently
+#: returning something production never would.
+_SUPPORTED_GET_MESSAGES_KWARGS = frozenset(
+    {"entity", "limit", "min_id", "max_id", "reverse", "wait_time"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class FakeMessage:
@@ -189,7 +197,43 @@ class FakeTelegramClient:
             )
         ]
 
-    async def get_messages(
+    async def get_messages(self, *args: Any, **kwargs: Any) -> list[FakeMessage]:
+        """Scripted history. `min_id` is exclusive and `max_id` is
+        exclusive, matching Telethon; `reverse=True` returns oldest
+        first, otherwise newest first.
+
+        **The default `limit` is Telethon's, exactly: ONE message.**
+        Telethon 1.44.0 `get_messages()` (telethon/client/messages.py
+        :590-594) sets `limit=1` unless `limit` is given (by keyword or
+        positionally), or both `min_id` and `max_id` are given by
+        keyword, in which case it returns the whole range. The block
+        below is that code, verbatim. So
+        `get_messages(channel, min_id=pointer, reverse=True)` returns one
+        message here exactly as it does in production -- a poll written
+        that way is caught by its tests instead of fetching one message
+        per interval in production while every test passes.
+        `tests/test_fakes_telegram.py` pins this against the installed
+        Telethon's own `get_messages` so the two cannot drift.
+
+        History is *not* affected by a blackout or a dropped socket --
+        that asymmetry is the whole point of the fake.
+        """
+        # telethon/client/messages.py:590-594 (Telethon 1.44.0), verbatim:
+        if len(args) == 1 and 'limit' not in kwargs:
+            if 'min_id' in kwargs and 'max_id' in kwargs:
+                kwargs['limit'] = None
+            else:
+                kwargs['limit'] = 1
+
+        unsupported = set(kwargs) - _SUPPORTED_GET_MESSAGES_KWARGS
+        if unsupported:
+            raise NotImplementedError(
+                f"FakeTelegramClient.get_messages() does not implement "
+                f"{sorted(unsupported)}; add it to the fake before relying on it"
+            )
+        return self._read_history(*args, **kwargs)
+
+    def _read_history(
         self,
         entity: Any,
         limit: int | None = None,
@@ -197,15 +241,10 @@ class FakeTelegramClient:
         min_id: int = 0,
         max_id: int = 0,
         reverse: bool = False,
-        **kwargs: Any,
+        wait_time: float | None = None,
     ) -> list[FakeMessage]:
-        """Scripted history. `min_id` is exclusive and `max_id` is
-        exclusive, matching Telethon; `reverse=True` returns oldest
-        first, otherwise newest first.
-
-        History is *not* affected by a blackout or a dropped socket --
-        that asymmetry is the whole point of the fake.
-        """
+        """`iter_messages()`'s signature and defaults (`limit=None` means
+        everything), applied to the scripted history."""
         self.calls.append("get_messages")
         self.get_messages_calls.append(
             GetMessagesCall(

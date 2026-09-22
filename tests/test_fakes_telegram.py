@@ -15,10 +15,12 @@ No network anywhere: `telethon` is imported only for the
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import UTC, datetime
 
 import pytest
 from telethon import events
+from telethon.client.messages import MessageMethods
 
 from fakes.telegram import FakeMessage, FakeTelegramClient
 
@@ -105,7 +107,7 @@ def test_blackout_hides_messages_from_handlers_but_keeps_them_in_history() -> No
         delivered = await client.emit(CHANNEL, _msg(7))
         client.end_blackout()
 
-        history = await client.get_messages(CHANNEL, min_id=0, reverse=True)
+        history = await client.get_messages(CHANNEL, min_id=0, reverse=True, limit=None)
         return delivered, seen, history
 
     delivered, seen, history = asyncio.run(scenario())
@@ -126,7 +128,7 @@ def test_blackout_ends_and_delivery_resumes() -> None:
             await client.emit(CHANNEL, _msg(7))
         await client.emit(CHANNEL, _msg(8))
 
-        history = await client.get_messages(CHANNEL, min_id=0, reverse=True)
+        history = await client.get_messages(CHANNEL, min_id=0, reverse=True, limit=None)
         return seen, history
 
     seen, history = asyncio.run(scenario())
@@ -169,8 +171,8 @@ def test_get_messages_honours_min_id_reverse_and_limit() -> None:
             history={CHANNEL: [_msg(1), _msg(2), _msg(3), _msg(4)]}
         )
         await client.connect()
-        ascending = await client.get_messages(CHANNEL, min_id=2, reverse=True)
-        descending = await client.get_messages(CHANNEL, min_id=0)
+        ascending = await client.get_messages(CHANNEL, min_id=2, reverse=True, limit=None)
+        descending = await client.get_messages(CHANNEL, min_id=0, limit=None)
         limited = await client.get_messages(CHANNEL, min_id=0, reverse=True, limit=2)
         return ascending, descending, limited
 
@@ -179,6 +181,95 @@ def test_get_messages_honours_min_id_reverse_and_limit() -> None:
     assert [m.id for m in ascending] == [3, 4]
     assert [m.id for m in descending] == [4, 3, 2, 1]
     assert [m.id for m in limited] == [1, 2]
+
+
+def test_get_messages_without_limit_returns_one_message_as_telethon_does() -> None:
+    """Telethon 1.44's `get_messages()` defaults to `limit=1` unless both
+    `min_id` and `max_id` are passed by keyword. A poll written as
+    `get_messages(channel, min_id=pointer, reverse=True)` therefore
+    fetches ONE message per call in production; the fake must too, or
+    every test of such a poll passes while production falls behind."""
+
+    async def scenario():
+        client = FakeTelegramClient(
+            history={CHANNEL: [_msg(1), _msg(2), _msg(3), _msg(4)]}
+        )
+        await client.connect()
+        return (
+            await client.get_messages(CHANNEL, min_id=0, reverse=True),
+            await client.get_messages(CHANNEL),
+            await client.get_messages(CHANNEL, min_id=1, max_id=4),
+        )
+
+    no_limit_ascending, no_limit, full_range = asyncio.run(scenario())
+
+    assert [m.id for m in no_limit_ascending] == [1]
+    assert [m.id for m in no_limit] == [4]
+    # Both bounds given by keyword: Telethon returns the whole range.
+    assert [m.id for m in full_range] == [3, 2]
+
+
+class _RealGetMessagesProbe:
+    """Stands in for `self` so the body of Telethon's real
+    `MessageMethods.get_messages` runs offline: that body only resolves
+    the default `limit`, then calls `self.iter_messages(*args, **kwargs)`
+    and `await it.collect()`. This captures what `limit` it resolved."""
+
+    def __init__(self) -> None:
+        self.limit: object = "never called"
+
+    def iter_messages(self, *args, **kwargs):
+        bound = inspect.signature(MessageMethods.iter_messages).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        self.limit = bound.arguments["limit"]
+        return self
+
+    async def collect(self) -> list:
+        return []
+
+
+_GET_MESSAGES_CALL_SHAPES = [
+    pytest.param((CHANNEL,), {}, id="entity-only"),
+    pytest.param((CHANNEL,), {"min_id": 2, "reverse": True}, id="min_id-reverse"),
+    pytest.param((CHANNEL,), {"max_id": 4}, id="max_id-only"),
+    pytest.param((CHANNEL,), {"min_id": 1, "max_id": 4}, id="min_id-and-max_id"),
+    pytest.param((CHANNEL,), {"limit": None, "min_id": 2, "reverse": True}, id="limit-None"),
+    pytest.param((CHANNEL,), {"limit": 3, "min_id": 0, "reverse": True}, id="limit-3"),
+    pytest.param((CHANNEL, 2), {}, id="positional-limit"),
+    pytest.param((CHANNEL, None), {"min_id": 2}, id="positional-None"),
+    pytest.param((), {"entity": CHANNEL, "min_id": 2}, id="entity-by-keyword"),
+]
+
+
+@pytest.mark.parametrize(("args", "kwargs"), _GET_MESSAGES_CALL_SHAPES)
+def test_fake_get_messages_resolves_limit_exactly_as_real_telethon(args, kwargs) -> None:
+    """Pins the fake to the installed Telethon, not to a copy of it: if a
+    Telethon upgrade changes the default, this fails instead of the fake
+    silently drifting."""
+
+    async def scenario():
+        probe = _RealGetMessagesProbe()
+        await MessageMethods.get_messages(probe, *args, **dict(kwargs))
+        client = FakeTelegramClient(history={CHANNEL: [_msg(i) for i in range(1, 6)]})
+        await client.get_messages(*args, **dict(kwargs))
+        return probe.limit, client.get_messages_calls[-1].limit
+
+    real_limit, fake_limit = asyncio.run(scenario())
+
+    assert real_limit != "never called"
+    assert fake_limit == real_limit
+
+
+def test_get_messages_refuses_arguments_it_does_not_implement() -> None:
+    """`offset_id`, `ids`, `search`, ... all change what Telethon returns.
+    Silently ignoring one would let a test pass against a fiction."""
+
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL: [_msg(1)]})
+        with pytest.raises(NotImplementedError, match="offset_id"):
+            await client.get_messages(CHANNEL, offset_id=1, limit=None)
+
+    asyncio.run(scenario())
 
 
 def test_get_messages_records_its_call_arguments() -> None:
@@ -263,7 +354,7 @@ def test_drop_connection_pauses_delivery_and_reconnect_resumes_it() -> None:
         delivered_after_reconnect = await client.emit(CHANNEL, _msg(2))
         run_returned = task.done()
 
-        history = await client.get_messages(CHANNEL, min_id=0, reverse=True)
+        history = await client.get_messages(CHANNEL, min_id=0, reverse=True, limit=None)
 
         await client.disconnect()
         await asyncio.wait_for(task, timeout=1.0)

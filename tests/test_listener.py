@@ -551,6 +551,111 @@ def test_backfill_ingests_messages_newer_than_last_processed_and_advances_it(
     assert _last_processed(db_path, CHANNEL_ID) == SIGNAL_MESSAGE_ID
 
 
+def test_first_run_seeds_the_pointer_from_the_newest_message_and_ingests_no_history(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's D3: with the pointer at 0, `get_messages(min_id=0,
+    reverse=True, limit=N)` returns the first N messages the channel ever
+    posted -- possibly years-old signals, each queuing ENTRY outbox rows.
+    A first run must instead start from *now*: seed the pointer from the
+    newest message and ingest nothing historical."""
+    db_path = tmp_path / "store.db"
+    old_history = [_chatter_message(i) for i in range(1, 21)]
+    old_history[2] = _signal_message(3)  # an ancient signal, never to be traded
+
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL_ID: old_history})
+        async with _started(db_path, client, backfill_limit=5) as listener:
+            rows_after_start = _count(db_path, "messages")
+            pointer_after_start = listener.read_last_processed_message_id(CHANNEL_ID)
+            seed_calls = list(client.get_messages_calls)
+
+            # Going forward, everything after the first run is recorded --
+            # by the update stream, and by a history read for what it drops.
+            await client.emit(CHANNEL_ID, _chatter_message(21))
+            with client.blackout():
+                await client.emit(CHANNEL_ID, _chatter_message(22))
+            await listener.read_history(CHANNEL, source="poll", limit=100)
+        return rows_after_start, pointer_after_start, seed_calls
+
+    rows_after_start, pointer_after_start, seed_calls = asyncio.run(scenario())
+
+    assert rows_after_start == 0, "first run ingested the channel's old history"
+    assert pointer_after_start == 20
+    assert len(seed_calls) == 1
+    assert (seed_calls[0].entity, seed_calls[0].limit, seed_calls[0].reverse) == (
+        CHANNEL_ID,
+        1,
+        False,
+    ), "the seed must ask for exactly the newest message"
+    assert _rows(db_path, "SELECT message_id, source FROM messages ORDER BY message_id") == [
+        (21, "live"),
+        (22, "poll"),
+    ]
+    assert _count(db_path, "outbox") == 0
+
+
+def test_first_run_on_an_empty_channel_does_not_reseed_past_the_first_message(
+    tmp_path: Path,
+) -> None:
+    """An empty channel seeds nothing (there is no newest message), so the
+    pointer stays 0. The next history read must then read from 0 -- not
+    seed again, which would jump past a first post the stream dropped."""
+    db_path = tmp_path / "store.db"
+
+    async def scenario() -> tuple[int, int]:
+        client = FakeTelegramClient()
+        async with _started(db_path, client) as listener:
+            pointer_after_start = listener.read_last_processed_message_id(CHANNEL_ID)
+            with client.blackout():
+                await client.emit(CHANNEL_ID, _chatter_message(1))
+            await listener.read_history(CHANNEL, source="poll", limit=100)
+            return pointer_after_start, listener.read_last_processed_message_id(CHANNEL_ID)
+
+    pointer_after_start, pointer_after_read = asyncio.run(scenario())
+
+    assert pointer_after_start == 0
+    assert _rows(db_path, "SELECT message_id, source FROM messages") == [(1, "poll")]
+    assert pointer_after_read == 1
+
+
+def test_a_failed_first_run_seed_is_retried_as_a_seed_not_a_read_from_zero(
+    tmp_path: Path,
+) -> None:
+    """If the seed RPC fails at startup, the pointer is still 0 when the
+    poll first runs. Reading from 0 then would be D3 all over again."""
+    db_path = tmp_path / "store.db"
+
+    async def scenario() -> tuple[int, tuple, int]:
+        client = FakeTelegramClient(
+            history={CHANNEL_ID: [_chatter_message(i) for i in range(1, 21)]}
+        )
+        real_get_messages = client.get_messages
+        failures = [ConnectionError("simulated RPC failure")]
+
+        async def flaky_get_messages(*args, **kwargs):
+            if failures:
+                raise failures.pop()
+            return await real_get_messages(*args, **kwargs)
+
+        client.get_messages = flaky_get_messages
+        async with _started(db_path, client) as listener:
+            pointer_after_start = listener.read_last_processed_message_id(CHANNEL_ID)
+            results = await listener.read_history(CHANNEL, source="poll", limit=100)
+            return (
+                pointer_after_start,
+                results,
+                listener.read_last_processed_message_id(CHANNEL_ID),
+            )
+
+    pointer_after_start, results, pointer_after_read = asyncio.run(scenario())
+
+    assert pointer_after_start == 0
+    assert results == ()
+    assert _count(db_path, "messages") == 0
+    assert pointer_after_read == 20
+
+
 def test_backfill_asks_only_for_messages_newer_than_last_processed(
     tmp_path: Path,
 ) -> None:
@@ -568,6 +673,8 @@ def test_backfill_asks_only_for_messages_newer_than_last_processed(
     assert calls[0].entity == CHANNEL_ID
     assert calls[0].min_id == 4000
     assert calls[0].reverse is True
+    # Always explicit: Telethon's own default is ONE message.
+    assert calls[0].limit == listener_module.DEFAULT_BACKFILL_LIMIT
 
 
 def test_writer_connects_before_any_reader_connection(
@@ -680,28 +787,42 @@ def test_start_times_out_when_the_writer_never_connects(tmp_path: Path) -> None:
     assert "connect" not in calls
 
 
-def test_poll_hook_starts_after_handlers_are_registered(tmp_path: Path) -> None:
+def test_poll_hook_starts_only_after_backfill_and_handler_registration(
+    tmp_path: Path,
+) -> None:
     """Task 9 plugs its poll in here; it must not run before the update
-    stream is live, or it would race backfill over the same rows."""
+    stream is live, or it would race backfill over the same rows.
+
+    The snapshot is taken from *inside* the hook, the moment it first
+    runs -- the only place the ordering is observable. A snapshot taken
+    after `start()` returns sees the same calls whatever order they
+    happened in (the reviewer's M7 passed the old version of this test)."""
     db_path = tmp_path / "store.db"
-    started: list[str] = []
+    _seed_last_processed(db_path, CHANNEL_ID, 4000)
+    seen_by_poll: dict[str, object] = {}
 
     async def poll(listener: Listener) -> None:
-        started.append("poll")
+        seen_by_poll["calls"] = list(listener.client.calls)
+        seen_by_poll["pointer"] = listener.read_last_processed_message_id(CHANNEL_ID)
+        seen_by_poll["rows"] = _count(db_path, "messages")
         await asyncio.sleep(3600)
 
-    async def scenario() -> tuple[list[str], bool]:
-        client = FakeTelegramClient()
-        async with _started(db_path, client, poll_hook=poll) as listener:
-            calls_at_poll_start = list(client.calls)
-            await asyncio.sleep(0)
-            assert listener.poll_task is not None
-            return calls_at_poll_start, listener.poll_task.cancelled()
+    async def scenario() -> None:
+        client = FakeTelegramClient(history={CHANNEL_ID: [_signal_message()]})
+        async with _started(db_path, client, poll_hook=poll):
+            await _wait_for(lambda: "calls" in seen_by_poll)
 
-    calls, _cancelled = asyncio.run(scenario())
+    asyncio.run(scenario())
 
-    assert started == ["poll"]
-    assert "add_event_handler" in calls
+    assert seen_by_poll["calls"] == [
+        "connect",
+        "get_dialogs",
+        "get_messages",
+        "add_event_handler",
+    ]
+    # Backfill had *finished* -- its write landed -- not merely started.
+    assert seen_by_poll["pointer"] == SIGNAL_MESSAGE_ID
+    assert seen_by_poll["rows"] == 1
 
 
 def test_poll_task_is_cancelled_on_close(tmp_path: Path) -> None:
@@ -765,6 +886,63 @@ def test_run_listener_returns_a_non_zero_exit_code_when_the_client_stops(
 
     assert exit_code != 0
     assert exit_code == EXIT_LISTENER_STOPPED
+
+
+async def _failing_poll(listener: Listener) -> None:
+    await asyncio.sleep(0)
+    raise RuntimeError("poll blew up")
+
+
+def test_a_poll_that_raises_stops_the_listener_non_zero(tmp_path: Path) -> None:
+    """The poll is the safety net for everything the update stream drops.
+    If it dies while `run_until_disconnected()` carries on, the process
+    looks healthy and silently misses every blacked-out message."""
+    db_path = tmp_path / "store.db"
+
+    async def scenario() -> tuple[int, list[str]]:
+        client = FakeTelegramClient()
+        listener = _build_listener(db_path, client, poll_hook=_failing_poll)
+        exit_code = await asyncio.wait_for(run_listener(listener), timeout=2.0)
+        return exit_code, list(client.calls)
+
+    exit_code, calls = asyncio.run(scenario())
+
+    assert exit_code == EXIT_LISTENER_STOPPED
+    assert calls[-1] == "disconnect"
+
+
+def test_run_raises_listener_stopped_carrying_the_poll_failure(tmp_path: Path) -> None:
+    db_path = tmp_path / "store.db"
+
+    async def scenario() -> BaseException:
+        client = FakeTelegramClient()
+        listener = _build_listener(db_path, client, poll_hook=_failing_poll)
+        try:
+            with pytest.raises(ListenerStopped) as excinfo:
+                await asyncio.wait_for(listener.run(), timeout=2.0)
+        finally:
+            await listener.aclose()
+        return excinfo.value
+
+    error = asyncio.run(scenario())
+
+    assert isinstance(error.__cause__, RuntimeError)
+    assert "poll blew up" in str(error)
+
+
+def test_a_poll_that_returns_stops_the_listener_non_zero(tmp_path: Path) -> None:
+    """Returning is no better than raising: either way nothing is polling."""
+    db_path = tmp_path / "store.db"
+
+    async def returning_poll(listener: Listener) -> None:
+        await asyncio.sleep(0)
+
+    async def scenario() -> int:
+        client = FakeTelegramClient()
+        listener = _build_listener(db_path, client, poll_hook=returning_poll)
+        return await asyncio.wait_for(run_listener(listener), timeout=2.0)
+
+    assert asyncio.run(scenario()) == EXIT_LISTENER_STOPPED
 
 
 async def _wait_for(predicate, *, timeout: float = 2.0) -> None:
