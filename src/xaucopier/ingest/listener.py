@@ -55,6 +55,15 @@ For the same reason the handler is registered **without** Telethon's
 on `event.chat_id` against a pre-built dict costs nothing and cannot
 round-trip.
 
+**Only a history read moves the per-channel pointer.**
+`channel_state.last_processed_message_id` is where a history read
+(backfill, Task 9's poll -- both are `read_history()`) resumes. A
+history read walks ids in ascending order and so has seen everything
+below the id it advances to; the update stream can silently drop ids,
+so the handler ingests and never touches the pointer. The poll's re-read
+of a message the handler already stored is a `"duplicate"` no-op. See
+`_advance_last_processed` for the failure this prevents.
+
 **No `sqlite3` anywhere in this package.** Writes go through
 `Writer.submit()`; the one read this module does (the per-channel
 backfill pointer) goes through a `store.db.connect(role="reader")`
@@ -66,7 +75,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -95,6 +104,14 @@ Connection = Any
 
 #: The poll slot Task 9 fills: `async def poll(listener) -> None`.
 PollHook = Callable[["Listener"], Awaitable[None]]
+
+#: `messages.source` for a message delivered by the update stream.
+LIVE_SOURCE = "live"
+#: `messages.source` values for a message found by reading channel
+#: history. These -- and only these -- advance the per-channel pointer;
+#: see `_advance_last_processed` for why.
+HISTORY_SOURCES = frozenset({"backfill", "poll"})
+ALL_SOURCES = HISTORY_SOURCES | {LIVE_SOURCE}
 
 
 class ListenerStopped(RuntimeError):
@@ -127,6 +144,19 @@ class HandlerError:
     channel_id: int | None
     message_id: int | None
     error: str
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryIngest:
+    """What happened to one message a history read found.
+
+    `result` is the `ingest()` outcome -- `"new"` means the update stream
+    had not delivered it (yet), which is what Task 9's
+    `missed_by_eventstream` counter counts.
+    """
+
+    message_id: int
+    result: IngestResult
 
 
 def _to_utc(value: datetime) -> datetime:
@@ -172,10 +202,25 @@ def _advance_last_processed(
     conn: Connection, *, channel_id: int, message_id: int
 ) -> None:
     """Move `channel_state.last_processed_message_id` forward, never
-    backwards: live updates, backfill and (Task 9) the poll all write
-    this pointer, and they do not arrive in id order relative to each
-    other. `MAX()` makes an out-of-order write harmless instead of
-    rewinding the pointer and re-ingesting everything after it.
+    backwards.
+
+    **Only a history read may call this** -- startup backfill and
+    (Task 9) the poll, i.e. the sources in `HISTORY_SOURCES`. A history
+    read walks `get_messages(min_id=pointer, reverse=True)` in ascending
+    id order, so when it advances the pointer to N it has already seen
+    every id between the old pointer and N. The live update stream has
+    no such property: it can silently skip ids (the Telethon channel
+    blackout this whole design exists to survive), so a live message
+    moving the pointer to N would carry it past every message the
+    stream dropped -- and the poll, reading from the pointer, would
+    never see them. That is the reviewer's D1: blackout hides 10 and
+    11, 12 arrives live, and 10 and 11 are lost forever.
+
+    `MAX()` is only a guard against a history read being handed its
+    batch out of order; it is not what makes the pointer safe. What
+    makes it safe is that the live path never writes it at all. The
+    poll's re-read of a message the live path already stored is a
+    `"duplicate"` no-op via `UNIQUE(channel_id, message_id)`.
     """
     conn.execute(
         "INSERT INTO channel_state (channel_id, last_processed_message_id) "
@@ -198,8 +243,10 @@ class Listener:
     Task 9 and Task 11 build on the public surface here --
     `client`, `channels`, `enabled_channels`, `reader`,
     `channel_cfg_for()`, `read_last_processed_message_id()`,
-    `ingest_message()` and `poll_hook` -- rather than reaching into the
-    internals.
+    `read_history()`, `ingest_history()`, `ingest_message()` and
+    `poll_hook` -- rather than reaching into the internals. The poll
+    should be `read_history(channel, source="poll", limit=...)`: it is
+    the one place the pointer is read, fetched from and advanced.
     """
 
     def __init__(
@@ -288,8 +335,17 @@ class Listener:
     ) -> IngestResult:
         """Hand one message to the writer thread and await the result.
 
-        The whole job -- route, dedup, insert, outbox fan-out, and the
-        `last_processed_message_id` advance -- runs inside one
+        `source` is `"live"` for the update stream, or one of
+        `HISTORY_SOURCES` (`"backfill"`, `"poll"`) for a history read.
+        It decides whether the per-channel pointer moves: a history
+        source advances `last_processed_message_id` to this message; a
+        live one never touches it (see `_advance_last_processed` -- a
+        live advance is what let one live message hide a blackout's
+        worth of missed ones). Any other value raises `ValueError`
+        rather than silently landing on one side of that rule.
+
+        The whole job -- route, dedup, insert, outbox fan-out, and (for
+        a history source) the pointer advance -- runs inside one
         transaction on the writer thread, so a crash mid-way leaves
         neither a signal with no outbox row nor a pointer that has moved
         past a message that was never stored.
@@ -297,6 +353,11 @@ class Listener:
         `await`ing here does not block the event loop: it suspends this
         one update's task while the writer thread does the blocking work.
         """
+        if source not in ALL_SOURCES:
+            raise ValueError(
+                f"unknown ingest source {source!r}; expected one of {sorted(ALL_SOURCES)}"
+            )
+        advances_pointer = source in HISTORY_SOURCES
         now_utc = self._now()
         accounts = self.accounts
 
@@ -313,14 +374,76 @@ class Listener:
                 now_utc=now_utc,
                 accounts=accounts,
             )
-            _advance_last_processed(
-                conn,
-                channel_id=incoming.channel_id,
-                message_id=incoming.message_id,
-            )
+            if advances_pointer:
+                _advance_last_processed(
+                    conn,
+                    channel_id=incoming.channel_id,
+                    message_id=incoming.message_id,
+                )
             return result
 
         return await asyncio.wrap_future(self.writer.submit(job))
+
+    async def ingest_history(
+        self,
+        channel_cfg: ChannelCfg,
+        messages: Iterable[Any],
+        *,
+        min_id: int,
+        source: str,
+    ) -> tuple[HistoryIngest, ...]:
+        """Ingest a batch that one `get_messages(min_id=..., reverse=True)`
+        call returned, advancing the pointer message by message.
+
+        Messages are taken in ascending id order, so the pointer only
+        ever passes an id once everything below it in the batch has been
+        handled. Anything at or below `min_id` is skipped (Telethon's
+        `min_id` is already exclusive; this is a guard, not a filter).
+        """
+        if source not in HISTORY_SOURCES:
+            raise ValueError(
+                f"ingest_history() is for history reads only; source must be one of "
+                f"{sorted(HISTORY_SOURCES)}, got {source!r}"
+            )
+        outcomes: list[HistoryIngest] = []
+        for message in sorted(messages, key=lambda m: m.id):
+            incoming = normalise_message(message, channel_id=channel_cfg.channel_id)
+            if incoming.message_id <= min_id:
+                continue
+            result = await self.ingest_message(
+                incoming, channel_cfg=channel_cfg, source=source
+            )
+            outcomes.append(HistoryIngest(message_id=incoming.message_id, result=result))
+        return tuple(outcomes)
+
+    async def read_history(
+        self, channel_cfg: ChannelCfg, *, source: str, limit: int
+    ) -> tuple[HistoryIngest, ...]:
+        """One history read for one channel: fetch everything after the
+        pointer (oldest first, at most `limit`) and ingest it.
+
+        This is the only operation that moves the pointer, and both
+        startup backfill and Task 9's poll are this call. `limit` is
+        required and always passed to `get_messages()` explicitly:
+        Telethon 1.44 defaults `get_messages()` to **one** message unless
+        both `min_id` and `max_id` are given (telethon/client/messages.py
+        :590-594), so a call that leaves `limit` out quietly fetches one
+        message per read. A batch smaller than the gap is fine -- the
+        pointer stops at the last id read and the next call continues
+        from there.
+
+        RPC errors propagate; the caller decides whether to retry.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(f"limit must be a positive int, got {limit!r}")
+        channel_id = channel_cfg.channel_id
+        pointer = self.read_last_processed_message_id(channel_id)
+        messages = await self.client.get_messages(
+            channel_id, limit=limit, min_id=pointer, reverse=True
+        )
+        return await self.ingest_history(
+            channel_cfg, messages, min_id=pointer, source=source
+        )
 
     # -- startup ------------------------------------------------------------
 
@@ -351,34 +474,23 @@ class Listener:
         await asyncio.wrap_future(self.writer.submit(_writer_ready_probe))
 
     async def _backfill_channel(self, channel: ChannelCfg) -> None:
-        last_id = self.read_last_processed_message_id(channel.channel_id)
         try:
-            messages = await self.client.get_messages(
-                channel.channel_id,
-                limit=self._backfill_limit,
-                min_id=last_id,
-                reverse=True,
+            await self.read_history(
+                channel, source="backfill", limit=self._backfill_limit
             )
         except Exception as exc:  # noqa: BLE001 -- one bad channel must not block the rest
             # Failing the whole startup here would crash-loop the process
-            # for every *other* channel too. Task 9's poll uses the same
-            # pointer, so a channel skipped now is retried shortly --
-            # loudly logged, never silent.
+            # for every *other* channel too. Task 9's poll reads from the
+            # same pointer, which only a successful history read moves,
+            # so a channel skipped now is retried shortly -- loudly
+            # logged, never silent.
             logger.exception(
                 "backfill failed for channel %s (%s); continuing -- the poll "
-                "will retry from message_id %s: %s",
+                "will retry from the stored pointer: %s",
                 channel.channel_id,
                 channel.name,
-                last_id,
                 exc,
             )
-            return
-
-        for message in messages:
-            incoming = normalise_message(message, channel_id=channel.channel_id)
-            if incoming.message_id <= last_id:
-                continue
-            await self.ingest_message(incoming, channel_cfg=channel, source="backfill")
 
     def _register_handlers(self) -> None:
         # No `chats=` filter on purpose: resolving it puts a potential

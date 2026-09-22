@@ -43,7 +43,7 @@ from xaucopier.ingest.listener import (
     normalise_event,
     run_listener,
 )
-from xaucopier.store import db
+from xaucopier.store import db, messages_repo
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json"
 _FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -177,7 +177,9 @@ def test_emitted_message_writes_one_message_and_one_outbox_row_per_enabled_accou
     assert outbox == [("acct-a", "ENTRY", "QUEUED")]
     assert len(outbox) == ENABLED_ACCOUNT_COUNT
     assert _rows(db_path, "SELECT source FROM messages") == [("live",)]
-    assert _last_processed(db_path, CHANNEL_ID) == SIGNAL_MESSAGE_ID
+    # A live delivery never moves the history pointer -- see the
+    # "history pointer" section below for why.
+    assert _last_processed(db_path, CHANNEL_ID) == 0
 
 
 def test_duplicate_emission_writes_no_second_row(tmp_path: Path) -> None:
@@ -318,6 +320,185 @@ def test_message_posted_during_a_blackout_never_reaches_the_store(
     history = asyncio.run(scenario())
 
     assert [message.id for message in history] == [SIGNAL_MESSAGE_ID]
+    assert _count(db_path, "messages") == 0
+
+
+# -- the history pointer -----------------------------------------------------
+#
+# `channel_state.last_processed_message_id` is where a *history read*
+# (startup backfill, Task 9's poll) resumes. Only a history read sees a
+# contiguous run of ids, so only a history read may move it. If the live
+# path moved it too, one live message landing after a blackout would
+# carry the pointer past everything the blackout hid, and the poll --
+# which reads from the pointer -- would never see those messages at all.
+# A missed message is a missed trade.
+
+
+def test_live_message_after_a_blackout_does_not_carry_the_pointer_past_the_missed_ones(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's D1: blackout hides 10 and 11, then 12 arrives live."""
+    db_path = tmp_path / "store.db"
+    _seed_last_processed(db_path, CHANNEL_ID, 9)
+
+    async def scenario():
+        client = FakeTelegramClient()
+        async with _started(db_path, client) as listener:
+            with client.blackout():
+                delivered_10 = await client.emit(CHANNEL_ID, _chatter_message(10))
+                delivered_11 = await client.emit(CHANNEL_ID, _chatter_message(11))
+            delivered_12 = await client.emit(CHANNEL_ID, _chatter_message(12))
+            pointer_after_live = listener.read_last_processed_message_id(CHANNEL_ID)
+            assert pointer_after_live == 9, "a live message moved the history pointer"
+
+            # Exactly what a poll sees when it reads history from the pointer.
+            visible = await client.get_messages(
+                CHANNEL_ID, min_id=pointer_after_live, reverse=True, limit=None
+            )
+            results = await listener.read_history(CHANNEL, source="poll", limit=100)
+            pointer_after_read = listener.read_last_processed_message_id(CHANNEL_ID)
+        return (
+            (delivered_10, delivered_11, delivered_12),
+            pointer_after_live,
+            [message.id for message in visible],
+            [(r.message_id, r.result.outcome) for r in results],
+            pointer_after_read,
+        )
+
+    delivered, pointer_after_live, visible, outcomes, pointer_after_read = asyncio.run(
+        scenario()
+    )
+
+    assert delivered == (False, False, True)
+    assert pointer_after_live == 9, "a live message moved the history pointer"
+    assert visible == [10, 11, 12]
+    assert outcomes == [(10, "new"), (11, "new"), (12, "duplicate")]
+    assert _rows(db_path, "SELECT message_id, source FROM messages ORDER BY message_id") == [
+        (10, "poll"),
+        (11, "poll"),
+        (12, "live"),
+    ]
+    assert pointer_after_read == 12
+
+
+def test_live_message_after_a_partial_backfill_does_not_skip_the_rest_of_the_gap(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's D2: a long outage, backfill takes only the first
+    `backfill_limit` messages, then one live message arrives."""
+    db_path = tmp_path / "store.db"
+    _seed_last_processed(db_path, CHANNEL_ID, 1000)
+
+    async def scenario() -> tuple[int, int, int]:
+        client = FakeTelegramClient(
+            history={CHANNEL_ID: [_chatter_message(i) for i in range(1001, 1013)]}
+        )
+        async with _started(db_path, client, backfill_limit=5) as listener:
+            after_backfill = listener.read_last_processed_message_id(CHANNEL_ID)
+            await client.emit(CHANNEL_ID, _chatter_message(1013))
+            after_live = listener.read_last_processed_message_id(CHANNEL_ID)
+            assert after_live == 1005, "a live message moved the history pointer"
+            await listener.read_history(CHANNEL, source="poll", limit=100)
+            after_read = listener.read_last_processed_message_id(CHANNEL_ID)
+        return after_backfill, after_live, after_read
+
+    after_backfill, after_live, after_read = asyncio.run(scenario())
+
+    assert after_backfill == 1005
+    assert after_live == 1005, "a live message moved the history pointer"
+    stored = [row[0] for row in _rows(db_path, "SELECT message_id FROM messages ORDER BY message_id")]
+    assert stored == list(range(1001, 1014))
+    assert after_read == 1013
+
+
+def test_live_message_that_fails_is_recovered_by_the_next_history_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live N fails in the handler, live N+1 succeeds: the pointer must
+    not have moved past N, or the poll can never recover it."""
+    db_path = tmp_path / "store.db"
+    _seed_last_processed(db_path, CHANNEL_ID, 9)
+    real_ingest = messages_repo.ingest
+    fail_once = {10}
+
+    def flaky_ingest(conn, **kwargs):
+        if kwargs["message_id"] in fail_once:
+            fail_once.discard(kwargs["message_id"])
+            raise RuntimeError("simulated write failure")
+        return real_ingest(conn, **kwargs)
+
+    monkeypatch.setattr(messages_repo, "ingest", flaky_ingest)
+
+    async def scenario() -> tuple[int, int, int]:
+        client = FakeTelegramClient()
+        async with _started(db_path, client) as listener:
+            await client.emit(CHANNEL_ID, _chatter_message(10))
+            await client.emit(CHANNEL_ID, _chatter_message(11))
+            errors = listener.handler_error_count
+            pointer_after_live = listener.read_last_processed_message_id(CHANNEL_ID)
+            assert pointer_after_live == 9, "a live message moved the history pointer"
+            await listener.read_history(CHANNEL, source="poll", limit=100)
+            pointer_after_read = listener.read_last_processed_message_id(CHANNEL_ID)
+        return errors, pointer_after_live, pointer_after_read
+
+    errors, pointer_after_live, pointer_after_read = asyncio.run(scenario())
+
+    assert errors == 1
+    assert pointer_after_live == 9, "a live message moved the history pointer"
+    assert _rows(db_path, "SELECT message_id, source FROM messages ORDER BY message_id") == [
+        (10, "poll"),
+        (11, "live"),
+    ]
+    assert pointer_after_read == 11
+
+
+@pytest.mark.parametrize(
+    ("source", "pointer_after"),
+    [("live", 9), ("backfill", 10), ("poll", 10)],
+)
+def test_only_history_sources_move_the_pointer(
+    tmp_path: Path, source: str, pointer_after: int
+) -> None:
+    db_path = tmp_path / "store.db"
+    _seed_last_processed(db_path, CHANNEL_ID, 9)
+    incoming = IncomingMessage(
+        channel_id=CHANNEL_ID,
+        message_id=10,
+        text=CHATTER_TEXT,
+        posted_at_utc=POSTED,
+        edit_date_utc=None,
+        reply_to_message_id=None,
+    )
+
+    async def scenario() -> int:
+        client = FakeTelegramClient()
+        async with _started(db_path, client) as listener:
+            await listener.ingest_message(incoming, channel_cfg=CHANNEL, source=source)
+            return listener.read_last_processed_message_id(CHANNEL_ID)
+
+    assert asyncio.run(scenario()) == pointer_after
+
+
+def test_ingest_message_rejects_an_unknown_source(tmp_path: Path) -> None:
+    """The pointer rule is keyed on `source`, so a typo must not silently
+    pick a side of it."""
+    db_path = tmp_path / "store.db"
+    incoming = IncomingMessage(
+        channel_id=CHANNEL_ID,
+        message_id=10,
+        text=CHATTER_TEXT,
+        posted_at_utc=POSTED,
+        edit_date_utc=None,
+        reply_to_message_id=None,
+    )
+
+    async def scenario() -> None:
+        client = FakeTelegramClient()
+        async with _started(db_path, client) as listener:
+            with pytest.raises(ValueError, match="source"):
+                await listener.ingest_message(incoming, channel_cfg=CHANNEL, source="Poll")
+
+    asyncio.run(scenario())
     assert _count(db_path, "messages") == 0
 
 
