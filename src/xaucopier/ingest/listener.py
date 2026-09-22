@@ -747,7 +747,9 @@ class Listener:
 
     async def run(self) -> NoReturn:
         """`start()` then wait. Always raises: `ListenerStopped` when the
-        client stops, or whatever startup raised."""
+        client stops or the poll task dies, `ListenerStartupError` (a
+        `ListenerStopped`) when the writer never came up, or whatever
+        else startup raised."""
         await self.start()
         await self.wait_until_stopped()
 
