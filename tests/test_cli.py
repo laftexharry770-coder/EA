@@ -40,13 +40,14 @@ class _FakeClientSuccess:
     def __init__(self) -> None:
         self.session = _FakeSession(_FAKE_SESSION_AFTER_LOGIN)
         self.start_kwargs: dict[str, Any] = {}
+        self.disconnected = False
 
     async def start(self, **kwargs: Any) -> "_FakeClientSuccess":
         self.start_kwargs = kwargs
         return self
 
     async def disconnect(self) -> None:
-        pass
+        self.disconnected = True
 
 
 class _FakeClientTerminalFailure:
@@ -55,12 +56,13 @@ class _FakeClientTerminalFailure:
 
     def __init__(self) -> None:
         self.session = _FakeSession("")
+        self.disconnected = False
 
     async def start(self, **kwargs: Any) -> None:
         raise SessionRevokedError(request=None)
 
     async def disconnect(self) -> None:
-        pass
+        self.disconnected = True
 
 
 def _answers(monkeypatch: pytest.MonkeyPatch, target: str, values: list[str]) -> None:
@@ -91,6 +93,7 @@ def test_setup_login_success_writes_secrets_blob(
     assert "phone" in fake_client.start_kwargs
     assert "code_callback" in fake_client.start_kwargs
     assert "password" in fake_client.start_kwargs
+    assert fake_client.disconnected is True
 
 
 def test_setup_login_terminal_auth_error_exits_3(
@@ -106,6 +109,41 @@ def test_setup_login_terminal_auth_error_exits_3(
 
     assert exit_code == 3
     assert not target.exists()
+    # Security-review follow-up: the terminal-error branch used to return
+    # without disconnecting, leaking a connection.
+    assert fake_client.disconnected is True
+
+
+def test_setup_login_save_failure_after_successful_login_is_reported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Telegram-side login "succeeds" (fake), but writing the encrypted
+    # blob fails -- e.g. a full disk. Must not raise a raw traceback, must
+    # not leak the session string into whatever it does print, and must
+    # not leave a partial file behind.
+    fake_client = _FakeClientSuccess()
+    monkeypatch.setattr(cli_main, "build_client", lambda blob: fake_client)
+    _answers(monkeypatch, "builtins.input", [_FAKE_API_ID, _FAKE_PHONE])
+    _answers(monkeypatch, "getpass.getpass", [_FAKE_API_HASH])
+
+    def _boom(blob: Any, path: Path) -> None:
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli_main, "save", _boom)
+
+    target = tmp_path / "session.dpapi"
+    exit_code = cli_main.main(["setup-login", "--path", str(target)])
+
+    assert exit_code == 1
+    assert not target.exists()
+    assert fake_client.disconnected is True
+
+    captured = capsys.readouterr()
+    assert _FAKE_SESSION_AFTER_LOGIN not in captured.out
+    assert _FAKE_SESSION_AFTER_LOGIN not in captured.err
+    assert _FAKE_API_HASH not in captured.out
+    assert _FAKE_API_HASH not in captured.err
+    assert "Devices" in captured.err
 
 
 def test_setup_login_rejects_non_integer_api_id(

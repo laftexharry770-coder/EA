@@ -5,3 +5,4 @@ __pycache__/
 .superpowers/
 config/secrets*
 *.session
+*.dpapi

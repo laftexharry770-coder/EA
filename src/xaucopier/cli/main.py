@@ -63,26 +63,51 @@ async def _run_setup_login(path: Path) -> int:
     # session string, via client.session.save() once login succeeds.
     client = build_client(SecretsBlob(api_id=api_id, api_hash=api_hash, session_string=""))
 
+    session_string: str | None = None
     try:
-        await client.start(
-            phone=phone,
-            code_callback=_prompt_login_code,
-            password=_prompt_2fa_password,
-        )
-    except TERMINAL_AUTH_ERRORS as exc:
-        print(
-            f"Login failed with a terminal error ({type(exc).__name__}): "
-            "this cannot be retried. Check the account is not banned or "
-            "restricted, then run `setup-login` again.",
-            file=sys.stderr,
-        )
-        return EXIT_TERMINAL_AUTH
+        try:
+            await client.start(
+                phone=phone,
+                code_callback=_prompt_login_code,
+                password=_prompt_2fa_password,
+            )
+        except TERMINAL_AUTH_ERRORS as exc:
+            print(
+                f"Login failed with a terminal error ({type(exc).__name__}): "
+                "this cannot be retried. Check the account is not banned or "
+                "restricted, then run `setup-login` again.",
+                file=sys.stderr,
+            )
+            return EXIT_TERMINAL_AUTH
 
-    session_string = client.session.save()
-    await client.disconnect()
+        session_string = client.session.save()
+    finally:
+        # Always disconnect -- the terminal-error branch above used to
+        # return without this, leaking a connection and producing a
+        # noisy "Task was destroyed but it is pending" warning on exit.
+        await client.disconnect()
 
     blob = SecretsBlob(api_id=api_id, api_hash=api_hash, session_string=session_string)
-    save(blob, path)
+    try:
+        save(blob, path)
+    except Exception as exc:
+        # Telegram-side login already succeeded at this point: a live
+        # 'XAUCOPIER-TRADEBOX' device now exists on the account with no
+        # local copy of its credential. Say so plainly rather than
+        # emitting a raw traceback -- the user needs to go revoke it by
+        # hand, not decode a stack trace to figure that out. `exc` is
+        # save()'s own error message, which (per secrets.py) only ever
+        # references the file path, never the secret values.
+        print(
+            f"Login to Telegram succeeded, but saving the encrypted session "
+            f"to {path} failed: {exc}\n"
+            "IMPORTANT: a live 'XAUCOPIER-TRADEBOX' session now exists on "
+            "your Telegram account with no local copy of its credential. "
+            "Go to Telegram -> Settings -> Devices and terminate that "
+            "session by hand, then run `setup-login` again.",
+            file=sys.stderr,
+        )
+        return 1
 
     print(f"Login succeeded. Session saved (DPAPI-encrypted, this user only) to: {path}")
     print(
