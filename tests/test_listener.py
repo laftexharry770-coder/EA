@@ -98,13 +98,14 @@ def _build_listener(
     *,
     channels: tuple[ChannelCfg, ...] = (CHANNEL,),
     accounts: tuple[AccountCfg, ...] = ACCOUNTS,
+    writer: db.Writer | None = None,
     **kwargs,
 ) -> Listener:
     return Listener(
         client=client,
         channels=channels,
         accounts=accounts,
-        writer=db.Writer(db_path),
+        writer=writer if writer is not None else db.Writer(db_path),
         db_path=db_path,
         now=lambda: NOW,
         **kwargs,
@@ -598,6 +599,85 @@ def test_writer_connects_before_any_reader_connection(
     assert roles[0] == "writer", f"first connection was not the writer: {opened}"
     assert "reader" in roles, "the listener never opened a reader at all"
     assert opened[0][1] == "xaucopier-writer"
+
+
+def test_start_fails_promptly_and_non_zero_when_the_writer_cannot_connect(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's D6: the database's parent directory is missing, so
+    the writer thread dies in connect(). start() used to wait forever on
+    the probe, never reaching Telegram, while the process looked alive."""
+    db_path = tmp_path / "no_such_dir" / "store.db"
+
+    async def scenario():
+        client = FakeTelegramClient()
+        listener = _build_listener(db_path, client)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        # 10 s is a hang guard for the test itself; the default barrier
+        # timeout is 30 s, and a dead writer must beat it by a mile.
+        exit_code = await asyncio.wait_for(run_listener(listener), timeout=10.0)
+        return exit_code, loop.time() - started, list(client.calls)
+
+    exit_code, elapsed, calls = asyncio.run(scenario())
+
+    assert exit_code == EXIT_LISTENER_STOPPED
+    assert elapsed < 5.0, f"start() took {elapsed:.1f}s to notice a dead writer"
+    assert "connect" not in calls, "the listener reached Telegram without a writer"
+
+
+def test_start_raises_listener_startup_error_carrying_the_writer_death(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "no_such_dir" / "store.db"
+
+    async def scenario() -> BaseException:
+        client = FakeTelegramClient()
+        listener = _build_listener(db_path, client)
+        try:
+            with pytest.raises(listener_module.ListenerStartupError) as excinfo:
+                await asyncio.wait_for(listener.start(), timeout=10.0)
+        finally:
+            await listener.aclose()
+        return excinfo.value
+
+    error = asyncio.run(scenario())
+
+    assert isinstance(error, ListenerStopped), "a failed start must map to a non-zero exit"
+    assert isinstance(error.__cause__, db.WriterDeadError)
+    assert "unable to open database file" in str(error)
+
+
+class _NeverConnectingWriter(db.Writer):
+    """A writer whose thread never starts, so the startup probe can
+    never run: the stuck-but-not-dead case the barrier timeout exists
+    for."""
+
+    def start(self) -> None:
+        pass
+
+
+def test_start_times_out_when_the_writer_never_connects(tmp_path: Path) -> None:
+    db_path = tmp_path / "store.db"
+
+    async def scenario():
+        client = FakeTelegramClient()
+        listener = _build_listener(
+            db_path,
+            client,
+            writer=_NeverConnectingWriter(db_path),
+            writer_ready_timeout=0.2,
+        )
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        exit_code = await asyncio.wait_for(run_listener(listener), timeout=10.0)
+        return exit_code, loop.time() - started, list(client.calls)
+
+    exit_code, elapsed, calls = asyncio.run(scenario())
+
+    assert exit_code == EXIT_LISTENER_STOPPED
+    assert elapsed < 5.0
+    assert "connect" not in calls
 
 
 def test_poll_hook_starts_after_handlers_are_registered(tmp_path: Path) -> None:

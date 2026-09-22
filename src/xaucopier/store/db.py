@@ -35,10 +35,18 @@ Design decisions (the brief specifies the interface, not the body):
   cancelled it" and "the thread should not run the job" -- without this
   call, a cancelled future can still have its write silently land, while
   the caller believes ``CancelledError`` means nothing happened.
+- A writer thread that dies -- ``connect()`` failing (a missing parent
+  directory, a locked or corrupt file), or a ``BaseException`` escaping a
+  job -- fails the job it was running, every job still queued, and every
+  job submitted afterwards with ``WriterDeadError``. Before this, a
+  ``connect()`` failure killed the thread with its queue unserviced: every
+  pending future stayed pending forever, and a caller awaiting one (the
+  listener's startup probe) hung while the process looked alive.
 """
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import queue
 import sqlite3
 import threading
@@ -53,6 +61,8 @@ Role = Literal["writer", "reader"]
 _BUSY_TIMEOUT_MS = 10_000
 
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 
 def connect(path: Path, *, role: Role) -> sqlite3.Connection:
@@ -98,6 +108,20 @@ class WriterMisuseError(RuntimeError):
     """
 
 
+class WriterDeadError(RuntimeError):
+    """The writer thread has died, so this job did not run to completion
+    and never will, and no later job will run either.
+
+    Set on the future of the job the thread was running when it died,
+    of every job still queued, and of every job submitted afterwards --
+    a fresh instance each time, with `__cause__` set to whatever killed
+    the thread (e.g. `sqlite3.OperationalError: unable to open database
+    file` from `connect()`). A distinct type rather than that exception
+    itself, so a caller can tell "your job failed" (maybe transient) from
+    "there is no writer any more" (permanent for this process).
+    """
+
+
 class Writer:
     """Owns the only write connection to the store.
 
@@ -106,7 +130,10 @@ class Writer:
     returned future with `fn`'s result -- or, if `fn` raises, with that
     exception. The thread itself never dies from a bad `fn`: the
     exception is caught, the transaction is rolled back, and the thread
-    loops back to `queue.get()` for the next job.
+    loops back to `queue.get()` for the next job. If the thread dies
+    anyway -- `connect()` fails, or a `BaseException` escapes `fn` --
+    every job it will now never run is failed with `WriterDeadError`
+    rather than left pending forever.
 
     A future cancelled before the writer thread reaches it prevents `fn`
     from running at all (see `submit`); once `fn` has started, it always
@@ -128,6 +155,10 @@ class Writer:
         self._queue: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stopped = threading.Event()
+        # What killed the writer thread, once it has died. Read and
+        # written only under _lifecycle_lock, so a submit() either lands
+        # in the queue before _die() drains it, or sees this set.
+        self._death: BaseException | None = None
         # Guards the two critical sections that must not interleave:
         # submit()'s "check _stopped, then enqueue" and stop()'s "set
         # _stopped, then enqueue the sentinel". Without this lock, a
@@ -167,11 +198,16 @@ class Writer:
         runs to completion in that case.
 
         Raises `RuntimeError` if the writer has already been `stop()`ped.
+        If the writer thread has died, returns a future that has already
+        failed with `WriterDeadError`; `fn` never runs.
         """
         with self._lifecycle_lock:
             if self._stopped.is_set():
                 raise RuntimeError("Writer is stopped; cannot submit new work")
             future: concurrent.futures.Future[T] = concurrent.futures.Future()
+            if self._death is not None:
+                future.set_exception(self._dead_error(self._death))
+                return future
             self._queue.put((fn, future))
         return future
 
@@ -188,16 +224,69 @@ class Writer:
         self._thread.join(timeout)
 
     def _run(self) -> None:
-        conn = connect(self._path, role="writer")
+        try:
+            conn = connect(self._path, role="writer")
+        except BaseException as exc:  # noqa: BLE001 -- must reach every queued future
+            self._die(exc, in_flight=None)
+            return
+
+        in_flight: concurrent.futures.Future | None = None
         try:
             while True:
                 job = self._queue.get()
                 if job is None:
                     break
-                fn, future = job
-                self._run_job(conn, fn, future)
+                fn, in_flight = job
+                self._run_job(conn, fn, in_flight)
+                in_flight = None
+        except BaseException as exc:  # noqa: BLE001 -- same: never orphan a future
+            self._die(exc, in_flight=in_flight)
         finally:
             conn.close()
+
+    def _die(
+        self, exc: BaseException, *, in_flight: concurrent.futures.Future | None
+    ) -> None:
+        """The thread is ending abnormally. Fail the job it was running,
+        every job still queued, and (via `_death`) every later submit()."""
+        logger.critical(
+            "xaucopier writer thread for %s died (%s: %s); every pending and "
+            "future write will fail with WriterDeadError",
+            self._path,
+            type(exc).__name__,
+            exc,
+            exc_info=exc,
+        )
+        orphans: list[concurrent.futures.Future] = []
+        with self._lifecycle_lock:
+            self._death = exc
+            while True:
+                try:
+                    job = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if job is not None:  # a stop() sentinel has nothing to fail
+                    orphans.append(job[1])
+
+        if in_flight is not None:
+            # Already RUNNING (set_running_or_notify_cancel said so), and
+            # _run_job never resolved it because fn never returned.
+            try:
+                in_flight.set_exception(self._dead_error(exc))
+            except concurrent.futures.InvalidStateError:
+                pass
+        for future in orphans:
+            if future.set_running_or_notify_cancel():
+                future.set_exception(self._dead_error(exc))
+
+    @staticmethod
+    def _dead_error(exc: BaseException) -> WriterDeadError:
+        error = WriterDeadError(
+            f"the writer thread died ({type(exc).__name__}: {exc}); this write "
+            "did not run and no further write will"
+        )
+        error.__cause__ = exc
+        return error
 
     @staticmethod
     def _run_job(

@@ -17,7 +17,10 @@ never makes an RPC on the update path.
    the probe can only resolve after `Writer._run` has already called
    `connect()` on the writer thread, which makes "writer first" a fact
    about causality rather than about the order two lines happen to be
-   written in.
+   written in. The wait is bounded (`writer_ready_timeout`, 30 s): a
+   writer that died (`WriterDeadError`) or never connected makes
+   `start()` raise `ListenerStartupError` -- a `ListenerStopped`, so a
+   non-zero exit -- instead of hanging with the process looking alive.
 1. **connect.**
 2. **`await client.get_dialogs()`.** This primes the per-channel `pts`
    state Telethon's update engine needs. It is not cosmetic -- skipping
@@ -97,6 +100,10 @@ EXIT_LISTENER_STOPPED = 4
 
 DEFAULT_BACKFILL_LIMIT = 500
 DEFAULT_WRITER_STOP_TIMEOUT = 15.0
+#: How long `start()` waits for the writer thread to have connected.
+#: Connecting and migrating a local SQLite file takes milliseconds; 30 s
+#: only ever elapses when something is wrong.
+DEFAULT_WRITER_READY_TIMEOUT = 30.0
 
 #: `sqlite3.Connection`, unannotated on purpose: this package must not
 #: import sqlite3 at all (see the module docstring), not even for a type.
@@ -115,9 +122,17 @@ ALL_SOURCES = HISTORY_SOURCES | {LIVE_SOURCE}
 
 
 class ListenerStopped(RuntimeError):
-    """`run_until_disconnected()` returned. Whether it returned cleanly
-    or not, the listener has stopped listening -- which for a supervisor
-    is never a success."""
+    """The listener is not receiving Telegram updates: it stopped, or it
+    never got going. Whether that happened cleanly or not, for a
+    supervisor it is never a success -- `run_listener()` turns it into
+    `EXIT_LISTENER_STOPPED` ("restart me")."""
+
+
+class ListenerStartupError(ListenerStopped):
+    """`start()` could not bring the listener up -- e.g. the writer
+    thread died connecting to the database, or never connected within
+    `writer_ready_timeout`. A subclass of `ListenerStopped` so it exits
+    non-zero through the same door."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +276,7 @@ class Listener:
         poll_hook: PollHook | None = None,
         backfill_limit: int = DEFAULT_BACKFILL_LIMIT,
         writer_stop_timeout: float = DEFAULT_WRITER_STOP_TIMEOUT,
+        writer_ready_timeout: float = DEFAULT_WRITER_READY_TIMEOUT,
     ) -> None:
         self.client = client
         self.channels = tuple(channels)
@@ -273,6 +289,7 @@ class Listener:
         self._now = now if now is not None else _utcnow
         self._backfill_limit = backfill_limit
         self._writer_stop_timeout = writer_stop_timeout
+        self._writer_ready_timeout = writer_ready_timeout
         self._channels_by_id: dict[int, ChannelCfg] = {
             channel.channel_id: channel for channel in self.channels if channel.enabled
         }
@@ -471,7 +488,22 @@ class Listener:
         # The probe can only run after Writer._run has already called
         # db.connect() on the writer thread -- which is what makes
         # "the writer connected first" a guarantee rather than a hope.
-        await asyncio.wrap_future(self.writer.submit(_writer_ready_probe))
+        # Bounded, because "wait for the writer" must never become "wait
+        # forever": a supervisor cannot tell a hung start() from a
+        # healthy listener, and a hung listener misses every trade.
+        probe = asyncio.wrap_future(self.writer.submit(_writer_ready_probe))
+        try:
+            await asyncio.wait_for(probe, timeout=self._writer_ready_timeout)
+        except TimeoutError as exc:
+            raise ListenerStartupError(
+                f"the writer thread did not connect to {self.db_path} within "
+                f"{self._writer_ready_timeout:g}s; refusing to listen without it"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 -- any probe failure means no writer
+            raise ListenerStartupError(
+                f"the writer thread could not connect to {self.db_path}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
     async def _backfill_channel(self, channel: ChannelCfg) -> None:
         try:

@@ -18,6 +18,7 @@ from pathlib import Path
 import asyncio
 import pytest
 
+from xaucopier.store import db as store_db
 from xaucopier.store.db import Writer, WriterMisuseError, connect
 
 EXPECTED_TABLES = {
@@ -411,3 +412,95 @@ def test_well_behaved_fn_still_commits_normally(tmp_path: Path):
         assert row["last_processed_message_id"] == 55
     finally:
         reader.close()
+
+
+# -- a writer thread that dies -------------------------------------------------
+#
+# The reviewer's D6: with the database's parent directory missing,
+# `connect()` raised on the writer thread, the thread died, and every
+# future already queued -- including the listener's startup probe --
+# stayed pending forever. The listener sat blocked in start(), never
+# connected to Telegram, and looked alive to its supervisor. A dead
+# writer must fail every job it will now never run, loudly and at once.
+
+
+def test_writer_whose_connect_fails_fails_every_pending_future(tmp_path: Path):
+    db_path = tmp_path / "no_such_dir" / "store.db"
+    writer = Writer(db_path)
+    ran: list[str] = []
+
+    # Queued before the thread even exists, so all three are pending
+    # when connect() fails.
+    first = writer.submit(lambda conn: ran.append("first"))
+    cancelled = writer.submit(lambda conn: ran.append("cancelled"))
+    second = writer.submit(lambda conn: ran.append("second"))
+    assert cancelled.cancel()
+
+    writer.start()
+    try:
+        errors = [first.exception(timeout=5.0), second.exception(timeout=5.0)]
+    finally:
+        writer.stop(timeout=5.0)
+
+    for error in errors:
+        assert isinstance(error, store_db.WriterDeadError), error
+        assert isinstance(error.__cause__, sqlite3.OperationalError), error.__cause__
+        assert "unable to open database file" in str(error)
+    assert errors[0] is not errors[1], "each future needs its own exception instance"
+    assert cancelled.cancelled()
+    assert ran == []
+
+
+def test_submit_after_the_writer_died_fails_immediately(tmp_path: Path):
+    db_path = tmp_path / "no_such_dir" / "store.db"
+    writer = Writer(db_path)
+    writer.start()
+    ran: list[str] = []
+    try:
+        writer.submit(lambda conn: None).exception(timeout=5.0)  # wait for the death
+
+        late = writer.submit(lambda conn: ran.append("late"))
+        error = late.exception(timeout=0.5)
+    finally:
+        writer.stop(timeout=5.0)
+
+    assert isinstance(error, store_db.WriterDeadError)
+    assert isinstance(error.__cause__, sqlite3.OperationalError)
+    assert ran == []
+
+
+def test_writer_killed_mid_job_fails_the_in_flight_and_every_queued_job(tmp_path: Path):
+    """Not only connect(): a BaseException escaping a job (which the
+    per-job `except Exception` deliberately does not swallow) also ends
+    the thread, and must not orphan the job it was running or the ones
+    queued behind it."""
+    db_path = tmp_path / "store.db"
+    writer = Writer(db_path)
+    writer.start()
+    release = threading.Event()
+
+    def blocker(conn: sqlite3.Connection) -> str:
+        assert release.wait(timeout=5.0)
+        return "blocker done"
+
+    def killer(conn: sqlite3.Connection) -> None:
+        raise SystemExit("writer job called sys.exit()")
+
+    try:
+        blocked = writer.submit(blocker)
+        killed = writer.submit(killer)
+        queued = writer.submit(
+            lambda conn: _insert_channel_state(conn, channel_id=9, last_id=9)
+        )
+        release.set()
+
+        assert blocked.result(timeout=5.0) == "blocker done"
+        killed_error = killed.exception(timeout=5.0)
+        queued_error = queued.exception(timeout=5.0)
+    finally:
+        writer.stop(timeout=5.0)
+
+    assert isinstance(killed_error, store_db.WriterDeadError)
+    assert isinstance(killed_error.__cause__, SystemExit)
+    assert isinstance(queued_error, store_db.WriterDeadError)
+    assert isinstance(queued_error.__cause__, SystemExit)
