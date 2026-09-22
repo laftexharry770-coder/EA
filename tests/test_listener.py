@@ -25,8 +25,9 @@ import asyncio
 import contextlib
 import json
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -80,8 +81,13 @@ def _account(account_id: str, *, enabled: bool = True, ordinal: int = 1) -> Acco
     )
 
 
-ACCOUNTS = (_account("acct-a", ordinal=1), _account("acct-off", enabled=False, ordinal=2))
+ACCOUNTS = (
+    _account("acct-a", ordinal=1),
+    _account("acct-b", ordinal=2),
+    _account("acct-off", enabled=False, ordinal=3),
+)
 ENABLED_ACCOUNT_COUNT = sum(1 for account in ACCOUNTS if account.enabled)
+assert ENABLED_ACCOUNT_COUNT == 2, "the fan-out tests need more than one enabled account"
 
 
 def _signal_message(message_id: int = SIGNAL_MESSAGE_ID) -> FakeMessage:
@@ -174,8 +180,8 @@ def test_emitted_message_writes_one_message_and_one_outbox_row_per_enabled_accou
 
     assert _count(db_path, "messages") == 1
     assert _count(db_path, "signals") == 1
-    outbox = _rows(db_path, "SELECT account_id, kind, state FROM outbox")
-    assert outbox == [("acct-a", "ENTRY", "QUEUED")]
+    outbox = _rows(db_path, "SELECT account_id, kind, state FROM outbox ORDER BY account_id")
+    assert outbox == [("acct-a", "ENTRY", "QUEUED"), ("acct-b", "ENTRY", "QUEUED")]
     assert len(outbox) == ENABLED_ACCOUNT_COUNT
     assert _rows(db_path, "SELECT source FROM messages") == [("live",)]
     # A live delivery never moves the history pointer -- see the
@@ -200,9 +206,14 @@ def test_duplicate_emission_writes_no_second_row(tmp_path: Path) -> None:
 
 
 def test_handler_makes_no_rpc_calls(tmp_path: Path) -> None:
-    """Every client method the fake exposes appends to `calls`. If the
-    handler made *any* round trip -- get_entity, get_reply_message,
-    get_messages -- the log would grow while the handler ran."""
+    """Every RPC-shaped method the fake exposes -- on the client
+    (`get_messages`, `get_entity`, `get_input_entity`, ...) and on the
+    event (`get_reply_message`, `get_chat`, `get_sender`) -- appends to
+    `calls`. The call log is the evidence: if the handler made any round
+    trip, even one wrapped in `try/except: pass`, the log grows while
+    the handler runs. (Before the fake had these stubs, such a
+    suppressed call "failed" with AttributeError and this test passed --
+    the reviewer's M2d.)"""
     db_path = tmp_path / "store.db"
 
     async def scenario() -> list[str]:
@@ -288,6 +299,70 @@ def test_message_from_an_unconfigured_channel_is_ignored(tmp_path: Path) -> None
 
     assert errors == 0
     assert _count(db_path, "messages") == 0
+
+
+def test_messages_from_unwatched_chats_are_dropped_before_any_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """There is no `chats=` filter, so the handler sees every chat the
+    account is in. Routing on `event.chat_id` comes first, so a message
+    from a chat nobody watches costs one dict lookup -- no normalising,
+    and no chance of recording an error for a chat we do not care about."""
+    db_path = tmp_path / "store.db"
+    normalised: list[int] = []
+    real_normalise = listener_module.normalise_event
+
+    def spy(event):
+        normalised.append(event.chat_id)
+        return real_normalise(event)
+
+    monkeypatch.setattr(listener_module, "normalise_event", spy)
+
+    async def scenario() -> int:
+        client = FakeTelegramClient()
+        async with _started(db_path, client, channels=(CHANNEL, DISABLED_CHANNEL)) as listener:
+            await client.emit(UNKNOWN_CHANNEL_ID, _chatter_message(1))
+            await client.emit(DISABLED_CHANNEL.channel_id, _chatter_message(2))
+            await client.emit(CHANNEL_ID, _chatter_message(3))
+            return listener.handler_error_count
+
+    errors = asyncio.run(scenario())
+
+    assert normalised == [CHANNEL_ID]
+    assert errors == 0
+    assert _rows(db_path, "SELECT channel_id, message_id FROM messages") == [(CHANNEL_ID, 3)]
+
+
+def test_handler_error_log_is_bounded_but_the_count_is_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sustained failure must not grow memory for the life of the
+    process; the count keeps the true total."""
+    db_path = tmp_path / "store.db"
+    kept = listener_module.MAX_RECORDED_HANDLER_ERRORS
+    total = kept + 44
+
+    def boom(event):
+        raise ValueError(f"bad message {event.message.id}")
+
+    monkeypatch.setattr(listener_module, "normalise_event", boom)
+
+    async def scenario():
+        client = FakeTelegramClient()
+        async with _started(db_path, client) as listener:
+            for message_id in range(1, total + 1):
+                await client.emit(CHANNEL_ID, _chatter_message(message_id))
+            return listener.handler_error_count, listener.handler_errors
+
+    count, errors = asyncio.run(scenario())
+
+    assert count == total
+    assert len(errors) == kept
+    assert isinstance(errors, tuple)
+    # The most recent are the ones kept.
+    assert errors[-1].error == f"ValueError: bad message {total}"
+    assert errors[0].error == f"ValueError: bad message {total - kept + 1}"
+    assert {error.source for error in errors} == {"live"}
 
 
 def test_message_from_a_disabled_channel_is_ignored(tmp_path: Path) -> None:
@@ -656,6 +731,56 @@ def test_a_failed_first_run_seed_is_retried_as_a_seed_not_a_read_from_zero(
     assert pointer_after_read == 20
 
 
+@pytest.mark.parametrize("failing_step", ["normalise", "ingest"])
+def test_one_poison_backfill_message_does_not_stop_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_step: str
+) -> None:
+    """A message that fails every time must not wedge its channel: the
+    live path records a failure and carries on, and a history read must
+    too. Otherwise every restart's backfill -- and every poll after it,
+    reading from the same pointer -- stops dead on the same message."""
+    db_path = tmp_path / "store.db"
+    _seed_last_processed(db_path, CHANNEL_ID, 4000)
+    poison_id = 4002
+
+    if failing_step == "normalise":
+        real_normalise_message = listener_module.normalise_message
+
+        def poisoned_normalise(message, *, channel_id):
+            if message.id == poison_id:
+                raise ValueError("cannot normalise this one")
+            return real_normalise_message(message, channel_id=channel_id)
+
+        monkeypatch.setattr(listener_module, "normalise_message", poisoned_normalise)
+    else:
+        real_ingest = messages_repo.ingest
+
+        def poisoned_ingest(conn, **kwargs):
+            if kwargs["message_id"] == poison_id:
+                raise ValueError("cannot ingest this one")
+            return real_ingest(conn, **kwargs)
+
+        monkeypatch.setattr(messages_repo, "ingest", poisoned_ingest)
+
+    async def scenario():
+        client = FakeTelegramClient(
+            history={CHANNEL_ID: [_chatter_message(i) for i in (4001, 4002, 4003)]}
+        )
+        async with _started(db_path, client) as listener:
+            return listener.handler_errors
+
+    errors = asyncio.run(scenario())
+
+    assert _rows(db_path, "SELECT message_id, source FROM messages ORDER BY message_id") == [
+        (4001, "backfill"),
+        (4003, "backfill"),
+    ]
+    assert [(e.channel_id, e.message_id, e.source) for e in errors] == [
+        (CHANNEL_ID, poison_id, "backfill")
+    ]
+    assert _last_processed(db_path, CHANNEL_ID) == 4003
+
+
 def test_backfill_asks_only_for_messages_newer_than_last_processed(
     tmp_path: Path,
 ) -> None:
@@ -983,15 +1108,38 @@ def test_normalise_event_reads_everything_off_the_event(tmp_path: Path) -> None:
     )
 
 
-def test_normalise_event_forces_utc_on_a_naive_datetime() -> None:
-    from fakes.telegram import FakeNewMessageEvent
+@pytest.mark.parametrize("field", ["date", "edit_date"])
+def test_normalise_rejects_a_naive_datetime_instead_of_relabelling_it(field: str) -> None:
+    """Telethon 1.44 always returns aware UTC datetimes, so a naive one
+    can only come from test or fake code. Labelling it UTC would silently
+    shift a signal's age by the local offset -- hours -- and defeat the
+    staleness gate. Refuse it instead. (`FakeMessage` itself rejects naive
+    dates, so this uses a bare stand-in.)"""
+    naive = datetime(2026, 9, 5, 10, 45)
+    message = SimpleNamespace(
+        id=7,
+        message="hi",
+        date=naive if field == "date" else POSTED,
+        edit_date=naive if field == "edit_date" else None,
+        reply_to_msg_id=None,
+    )
+    event = SimpleNamespace(chat_id=CHANNEL_ID, message=message)
 
-    event = FakeNewMessageEvent(
-        chat_id=CHANNEL_ID,
-        message=FakeMessage(id=7, message="hi", date=datetime(2026, 9, 5, 10, 45)),
+    with pytest.raises(ValueError, match="naive"):
+        normalise_event(event)
+
+
+def test_normalise_converts_an_aware_non_utc_datetime_to_utc() -> None:
+    plus_two = timezone(timedelta(hours=2))
+    message = SimpleNamespace(
+        id=7,
+        message="hi",
+        date=datetime(2026, 9, 5, 12, 45, tzinfo=plus_two),
+        edit_date=None,
+        reply_to_msg_id=None,
     )
 
-    incoming = normalise_event(event)
+    incoming = normalise_event(SimpleNamespace(chat_id=CHANNEL_ID, message=message))
 
-    assert incoming.posted_at_utc.tzinfo is not None
     assert incoming.posted_at_utc == datetime(2026, 9, 5, 10, 45, tzinfo=UTC)
+    assert incoming.posted_at_utc.tzinfo is UTC

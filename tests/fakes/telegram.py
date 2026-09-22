@@ -37,9 +37,24 @@ registered handler propagates out of `emit()` instead of being swallowed
 and logged. Real Telethon catches callback exceptions; if the fake did
 too, the listener's "a handler exception must not kill the client"
 guarantee would be untestable, because every test would pass whether the
-listener handled the exception or not. The exception is also appended to
-`handler_exceptions`, and dispatch to the remaining handlers continues,
-so a test can assert on both halves.
+listener handled the exception or not. Everything else matches Telethon:
+dispatch carries on to the remaining handlers first (Telethon's
+`_dispatch_update` catches per callback and moves on), and only then is
+the first exception re-raised. It is also appended to
+`handler_exceptions`, and the `"event"` delivery is recorded either way
+-- the stream did deliver it.
+
+**RPCs are logged, not missing.** Every method that is a network round
+trip in Telethon and that a handler might be tempted to call --
+`get_messages`, `get_entity`, `get_input_entity` on the client;
+`get_reply_message`, `get_chat`, `get_sender` on the event -- exists
+here and appends to `calls`. A missing method would make such a call
+fail with `AttributeError`, which a `try/except: pass` swallows without
+a trace; a logged one cannot hide.
+
+**`get_messages()` defaults to ONE message, as Telethon's does** --
+see its docstring. Omitting `limit` is a production bug the fake must
+reproduce, not paper over.
 """
 from __future__ import annotations
 
@@ -70,7 +85,9 @@ class FakeMessage:
     Field names match Telethon's exactly (`id`, `message`, `date`,
     `edit_date`, `reply_to_msg_id`) so a listener written against this
     object is written against the real one. `date`/`edit_date` must be
-    timezone-aware UTC, as Telethon's are.
+    timezone-aware, as Telethon's (UTC) always are; a naive one raises
+    `ValueError`, because a test that builds one is testing a message
+    production can never produce.
     """
 
     id: int
@@ -78,6 +95,15 @@ class FakeMessage:
     date: datetime
     edit_date: datetime | None = None
     reply_to_msg_id: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("date", "edit_date"):
+            value = getattr(self, name)
+            if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+                raise ValueError(
+                    f"FakeMessage.{name} must be timezone-aware, as Telethon's "
+                    f"always is; got naive {value!r}"
+                )
 
     @property
     def text(self) -> str:
@@ -95,10 +121,40 @@ class FakeNewMessageEvent:
     Telethon's event proxies unknown attribute reads to the underlying
     message; `__getattr__` below does the same, so `event.text`,
     `event.id` and `event.date` work exactly as they do in production.
+
+    `client` is the client that delivered it, as on Telethon's events;
+    the RPC-shaped methods below log to its `calls`.
     """
 
     chat_id: int
     message: FakeMessage
+    client: FakeTelegramClient | None = field(default=None, repr=False, compare=False)
+
+    async def get_reply_message(self) -> FakeMessage | None:
+        """An RPC in Telethon (it fetches the replied-to message).
+        Logged, then answered from the fake's history."""
+        self._log_rpc("get_reply_message")
+        reply_to = self.message.reply_to_msg_id
+        if reply_to is None or self.client is None:
+            return None
+        return next(
+            (m for m in self.client.history.get(self.chat_id, []) if m.id == reply_to),
+            None,
+        )
+
+    async def get_chat(self) -> Any:
+        """Can be an RPC in Telethon. Logged."""
+        self._log_rpc("get_chat")
+        return None
+
+    async def get_sender(self) -> Any:
+        """Can be an RPC in Telethon. Logged."""
+        self._log_rpc("get_sender")
+        return None
+
+    def _log_rpc(self, name: str) -> None:
+        if self.client is not None:
+            self.client.calls.append(name)
 
     def __getattr__(self, name: str) -> Any:
         try:
@@ -272,6 +328,18 @@ class FakeTelegramClient:
             )
         return messages
 
+    # -- RPC-shaped methods ------------------------------------------------
+    # Network round trips in Telethon. They exist so that calling one is
+    # *logged* rather than an AttributeError a `try/except` could hide.
+
+    async def get_entity(self, entity: Any) -> Any:
+        self.calls.append("get_entity")
+        return entity
+
+    async def get_input_entity(self, peer: Any) -> Any:
+        self.calls.append("get_input_entity")
+        return peer
+
     async def run_until_disconnected(self) -> None:
         """Blocks until `disconnect()` (terminal). A `drop_connection()`
         deliberately does not end it: Telethon reconnects on its own."""
@@ -307,12 +375,17 @@ class FakeTelegramClient:
         if not self._connected or self._blackout:
             return False
 
-        event = FakeNewMessageEvent(chat_id=channel_id, message=message)
-        delivered = await self.dispatch(event, filter_type=events.NewMessage)
+        event = FakeNewMessageEvent(chat_id=channel_id, message=message, client=self)
+        delivered, errors = await self._dispatch_collecting(
+            event, filter_type=events.NewMessage
+        )
         if delivered:
+            # Recorded even if a handler raised: the stream did deliver it.
             self.deliveries.append(
                 Delivery(channel_id=channel_id, message_id=message.id, route="event")
             )
+        if errors:
+            raise errors[0]
         return delivered
 
     async def dispatch(self, event: Any, *, filter_type: type) -> bool:
@@ -320,22 +393,35 @@ class FakeTelegramClient:
         `filter_type` (or with no filter at all). Returns True if at
         least one handler was invoked.
 
+        A handler that raises does not stop dispatch -- the remaining
+        handlers still run, as in Telethon -- and the first exception is
+        then re-raised (see the module docstring).
+
         Generic on purpose: Task 10 emits `MessageEdited` /
         `MessageDeleted` events through this same door without the fake
         needing to know anything about them.
         """
+        invoked, errors = await self._dispatch_collecting(event, filter_type=filter_type)
+        if errors:
+            raise errors[0]
+        return invoked
+
+    async def _dispatch_collecting(
+        self, event: Any, *, filter_type: type
+    ) -> tuple[bool, list[Exception]]:
         channel_id = getattr(event, "chat_id", None)
         invoked = False
+        errors: list[Exception] = []
         for handler in list(self.handlers):
             if not self._filter_matches(handler.event_filter, filter_type, channel_id):
                 continue
             invoked = True
             try:
                 await handler.callback(event)
-            except BaseException as exc:  # noqa: BLE001 -- recorded, then re-raised
+            except Exception as exc:  # noqa: BLE001 -- recorded, re-raised after dispatch
                 self.handler_exceptions.append(exc)
-                raise
-        return invoked
+                errors.append(exc)
+        return invoked, errors
 
     def add_to_history(self, channel_id: int, message: FakeMessage) -> None:
         """Put `message` in the channel's history without any update

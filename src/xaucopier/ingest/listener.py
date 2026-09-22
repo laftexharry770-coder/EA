@@ -51,8 +51,10 @@ never makes an RPC on the update path.
    returns) is a stopped listener too, not a background failure nobody
    sees.
 
-**The handler does exactly four things: normalise, route, submit,
-return.** No `get_entity`, no `get_reply_message`, no RPC of any kind --
+**The handler does exactly four things: route, normalise, submit,
+return.** Routing comes first -- one dict lookup on `event.chat_id` --
+so a message from a chat nobody watches is dropped before any other
+work. No `get_entity`, no `get_reply_message`, no RPC of any kind --
 each of those is a network round trip on the update path, and a slow
 handler stalls the event loop, which is a documented cause of dropped
 channel updates, which is a missed trade. Everything the handler needs
@@ -86,6 +88,7 @@ tests/test_listener.py asserts this with an AST walk over the whole
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
@@ -113,6 +116,11 @@ DEFAULT_WRITER_STOP_TIMEOUT = 15.0
 #: Connecting and migrating a local SQLite file takes milliseconds; 30 s
 #: only ever elapses when something is wrong.
 DEFAULT_WRITER_READY_TIMEOUT = 30.0
+
+#: How many `HandlerError`s are kept for inspection. Older ones are
+#: dropped; `handler_error_count` keeps the true total. Bounded so a
+#: sustained failure cannot grow memory for the life of the process.
+MAX_RECORDED_HANDLER_ERRORS = 256
 
 #: `sqlite3.Connection`, unannotated on purpose: this package must not
 #: import sqlite3 at all (see the module docstring), not even for a type.
@@ -162,12 +170,15 @@ class IncomingMessage:
 
 @dataclass(frozen=True, slots=True)
 class HandlerError:
-    """A handler exception, kept so a test (and an operator) can see that
-    one happened rather than inferring it from a missing row."""
+    """A per-message failure on any ingest path, kept so a test (and an
+    operator) can see that one happened rather than inferring it from a
+    missing row. `source` is the path it happened on: `"live"` (the
+    update handler) or a history read (`"backfill"`, `"poll"`)."""
 
     channel_id: int | None
     message_id: int | None
     error: str
+    source: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,15 +191,23 @@ class HistoryIngest:
     """
 
     message_id: int
-    result: IngestResult
+    #: None when this message failed; the failure is in `handler_errors`.
+    result: IngestResult | None
 
 
-def _to_utc(value: datetime) -> datetime:
-    """Force a timezone-aware UTC datetime. Telethon already hands out
-    aware UTC datetimes; a naive one would otherwise be written to the
-    store as if it were local time."""
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
+def _to_utc(value: datetime, *, field: str) -> datetime:
+    """Convert an aware datetime to UTC; refuse a naive one.
+
+    Telethon 1.44 always hands out aware UTC datetimes, so a naive one
+    can only come from test or fake code. Labelling it UTC would treat
+    local wall-clock time as UTC -- shifting a signal's age by the local
+    offset, hours, and quietly defeating the staleness gate -- so it is
+    an error instead."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(
+            f"message {field} {value!r} is naive; refusing to guess its timezone "
+            "(Telethon always returns timezone-aware UTC)"
+        )
     return value.astimezone(UTC)
 
 
@@ -209,8 +228,8 @@ def normalise_message(message: Any, *, channel_id: int) -> IncomingMessage:
         channel_id=channel_id,
         message_id=message.id,
         text=text or "",
-        posted_at_utc=_to_utc(message.date),
-        edit_date_utc=_to_utc(edit_date) if edit_date is not None else None,
+        posted_at_utc=_to_utc(message.date, field="date"),
+        edit_date_utc=_to_utc(edit_date, field="edit_date") if edit_date is not None else None,
         reply_to_message_id=reply_to,
     )
 
@@ -304,7 +323,10 @@ class Listener:
             channel.channel_id: channel for channel in self.channels if channel.enabled
         }
         self._reader: Connection = None
-        self._handler_errors: list[HandlerError] = []
+        self._handler_errors: collections.deque[HandlerError] = collections.deque(
+            maxlen=MAX_RECORDED_HANDLER_ERRORS
+        )
+        self._handler_error_count = 0
         # Channels whose pointer this process has established -- read as
         # non-zero, or seeded (even to 0, for an empty channel). Only a
         # channel *not* in here may be seeded: re-seeding an empty
@@ -334,11 +356,15 @@ class Listener:
 
     @property
     def handler_errors(self) -> tuple[HandlerError, ...]:
+        """The most recent `MAX_RECORDED_HANDLER_ERRORS` failures, oldest
+        first."""
         return tuple(self._handler_errors)
 
     @property
     def handler_error_count(self) -> int:
-        return len(self._handler_errors)
+        """Every failure since start, including those no longer kept in
+        `handler_errors`."""
+        return self._handler_error_count
 
     def channel_cfg_for(self, channel_id: int) -> ChannelCfg | None:
         """The enabled channel config for `channel_id`, or None if this
@@ -431,21 +457,37 @@ class Listener:
         ever passes an id once everything below it in the batch has been
         handled. Anything at or below `min_id` is skipped (Telethon's
         `min_id` is already exclusive; this is a guard, not a filter).
+
+        A message that fails -- normalising or ingesting -- is recorded
+        in `handler_errors` (with this `source`), logged, returned with
+        `result=None`, and the batch carries on, exactly as the live
+        handler does. Stopping instead would wedge the channel: every
+        restart's backfill and every poll after it reads from the same
+        pointer and would stop dead on the same message. The cost is
+        that the pointer passes a failed message once a later one in the
+        channel succeeds, so it is not retried after that -- which is
+        why the failure is recorded and logged, never silent.
         """
         if source not in HISTORY_SOURCES:
             raise ValueError(
                 f"ingest_history() is for history reads only; source must be one of "
                 f"{sorted(HISTORY_SOURCES)}, got {source!r}"
             )
+        channel_id = channel_cfg.channel_id
         outcomes: list[HistoryIngest] = []
         for message in sorted(messages, key=lambda m: m.id):
-            incoming = normalise_message(message, channel_id=channel_cfg.channel_id)
-            if incoming.message_id <= min_id:
+            if message.id <= min_id:
                 continue
-            result = await self.ingest_message(
-                incoming, channel_cfg=channel_cfg, source=source
-            )
-            outcomes.append(HistoryIngest(message_id=incoming.message_id, result=result))
+            try:
+                incoming = normalise_message(message, channel_id=channel_id)
+                result = await self.ingest_message(
+                    incoming, channel_cfg=channel_cfg, source=source
+                )
+            except Exception as exc:  # noqa: BLE001 -- recorded; one message must not wedge the channel
+                self._record_handler_error(channel_id, message.id, exc, source=source)
+                outcomes.append(HistoryIngest(message_id=message.id, result=None))
+                continue
+            outcomes.append(HistoryIngest(message_id=message.id, result=result))
         return tuple(outcomes)
 
     async def read_history(
@@ -589,44 +631,58 @@ class Listener:
     # -- the hot path -------------------------------------------------------
 
     async def _on_new_message(self, event: Any) -> None:
-        """Normalise, route, submit, return. Nothing else belongs here.
+        """Route, normalise, submit, return. Nothing else belongs here.
+
+        Routing is first: with no `chats=` filter the handler sees every
+        chat the account is in, and a message from one nobody watches
+        must cost one dict lookup, not a normalisation (or an error
+        record for a chat we do not care about).
 
         Every exception is caught and recorded: a handler that raises
         must never take down the client (and with it every *other*
         channel's updates) over one malformed message.
         """
         channel_id: int | None = None
-        message_id: int | None = None
         try:
-            incoming = normalise_event(event)  # 1. normalise
-            channel_id = incoming.channel_id
-            message_id = incoming.message_id
-
-            channel_cfg = self.channel_cfg_for(channel_id)  # 2. route
+            channel_id = event.chat_id
+            channel_cfg = self.channel_cfg_for(channel_id)  # 1. route
             if channel_cfg is None:
                 return
 
+            incoming = normalise_event(event)  # 2. normalise
+
             await self.ingest_message(  # 3. submit
-                incoming, channel_cfg=channel_cfg, source="live"
+                incoming, channel_cfg=channel_cfg, source=LIVE_SOURCE
             )  # 4. return
         except Exception as exc:  # noqa: BLE001 -- recorded, never fatal
-            self._record_handler_error(channel_id, message_id, exc)
+            # Error path only: a plain attribute read for the record.
+            message_id = getattr(getattr(event, "message", None), "id", None)
+            self._record_handler_error(channel_id, message_id, exc, source=LIVE_SOURCE)
 
     def _record_handler_error(
-        self, channel_id: int | None, message_id: int | None, exc: Exception
+        self,
+        channel_id: int | None,
+        message_id: int | None,
+        exc: Exception,
+        *,
+        source: str,
     ) -> None:
+        self._handler_error_count += 1
         self._handler_errors.append(
             HandlerError(
                 channel_id=channel_id,
                 message_id=message_id,
                 error=f"{type(exc).__name__}: {exc}",
+                source=source,
             )
         )
-        logger.exception(
-            "listener handler failed for channel=%s message_id=%s: %s",
+        logger.error(
+            "ingest failed (%s) for channel=%s message_id=%s: %s",
+            source,
             channel_id,
             message_id,
             exc,
+            exc_info=exc,
         )
 
     # -- running and stopping ------------------------------------------------

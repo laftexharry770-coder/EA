@@ -413,6 +413,81 @@ def test_emit_reraises_a_handler_exception_and_records_it() -> None:
     assert isinstance(exceptions[0], ValueError)
 
 
+def test_dispatch_continues_past_a_failing_handler_then_reraises() -> None:
+    """Telethon's dispatch catches a callback's exception and moves on to
+    the next handler (telethon/client/updates.py `_dispatch_update`). The
+    fake does the same, then re-raises the first exception so a test can
+    still see it. The stream did deliver the event, so the delivery is
+    recorded either way."""
+
+    async def scenario():
+        client = FakeTelegramClient()
+        seen, second = _collector()
+
+        async def first(event) -> None:
+            raise ValueError("first handler blew up")
+
+        client.add_event_handler(first, events.NewMessage())
+        client.add_event_handler(second, events.NewMessage())
+        await client.connect()
+        with pytest.raises(ValueError, match="first handler blew up"):
+            await client.emit(CHANNEL, _msg(1))
+        return seen, client.deliveries, client.handler_exceptions
+
+    seen, deliveries, exceptions = asyncio.run(scenario())
+
+    assert [event.message.id for event in seen] == [1]
+    assert [(d.message_id, d.route) for d in deliveries] == [(1, "event")]
+    assert len(exceptions) == 1
+
+
+def test_rpc_shaped_methods_are_logged_to_calls() -> None:
+    """Every method that is a network round trip in Telethon exists on
+    the fake and logs to `calls`. Without these, a handler calling one
+    inside `try/except: pass` "failed" with AttributeError and left the
+    call log untouched -- the no-RPC test passed (reviewer's M2d)."""
+
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL: [_msg(1)]})
+        seen, handler = _collector()
+        client.add_event_handler(handler, events.NewMessage())
+        await client.connect()
+        await client.emit(
+            CHANNEL, FakeMessage(id=2, message="re", date=POSTED, reply_to_msg_id=1)
+        )
+        event = seen[0]
+        before = len(client.calls)
+        await client.get_entity(CHANNEL)
+        await client.get_input_entity(CHANNEL)
+        replied = await event.get_reply_message()
+        await event.get_chat()
+        await event.get_sender()
+        return client.calls[before:], replied
+
+    new_calls, replied = asyncio.run(scenario())
+
+    assert new_calls == [
+        "get_entity",
+        "get_input_entity",
+        "get_reply_message",
+        "get_chat",
+        "get_sender",
+    ]
+    assert replied is not None and replied.id == 1
+
+
+def test_fake_message_rejects_naive_datetimes() -> None:
+    """Telethon 1.44 always hands out aware UTC datetimes. A naive one in
+    the fake could only ever come from test code -- and silently reading
+    it as UTC could shift a signal's age by hours."""
+    naive = datetime(2026, 9, 5, 10, 45)
+
+    with pytest.raises(ValueError, match="date"):
+        FakeMessage(id=1, message="hi", date=naive)
+    with pytest.raises(ValueError, match="edit_date"):
+        FakeMessage(id=1, message="hi", date=POSTED, edit_date=naive)
+
+
 def test_remove_event_handler_stops_delivery() -> None:
     async def scenario():
         client = FakeTelegramClient()
