@@ -411,3 +411,31 @@ def test_a_malformed_channels_file_exits_5(rig: Rig) -> None:
     rig.channels_path.write_text("[[channels]\n", encoding="utf-8")
     assert cli_main.main(rig.argv()) == exit_codes.EXIT_CONFIG_ERROR
     assert rig.client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "words"),
+    [
+        (errors.ApiIdPublishedFloodError(request=None), 5, "my.telegram.org"),
+        (errors.UserDeactivatedBanError(request=None), 3, "setup-login"),
+    ],
+    ids=["api_id rejected", "account banned"],
+)
+def test_a_permanent_telegram_error_mid_lookup_exits_with_its_code(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+    code: int,
+    words: str,
+) -> None:
+    async def refused(entity: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(rig.client, "get_entity", refused)
+    before = rig.channels_path.read_bytes()
+
+    assert cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes")) == code
+    assert rig.channels_path.read_bytes() == before
+    assert words in capsys.readouterr().err
+    assert "disconnect" in rig.client.calls
