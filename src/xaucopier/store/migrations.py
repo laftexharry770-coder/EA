@@ -85,7 +85,7 @@ runs inside the *same* transaction as the one ``user_version`` write, so
 a version-0 file goes to the current version in one atomic step, and a
 version-1 file likewise.
 
-**Migration 2 (Plan 2 Task 10: edits and deletions).** Three changes,
+**Migration 2 (Plan 2 Task 10: edits and deletions).** Four changes,
 all in :data:`_MIGRATION_2`:
 
 - ``alerts``: one durable row per thing an operator must look at. Plan 3
@@ -111,6 +111,17 @@ all in :data:`_MIGRATION_2`:
   Nothing references ``followups`` by foreign key, so the rebuild needs
   no ``PRAGMA foreign_keys`` change (which SQLite would ignore inside a
   transaction anyway).
+- ``signals.withdrawn_at_utc`` and ``signals.first_trade_hash``. The first
+  records that the poster withdrew a signal (deleted it, or edited it into
+  something that is no signal). A withdrawn signal that was already
+  executed keeps ``state = 'NEW'`` so Plan 3 still manages its live legs,
+  so ``state`` alone cannot tell ``outbox.claim()`` that its entries must
+  never be handed out again -- this column does. The second keeps the
+  trade hash a signal was first accepted with: an SL/TP edit rewrites
+  ``trade_hash``, and relay dedup must still recognise another channel's
+  copy of the *pre-edit* call as the same trade (``signals_repo.
+  find_relay_duplicate`` matches either). Existing rows get
+  ``first_trade_hash = trade_hash``.
 """
 from __future__ import annotations
 
@@ -156,6 +167,10 @@ _MIGRATION_2: tuple[str, ...] = (
     "reply_to_message_id, target_signal_id, resolution_path, 0 FROM followups",
     "DROP TABLE followups",
     "ALTER TABLE followups_v2 RENAME TO followups",
+    "ALTER TABLE signals ADD COLUMN withdrawn_at_utc TEXT",
+    "ALTER TABLE signals ADD COLUMN first_trade_hash TEXT",
+    "UPDATE signals SET first_trade_hash = trade_hash",
+    "CREATE INDEX IF NOT EXISTS idx_signals_first_trade_hash ON signals(first_trade_hash)",
 )
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"

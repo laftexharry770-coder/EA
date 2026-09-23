@@ -384,7 +384,10 @@ def _dump(conn):
             "SELECT channel_id, message_id, kind, content_hash, raw_text, edit_date_utc, "
             "received_at_utc, posted_at_utc, source FROM messages ORDER BY 1, 2"
         ).fetchall(),
-        "signals": conn.execute("SELECT * FROM signals ORDER BY signal_id").fetchall(),
+        "signals": conn.execute(
+            "SELECT signal_id, channel_id, message_id, parsed_json, trade_hash, state, version "
+            "FROM signals ORDER BY signal_id"
+        ).fetchall(),
         "followups": conn.execute(
             "SELECT followup_id, channel_id, message_id, op, parsed_json, "
             "reply_to_message_id, target_signal_id, resolution_path FROM followups "
@@ -423,6 +426,11 @@ def test_upgrading_a_version_1_database_to_2_preserves_every_row(tmp_path):
     assert conn.execute(
         "SELECT deleted_at_utc, deleted_detected_by FROM messages"
     ).fetchall() == [(None, None), (None, None)]
+    # A signal accepted before migration 2 was first accepted with the
+    # trade hash it has now, and has not been withdrawn.
+    assert conn.execute(
+        "SELECT first_trade_hash, trade_hash, withdrawn_at_utc FROM signals"
+    ).fetchall() == [("hash1", "hash1", None)]
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert tables == EXPECTED_TABLES
     conn.close()
@@ -471,6 +479,7 @@ def test_migration_2_rolls_back_whole_on_a_failure_after_the_rebuild(tmp_path, m
     assert _dump(conn) == before
     assert "edit_seq" not in _columns(conn, "followups")
     assert "deleted_at_utc" not in _columns(conn, "messages")
+    assert "withdrawn_at_utc" not in _columns(conn, "signals")
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "alerts" not in tables and "followups_v2" not in tables
 
@@ -487,6 +496,7 @@ def test_a_fresh_database_goes_straight_to_version_2(tmp_path):
     assert version == 2
     assert "edit_seq" in _columns(conn, "followups")
     assert {"deleted_at_utc", "deleted_detected_by"} <= set(_columns(conn, "messages"))
+    assert {"withdrawn_at_utc", "first_trade_hash"} <= set(_columns(conn, "signals"))
     assert {
         "alert_id", "created_at_utc", "level", "code", "channel_id",
         "message_id", "signal_id", "detail", "acked",

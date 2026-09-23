@@ -185,6 +185,30 @@ def test_sl_edit_is_recorded_as_edited_not_swallowed(conn):
     assert message_row["edit_date_utc"] == edit_time.isoformat()
 
 
+@pytest.mark.parametrize("relayed", ["pre-edit", "post-edit"])
+def test_a_relay_of_an_edited_signal_is_still_a_relay_duplicate(conn, relayed):
+    """Channel A's signal is edited (SL 4470 -> 4460), which rewrites its
+    trade_hash. Channel B then relays the call inside the relay window:
+    whichever version it copied, it is the same trade and must not become
+    a second signal -- a second ENTRY (Task 10 review, Minor 3)."""
+    assert _ingest(conn).outcome == "new"
+    edited = _ingest(conn, text=EDITED_SL_TEXT, edit_date_utc=POSTED + timedelta(minutes=1))
+    assert edited.outcome == "edited"
+
+    relay = _ingest(
+        conn,
+        channel_cfg=CHANNEL_B,
+        message_id=900,
+        text=SIGNAL_TEXT if relayed == "pre-edit" else EDITED_SL_TEXT,
+        posted_at_utc=POSTED + timedelta(minutes=2),
+    )
+
+    assert relay.outcome == "relay_duplicate"
+    assert _count(conn, "signals") == 1
+    row = conn.execute("SELECT trade_hash, first_trade_hash FROM signals").fetchone()
+    assert row["trade_hash"] != row["first_trade_hash"]  # the edit did move trade_hash
+
+
 def test_cosmetic_edit_is_duplicate(conn):
     first = _ingest(conn)
     assert first.outcome == "new"

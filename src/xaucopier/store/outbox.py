@@ -73,6 +73,25 @@ violation is now a clean raise with nothing committed. See
 tests/test_outbox.py, which assert both the raise and (from a second,
 independent connection) that the pending write never became visible.
 
+**An ENTRY is never handed out for a signal that is no longer
+tradeable** (Task 10 review). A signal can be invalidated by an edit
+(``state = 'INVALID'``) or withdrawn by its poster (``withdrawn_at_utc``
+set -- a live one keeps ``state = 'NEW'`` so its legs are still managed)
+while one of its ENTRY rows is CLAIMED by a worker. If that worker dies,
+the lease expires and the row would come back: ``sweep_expired()`` would
+re-queue it and ``claim()`` hand it to the next worker, which would open
+the very trade the poster re-aimed or retracted. So both check the
+signal, in their own ``BEGIN IMMEDIATE`` transaction:
+``sweep_expired()`` SKIPs such an expired row instead of re-queueing it,
+and ``claim()`` SKIPs every claimable ENTRY row of such a signal for the
+account before it picks one -- so no path hands one out, including a row
+re-queued before the signal died. Both count what they skipped in the
+``outbox_dead_entry_skipped`` metric. FOLLOWUP rows are never refused
+this way: a withdrawn or invalid signal that is live still needs its
+legs managed. (A row already CLAIMED by a live worker cannot be stopped
+here; ``store/edits_repo.py`` treats it as in flight, i.e. possibly
+executed.)
+
 **claim() and sweep_expired() are not Writer work -- call them on their
 own connection, never the Writer's.** ``store/db.py``'s ``Writer`` exists
 for exactly one reason: to keep SQLite's synchronous ``commit()`` off the
@@ -113,6 +132,18 @@ OutboxKind = Literal["ENTRY", "FOLLOWUP"]
 OutboxState = Literal["QUEUED", "CLAIMED", "DONE", "SKIPPED"]
 
 _DEFAULT_LEASE_SECONDS = 90
+
+#: `metrics.name` for ENTRY rows claim()/sweep_expired() skipped because
+#: their signal is no longer tradeable.
+DEAD_ENTRY_SKIPPED_METRIC = "outbox_dead_entry_skipped"
+
+#: An ENTRY row whose signal must never be traded again: invalidated (or
+#: voided, or anything not NEW), or withdrawn by its poster. A signal_id
+#: with no signals row at all is *not* dead -- nothing says so.
+_DEAD_ENTRY = (
+    "kind = 'ENTRY' AND signal_id IN ("
+    "SELECT signal_id FROM signals WHERE state != 'NEW' OR withdrawn_at_utc IS NOT NULL)"
+)
 
 
 class _AccountCfgLike(Protocol):
@@ -228,6 +259,11 @@ def claim(
     `now_utc` is always a parameter, never read from the wall clock --
     it is what makes the lease-expiry rule testable at all.
 
+    An ENTRY row whose signal is no longer tradeable (INVALID, VOIDED,
+    withdrawn) is never returned: in the same transaction, every such
+    claimable row for the account is SKIPPED (see the module docstring)
+    before the oldest remaining one is taken.
+
     Manages its own BEGIN IMMEDIATE / COMMIT / ROLLBACK -- see the module
     docstring for why a bare UPDATE ... RETURNING is not enough to avoid
     a "database is locked" race between two concurrent claimants.
@@ -245,6 +281,21 @@ def claim(
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            dead = conn.execute(
+                "UPDATE outbox SET state = 'SKIPPED', "
+                "reason = 'signal no longer tradeable (invalidated or withdrawn) at claim' "
+                "WHERE account_id = ? "
+                "  AND (state = 'QUEUED' OR (state = 'CLAIMED' AND claimed_at_utc < ?)) "
+                f"  AND {_DEAD_ENTRY}",
+                (account_id, cutoff_iso),
+            ).rowcount
+            if dead:
+                metrics.bump(
+                    conn,
+                    day_key=metrics.day_key_for(now_utc),
+                    name=DEAD_ENTRY_SKIPPED_METRIC,
+                    value=dead,
+                )
             row = conn.execute(
                 "UPDATE outbox SET "
                 "  state = 'CLAIMED', "
@@ -317,6 +368,10 @@ def sweep_expired(
     whose owner has had more than `lease_seconds` to make its first
     durable write and still hasn't.
 
+    An expired ENTRY row whose signal is no longer tradeable (INVALID,
+    VOIDED, withdrawn) is SKIPPED instead of re-queued, and counted in
+    `outbox_dead_entry_skipped`, not in the return value.
+
     Raises RuntimeError if `conn` already has a transaction pending --
     see `_require_no_pending_transaction` and the module docstring.
     """
@@ -330,6 +385,14 @@ def sweep_expired(
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            dead = conn.execute(
+                "UPDATE outbox SET state = 'SKIPPED', "
+                "reason = 'lease expired; signal no longer tradeable (invalidated or withdrawn)' "
+                f"WHERE state = 'CLAIMED' AND claimed_at_utc < ? AND {_DEAD_ENTRY}",
+                (cutoff_iso,),
+            ).rowcount
+            if dead:
+                metrics.bump(conn, day_key=day_key, name=DEAD_ENTRY_SKIPPED_METRIC, value=dead)
             cursor = conn.execute(
                 "UPDATE outbox SET state = 'QUEUED', claimed_by_pid = NULL, "
                 "claimed_at_utc = NULL "
@@ -417,9 +480,12 @@ def skip_queued(
     has taken it.
 
     Only ``QUEUED``: a ``CLAIMED`` row belongs to a worker that may be
-    mid-send, and ``DONE``/``SKIPPED`` are final. Plan 3's worker must
-    therefore re-check the signal's state after it claims (see the Task
-    10 report). Never commits."""
+    mid-send (``edits_repo`` treats it as in flight, i.e. possibly
+    executed), and ``DONE``/``SKIPPED`` are final. If that worker dies,
+    the row does not come back to life: once the signal is invalidated
+    or withdrawn, ``sweep_expired()`` skips it rather than re-queue it,
+    and ``claim()`` never hands out an ENTRY of such a signal (see the
+    module docstring). Never commits."""
     if (signal_id is None) == (followup_id is None):
         raise ValueError("skip_queued requires exactly one of signal_id or followup_id")
     if not reason:

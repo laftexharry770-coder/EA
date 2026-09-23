@@ -68,6 +68,12 @@ def find_relay_duplicate(
     shares `trade_hash` and whose own message was posted within
     `relay_window_seconds` of `posted_at_utc` (spec G7).
 
+    "Shares `trade_hash`" means either the signal's current trade hash or
+    the one it was first accepted with (`first_trade_hash`): an SL/TP
+    edit rewrites `trade_hash`, and a relay of the *pre-edit* call is
+    still the same trade -- without the second match it would be a second
+    ENTRY (Task 10 review).
+
     `UNIQUE(channel_id, message_id)` on `signals` cannot express this: the
     user's channel is itself a relay of a VIP channel, so the same call
     legitimately arrives twice under two different (channel_id,
@@ -84,8 +90,8 @@ def find_relay_duplicate(
         "SELECT s.signal_id, s.channel_id, s.message_id, m.posted_at_utc "
         "FROM signals s "
         "JOIN messages m ON m.channel_id = s.channel_id AND m.message_id = s.message_id "
-        "WHERE s.trade_hash = ?",
-        (trade_hash,),
+        "WHERE s.trade_hash = ? OR s.first_trade_hash = ?",
+        (trade_hash, trade_hash),
     ).fetchall()
 
     window = timedelta(seconds=relay_window_seconds)
@@ -100,9 +106,15 @@ def insert_signal(
     conn: sqlite3.Connection, *, channel_id: int, message_id: int, signal: Signal
 ) -> int:
     cursor = conn.execute(
-        "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, state, version) "
-        "VALUES (?, ?, ?, ?, 'NEW', 1)",
-        (channel_id, message_id, signal_to_json(signal), signal.content_hash),
+        "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, "
+        "first_trade_hash, state, version) VALUES (?, ?, ?, ?, ?, 'NEW', 1)",
+        (
+            channel_id,
+            message_id,
+            signal_to_json(signal),
+            signal.content_hash,
+            signal.content_hash,
+        ),
     )
     return cursor.lastrowid
 
@@ -117,6 +129,9 @@ def update_signal_on_edit(
     A no-op (matches zero rows) if the original message never produced a
     `signals` row in the first place -- e.g. it was a relay_duplicate.
     There is nothing to correct in that case; nothing to fabricate either.
+
+    `first_trade_hash` is left alone: relay dedup keeps matching the call
+    as it was first accepted (see `find_relay_duplicate`).
     """
     conn.execute(
         "UPDATE signals SET parsed_json = ?, trade_hash = ?, version = version + 1 "
@@ -143,6 +158,17 @@ def set_signal_state(
         (state, signal_id, from_state),
     )
     return cursor.rowcount == 1
+
+
+def mark_withdrawn(conn: sqlite3.Connection, *, signal_id: int, now_utc: datetime) -> None:
+    """Record that the poster withdrew this signal (deleted it, or edited
+    it into something that is no signal). Kept once set. `outbox.claim()`
+    never hands out an ENTRY of a withdrawn signal, even one whose
+    `state` stays NEW because it is live."""
+    conn.execute(
+        "UPDATE signals SET withdrawn_at_utc = ? WHERE signal_id = ? AND withdrawn_at_utc IS NULL",
+        (now_utc.isoformat(), signal_id),
+    )
 
 
 def get_signal_id(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> int | None:

@@ -784,3 +784,101 @@ def test_claim_on_its_own_connection_succeeds(tmp_path: Path):
         assert result.attempts == 1
     finally:
         worker_conn.close()
+
+
+# -- dead ENTRY rows: never handed out again (Task 10 review, Important 1) -----
+
+
+def _signal_with_entries(conn, *, state: str = "NEW", withdrawn: bool = False) -> int:
+    """A real signal (ingested, so it has a signals row and one QUEUED
+    ENTRY per account), then put in `state` / withdrawn."""
+    result = _ingest(conn)
+    conn.execute(
+        "UPDATE signals SET state = ?, withdrawn_at_utc = ? WHERE signal_id = ?",
+        (state, NOW.isoformat() if withdrawn else None, result.signal_id),
+    )
+    conn.commit()
+    return result.signal_id
+
+
+def _entry_states(conn, signal_id: int) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT account_id, state, reason IS NOT NULL FROM outbox "
+            "WHERE kind = 'ENTRY' AND signal_id = ? ORDER BY outbox_id",
+            (signal_id,),
+        )
+    ]
+
+
+def _dead_metric(conn) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(SUM(value), 0) FROM metrics WHERE name = ?",
+        (outbox.DEAD_ENTRY_SKIPPED_METRIC,),
+    ).fetchone()
+    return row[0]
+
+
+@pytest.mark.parametrize(
+    ("state", "withdrawn"),
+    [("INVALID", False), ("VOIDED", False), ("NEW", True)],
+    ids=["invalid", "voided", "withdrawn-but-live"],
+)
+def test_claim_never_hands_out_an_entry_of_a_dead_signal(conn, state, withdrawn):
+    signal_id = _signal_with_entries(conn, state=state, withdrawn=withdrawn)
+    followup_id = _insert_outbox_row(conn, kind="FOLLOWUP", signal_id=None, followup_id=77)
+
+    claimed = outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW)
+
+    # The dead ENTRY is skipped with a reason; the account's FOLLOWUP (a
+    # live signal's legs still need managing) is what gets handed out.
+    assert claimed is not None and claimed.outbox_id == followup_id
+    assert _entry_states(conn, signal_id) == [("acct-1", "SKIPPED", 1), ("acct-2", "QUEUED", 0)]
+    assert _dead_metric(conn) == 1
+
+
+def test_claim_still_hands_out_an_entry_of_a_live_new_signal(conn):
+    """Control: the refusal is about the signal, not ENTRY rows as such."""
+    signal_id = _signal_with_entries(conn)
+    claimed = outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW)
+    assert claimed is not None and (claimed.kind, claimed.signal_id) == ("ENTRY", signal_id)
+
+
+@pytest.mark.parametrize("dies_as", ["invalid", "withdrawn"])
+def test_an_expired_claim_of_a_dead_signal_is_skipped_not_requeued(conn, dies_as):
+    """The Important-1 sequence: a worker claims the ENTRY, the signal is
+    invalidated or withdrawn while it holds it, the worker dies, the lease
+    expires. Neither the sweep nor the next claim may bring it back."""
+    signal_id = _signal_with_entries(conn)
+    first = outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW)
+    assert first is not None and first.signal_id == signal_id
+    conn.execute(
+        "UPDATE signals SET state = ?, withdrawn_at_utc = ? WHERE signal_id = ?",
+        (
+            "INVALID" if dies_as == "invalid" else "NEW",
+            NOW.isoformat() if dies_as == "withdrawn" else None,
+            signal_id,
+        ),
+    )
+    conn.commit()
+    later = NOW + timedelta(days=1)
+
+    reclaimed = outbox.sweep_expired(conn, now_utc=later)
+    again = outbox.claim(conn, account_id="acct-1", pid=2, now_utc=later)
+
+    assert reclaimed == 0
+    assert again is None
+    assert _entry_states(conn, signal_id)[0] == ("acct-1", "SKIPPED", 1)
+    assert _dead_metric(conn) >= 1
+
+
+def test_claim_refuses_an_expired_claim_of_a_dead_signal_even_without_a_sweep(conn):
+    """claim() matches expired CLAIMED rows itself, so it must check too."""
+    signal_id = _signal_with_entries(conn)
+    assert outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW) is not None
+    conn.execute("UPDATE signals SET state = 'INVALID' WHERE signal_id = ?", (signal_id,))
+    conn.commit()
+
+    assert outbox.claim(conn, account_id="acct-1", pid=2, now_utc=NOW + timedelta(days=1)) is None
+    assert _entry_states(conn, signal_id)[0] == ("acct-1", "SKIPPED", 1)
