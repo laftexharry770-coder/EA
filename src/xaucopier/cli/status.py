@@ -20,14 +20,15 @@ Ctrl+C, or the computer slept.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from xaucopier.cli import exit_codes
+from xaucopier.cli import exit_codes, paths
 from xaucopier.cli.watch import SetupError, load_channels_config
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.ingest.client import EXIT_TERMINAL_AUTH
+from xaucopier.ingest.client import EXIT_CONFIG_ERROR, EXIT_TERMINAL_AUTH
 from xaucopier.ingest.listener import HISTORY_SKIPPED_METRIC
 from xaucopier.ingest.poll import MISSED_BY_EVENTSTREAM_METRIC
 from xaucopier.store import db, heartbeats, metrics, report
@@ -77,6 +78,24 @@ _STATES: tuple[tuple[str, str], ...] = (
     ("SUPERSEDED", "SUPERSEDED"),
 )
 _OUTBOX_STATES = ("QUEUED", "CLAIMED", "DONE", "SKIPPED")
+
+#: The poll's round stamp detail: "N of M channel(s) read" (poll.py).
+_ROUND_DETAIL = re.compile(r"^(\d+) of (\d+) channel")
+
+_CMD = paths.USER_COMMAND
+#: What to do about a watch that is stuck or was closed. A stuck watch
+#: still holds the session, so a second one would exit 6: stop it first.
+_RESTART_ADVICE = (
+    "If the watch window is still open, click in it, press Ctrl+C and answer Y; "
+    f"then start it again with `{_CMD} watch`."
+)
+
+
+def round_counts(detail: str | None) -> tuple[int, int] | None:
+    """(channels read, channels tried) from a round stamp's detail, or
+    None if it does not say."""
+    match = _ROUND_DETAIL.match(detail or "")
+    return (int(match[1]), int(match[2])) if match else None
 
 
 def _utcnow() -> datetime:
@@ -148,8 +167,8 @@ def _watch_lines(rep: report.StatusReport, now: datetime, secrets_path: Path) ->
             if now - started.at_utc > STALE_AFTER:
                 lines.append(
                     f"  NOT HEALTHY: {since}, but no check of the channel has finished "
-                    "since. It may be stuck connecting, or its window was closed. If its "
-                    "window is gone, start it again."
+                    "since. It may be stuck connecting, or its window was closed. "
+                    + _RESTART_ADVICE
                 )
             else:
                 lines.append(f"  STARTING: {since}; the first check has not finished yet.")
@@ -158,7 +177,18 @@ def _watch_lines(rep: report.StatusReport, now: datetime, secrets_path: Path) ->
                 f"  NOT HEALTHY: the last check of the channel finished "
                 f"{ago(now, last_round.at_utc)} ({when(last_round.at_utc)}). watch was "
                 "probably closed without Ctrl+C, or the computer slept, or it is stuck. "
-                "If its window is gone, start it again."
+                + _RESTART_ADVICE
+            )
+        elif (counts := round_counts(last_round.detail)) is not None and counts[0] < counts[1]:
+            # A round that finished but read fewer channels than it tried is
+            # not health: nothing is being recorded from the rest.
+            lines.append(
+                f"  NOT HEALTHY: {since}, and still checking -- but the last check "
+                f"({ago(now, last_round.at_utc)}) could read only {counts[0]} of "
+                f"{counts[1]} channel(s): Telegram is not answering for the rest (see "
+                f"CHANNELS below, and {paths.LOG_FILE_NAME}), so nothing new is being "
+                "recorded from them. If this lasts more than a few minutes: "
+                + _RESTART_ADVICE
             )
         else:
             lines.append(
@@ -178,14 +208,19 @@ def _watch_lines(rep: report.StatusReport, now: datetime, secrets_path: Path) ->
         )
         if code == EXIT_TERMINAL_AUTH:
             lines.append(
-                "  Telegram has logged this session out. Run `xaucopier setup-login`, "
-                "then `xaucopier watch`."
+                "  Telegram refuses this login (logged out, used from two places at once, "
+                f"or the account is banned). Run `{_CMD} setup-login`, then `{_CMD} watch`."
+            )
+        elif code == EXIT_CONFIG_ERROR:
+            lines.append(
+                "  Telegram rejects this program's api_id/api_hash. Get a NEW pair at "
+                f"https://my.telegram.org, run `{_CMD} setup-login`, then `{_CMD} watch`."
             )
     if secrets_path.is_file():
         lines.append(f"  Telegram session file: present ({secrets_path})")
     else:
         lines.append(
-            f"  Telegram session file: MISSING ({secrets_path}) -- run `xaucopier setup-login`"
+            f"  Telegram session file: MISSING ({secrets_path}) -- run `{_CMD} setup-login`"
         )
     return lines
 
@@ -263,12 +298,18 @@ def _channel_lines(
 ) -> list[str]:
     lines = ["CHANNELS"]
     activity = {item.channel_id: item for item in rep.channels}
+    last_round = rep.heartbeat(heartbeats.POLL_ROUND)
     entries: list[tuple[int, str, bool]] = []
     if configured is not None:
         for channel in configured:
             if channel.channel_id == 0:
                 entries.append(
-                    (0, f"{channel.name} -- id not looked up yet (run resolve-channels)", False)
+                    (
+                        0,
+                        f"{channel.name} -- id not looked up yet "
+                        f"(run `{_CMD} resolve-channels`)",
+                        False,
+                    )
                 )
             else:
                 state = "switched on" if channel.enabled else "switched off"
@@ -304,11 +345,12 @@ def _channel_lines(
         pointer = item.pointer if item is not None else 0
         failures = item.consecutive_parse_failures if item is not None else 0
         read_text = f"{ago(now, read.at_utc)}" if read is not None else "never"
-        warn = (
-            "  <-- NOT BEING READ"
-            if watched and watch_running and (read is None or now - read.at_utc > STALE_AFTER)
-            else ""
-        )
+        warn = ""
+        if watched and watch_running:
+            if read is None or now - read.at_utc > STALE_AFTER:
+                warn = "  <-- NOT BEING READ"
+            elif last_round is not None and read.at_utc < last_round.at_utc:
+                warn = "  <-- could not be read in the last check"
         resumes = f"reading resumes after #{pointer}" if pointer else "not read from history yet"
         lines.append(
             f"    last read by the 5-second check: {read_text}{warn}; {resumes}; "
@@ -367,13 +409,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         print(
             f"No recordings yet: there is no database at {db_path}. "
-            "Run `xaucopier watch` first.",
+            f"Run `{_CMD} watch` first.",
             file=sys.stderr,
         )
         return exit_codes.EXIT_FAILED
     except db.SchemaVersionError as exc:
         print(
-            f"{exc}. Run `xaucopier watch` once to bring it up to date, then try again.",
+            f"{exc}. Run `{_CMD} watch` once to bring it up to date, then try again.",
             file=sys.stderr,
         )
         return exit_codes.EXIT_FAILED

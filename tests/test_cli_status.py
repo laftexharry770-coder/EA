@@ -256,7 +256,7 @@ def test_status_prints_alerts_first_critical_first_and_every_required_number(
         "last check of the channel 3 s ago (1 of 1 channel(s) read)",
         "Telegram session file: present",
         f"Test Channel (id {A}) -- switched on",
-        "Not Yet Resolved -- id not looked up yet (run resolve-channels)",
+        "Not Yet Resolved -- id not looked up yet (run `.\\xaucopier resolve-channels`)",
         f"id {B} (not in channels.toml)",
     ):
         assert expected in out, expected
@@ -347,7 +347,7 @@ def test_status_never_migrates_an_older_database(
 
     assert cli_main.main(["status", "--db", str(db_path), "--config-dir", str(tmp_path)]) == 1
     assert db_path.read_bytes() == before
-    assert "Run `xaucopier watch` once" in capsys.readouterr().err
+    assert "Run `.\\xaucopier watch` once" in capsys.readouterr().err
 
 
 # -- is watch alive? ------------------------------------------------------------------------------
@@ -397,7 +397,12 @@ def _beat(name: str, ago: timedelta, detail: str | None = None) -> heartbeats.He
         (
             (_beat(heartbeats.WATCH_STARTED, timedelta(hours=2)),
              _beat(heartbeats.WATCH_STOPPED, timedelta(hours=1), "3")),
-            "Telegram has logged this session out. Run `xaucopier setup-login`",
+            "Telegram refuses this login (logged out, used from two places at once",
+        ),
+        (
+            (_beat(heartbeats.WATCH_STARTED, timedelta(hours=2)),
+             _beat(heartbeats.WATCH_STOPPED, timedelta(hours=1), "5")),
+            "Get a NEW pair at https://my.telegram.org",
         ),
         (
             (_beat(heartbeats.WATCH_STARTED, timedelta(hours=2)),
@@ -426,3 +431,67 @@ def test_a_channel_not_read_lately_is_flagged_while_watch_runs(tmp_path: Path) -
     )
 
     assert "last read by the 5-second check: 30 min ago  <-- NOT BEING READ" in out
+
+
+# -- a round that read fewer channels than it tried is not health ----------------------------
+
+
+@pytest.mark.parametrize("detail", ["0 of 1 channel(s) read", "1 of 2 channel(s) read"])
+def test_a_round_that_could_not_read_every_channel_is_not_healthy(
+    tmp_path: Path, detail: str
+) -> None:
+    """The poll finished a round seconds ago -- but could not read the
+    channel. Nothing is being recorded, so the headline must not say
+    RUNNING (it did: it trusted that a round finished)."""
+    out = _render(
+        _report(
+            _beat(heartbeats.WATCH_STARTED, timedelta(hours=1)),
+            _beat(heartbeats.POLL_ROUND, timedelta(seconds=4), detail),
+            _beat(heartbeats.channel_read_name(A), timedelta(seconds=9)),
+        ),
+        tmp_path,
+    )
+
+    read, tried = detail.split(" of ")[0], detail.split(" of ")[1].split()[0]
+    assert "RUNNING:" not in out
+    assert "NOT HEALTHY: started" in out
+    assert f"could read only {read} of {tried} channel(s)" in out
+    assert "press Ctrl+C and answer Y" in out
+    # The channel itself is flagged at once, not only after two minutes.
+    assert "<-- could not be read in the last check" in out
+
+
+def test_a_round_that_read_every_channel_is_running(tmp_path: Path) -> None:
+    out = _render(
+        _report(
+            _beat(heartbeats.WATCH_STARTED, timedelta(hours=1)),
+            _beat(heartbeats.POLL_ROUND, timedelta(seconds=4), "1 of 1 channel(s) read"),
+            _beat(heartbeats.channel_read_name(A), timedelta(seconds=4)),
+        ),
+        tmp_path,
+    )
+
+    assert "RUNNING: started" in out and "NOT HEALTHY" not in out
+    assert "<--" not in out
+
+
+def test_stuck_advice_says_to_stop_the_old_window_first(tmp_path: Path) -> None:
+    """A stuck watch still holds the session: starting a second one would
+    only exit 6. The advice must say to stop the old one first."""
+    out = _render(
+        _report(
+            _beat(heartbeats.WATCH_STARTED, timedelta(hours=1)),
+            _beat(heartbeats.POLL_ROUND, timedelta(minutes=10), "1 of 1 channel(s) read"),
+        ),
+        tmp_path,
+    )
+
+    assert "If the watch window is still open, click in it, press Ctrl+C and answer Y" in out
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [("2 of 3 channel(s) read", (2, 3)), ("0 of 1 channel(s) read", (0, 1)), (None, None), ("?", None)],
+)
+def test_round_counts_reads_the_polls_own_wording(detail, expected) -> None:
+    assert status_module.round_counts(detail) == expected
