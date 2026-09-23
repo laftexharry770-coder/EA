@@ -78,7 +78,7 @@ from typing import Literal, Protocol
 
 from xaucopier.parsing.normalize import normalize
 from xaucopier.parsing.router import RouteResult, route
-from xaucopier.store import outbox, signals_repo
+from xaucopier.store import metrics, outbox, signals_repo
 
 IngestOutcome = Literal["new", "duplicate", "edited", "relay_duplicate"]
 
@@ -161,15 +161,6 @@ def _insert_message(
     )
 
 
-def _record_metric(conn: sqlite3.Connection, *, now_utc: datetime, name: str, value: int = 1) -> None:
-    day_key = now_utc.date().isoformat()
-    conn.execute(
-        "INSERT INTO metrics (day_key, name, value) VALUES (?, ?, ?) "
-        "ON CONFLICT(day_key, name) DO UPDATE SET value = value + excluded.value",
-        (day_key, name, value),
-    )
-
-
 def _fan_out_and_guard(
     conn: sqlite3.Connection,
     *,
@@ -204,7 +195,9 @@ def _fan_out_and_guard(
     enabled_count = sum(1 for account in accounts if account.enabled)
 
     if fanout_count == 0:
-        _record_metric(conn, now_utc=now_utc, name="ingest_new_no_accounts")
+        metrics.bump(
+            conn, day_key=metrics.day_key_for(now_utc), name="ingest_new_no_accounts"
+        )
 
     if fanout_count != enabled_count:
         raise RuntimeError(

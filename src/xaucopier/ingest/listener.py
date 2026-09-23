@@ -109,7 +109,7 @@ from telethon import events
 
 from xaucopier.config.accounts import AccountCfg
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.store import db, messages_repo
+from xaucopier.store import db, messages_repo, metrics
 from xaucopier.store.messages_repo import IngestResult
 
 logger = logging.getLogger(__name__)
@@ -295,18 +295,6 @@ def _advance_last_processed(
         "ON CONFLICT(channel_id) DO UPDATE SET last_processed_message_id = "
         "MAX(last_processed_message_id, excluded.last_processed_message_id)",
         (channel_id, message_id),
-    )
-
-
-def _bump_metric(conn: Connection, *, day_key: str, name: str) -> None:
-    """`metrics(day_key, name) += 1`. The same upsert as
-    `messages_repo._record_metric` / `outbox._bump_metric` (a duplication
-    already ledgered); kept local rather than reaching into another
-    module's private helper."""
-    conn.execute(
-        "INSERT INTO metrics (day_key, name, value) VALUES (?, ?, 1) "
-        "ON CONFLICT(day_key, name) DO UPDATE SET value = value + 1",
-        (day_key, name),
     )
 
 
@@ -599,11 +587,11 @@ class Listener:
         below this id and `MAX()` moves it past this one message only.
         Returns False (and skips nothing) if the job itself fails."""
         channel_id = channel_cfg.channel_id
-        day_key = self._now().date().isoformat()
+        day_key = metrics.day_key_for(self._now())
 
         def skip(conn: Connection) -> None:
             _advance_last_processed(conn, channel_id=channel_id, message_id=message_id)
-            _bump_metric(conn, day_key=day_key, name=HISTORY_SKIPPED_METRIC)
+            metrics.bump(conn, day_key=day_key, name=HISTORY_SKIPPED_METRIC)
 
         try:
             await self._run_on_writer(skip)

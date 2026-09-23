@@ -107,6 +107,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
+from xaucopier.store import metrics
+
 OutboxKind = Literal["ENTRY", "FOLLOWUP"]
 OutboxState = Literal["QUEUED", "CLAIMED", "DONE", "SKIPPED"]
 
@@ -151,20 +153,6 @@ def _row_to_outbox(row: sqlite3.Row) -> OutboxRow:
         claimed_at_utc=datetime.fromisoformat(claimed_at) if claimed_at is not None else None,
         claimed_by_pid=row["claimed_by_pid"],
         attempts=row["attempts"],
-    )
-
-
-def _bump_metric(conn: sqlite3.Connection, *, day_key: str, name: str, value: int) -> None:
-    """Shared metrics upsert: adds `value` to `metrics(day_key, name)`,
-    creating the row if needed. Extracted to its own function (rather than
-    inlined in sweep_expired()) specifically so a test can monkeypatch it
-    to simulate a crash between the reset UPDATE and the metric write, and
-    prove the pairing really is atomic rather than merely reading that way.
-    """
-    conn.execute(
-        "INSERT INTO metrics (day_key, name, value) VALUES (?, ?, ?) "
-        "ON CONFLICT(day_key, name) DO UPDATE SET value = value + excluded.value",
-        (day_key, name, value),
     )
 
 
@@ -335,7 +323,7 @@ def sweep_expired(
     _require_no_pending_transaction(conn, caller="sweep_expired")
 
     cutoff_iso = (now_utc - timedelta(seconds=lease_seconds)).isoformat()
-    day_key = now_utc.date().isoformat()
+    day_key = metrics.day_key_for(now_utc)
 
     previous_isolation_level = conn.isolation_level
     conn.isolation_level = None
@@ -350,7 +338,12 @@ def sweep_expired(
             )
             reclaimed = cursor.rowcount
             if reclaimed > 0:
-                _bump_metric(conn, day_key=day_key, name="outbox_lease_reclaimed", value=reclaimed)
+                # Called through the module (not imported by name) so a test
+                # can monkeypatch `metrics.bump` to crash between the reset
+                # UPDATE and the metric write, and prove the pair is atomic.
+                metrics.bump(
+                    conn, day_key=day_key, name="outbox_lease_reclaimed", value=reclaimed
+                )
         except BaseException:
             conn.execute("ROLLBACK")
             raise

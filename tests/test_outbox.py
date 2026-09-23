@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.store import db, outbox
+from xaucopier.store import db, metrics, outbox
 from xaucopier.store.messages_repo import ingest
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json"
@@ -406,7 +406,7 @@ def test_sweep_expired_rolls_back_reset_if_metric_write_fails(conn, monkeypatch)
     """Companion to claim()'s thread-contention test and ingest()'s
     monkeypatch atomicity tests: sweep_expired()'s reset+metric pairing
     had only been verified by reading the code, never by injecting a
-    crash between the two statements. Monkeypatching `_bump_metric`
+    crash between the two statements. Monkeypatching `metrics.bump`
     specifically (not the whole function) lets the reset UPDATE genuinely
     run first and then fail, proving the UPDATE itself rolls back rather
     than landing alone while the metric is missed.
@@ -419,7 +419,7 @@ def test_sweep_expired_rolls_back_reset_if_metric_write_fails(conn, monkeypatch)
     def boom(*args, **kwargs):
         raise RuntimeError("simulated crash between reset UPDATE and metric write")
 
-    monkeypatch.setattr(outbox, "_bump_metric", boom)
+    monkeypatch.setattr(metrics, "bump", boom)
 
     with pytest.raises(RuntimeError, match="simulated crash"):
         outbox.sweep_expired(conn, now_utc=NOW, lease_seconds=90)
