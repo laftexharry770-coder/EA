@@ -35,6 +35,7 @@ import sys
 from pathlib import Path
 
 from xaucopier.cli import exit_codes, paths
+from xaucopier.cli.fixtures import cmd_export_fixtures
 from xaucopier.cli.resolve import cmd_resolve_channels
 from xaucopier.cli.status import cmd_status
 from xaucopier.cli.watch import cmd_watch
@@ -248,6 +249,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_db(status)
     _add_secrets(status)
     status.set_defaults(func=cmd_status)
+
+    export = subparsers.add_parser(
+        "export-fixtures",
+        help="Write every recorded message out as a replay-test fixture.",
+        description=(
+            "Writes every recorded message into the replay harness's fixture folder "
+            "as one JSON file each. Never overwrites a file, and skips a message "
+            "any existing fixture already covers."
+        ),
+        epilog=exit_codes.help_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_db(export)
+    export.add_argument(
+        "--out",
+        type=Path,
+        default=paths.DEFAULT_FIXTURES_DIR,
+        help="Folder to write the fixtures into (default: %(default)s).",
+    )
+    export.set_defaults(func=cmd_export_fixtures)
 
     return parser
 
