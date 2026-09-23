@@ -49,7 +49,11 @@ never makes an RPC on the update path.
    The poll task is watched alongside it: the poll is the safety net
    for everything the update stream drops, so a poll that raises (or
    returns) is a stopped listener too, not a background failure nobody
-   sees.
+   sees. So is the writer: every write goes through `_run_on_writer()`,
+   and the first `WriterDeadError` any path meets -- handler, backfill,
+   poll -- stops the listener. Without a writer nothing can be stored,
+   and a process that keeps running anyway looks healthy to its
+   supervisor while recording nothing.
 
 **The handler does exactly four things: route, normalise, submit,
 return.** Routing comes first -- one dict lookup on `event.chat_id` --
@@ -366,6 +370,10 @@ class Listener:
         # Failed history-read attempts per (channel_id, message_id); see
         # ingest_history(). Cleared on success or skip.
         self._history_attempts: dict[tuple[int, int], int] = {}
+        # Resolved (with the WriterDeadError) the first time any write
+        # finds the writer thread dead; watched by wait_until_stopped().
+        # Created in start(), where a running loop is guaranteed.
+        self._writer_death: asyncio.Future[db.WriterDeadError] | None = None
         self._started = False
         self._closed = False
 
@@ -474,7 +482,32 @@ class Listener:
                 )
             return result
 
-        return await asyncio.wrap_future(self.writer.submit(job))
+        return await self._run_on_writer(job)
+
+    async def _run_on_writer(self, job: Callable[[Connection], Any]) -> Any:
+        """Run `job` on the writer thread and await it -- the one door
+        every listener write goes through (the startup probe aside, which
+        has its own handling). A `WriterDeadError` is re-raised to the
+        caller *and* reported to `wait_until_stopped()`, so a writer that
+        dies after startup stops the listener instead of leaving it
+        running with nothing able to record."""
+        try:
+            return await asyncio.wrap_future(self.writer.submit(job))
+        except db.WriterDeadError as exc:
+            self._writer_died(exc)
+            raise
+
+    def _writer_died(self, exc: db.WriterDeadError) -> None:
+        if self._writer_death is None or self._writer_death.done():
+            return
+        logger.critical(
+            "the writer thread is dead (%s); nothing can be stored, so the "
+            "listener is stopping for its supervisor to restart it",
+            exc,
+        )
+        # A result, not an exception: nothing is lost if no one ever
+        # awaits it, and wait_until_stopped() chains it as the cause.
+        self._writer_death.set_result(exc)
 
     async def ingest_history(
         self,
@@ -573,7 +606,7 @@ class Listener:
             _bump_metric(conn, day_key=day_key, name=HISTORY_SKIPPED_METRIC)
 
         try:
-            await asyncio.wrap_future(self.writer.submit(skip))
+            await self._run_on_writer(skip)
         except Exception as exc:  # noqa: BLE001 -- the next read retries the skip
             logger.error(
                 "could not skip channel %s message_id %s (%s: %s); the next read "
@@ -650,7 +683,7 @@ class Listener:
             def seed(conn: Connection) -> None:
                 _advance_last_processed(conn, channel_id=channel_id, message_id=newest_id)
 
-            await asyncio.wrap_future(self.writer.submit(seed))
+            await self._run_on_writer(seed)
         self._pointer_seeded.add(channel_id)
         logger.warning(
             "first run for channel %s (%s): pointer seeded at message_id %s; "
@@ -669,6 +702,7 @@ class Listener:
         if self._started:
             raise RuntimeError("Listener.start() called twice")
         self._started = True
+        self._writer_death = asyncio.get_running_loop().create_future()
 
         await self._start_writer_and_wait_for_connection()  # 0
         self._reader = db.connect(self.db_path, role="reader")
@@ -796,8 +830,8 @@ class Listener:
     # -- running and stopping ------------------------------------------------
 
     async def wait_until_stopped(self) -> NoReturn:
-        """Step 6. Wait on `run_until_disconnected()` *and* the poll
-        task; whichever finishes first ends the listener.
+        """Step 6. Wait on `run_until_disconnected()`, the poll task *and*
+        the writer's death; whichever comes first ends the listener.
 
         Any return from `run_until_disconnected()` -- clean or not --
         means this process is no longer receiving updates, so it is
@@ -806,7 +840,10 @@ class Listener:
         classify it). The poll finishing -- raising, returning, or being
         cancelled -- is `ListenerStopped` too: without it, a blackout's
         worth of messages is silently lost while the process looks
-        healthy, so the supervisor must restart it.
+        healthy, so the supervisor must restart it. And any write that
+        found the writer thread dead is `ListenerStopped`, chained from
+        the `WriterDeadError`: a listener that cannot store anything must
+        not keep looking healthy either.
         """
         run_task: asyncio.Future[Any] = asyncio.ensure_future(
             self.client.run_until_disconnected()
@@ -814,6 +851,8 @@ class Listener:
         watched: set[asyncio.Future[Any]] = {run_task}
         if self.poll_task is not None:
             watched.add(self.poll_task)
+        if self._writer_death is not None:
+            watched.add(self._writer_death)
         try:
             done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -833,7 +872,14 @@ class Listener:
                 "listening is never a successful exit."
             )
 
-        # Only two things are watched, so the poll task finished first.
+        if self._writer_death is not None and self._writer_death in done:
+            death = self._writer_death.result()
+            raise ListenerStopped(
+                f"the writer thread died ({death}): nothing can be stored, so the "
+                "listener is stopping rather than running without a writer"
+            ) from death
+
+        # Neither of the others, so the poll task finished first.
         poll_task = self.poll_task
         if poll_task is None:  # pragma: no cover -- unreachable, see above
             raise ListenerStopped("the listener stopped for an unknown reason")

@@ -1230,6 +1230,99 @@ def test_a_poll_that_returns_stops_the_listener_non_zero(tmp_path: Path) -> None
     assert asyncio.run(scenario()) == EXIT_LISTENER_STOPPED
 
 
+# -- a writer that dies after startup ------------------------------------------
+#
+# WriterDeadError is permanent for the process. A listener that keeps
+# running without a writer records nothing while its supervisor sees a
+# healthy process (the re-reviewer's W4) -- it must stop, non-zero.
+
+
+def _kill_the_writer(conn) -> None:
+    raise SystemExit("simulated writer-thread death")
+
+
+async def _kill_writer_of(listener: Listener) -> None:
+    killed = listener.writer.submit(_kill_the_writer)
+    with pytest.raises(db.WriterDeadError):
+        await asyncio.wrap_future(killed)
+
+
+def test_a_writer_that_dies_mid_run_stops_the_listener_non_zero(tmp_path: Path) -> None:
+    db_path = tmp_path / "store.db"
+
+    async def scenario():
+        client = FakeTelegramClient()
+        listener = _build_listener(db_path, client)
+        task = asyncio.create_task(run_listener(listener))
+        await _wait_for(lambda: "run_until_disconnected" in client.calls)
+        await _kill_writer_of(listener)
+
+        await client.emit(CHANNEL_ID, _chatter_message(1))  # the first write that notices
+        exit_code = await asyncio.wait_for(task, timeout=2.0)
+        return exit_code, listener.handler_errors, list(client.calls)
+
+    exit_code, errors, calls = asyncio.run(scenario())
+
+    assert exit_code == EXIT_LISTENER_STOPPED
+    assert [(e.message_id, e.source) for e in errors] == [(1, "live")]
+    assert errors[0].error.startswith("WriterDeadError")
+    assert calls[-1] == "disconnect"
+
+
+def test_run_raises_listener_stopped_carrying_the_writer_death(tmp_path: Path) -> None:
+    db_path = tmp_path / "store.db"
+
+    async def scenario() -> BaseException:
+        client = FakeTelegramClient()
+        listener = _build_listener(db_path, client)
+        run = asyncio.create_task(listener.run())
+        try:
+            await _wait_for(lambda: "run_until_disconnected" in client.calls)
+            await _kill_writer_of(listener)
+            await client.emit(CHANNEL_ID, _chatter_message(1))
+            with pytest.raises(ListenerStopped) as excinfo:
+                await asyncio.wait_for(run, timeout=2.0)
+        finally:
+            await listener.aclose()
+        return excinfo.value
+
+    error = asyncio.run(scenario())
+
+    assert isinstance(error.__cause__, db.WriterDeadError)
+    assert isinstance(error.__cause__.__cause__, SystemExit)
+    assert "writer" in str(error)
+
+
+def test_a_writer_death_seen_by_a_history_read_stops_the_listener(tmp_path: Path) -> None:
+    """The poll path too: a message only history has (a blackout) meets
+    the dead writer in read_history(), not in the handler."""
+    db_path = tmp_path / "store.db"
+    _seed_last_processed(db_path, CHANNEL_ID, 9)
+
+    async def polling(listener: Listener) -> None:
+        while True:
+            await listener.read_history(CHANNEL, source="poll", limit=100)
+            await asyncio.sleep(0.01)
+
+    async def scenario():
+        client = FakeTelegramClient()
+        listener = _build_listener(db_path, client, poll_hook=polling)
+        task = asyncio.create_task(run_listener(listener))
+        await _wait_for(lambda: "run_until_disconnected" in client.calls)
+        await _kill_writer_of(listener)
+
+        with client.blackout():
+            await client.emit(CHANNEL_ID, _chatter_message(10))
+        exit_code = await asyncio.wait_for(task, timeout=2.0)
+        return exit_code, listener.handler_errors
+
+    exit_code, errors = asyncio.run(scenario())
+
+    assert exit_code == EXIT_LISTENER_STOPPED
+    assert (errors[0].message_id, errors[0].source) == (10, "poll")
+    assert errors[0].error.startswith("WriterDeadError")
+
+
 async def _wait_for(predicate, *, timeout: float = 2.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
