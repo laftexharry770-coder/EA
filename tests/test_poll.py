@@ -896,10 +896,10 @@ def test_a_stamp_that_cannot_be_written_does_not_stop_the_poll(
             real = listener.record_heartbeats
             failures = [sqlite3.OperationalError("database is locked")]
 
-            async def flaky(beats):
+            async def flaky(beats, **kwargs):
                 if failures:
                     raise failures.pop()
-                await real(beats)
+                await real(beats, **kwargs)
 
             monkeypatch.setattr(listener, "record_heartbeats", flaky)
             client.add_to_history(A, _chatter(10))
@@ -928,7 +928,7 @@ def test_a_writer_death_met_by_the_stamp_stops_the_poll(
         client = FakeTelegramClient()
         async with _polling(db_path, client, time) as listener:
 
-            async def dead(beats):
+            async def dead(beats, **kwargs):
                 raise db.WriterDeadError("simulated")
 
             monkeypatch.setattr(listener, "record_heartbeats", dead)

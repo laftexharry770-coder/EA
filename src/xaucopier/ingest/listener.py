@@ -856,20 +856,34 @@ class Listener:
 
         await self._run_on_writer(bump)
 
-    async def record_heartbeats(self, beats: Mapping[str, str | None]) -> None:
+    async def record_heartbeats(
+        self, beats: Mapping[str, str | None], *, resolve_alerts: tuple[str, ...] = ()
+    ) -> int:
         """Stamp every `name -> detail` in `beats` at this listener's
         injected "now" (`store.heartbeats.beat`), in one writer job -- so a
-        round's stamps land together or not at all. Through
-        `_run_on_writer()`, so a dead writer stops the listener here too.
-        `xaucopier status` reads them from its own process."""
+        round's stamps land together or not at all -- and in the same job
+        acknowledge every unacknowledged alert whose code is in
+        `resolve_alerts` (the condition it reported is gone). Returns how
+        many alerts that cleared. Through `_run_on_writer()`, so a dead
+        writer stops the listener here too. `xaucopier status` reads the
+        stamps from its own process."""
         now_utc = self._now()
         items = tuple(beats.items())
+        codes = tuple(resolve_alerts)
 
-        def job(conn: Connection) -> None:
+        def job(conn: Connection) -> int:
             for name, detail in items:
                 heartbeats.beat(conn, name=name, now_utc=now_utc, detail=detail)
+            return alerts.ack_all(conn, codes=codes) if codes else 0
 
-        await self._run_on_writer(job)
+        cleared = await self._run_on_writer(job)
+        if cleared:
+            logger.warning(
+                "cleared %d alert(s) %s: Telegram is answering this session again",
+                cleared,
+                list(codes),
+            )
+        return cleared
 
     async def record_alert(
         self,
@@ -1025,6 +1039,9 @@ class Listener:
             ) from exc
 
     async def _backfill_channel(self, channel: ChannelCfg) -> None:
+        # Imported here for the same reason as in run_listener().
+        from xaucopier.ingest.client import PERMANENT_TELEGRAM_ERRORS
+
         try:
             await self.read_history(
                 channel,
@@ -1032,6 +1049,11 @@ class Listener:
                 limit=self._backfill_limit,
                 rpc_timeout=self._backfill_rpc_timeout,
             )
+        except PERMANENT_TELEGRAM_ERRORS:
+            # A dead session or a rejected api_id is not "one bad channel":
+            # every read will fail the same way, so stop at startup rather
+            # than log it here and meet it again in the poll.
+            raise
         except Exception as exc:  # noqa: BLE001 -- one bad channel must not block the rest
             # Failing the whole startup here would crash-loop the process
             # for every *other* channel too. Task 9's poll reads from the
@@ -1183,7 +1205,8 @@ class Listener:
         worth of messages is silently lost while the process looks
         healthy, so the supervisor must restart it. The one exception is
         a terminal auth error from the poll, re-raised as itself (like
-        one from `run_until_disconnected()`) so it exits 3, not 4. And any write that
+        one from `run_until_disconnected()`) so it exits 3, not 4 -- and
+        likewise a rejected api_id/api_hash, which exits 5. And any write that
         found the writer thread dead is `ListenerStopped`, chained from
         the `WriterDeadError`: a listener that cannot store anything must
         not keep looking healthy either.
@@ -1234,12 +1257,13 @@ class Listener:
         poll_error = poll_task.exception()
         if poll_error is not None:
             # Imported here for the same reason as in run_listener().
-            from xaucopier.ingest.client import TERMINAL_AUTH_ERRORS
+            from xaucopier.ingest.client import PERMANENT_TELEGRAM_ERRORS
 
-            if isinstance(poll_error, TERMINAL_AUTH_ERRORS):
-                # As `run_task.result()` does above: a dead session is
-                # not "restart me" but "stop trying", and run_listener()
-                # can only say so (exit 3) if it sees the error itself.
+            if isinstance(poll_error, PERMANENT_TELEGRAM_ERRORS):
+                # As `run_task.result()` does above: a dead session (or a
+                # rejected api_id) is not "restart me" but "stop trying",
+                # and run_listener() can only say so (exit 3 or 5) if it
+                # sees the error itself.
                 raise poll_error
             raise ListenerStopped(
                 f"the poll task died ({type(poll_error).__name__}: {poll_error}): "
@@ -1307,12 +1331,19 @@ async def run_listener(listener: Listener) -> int:
 
     Never returns 0: reaching the end of this function at all means the
     listener stopped. `EXIT_TERMINAL_AUTH` (3) tells the supervisor the
-    session is dead and a restart is pointless; `EXIT_LISTENER_STOPPED`
-    (4) means "stopped, restart me".
+    session (or the account) is dead and a restart is pointless;
+    `EXIT_CONFIG_ERROR` (5) that Telegram rejects the api_id/api_hash,
+    which only a new pair can fix; `EXIT_LISTENER_STOPPED` (4) means
+    "stopped, restart me".
     """
     # Imported here rather than at module import time so this module
     # stays importable (and testable) without pywin32 being loaded.
-    from xaucopier.ingest.client import EXIT_TERMINAL_AUTH, TERMINAL_AUTH_ERRORS
+    from xaucopier.ingest.client import (
+        API_CREDENTIAL_ERRORS,
+        EXIT_CONFIG_ERROR,
+        EXIT_TERMINAL_AUTH,
+        TERMINAL_AUTH_ERRORS,
+    )
 
     try:
         await listener.run()
@@ -1321,11 +1352,21 @@ async def run_listener(listener: Listener) -> int:
         return EXIT_LISTENER_STOPPED
     except TERMINAL_AUTH_ERRORS as exc:
         logger.error(
-            "terminal Telegram auth error (%s): the session is dead and a "
-            "restart cannot revive it. Run `xaucopier setup-login` again.",
+            "Telegram refuses this session (%s): it was logged out, revoked, used "
+            "from two places at once, or the account is deactivated, banned or "
+            "frozen. A restart cannot fix it. Run `.\\xaucopier setup-login` again.",
             type(exc).__name__,
         )
         return EXIT_TERMINAL_AUTH
+    except API_CREDENTIAL_ERRORS as exc:
+        logger.error(
+            "Telegram rejects this program's api_id/api_hash (%s). Neither a restart "
+            "nor logging in again with the same pair can fix it: get a new "
+            "api_id/api_hash at https://my.telegram.org, then run "
+            "`.\\xaucopier setup-login` again.",
+            type(exc).__name__,
+        )
+        return EXIT_CONFIG_ERROR
     finally:
         await listener.aclose()
 

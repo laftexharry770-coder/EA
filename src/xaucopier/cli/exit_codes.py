@@ -13,7 +13,7 @@ ever differ.
 """
 from __future__ import annotations
 
-from xaucopier.ingest.client import EXIT_TERMINAL_AUTH
+from xaucopier.ingest.client import EXIT_CONFIG_ERROR, EXIT_TERMINAL_AUTH
 from xaucopier.ingest.listener import EXIT_LISTENER_STOPPED
 
 #: A one-shot command finished and did what it was asked.
@@ -22,8 +22,9 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 #: The command line itself was wrong (argparse's own code).
 EXIT_USAGE = 2
-#: Telegram has logged this session out, or it is otherwise dead
-#: (`client.TERMINAL_AUTH_ERRORS`). Do NOT restart: run `setup-login`.
+#: Telegram refuses this session or account (`client.TERMINAL_AUTH_ERRORS`:
+#: logged out, revoked, used from two places at once, deactivated, banned,
+#: frozen). Do NOT restart: run `setup-login`.
 assert EXIT_TERMINAL_AUTH == 3
 #: `watch` stopped listening -- a network drop it could not ride out, a
 #: database write that failed, anything unexpected. Restart it.
@@ -31,8 +32,9 @@ assert EXIT_LISTENER_STOPPED == 4
 #: A setup problem a restart cannot fix: a missing or malformed config
 #: file, a channel switched on with `channel_id = 0`, no channel switched
 #: on at all, a missing database folder or an unusable database file, a
-#: missing or unreadable Telegram session file. Do NOT restart: fix it.
-EXIT_CONFIG_ERROR = 5
+#: missing or unreadable Telegram session file -- or an api_id/api_hash
+#: Telegram rejects (`client.API_CREDENTIAL_ERRORS`). Do NOT restart: fix it.
+assert EXIT_CONFIG_ERROR == 5
 #: Another `watch` (or `resolve-channels`) already holds this machine's
 #: Telegram session. Do NOT start a second one: two processes on one
 #: session can get it permanently revoked by Telegram.
@@ -48,13 +50,14 @@ MEANINGS: tuple[tuple[int, str], ...] = (
     (EXIT_USAGE, "the command line was wrong; see --help"),
     (
         EXIT_TERMINAL_AUTH,
-        "Telegram logged this session out -- do not restart; run setup-login again",
+        "Telegram refuses this login (logged out, used twice at once, or the account "
+        "is banned) -- do not restart; run setup-login again",
     ),
     (EXIT_LISTENER_STOPPED, "watch stopped unexpectedly -- safe to start it again"),
     (
         EXIT_CONFIG_ERROR,
-        "a setup problem (config file, channel id, database folder, session "
-        "file) -- do not restart until it is fixed",
+        "a setup problem (config file, channel id, database folder, session file, "
+        "or an api_id/api_hash Telegram rejects) -- do not restart until it is fixed",
     ),
     (
         EXIT_ALREADY_RUNNING,

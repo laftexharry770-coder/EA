@@ -41,7 +41,10 @@ Every `interval` (5 s) the poll runs one *round*:
 5. **Stamp the round** (Task 11): one writer job records
    `heartbeats.POLL_ROUND` ("N of M channel(s) read") and, for each
    channel whose forward read succeeded this round, its
-   `channel_read:<id>` stamp. `xaucopier status` runs in another process
+   `channel_read:<id>` stamp. If any read succeeded, the same job
+   acknowledges the session alerts (`alerts.SESSION_ALERT_CODES`: a dead
+   session, a rejected api_id) -- Telegram has just answered, so the
+   condition they report is gone. `xaucopier status` runs in another process
    and reads these to say whether `watch` is alive and whether Telegram
    is still answering. A stamp that fails to write is logged and the
    poll carries on -- a missing stamp makes `status` look stale, never
@@ -91,10 +94,14 @@ listener) at once:
   reach it: `ingest_history()` records that message as failed and ends
   the batch, and the read returns normally. The listener still stops,
   through the writer door; the poll simply finishes its round first.
-- A terminal auth error (`client.TERMINAL_AUTH_ERRORS`): the session is
-  dead and no retry revives it. Swallowing it would leave a process that
-  looks alive and can never read anything again. The listener re-raises
-  it as itself, so the process exits 3 ("do not restart"), not 4.
+- A permanent Telegram error (`client.PERMANENT_TELEGRAM_ERRORS`): the
+  session or account is dead (`TERMINAL_AUTH_ERRORS`, exit 3), or
+  Telegram rejects the api_id/api_hash (`API_CREDENTIAL_ERRORS`, exit 5).
+  No retry revives either. Swallowing one would leave a process that
+  looks alive -- `status` saying RUNNING -- and can never read anything
+  again. The listener re-raises it as itself, so the process exits 3 or
+  5 ("do not restart"), not 4. (`FrozenMethodInvalidError` is a
+  `FloodError`; it is matched here first, never deferred as a flood.)
 - `WriterUnresponsiveError`: the writer did not run the probe within
   `writer_probe_timeout` -- a hung writer thread, which stores nothing
   and would hang the next ingest forever.
@@ -133,7 +140,7 @@ from xaucopier.ingest.edits import (
     validate_window,
 )
 from xaucopier.ingest.listener import DEFAULT_RPC_TIMEOUT, HistoryIngest, Listener
-from xaucopier.store import db, heartbeats
+from xaucopier.store import alerts, db, heartbeats
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +222,7 @@ class HistoryPoll:
         end it."""
         # Imported here, as run_listener() does, so importing this module
         # does not load pywin32.
-        from xaucopier.ingest.client import TERMINAL_AUTH_ERRORS
+        from xaucopier.ingest.client import PERMANENT_TELEGRAM_ERRORS
 
         # (step, channel_id) -> clock() reading before which that step of
         # that channel is not run again (a flood wait). Local: it belongs
@@ -236,7 +243,7 @@ class HistoryPoll:
             read: list[int] = []
             for channel in channels:
                 if await self._poll_channel(
-                    listener, channel, flood_until, TERMINAL_AUTH_ERRORS, absences
+                    listener, channel, flood_until, PERMANENT_TELEGRAM_ERRORS, absences
                 ):
                     read.append(channel.channel_id)
             await self._stamp_round(listener, read=tuple(read), total=len(channels))
@@ -254,7 +261,11 @@ class HistoryPoll:
         for channel_id in read:
             beats[heartbeats.channel_read_name(channel_id)] = None
         try:
-            await listener.record_heartbeats(beats)
+            # A read that succeeded proves Telegram accepts this session and
+            # this api_id again: the alerts saying otherwise are resolved.
+            await listener.record_heartbeats(
+                beats, resolve_alerts=alerts.SESSION_ALERT_CODES if read else ()
+            )
         except db.WriterDeadError:
             raise
         except Exception:  # noqa: BLE001 -- a lost stamp only makes status look stale

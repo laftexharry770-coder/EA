@@ -11,12 +11,29 @@ Two hazards this module exists to prevent:
    takes a named Windows mutex (`Global\\xaucopier_listener`) before
    anything touches the session, so a second process fails fast and
    loudly instead of racing the first one for the socket.
-2. **Retrying an error that can never succeed.** `AuthKeyUnregisteredError`,
-   `SessionRevokedError`, and `AuthKeyDuplicatedError` all mean the
-   session is dead -- logged out remotely, revoked, or duplicated. A
-   supervisor that blindly restarts on any non-zero exit would spin
-   forever on these. `classify_auth_error` and `EXIT_TERMINAL_AUTH` give
-   the supervisor an unambiguous signal to stop trying.
+2. **Retrying an error that can never succeed.** Two families of
+   Telegram error mean a restart cannot help, and a supervisor that
+   restarted on them would loop for ever:
+
+   - `TERMINAL_AUTH_ERRORS` -> `EXIT_TERMINAL_AUTH` (3): the session or
+     the account is dead. Every 401 (`UnauthorizedError`: logged out,
+     revoked, expired, a deactivated or banned account, ...) -- the same
+     rule Telethon 1.44's own update loop stops on
+     (telethon/client/updates.py:328, :373) -- plus
+     `AuthKeyDuplicatedError` (406: the key was used from two places at
+     once) and `FrozenMethodInvalidError` (420: a frozen account). *Not*
+     the `AuthKeyError` base class: that is every 406, including harmless
+     ones such as `FilerefUpgradeNeededError`.
+   - `API_CREDENTIAL_ERRORS` -> `EXIT_CONFIG_ERROR` (5): Telegram rejects
+     this program's api_id/api_hash (invalid, or published somewhere --
+     the tutorial-id ban). Logging in again with the same pair cannot fix
+     it; the user needs a new pair from my.telegram.org, so this is a
+     setup problem, not a dead session. Telethon's update loop treats
+     these 400s as transient (updates.py:344), so only this program's own
+     reads can notice them.
+
+   `PERMANENT_TELEGRAM_ERRORS` is both; `exit_code_for()` maps one to its
+   code.
 """
 from __future__ import annotations
 
@@ -25,27 +42,40 @@ from typing import Literal
 import win32api
 import win32event
 import winerror
-from telethon import TelegramClient
-from telethon.errors import (
-    AuthKeyDuplicatedError,
-    AuthKeyUnregisteredError,
-    SessionRevokedError,
-)
+from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
 
 from xaucopier.ingest.secrets import SecretsBlob
 
 _MUTEX_NAME = r"Global\xaucopier_listener"
 
-#: Terminal auth errors: the session is dead and no retry can revive it.
+#: The session or the account is dead and no retry can revive it (see
+#: the module docstring for why these three and not `AuthKeyError`).
 TERMINAL_AUTH_ERRORS: tuple[type[Exception], ...] = (
-    AuthKeyUnregisteredError,
-    SessionRevokedError,
-    AuthKeyDuplicatedError,
+    errors.UnauthorizedError,  # every 401
+    errors.AuthKeyDuplicatedError,  # 406 -- not the AuthKeyError base
+    errors.FrozenMethodInvalidError,  # 420, a frozen account
 )
 
-#: Exit code the supervisor must treat as "do not restart".
+#: Telegram rejects this program's api_id/api_hash: a new pair is needed.
+API_CREDENTIAL_ERRORS: tuple[type[Exception], ...] = (
+    errors.ApiIdInvalidError,
+    errors.ApiIdPublishedFloodError,
+    errors.ConnectionApiIdInvalidError,
+)
+
+#: Every Telegram error after which retrying cannot help.
+PERMANENT_TELEGRAM_ERRORS: tuple[type[Exception], ...] = (
+    TERMINAL_AUTH_ERRORS + API_CREDENTIAL_ERRORS
+)
+
+#: Exit code the supervisor must treat as "do not restart": the session is
+#: dead; run setup-login.
 EXIT_TERMINAL_AUTH = 3
+#: Exit code for a permanent setup problem -- here, an api_id/api_hash
+#: Telegram rejects. The CLI uses the same code for every other permanent
+#: setup problem (cli/exit_codes.py). Do not restart.
+EXIT_CONFIG_ERROR = 5
 
 
 class AlreadyRunningError(Exception):
@@ -120,6 +150,18 @@ def build_client(blob: SecretsBlob) -> TelegramClient:
 
 
 def classify_auth_error(exc: BaseException) -> Literal["terminal", "retryable"]:
-    """`"terminal"` for the three dead-session errors, `"retryable"` for
-    everything else (e.g. `FloodWaitError`, network errors)."""
-    return "terminal" if isinstance(exc, TERMINAL_AUTH_ERRORS) else "retryable"
+    """`"terminal"` for every `PERMANENT_TELEGRAM_ERRORS` error,
+    `"retryable"` for everything else (e.g. `FloodWaitError`, a harmless
+    406, network errors)."""
+    return "terminal" if isinstance(exc, PERMANENT_TELEGRAM_ERRORS) else "retryable"
+
+
+def exit_code_for(exc: BaseException) -> int | None:
+    """The exit code a permanent Telegram error means -- 3 for a dead
+    session or account, 5 for a rejected api_id/api_hash -- or None if a
+    retry could still succeed."""
+    if isinstance(exc, TERMINAL_AUTH_ERRORS):
+        return EXIT_TERMINAL_AUTH
+    if isinstance(exc, API_CREDENTIAL_ERRORS):
+        return EXIT_CONFIG_ERROR
+    return None

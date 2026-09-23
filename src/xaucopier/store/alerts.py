@@ -26,6 +26,17 @@ logger = logging.getLogger(__name__)
 
 AlertLevel = Literal["WARNING", "CRITICAL"]
 
+#: CRITICAL, recorded by `xaucopier watch` on exit 3: Telegram refuses this
+#: session (logged out, revoked, duplicated; the account deactivated,
+#: banned or frozen). Fix: run setup-login again.
+TELEGRAM_SESSION_DEAD = "TELEGRAM_SESSION_DEAD"
+#: CRITICAL, recorded by `xaucopier watch` when Telegram rejects the
+#: api_id/api_hash (exit 5). Fix: a new pair from my.telegram.org.
+TELEGRAM_API_ID_REJECTED = "TELEGRAM_API_ID_REJECTED"
+#: Alerts a successful read resolves: Telegram answering this session
+#: proves the condition is gone. The poll acknowledges them (poll.py).
+SESSION_ALERT_CODES: tuple[str, ...] = (TELEGRAM_SESSION_DEAD, TELEGRAM_API_ID_REJECTED)
+
 _LOG_LEVELS: dict[str, int] = {"WARNING": logging.WARNING, "CRITICAL": logging.CRITICAL}
 
 
@@ -115,6 +126,21 @@ def unacked(conn: sqlite3.Connection) -> tuple[Alert, ...]:
         )
         for row in rows
     )
+
+
+def ack_all(conn: sqlite3.Connection, *, codes: tuple[str, ...] | None = None) -> int:
+    """Acknowledge every unacknowledged alert -- or, with `codes`, every one
+    whose code is in `codes`. Returns how many. Never commits."""
+    if codes is None:
+        cursor = conn.execute("UPDATE alerts SET acked = 1 WHERE acked = 0")
+    else:
+        if not codes:
+            return 0
+        marks = ", ".join("?" for _ in codes)
+        cursor = conn.execute(
+            f"UPDATE alerts SET acked = 1 WHERE acked = 0 AND code IN ({marks})", tuple(codes)
+        )
+    return cursor.rowcount
 
 
 def ack(conn: sqlite3.Connection, *, alert_id: int) -> None:

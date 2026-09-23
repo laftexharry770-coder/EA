@@ -52,6 +52,8 @@ from xaucopier.cli import exit_codes, paths
 from xaucopier.cli.watch import SetupError, load_channels_config, load_session
 from xaucopier.config.channels import ChannelCfg, load_channels
 from xaucopier.ingest.client import (
+    API_CREDENTIAL_ERRORS,
+    PERMANENT_TELEGRAM_ERRORS,
     TERMINAL_AUTH_ERRORS,
     AlreadyRunningError,
     acquire_single_instance_lock,
@@ -280,7 +282,7 @@ async def resolve_link(client: Any, text: str) -> Resolved:
         )
     try:
         entity = await client.get_entity(link)
-    except TERMINAL_AUTH_ERRORS:
+    except PERMANENT_TELEGRAM_ERRORS:
         raise
     except Exception as exc:  # noqa: BLE001 -- Telethon raises ValueError or an RPCError
         raise ResolveError(f"Telegram could not find {link!r}: {exc}") from None
@@ -388,11 +390,20 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
             print(f"Saved: {cfg.name!r} is now channel {resolved.channel_id}, switched on.")
     except TERMINAL_AUTH_ERRORS as exc:
         print(
-            f"Telegram refused this session ({type(exc).__name__}): it has been logged out. "
-            "Run `xaucopier setup-login` again.",
+            f"Telegram refuses this login ({type(exc).__name__}): it was logged out, "
+            "used from two places at once, or the account is banned. Run "
+            "`.\\xaucopier setup-login` again.",
             file=sys.stderr,
         )
         return exit_codes.EXIT_TERMINAL_AUTH
+    except API_CREDENTIAL_ERRORS as exc:
+        print(
+            f"Telegram rejects this program's api_id/api_hash ({type(exc).__name__}). "
+            "Get a NEW pair at https://my.telegram.org, then run "
+            "`.\\xaucopier setup-login` again.",
+            file=sys.stderr,
+        )
+        return exit_codes.EXIT_CONFIG_ERROR
     finally:
         await client.disconnect()
 

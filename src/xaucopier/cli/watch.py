@@ -47,6 +47,7 @@ from xaucopier.config.accounts import AccountCfg, load_accounts
 from xaucopier.config.channels import ChannelCfg, load_channels
 from xaucopier.config.loader import ConfigError
 from xaucopier.ingest.client import (
+    EXIT_CONFIG_ERROR,
     EXIT_TERMINAL_AUTH,
     AlreadyRunningError,
     acquire_single_instance_lock,
@@ -60,9 +61,34 @@ from xaucopier.store import alerts, db, heartbeats
 
 logger = logging.getLogger(__name__)
 
-#: `alerts.code` recorded when `watch` exits 3: Telegram logged the
-#: session out, and only the user can fix that (`setup-login`).
-TELEGRAM_SESSION_DEAD = "TELEGRAM_SESSION_DEAD"
+#: `alerts.code` recorded when `watch` exits 3: Telegram refuses the
+#: session, and only the user can fix that (`setup-login`).
+TELEGRAM_SESSION_DEAD = alerts.TELEGRAM_SESSION_DEAD
+#: `alerts.code` recorded when Telegram rejects the api_id/api_hash (exit
+#: 5 from the listener): only a new pair from my.telegram.org fixes it.
+TELEGRAM_API_ID_REJECTED = alerts.TELEGRAM_API_ID_REJECTED
+
+#: What the user must do, per permanent Telegram stop: the alert's text
+#: and the line printed when `watch` exits.
+_TELEGRAM_STOPS: dict[int, tuple[str, str]] = {
+    EXIT_TERMINAL_AUTH: (
+        TELEGRAM_SESSION_DEAD,
+        "Telegram refuses this login: it was logged out (for example from "
+        "Telegram -> Settings -> Devices), used from two places at once, or the "
+        "account is deactivated, banned or frozen. watch cannot record anything "
+        "until you run `.\\xaucopier setup-login` again. This alert clears "
+        "itself once watch reads the channel again.",
+    ),
+    EXIT_CONFIG_ERROR: (
+        TELEGRAM_API_ID_REJECTED,
+        "Telegram rejects this program's api_id/api_hash (it is invalid, or it "
+        "was published somewhere, e.g. copied from a tutorial). Restarting, or "
+        "logging in again with the same pair, cannot fix it: get a NEW "
+        "api_id/api_hash at https://my.telegram.org, then run "
+        "`.\\xaucopier setup-login` again. This alert clears itself once "
+        "watch reads the channel again.",
+    ),
+}
 
 #: The log file rotates at this size, keeping this many old files.
 _LOG_MAX_BYTES = 5_000_000
@@ -187,11 +213,14 @@ def stamp_start(db_path: Path) -> None:
 
 
 def stamp_stop(db_path: Path, exit_code: int) -> None:
-    """Stamp `watch_stopped` with `exit_code` and, for exit 3, record the
-    CRITICAL alert `status` shows. Best effort: it runs after the
-    listener's writer has stopped, and a store that cannot take this
-    write has already said so; failing here only means `status` shows
-    an older state."""
+    """Stamp `watch_stopped` with `exit_code` and, for a permanent Telegram
+    stop -- exit 3 (the session is refused) or exit 5 (the only exit 5 a
+    *running* watch can return: Telegram rejected the api_id/api_hash;
+    every other setup problem exits before the store is opened) --
+    record the CRITICAL alert `status` shows, naming the fix. Best
+    effort: it runs after the listener's writer has stopped, and a store
+    that cannot take this write has already said so; failing here only
+    means `status` shows an older state."""
     now_utc = _utcnow()
     try:
         conn = db.connect(db_path, role="writer")
@@ -199,17 +228,10 @@ def stamp_stop(db_path: Path, exit_code: int) -> None:
             heartbeats.beat(
                 conn, name=heartbeats.WATCH_STOPPED, now_utc=now_utc, detail=str(exit_code)
             )
-            if exit_code == EXIT_TERMINAL_AUTH:
+            if exit_code in _TELEGRAM_STOPS:
+                code, detail = _TELEGRAM_STOPS[exit_code]
                 alerts.record(
-                    conn,
-                    now_utc=now_utc,
-                    level="CRITICAL",
-                    code=TELEGRAM_SESSION_DEAD,
-                    detail=(
-                        "Telegram logged this session out (or it was revoked or used "
-                        "from two places at once). watch cannot record anything until "
-                        "you run `xaucopier setup-login` again."
-                    ),
+                    conn, now_utc=now_utc, level="CRITICAL", code=code, detail=detail
                 )
             conn.commit()
         finally:
@@ -341,6 +363,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if exit_code is not None:
                 stamp_stop(setup.db_path, exit_code)
                 print(f"watch stopped (exit code {exit_code}: {exit_codes.meaning(exit_code)}).")
+                if exit_code in _TELEGRAM_STOPS:
+                    print(_TELEGRAM_STOPS[exit_code][1], file=sys.stderr)
         finally:
             stop_logging()
             lock.release()
