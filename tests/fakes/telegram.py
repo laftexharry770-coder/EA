@@ -55,26 +55,39 @@ a trace; a logged one cannot hide.
 **`get_messages()` defaults to ONE message, as Telethon's does** --
 see its docstring. Omitting `limit` is a production bug the fake must
 reproduce, not paper over.
+
+**Edits and deletions (Task 10).** `emit_edit()` rewrites a message in
+history (new text, `edit_date` set) and `emit_delete()` removes one;
+each then fires the matching event (`MessageEdited`, `MessageDeleted`)
+under exactly the rules `emit()` follows for `NewMessage` -- not while
+disconnected, not during a blackout. History changes either way, which
+is what lets the poll's window re-read (`get_messages(ids=[...])`, which
+returns `None` for a deleted id, as Telethon does) find what the event
+stream dropped. Handlers are matched to events by the builder's *exact*
+type, as Telethon does (see `_filter_matches`): `MessageEdited`
+subclasses `NewMessage`, so an `isinstance` match would hand every new
+message to an edit handler too.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Literal
 
-from telethon import events
+from telethon import events, utils
 
 DeliveryRoute = Literal["event", "history"]
 
 #: `get_messages()` keyword arguments the fake implements. Every other
-#: Telethon keyword (`offset_id`, `ids`, `search`, `filter`, ...) changes
-#: what Telethon returns, so the fake refuses it rather than silently
+#: Telethon keyword (`offset_id`, `search`, `filter`, ...) changes what
+#: Telethon returns, so the fake refuses it rather than silently
 #: returning something production never would.
 _SUPPORTED_GET_MESSAGES_KWARGS = frozenset(
-    {"entity", "limit", "min_id", "max_id", "offset_date", "reverse", "wait_time"}
+    {"entity", "limit", "min_id", "max_id", "offset_date", "reverse", "wait_time", "ids"}
 )
 
 
@@ -164,6 +177,34 @@ class FakeNewMessageEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class FakeMessageEditedEvent(FakeNewMessageEvent):
+    """Stand-in for `events.MessageEdited.Event`, which in Telethon is a
+    subclass of `NewMessage.Event` with nothing added
+    (telethon/events/messageedited.py). `message` is the message as it
+    reads *after* the edit, `edit_date` set."""
+
+
+@dataclass(frozen=True, slots=True)
+class FakeMessageDeletedEvent:
+    """Stand-in for `events.MessageDeleted.Event`.
+
+    For a channel, Telethon builds it from `UpdateDeleteChannelMessages`
+    with `peer=PeerChannel(channel_id)`, so `chat_id` is the marked
+    channel id, as on `NewMessage`; `deleted_ids` is every id the update
+    carried and `deleted_id` the first of them
+    (telethon/events/messagedeleted.py). There is no message: it is gone.
+    """
+
+    chat_id: int
+    deleted_ids: tuple[int, ...]
+    client: FakeTelegramClient | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def deleted_id(self) -> int | None:
+        return self.deleted_ids[0] if self.deleted_ids else None
+
+
+@dataclass(frozen=True, slots=True)
 class Delivery:
     """One message handed to the caller, and by which route."""
 
@@ -180,6 +221,10 @@ class GetMessagesCall:
     limit: int | None
     reverse: bool
     offset_date: datetime | None = None
+    #: The `ids=` a by-id read asked for, as passed; None for a history
+    #: read. For a by-id read `limit` is what Telethon uses, `len(ids)`,
+    #: and `min_id`/`max_id` are 0 (Telethon ignores them).
+    ids: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,7 +340,67 @@ class FakeTelegramClient:
                 f"FakeTelegramClient.get_messages() does not implement "
                 f"{sorted(unsupported)}; add it to the fake before relying on it"
             )
+        if kwargs.get("ids") is not None:
+            return self._read_ids(*args, **kwargs)
         return self._read_history(*args, **kwargs)
+
+    def _read_ids(
+        self,
+        entity: Any,
+        limit: int | None = None,
+        *,
+        ids: Any,
+        reverse: bool = False,
+        **ignored: Any,
+    ) -> Any:
+        """`get_messages(entity, ids=...)`, as Telethon 1.44 answers it.
+
+        telethon/client/messages.py, in substance:
+
+        - :526-537 -- `ids` takes precedence over everything else: a
+          scalar is wrapped in a list, and `_IDsIter` is built with
+          `limit=len(ids)`, so `limit`, `min_id`, `max_id`, `offset_date`
+          are all ignored (`**ignored` here);
+        - :288 -- `reverse=True` reverses the ids;
+        - :316-318 and :332-335 -- a `MessageEmpty` (a deleted or
+          never-existing id) becomes `None` in its place, so the result
+          zips one-to-one with the ids asked for, in the same order;
+        - :598-604 -- a scalar `ids` returns the one message (or `None`)
+          rather than a list.
+
+        `tests/test_fakes_telegram.py` runs the installed Telethon's own
+        `get_messages` against this history and compares, so the two
+        cannot drift. History is unaffected by a blackout, as always.
+        """
+        list_like = utils.is_list_like(ids)
+        wanted = list(ids) if list_like else [ids]
+        for message_id in wanted:
+            if isinstance(message_id, bool) or not isinstance(message_id, int):
+                raise TypeError(f"the fake models integer message ids only, got {message_id!r}")
+        self.calls.append("get_messages")
+        self.get_messages_calls.append(
+            GetMessagesCall(
+                entity=entity,
+                min_id=0,
+                max_id=0,
+                limit=len(wanted),
+                reverse=reverse,
+                ids=tuple(wanted),
+            )
+        )
+        if reverse:
+            wanted.reverse()
+        channel_id = self._channel_id_of(entity)
+        by_id = {message.id: message for message in self.history.get(channel_id, [])}
+        result = [by_id.get(message_id) for message_id in wanted]
+        for message in result:
+            if message is not None:
+                self.deliveries.append(
+                    Delivery(channel_id=channel_id, message_id=message.id, route="history")
+                )
+        if ids and not list_like:
+            return result[0]
+        return result
 
     def _read_history(
         self,
@@ -444,6 +549,77 @@ class FakeTelegramClient:
                 errors.append(exc)
         return invoked, errors
 
+    async def emit_edit(
+        self,
+        channel_id: int,
+        message_id: int,
+        text: str,
+        *,
+        edit_date: datetime,
+    ) -> bool:
+        """The poster edits message `message_id` to `text` at `edit_date`.
+
+        History always changes -- the edit really happened. The
+        `MessageEdited` event reaches handlers under the same rules as
+        `emit()`: not while disconnected, not during a blackout. Returns
+        True iff it was delivered as an update.
+
+        Refuses what Telegram cannot produce: an edit of a message the
+        channel does not have (`KeyError`), a naive `edit_date`, or one
+        before the message's own `date` (`ValueError`)."""
+        current = self._message(channel_id, message_id)
+        if edit_date.tzinfo is None or edit_date.utcoffset() is None:
+            raise ValueError(f"edit_date must be timezone-aware, got naive {edit_date!r}")
+        if edit_date < current.date:
+            raise ValueError(
+                f"edit_date {edit_date.isoformat()} is before the message's own date "
+                f"{current.date.isoformat()}"
+            )
+        edited = dataclasses.replace(current, message=text, edit_date=edit_date)
+        self.add_to_history(channel_id, edited)
+
+        if not self._connected or self._blackout:
+            return False
+        event = FakeMessageEditedEvent(chat_id=channel_id, message=edited, client=self)
+        delivered, errors = await self._dispatch_collecting(
+            event, filter_type=events.MessageEdited
+        )
+        if errors:
+            raise errors[0]
+        return delivered
+
+    async def emit_delete(self, channel_id: int, *message_ids: int) -> bool:
+        """The poster deletes `message_ids` from the channel: gone from
+        history (a by-id read returns `None` for them), and one
+        `MessageDeleted` event carrying them all reaches handlers under
+        `emit()`'s rules. Returns True iff it was delivered. Deleting a
+        message the channel does not have raises `KeyError`, before
+        anything is removed."""
+        for message_id in message_ids:
+            self._message(channel_id, message_id)
+        doomed = set(message_ids)
+        self.history[channel_id] = [
+            message for message in self.history[channel_id] if message.id not in doomed
+        ]
+
+        if not self._connected or self._blackout:
+            return False
+        event = FakeMessageDeletedEvent(
+            chat_id=channel_id, deleted_ids=tuple(message_ids), client=self
+        )
+        delivered, errors = await self._dispatch_collecting(
+            event, filter_type=events.MessageDeleted
+        )
+        if errors:
+            raise errors[0]
+        return delivered
+
+    def _message(self, channel_id: int, message_id: int) -> FakeMessage:
+        for message in self.history.get(channel_id, []):
+            if message.id == message_id:
+                return message
+        raise KeyError(f"channel {channel_id} has no message {message_id}")
+
     def add_to_history(self, channel_id: int, message: FakeMessage) -> None:
         """Put `message` in the channel's history without any update
         delivery at all -- a message that only ever existed as history,
@@ -499,7 +675,12 @@ class FakeTelegramClient:
 
     @staticmethod
     def _filter_matches(event_filter: Any, filter_type: type, channel_id: int | None) -> bool:
-        if event_filter is not None and not isinstance(event_filter, filter_type):
+        # The builder's exact type, as Telethon dispatches: `_dispatch_update`
+        # asks `built[type(builder)]` (telethon/client/updates.py:591), and
+        # each builder's `build()` accepts only its own update types.
+        # `isinstance` would be wrong: `MessageEdited` subclasses
+        # `NewMessage`, and would then receive every new message too.
+        if event_filter is not None and type(event_filter) is not filter_type:
             return False
 
         # Simplified `chats=` matching: integer ids only, no username

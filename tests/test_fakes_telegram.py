@@ -261,7 +261,7 @@ def test_fake_get_messages_resolves_limit_exactly_as_real_telethon(args, kwargs)
 
 
 def test_get_messages_refuses_arguments_it_does_not_implement() -> None:
-    """`offset_id`, `ids`, `search`, ... all change what Telethon returns.
+    """`offset_id`, `search`, ... all change what Telethon returns.
     Silently ignoring one would let a test pass against a fiction."""
 
     async def scenario():
@@ -544,3 +544,227 @@ def test_message_fields_are_tz_aware_utc() -> None:
     message = _msg(1)
     assert message.date.tzinfo is not None
     assert message.date.utcoffset() == POSTED.utcoffset()
+
+
+# -- get_messages(ids=...): Task 10's window re-read ---------------------------
+
+
+class _RealIdsStub:
+    """Stands in for `self` so Telethon 1.44's real `get_messages` /
+    `iter_messages` / `_IDsIter` run offline against the fake's history.
+
+    `_IDsIter` resolves the entity (`get_input_entity`), sends one
+    `channels.GetMessagesRequest` per 100 ids, and turns each
+    `MessageEmpty` Telegram answers for a deleted id into `None`
+    (telethon/client/messages.py:285-338). This stub answers that request
+    the way Telegram does -- a `Message` per existing id, a
+    `MessageEmpty` per missing one, in the requested order -- so the
+    *real* library code decides the shape of the result, and the fake is
+    compared against it rather than against a copy of it."""
+
+    _self_id = 1
+
+    class _Cache:
+        def get(self, *args, **kwargs):
+            return None
+
+    _mb_entity_cache = _Cache()
+
+    def __init__(self, fake: FakeTelegramClient, channel_id: int) -> None:
+        self._by_id = {m.id: m for m in fake.history.get(channel_id, [])}
+        self.requests = 0
+
+    async def get_input_entity(self, entity):
+        from telethon.tl import types
+
+        return types.InputPeerChannel(channel_id=1111111111, access_hash=0)
+
+    async def __call__(self, request):
+        from telethon.tl import types
+
+        self.requests += 1
+        peer = types.PeerChannel(1111111111)
+        answered = []
+        for wanted in request.id:
+            wanted = getattr(wanted, "id", wanted)
+            message = self._by_id.get(wanted)
+            if message is None:
+                answered.append(types.MessageEmpty(id=wanted, peer_id=peer))
+            else:
+                answered.append(
+                    types.Message(
+                        id=wanted, peer_id=peer, date=message.date, message=message.message
+                    )
+                )
+        return types.messages.ChannelMessages(
+            pts=1, count=len(answered), messages=answered, chats=[], users=[], topics=[]
+        )
+
+    def iter_messages(self, *args, **kwargs):
+        return MessageMethods.iter_messages(self, *args, **kwargs)
+
+
+def _ids_of(result):
+    if isinstance(result, list):
+        return [None if m is None else m.id for m in result]
+    return None if result is None else result.id
+
+
+_IDS_CALL_SHAPES = [
+    pytest.param({"ids": [5, 4, 3, 1]}, id="list-with-deleted"),
+    pytest.param({"ids": (2, 9, 3)}, id="tuple-with-never-existed"),
+    pytest.param({"ids": [5, 4, 3], "limit": 1}, id="limit-is-ignored"),
+    pytest.param({"ids": [5, 4, 3], "min_id": 4}, id="min_id-is-ignored"),
+    pytest.param({"ids": [1, 2, 3], "reverse": True}, id="reverse-reverses-the-ids"),
+    pytest.param({"ids": 3}, id="scalar-present"),
+    pytest.param({"ids": 4}, id="scalar-deleted"),
+    pytest.param({"ids": []}, id="empty"),
+]
+
+
+@pytest.mark.parametrize("kwargs", _IDS_CALL_SHAPES)
+def test_fake_get_messages_ids_matches_real_telethon(kwargs) -> None:
+    """A list in, a list out, the same order, `None` where a message is
+    missing or deleted; a scalar in, one message (or `None`) out; every
+    other argument ignored -- exactly what the installed Telethon does."""
+    history = [_msg(1), _msg(2), _msg(3), _msg(5)]  # 4 was deleted
+
+    async def scenario():
+        fake = FakeTelegramClient(history={CHANNEL: history})
+        real = await MessageMethods.get_messages(
+            _RealIdsStub(fake, CHANNEL), CHANNEL, **dict(kwargs)
+        )
+        mine = await fake.get_messages(CHANNEL, **dict(kwargs))
+        return real, mine
+
+    real, mine = asyncio.run(scenario())
+
+    assert _ids_of(mine) == _ids_of(real)
+    assert isinstance(mine, list) == isinstance(real, list)
+
+
+def test_get_messages_ids_records_the_call_and_the_history_deliveries() -> None:
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL: [_msg(1), _msg(3)]})
+        result = await client.get_messages(CHANNEL, ids=[3, 2, 1])
+        return result, client.get_messages_calls, client.deliveries, client.calls
+
+    result, calls, deliveries, call_log = asyncio.run(scenario())
+
+    assert _ids_of(result) == [3, None, 1]
+    assert [(c.entity, c.ids, c.limit) for c in calls] == [(CHANNEL, (3, 2, 1), 3)]
+    assert [(d.message_id, d.route) for d in deliveries] == [(3, "history"), (1, "history")]
+    assert call_log == ["get_messages"]
+
+
+def test_get_messages_ids_still_refuses_arguments_it_does_not_implement() -> None:
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL: [_msg(1)]})
+        with pytest.raises(NotImplementedError, match="search"):
+            await client.get_messages(CHANNEL, ids=[1], search="x")
+
+    asyncio.run(scenario())
+
+
+# -- edits and deletions --------------------------------------------------------
+
+
+EDITED_AT = datetime(2026, 9, 5, 10, 50, tzinfo=UTC)
+
+
+def test_emit_edit_updates_history_and_reaches_only_message_edited_handlers() -> None:
+    """Telethon dispatches by the *builder's type*
+    (telethon/client/updates.py:591, `built[type(builder)]`), and each
+    builder's `build()` accepts only its own updates -- `MessageEdited`
+    takes the edit updates, `NewMessage` the new-message ones.
+    `MessageEdited` subclasses `NewMessage`, so an `isinstance` filter
+    would wrongly hand every new message to an edit handler too."""
+
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL: [_msg(1, "before")]})
+        new_seen, on_new = _collector()
+        edit_seen, on_edit = _collector()
+        client.add_event_handler(on_new, events.NewMessage())
+        client.add_event_handler(on_edit, events.MessageEdited())
+        await client.connect()
+        delivered = await client.emit_edit(CHANNEL, 1, "after", edit_date=EDITED_AT)
+        await client.emit(CHANNEL, _msg(2))
+        (current,) = await client.get_messages(CHANNEL, ids=[1])
+        return delivered, new_seen, edit_seen, current
+
+    delivered, new_seen, edit_seen, current = asyncio.run(scenario())
+
+    assert delivered is True
+    assert [e.message.id for e in new_seen] == [2]
+    assert [
+        (e.chat_id, e.message.id, e.message.message, e.message.edit_date) for e in edit_seen
+    ] == [(CHANNEL, 1, "after", EDITED_AT)]
+    assert (current.message, current.edit_date, current.date) == ("after", EDITED_AT, POSTED)
+
+
+def test_emit_delete_removes_from_history_and_reaches_only_message_deleted_handlers() -> None:
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL: [_msg(1), _msg(2), _msg(3)]})
+        new_seen, on_new = _collector()
+        deleted_seen, on_deleted = _collector()
+        client.add_event_handler(on_new, events.NewMessage())
+        client.add_event_handler(on_deleted, events.MessageDeleted())
+        await client.connect()
+        delivered = await client.emit_delete(CHANNEL, 1, 3)
+        by_id = await client.get_messages(CHANNEL, ids=[1, 2, 3])
+        return delivered, new_seen, deleted_seen, by_id
+
+    delivered, new_seen, deleted_seen, by_id = asyncio.run(scenario())
+
+    assert delivered is True
+    assert new_seen == []
+    (event,) = deleted_seen
+    assert (event.chat_id, list(event.deleted_ids), event.deleted_id) == (CHANNEL, [1, 3], 1)
+    assert _ids_of(by_id) == [None, 2, None]
+
+
+@pytest.mark.parametrize("outage", ["blackout", "dropped"])
+def test_edits_and_deletions_during_an_outage_change_history_but_are_not_delivered(
+    outage: str,
+) -> None:
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL: [_msg(1), _msg(2)]})
+        seen, handler = _collector()
+        client.add_event_handler(handler, events.MessageEdited())
+        client.add_event_handler(handler, events.MessageDeleted())
+        await client.connect()
+        if outage == "blackout":
+            client.start_blackout()
+        else:
+            await client.drop_connection()
+        edited = await client.emit_edit(CHANNEL, 1, "after", edit_date=EDITED_AT)
+        deleted = await client.emit_delete(CHANNEL, 2)
+        by_id = await client.get_messages(CHANNEL, ids=[1, 2])
+        return edited, deleted, seen, by_id
+
+    edited, deleted, seen, by_id = asyncio.run(scenario())
+
+    assert (edited, deleted) == (False, False)
+    assert seen == []
+    assert by_id[0].message == "after" and by_id[1] is None
+
+
+def test_emit_edit_and_delete_refuse_what_telegram_could_not_produce() -> None:
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL: [_msg(1)]})
+        await client.connect()
+        with pytest.raises(KeyError):
+            await client.emit_edit(CHANNEL, 99, "x", edit_date=EDITED_AT)
+        with pytest.raises(KeyError):
+            await client.emit_delete(CHANNEL, 99)
+        with pytest.raises(ValueError, match="naive"):
+            await client.emit_edit(CHANNEL, 1, "x", edit_date=datetime(2026, 9, 5, 11, 0))
+        with pytest.raises(ValueError, match="before"):
+            await client.emit_edit(
+                CHANNEL, 1, "x", edit_date=datetime(2026, 9, 5, 10, 0, tzinfo=UTC)
+            )
+        # A refused call changed nothing.
+        (unchanged,) = await client.get_messages(CHANNEL, ids=[1])
+        assert unchanged == _msg(1)
+
+    asyncio.run(scenario())
