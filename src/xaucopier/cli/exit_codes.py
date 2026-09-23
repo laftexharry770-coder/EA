@@ -7,8 +7,9 @@ a condition a restart cannot fix, so restarting on it would loop forever
 (the reason 5 exists: before it, a missing database folder exited 4 and
 a supervisor would have restarted it hot, for ever).
 
-`--help` and docs/RUNBOOK.md print `MEANINGS`, so the three can never
-disagree about a number.
+`--help` prints `MEANINGS`; docs/RUNBOOK.md has the same table in the
+user's words, and tests/test_runbook.py fails if its codes and these
+ever differ.
 """
 from __future__ import annotations
 
