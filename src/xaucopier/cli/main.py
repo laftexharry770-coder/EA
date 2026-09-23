@@ -66,11 +66,38 @@ def _prompt_login_code() -> str:
     return input("Enter the login code Telegram just sent you: ").strip()
 
 
+#: How many times a blank answer at the 2FA prompt is asked again.
+_PASSWORD_TRIES = 3
+
+
+class BlankPasswordError(Exception):
+    """The two-step verification password was left blank `_PASSWORD_TRIES`
+    times in a row."""
+
+
 def _prompt_2fa_password() -> str:
-    return getpass.getpass(
-        "Enter your Telegram 2FA (cloud) password, or leave blank if you "
-        "don't have one: "
-    )
+    """Ask for the two-step verification password.
+
+    Telethon only calls this when the account HAS two-step verification
+    on, so a blank answer is never right here -- and it is dangerous:
+    Telethon takes an empty password as "no password", asks Telegram to
+    send a new login code instead of checking one, and returns from
+    `start()` as if the login had worked. So a blank is refused and asked
+    again, and after `_PASSWORD_TRIES` blanks the login gives up
+    (`BlankPasswordError`)."""
+    for _ in range(_PASSWORD_TRIES):
+        password = getpass.getpass(
+            "This Telegram account has two-step verification turned on. "
+            "Enter its password (it will not be shown): "
+        )
+        if password:
+            return password
+        print(
+            "The password cannot be blank: this account has two-step verification "
+            "on, so Telegram needs it.",
+            file=sys.stderr,
+        )
+    raise BlankPasswordError
 
 
 def login_failure(exc: BaseException) -> tuple[int, str]:
@@ -118,6 +145,13 @@ def login_failure(exc: BaseException) -> tuple[int, str]:
             f"{_AGAIN[0].upper()}{_AGAIN[1:]} and type the newest code Telegram sends to "
             "your Telegram app."
         )
+    if isinstance(exc, BlankPasswordError):
+        return exit_codes.EXIT_FAILED, (
+            "This account has two-step verification turned on, so Telegram needs its "
+            f"password, and it was left blank {_PASSWORD_TRIES} times. Find it (or reset "
+            "it) in Telegram -> Settings -> Privacy and Security -> Two-Step "
+            f"Verification, then {_AGAIN}."
+        )
     if isinstance(exc, errors.PasswordHashInvalidError):
         return exit_codes.EXIT_FAILED, (
             "The 2FA password was wrong 3 times. "
@@ -150,8 +184,9 @@ def login_failure(exc: BaseException) -> tuple[int, str]:
         )
     if isinstance(exc, EOFError):
         return exit_codes.EXIT_FAILED, (
-            "No answer could be read: the input was closed. Run setup-login in an "
-            "ordinary PowerShell window and type the answers there."
+            "No answer could be read: the input was closed. Run "
+            f"`{paths.USER_COMMAND} setup-login` in an ordinary PowerShell window and "
+            "type the answers there."
         )
     # Telegram's own error text is fixed wording; anything else might hold
     # something the user typed, so only its type is named.
@@ -197,7 +232,21 @@ async def _run_setup_login(path: Path) -> int:
         return exit_codes.EXIT_FAILED
 
     api_hash = getpass.getpass("api_hash (hidden): ").strip()
+    if not api_hash:
+        print(
+            "The api_hash was empty. Paste the api_hash shown at https://my.telegram.org "
+            f"(nothing appears while you paste; that is normal). Nothing was saved; {_AGAIN}.",
+            file=sys.stderr,
+        )
+        return exit_codes.EXIT_FAILED
     phone = input("Phone number, with country code (e.g. +15551234567): ").strip()
+    if not phone:
+        print(
+            "The phone number was empty. Enter it starting with + and your country "
+            f"code, for example +2547..., with no spaces. Nothing was saved; {_AGAIN}.",
+            file=sys.stderr,
+        )
+        return exit_codes.EXIT_FAILED
 
     # A blank StringSession -- build_client() only needs api_id/api_hash
     # at this point; client.start() below is what actually produces a
@@ -212,8 +261,19 @@ async def _run_setup_login(path: Path) -> int:
                 code_callback=_prompt_login_code,
                 password=_prompt_2fa_password,
             )
+            # Defence in depth: `start()` returning is not proof of a login
+            # (a blank 2FA password made it return without one). Never save
+            # a session Telegram does not recognise as logged in.
+            authorized = await client.is_user_authorized()
         except Exception as exc:  # noqa: BLE001 -- every failure is explained, none escapes
             return _print_failure(exc)
+        if not authorized:
+            print(
+                "Telegram did not log this program in, although no error was reported. "
+                f"Nothing was saved; {_AGAIN}.",
+                file=sys.stderr,
+            )
+            return exit_codes.EXIT_FAILED
 
         session_string = client.session.save()
     finally:

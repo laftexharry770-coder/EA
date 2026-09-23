@@ -44,9 +44,12 @@ Type `.\xaucopier setup-login` and press Enter. It asks for, in order:
 3. **Phone number** — your own, starting with `+` and the country code.
 4. **The login code** — Telegram sends it **inside the Telegram app**, as a
    message from "Telegram". Type it in.
-5. **Your 2FA password** — only if you have turned on two-step verification
-   in Telegram. If you have not, just press Enter. Nothing appears while you
-   type.
+5. **Your two-step verification password** — this step **only appears if
+   two-step verification is turned on** for your Telegram account. If it
+   does not appear, there is nothing to do. If it does appear, you need that
+   password: it cannot be left blank. Nothing appears while you type. If you
+   have forgotten it, reset it in Telegram → *Settings → Privacy and
+   Security → Two-Step Verification*, then start step 2 again.
 
 When it says *Login succeeded*, open Telegram on your phone and go to
 **Settings → Devices**. You will see a new session called

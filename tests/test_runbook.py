@@ -26,6 +26,14 @@ def test_every_command_the_runbook_tells_the_user_to_type_exists() -> None:
     assert {"setup-login", "resolve-channels", "watch", "status", "ack"} <= typed
 
 
+def test_the_runbook_never_invites_a_blank_2fa_password() -> None:
+    step_2 = RUNBOOK.split("## 2.", 1)[1].split("## 3.", 1)[0]
+    password_step = step_2.split("5. **", 1)[1].split("\n\n", 1)[0]
+    assert "two-step verification" in password_step
+    assert "press Enter" not in password_step
+    assert "leave blank" not in step_2.lower() and "just press Enter" not in step_2
+
+
 def test_the_runbook_says_what_the_user_must_know() -> None:
     for phrase in (
         "never stores the login code, your 2FA password",
@@ -42,6 +50,10 @@ def test_the_runbook_says_what_the_user_must_know() -> None:
         "a second copy of the session was used somewhere else",
         # How to clear alerts, and which need action first.
         "ack --all",
+        # Fix round 2: the password step only appears with 2FA on, and then
+        # a blank answer is wrong -- never "just press Enter".
+        "two-step verification is turned on** for your Telegram account",
+        "it cannot be left blank",
         "TELEGRAM_SESSION_DEAD",
         "TELEGRAM_API_ID_REJECTED",
     ):

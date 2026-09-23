@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 from telethon import errors
+from telethon.tl import types
 from telethon.errors import SessionRevokedError
 
 import xaucopier.cli.main as cli_main
@@ -38,14 +39,18 @@ class _FakeClientSuccess:
     """Stands in for telethon.TelegramClient: start() "succeeds" without
     any network, and session.save() returns a fixed fake string."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, authorized: bool = True) -> None:
         self.session = _FakeSession(_FAKE_SESSION_AFTER_LOGIN)
         self.start_kwargs: dict[str, Any] = {}
         self.disconnected = False
+        self.authorized = authorized
 
     async def start(self, **kwargs: Any) -> "_FakeClientSuccess":
         self.start_kwargs = kwargs
         return self
+
+    async def is_user_authorized(self) -> bool:
+        return self.authorized
 
     async def disconnect(self) -> None:
         self.disconnected = True
@@ -295,7 +300,9 @@ def _real_client_offline(monkeypatch: pytest.MonkeyPatch, *, send_code=None, sig
     retry counting, its give-up errors) runs for real, offline."""
     from xaucopier.ingest.client import build_client
 
-    made: dict[str, Any] = {"sign_ins": [], "disconnected": False}
+    made: dict[str, Any] = {
+        "sign_ins": [], "disconnected": False, "code_requests": 0, "signed_in": False
+    }
 
     def build(blob):
         client = build_client(blob)
@@ -307,12 +314,25 @@ def _real_client_offline(monkeypatch: pytest.MonkeyPatch, *, send_code=None, sig
             return None  # not logged in yet
 
         async def send_code_request(*args: Any, **kwargs: Any) -> None:
+            made["code_requests"] += 1
             if send_code is not None:
                 raise send_code
 
-        async def sign_in_(*args: Any, **kwargs: Any) -> None:
+        async def sign_in_(*args: Any, **kwargs: Any) -> Any:
             made["sign_ins"].append(sorted(k for k, v in kwargs.items() if v))
-            raise sign_in(kwargs)
+            if not kwargs.get("code") and not kwargs.get("password"):
+                # Telethon's sign_in with neither (auth.py:331): it asks for
+                # a new code and returns the SentCode -- no login.
+                made["code_requests"] += 1
+                return object()
+            outcome = sign_in(kwargs)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            made["signed_in"] = True  # as Telethon's _on_login() would record
+            return outcome
+
+        async def is_user_authorized() -> bool:
+            return made["signed_in"]
 
         async def disconnect() -> None:
             made["disconnected"] = True
@@ -322,7 +342,9 @@ def _real_client_offline(monkeypatch: pytest.MonkeyPatch, *, send_code=None, sig
         monkeypatch.setattr(client, "get_me", get_me)
         monkeypatch.setattr(client, "send_code_request", send_code_request)
         monkeypatch.setattr(client, "sign_in", sign_in_)
+        monkeypatch.setattr(client, "is_user_authorized", is_user_authorized)
         monkeypatch.setattr(client, "disconnect", disconnect)
+        monkeypatch.setattr(client.session, "save", lambda: _FAKE_SESSION_AFTER_LOGIN)
         return client
 
     monkeypatch.setattr(cli_main, "build_client", build)
@@ -391,3 +413,117 @@ def test_telethon_still_gives_up_on_codes_with_the_words_we_match() -> None:
     from telethon.client import auth
 
     assert cli_main._THREE_WRONG_CODES in inspect.getsource(auth)
+
+
+# -- two-step verification: a blank password is never taken as "no password" ----------------
+#
+# Telethon only asks for the password when 2FA is on. Given a blank one,
+# its sign_in() asks Telegram to resend the code instead of checking a
+# password and returns without logging in -- and start() returned as if it
+# had: "Login succeeded", a saved session that is not logged in, and exit
+# 3 at the next command. Measured by the reviewer.
+
+_USER = types.User(id=777, first_name="Signed In")
+
+
+def _two_step(kwargs: dict[str, Any]) -> Any:
+    """The code is right; the account has 2FA; "right" is its password."""
+    if kwargs.get("code"):
+        return errors.SessionPasswordNeededError(request=None)
+    if kwargs.get("password") == "right":
+        return _USER
+    return errors.PasswordHashInvalidError(request=None)
+
+
+def test_a_blank_2fa_answer_is_asked_again_and_the_right_password_logs_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    made = _real_client_offline(monkeypatch, sign_in=_two_step)
+    _answers(monkeypatch, "builtins.input", [_FAKE_API_ID, _FAKE_PHONE, "12345"])
+    prompts: list[str] = []
+    answers = iter([_FAKE_API_HASH, "", "", "right"])
+
+    def getpass_(prompt: str = "") -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr("getpass.getpass", getpass_)
+    target = tmp_path / "session.dpapi"
+
+    assert cli_main.main(["setup-login", "--path", str(target)]) == 0
+
+    assert load(target).session_string == _FAKE_SESSION_AFTER_LOGIN
+    # The blanks never reached Telegram: one sign-in with the code, one with
+    # the password -- and only the one code request, never a resend.
+    assert made["sign_ins"] == [["code"], ["password", "phone"]]
+    assert made["code_requests"] == 1
+    password_prompts = prompts[1:]
+    assert len(password_prompts) == 3
+    for prompt in password_prompts:
+        assert "two-step verification" in prompt and "blank" not in prompt.lower()
+    assert "cannot be blank" in capsys.readouterr().err
+
+
+def test_three_blank_2fa_answers_give_up_and_save_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    made = _real_client_offline(monkeypatch, sign_in=_two_step)
+    _answers(monkeypatch, "builtins.input", [_FAKE_API_ID, _FAKE_PHONE, "12345"])
+    _answers(monkeypatch, "getpass.getpass", [_FAKE_API_HASH, "", "", ""])
+    target = tmp_path / "session.dpapi"
+
+    assert cli_main.main(["setup-login", "--path", str(target)]) == 1
+
+    assert not target.exists()
+    assert made["sign_ins"] == [["code"]] and made["code_requests"] == 1
+    assert made["disconnected"]
+    err = capsys.readouterr().err
+    assert "two-step verification turned on" in err and "left blank 3 times" in err
+    assert "Two-Step Verification" in err and "Nothing was saved" in err
+
+
+def test_a_start_that_returns_without_a_login_saves_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Defence in depth: whatever start() returned, a session Telegram does
+    not recognise as logged in is never saved."""
+    fake_client = _FakeClientSuccess(authorized=False)
+    monkeypatch.setattr(cli_main, "build_client", lambda blob: fake_client)
+    _answers(monkeypatch, "builtins.input", [_FAKE_API_ID, _FAKE_PHONE])
+    _answers(monkeypatch, "getpass.getpass", [_FAKE_API_HASH])
+    target = tmp_path / "session.dpapi"
+
+    assert cli_main.main(["setup-login", "--path", str(target)]) == 1
+
+    assert not target.exists()
+    assert fake_client.disconnected is True
+    captured = capsys.readouterr()
+    assert "did not log this program in" in captured.err
+    assert "Login succeeded" not in captured.out
+
+
+@pytest.mark.parametrize(
+    ("answers", "words"),
+    [
+        ([_FAKE_API_ID, ""], "The phone number was empty"),
+        ([_FAKE_API_ID], "The api_hash was empty"),
+    ],
+    ids=["empty phone", "empty api_hash"],
+)
+def test_an_empty_answer_is_explained_before_anything_is_sent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    answers: list[str],
+    words: str,
+) -> None:
+    monkeypatch.setattr(
+        cli_main, "build_client",
+        lambda blob: (_ for _ in ()).throw(AssertionError("a client was built")),
+    )
+    _answers(monkeypatch, "builtins.input", answers)
+    _answers(monkeypatch, "getpass.getpass", ["" if "api_hash" in words else _FAKE_API_HASH])
+
+    assert cli_main.main(["setup-login", "--path", str(tmp_path / "s.dpapi")]) == 1
+    err = capsys.readouterr().err
+    assert words in err and "Traceback" not in err
