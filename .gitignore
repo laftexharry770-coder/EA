@@ -6,3 +6,7 @@ __pycache__/
 config/secrets*
 *.session
 *.dpapi
+# the recordings database and the watch log (xaucopier watch); the folder
+# itself ships so the default --db location always exists
+data/*
+!data/.gitkeep

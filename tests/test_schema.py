@@ -15,7 +15,7 @@ from xaucopier.store.migrations import CURRENT_VERSION, migrate
 
 EXPECTED_TABLES = {
     "messages", "signals", "followups", "outbox",
-    "channel_state", "metrics", "alerts",
+    "channel_state", "metrics", "alerts", "heartbeats",
 }
 
 
@@ -80,7 +80,8 @@ def test_no_extra_tables_beyond_the_brief(tmp_path):
     """Plan 3 adds legs, fills, account_state -- not Plan 2. (`alerts`
     moved into Plan 2 with Task 10's migration 2: edits and deletions
     must be able to record an operator alert durably before Plan 3's
-    notifier exists.)"""
+    notifier exists. `heartbeats` is Task 11's migration 3: `status`
+    runs in another process and can only report what `watch` stamped.)"""
     conn = _connect(tmp_path)
     tables = {
         row[0]
@@ -403,8 +404,8 @@ def _columns(conn, table):
     return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
 
 
-def test_current_version_is_two():
-    assert CURRENT_VERSION == 2
+def test_current_version_is_three():
+    assert CURRENT_VERSION == 3
 
 
 def test_upgrading_a_version_1_database_to_2_preserves_every_row(tmp_path):
@@ -415,7 +416,7 @@ def test_upgrading_a_version_1_database_to_2_preserves_every_row(tmp_path):
     migrate(conn)
 
     (version,) = conn.execute("PRAGMA user_version").fetchone()
-    assert version == 2
+    assert version == CURRENT_VERSION
     assert _dump(conn) == before
     # followup_id survives the table rebuild, so outbox.followup_id still
     # points at the same follow-up.
@@ -447,7 +448,7 @@ def test_migration_2_is_idempotent(tmp_path):
     conn = sqlite3.connect(db_path)
     migrate(conn)  # a fresh connection, likewise
     (version,) = conn.execute("PRAGMA user_version").fetchone()
-    assert version == 2
+    assert version == CURRENT_VERSION
     assert _dump(conn) == after_first
     conn.close()
 
@@ -485,15 +486,16 @@ def test_migration_2_rolls_back_whole_on_a_failure_after_the_rebuild(tmp_path, m
 
     migrate(conn)  # and the next, unpatched, attempt completes
     (version,) = conn.execute("PRAGMA user_version").fetchone()
-    assert version == 2
+    assert version == CURRENT_VERSION
     assert _dump(conn) == before
     conn.close()
 
 
-def test_a_fresh_database_goes_straight_to_version_2(tmp_path):
+def test_a_fresh_database_goes_straight_to_the_current_version(tmp_path):
     conn = _connect(tmp_path)
     (version,) = conn.execute("PRAGMA user_version").fetchone()
-    assert version == 2
+    assert version == CURRENT_VERSION
+    assert {"name", "at_utc", "detail"} == set(_columns(conn, "heartbeats"))
     assert "edit_seq" in _columns(conn, "followups")
     assert {"deleted_at_utc", "deleted_detected_by"} <= set(_columns(conn, "messages"))
     assert {"withdrawn_at_utc", "first_trade_hash"} <= set(_columns(conn, "signals"))
@@ -525,4 +527,84 @@ def test_followups_are_unique_per_message_and_edit_seq(tmp_path):
             "INSERT INTO followups (channel_id, message_id, op, parsed_json, edit_seq) "
             "VALUES (1, 200, 'amend_tp', '{}', 2)"
         )
+    conn.close()
+
+
+# -- migration 3 (Task 11): heartbeats ------------------------------------------
+
+
+def _v2_database(db_path):
+    """A version-1 database upgraded to exactly version 2 (migration 3
+    withheld), holding a row in every table and one alert."""
+    import xaucopier.store.migrations as migrations_module
+
+    conn = _v1_database(db_path)
+    conn.isolation_level = None
+    conn.execute("BEGIN")
+    for statement in migrations_module._migration_2_statements():
+        conn.execute(statement)
+    conn.execute("PRAGMA user_version = 2")
+    conn.execute("COMMIT")
+    conn.isolation_level = ""
+    conn.execute(
+        "INSERT INTO alerts (created_at_utc, level, code, detail) "
+        "VALUES ('2026-09-10T00:00:00+00:00', 'CRITICAL', 'X', 'an alert')"
+    )
+    conn.commit()
+    return conn
+
+
+def test_upgrading_a_version_2_database_to_3_preserves_every_row(tmp_path):
+    conn = _v2_database(tmp_path / "store.db")
+    before = _dump(conn)
+    alerts_before = conn.execute("SELECT * FROM alerts").fetchall()
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "heartbeats" not in tables
+
+    migrate(conn)
+
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 3
+    assert _dump(conn) == before
+    assert conn.execute("SELECT * FROM alerts").fetchall() == alerts_before
+    assert conn.execute("SELECT COUNT(*) FROM heartbeats").fetchone() == (0,)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert tables == EXPECTED_TABLES
+    conn.close()
+
+
+def test_migration_3_rolls_back_whole_on_a_failure(tmp_path, monkeypatch):
+    import xaucopier.store.migrations as migrations_module
+
+    conn = _v2_database(tmp_path / "store.db")
+    before = _dump(conn)
+    real = migrations_module._migration_3_statements
+    monkeypatch.setattr(
+        migrations_module,
+        "_migration_3_statements",
+        lambda: (*real(), "CREATE TABLE this is not valid sql"),
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        migrations_module.migrate(conn)
+    monkeypatch.undo()
+
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 2
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "heartbeats" not in tables
+    assert _dump(conn) == before
+
+    migrate(conn)
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 3
+    conn.close()
+
+
+def test_heartbeats_are_one_row_per_name(tmp_path):
+    conn = _connect(tmp_path)
+    conn.execute("INSERT INTO heartbeats (name, at_utc) VALUES ('a', 't1')")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO heartbeats (name, at_utc) VALUES ('a', 't2')")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO heartbeats (name, at_utc) VALUES ('b', NULL)")
     conn.close()

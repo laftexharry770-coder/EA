@@ -38,6 +38,15 @@ Every `interval` (5 s) the poll runs one *round*:
    handling below, and it never moves the pointer. Edits and deletions
    it finds are counted in `edit_missed_by_eventstream` /
    `delete_missed_by_eventstream`.
+5. **Stamp the round** (Task 11): one writer job records
+   `heartbeats.POLL_ROUND` ("N of M channel(s) read") and, for each
+   channel whose forward read succeeded this round, its
+   `channel_read:<id>` stamp. `xaucopier status` runs in another process
+   and reads these to say whether `watch` is alive and whether Telegram
+   is still answering. A stamp that fails to write is logged and the
+   poll carries on -- a missing stamp makes `status` look stale, never
+   makes a message go missing -- except a `WriterDeadError`, which stops
+   the poll like any other.
 
 Why 5 s and not 30: spec section 9 G6 gates a signal on its own
 timestamp, and the Plan 1 review found that a slow poll behind a tight
@@ -77,8 +86,8 @@ listener) at once:
   write goes through the listener's writer door, which stops the
   listener on the first one, whoever meets it. The poll re-raises the
   deaths that reach it -- from the probe, a first-run seed's pointer
-  write, or the metric write -- rather than carrying on with a round
-  that can record nothing. A death met *inside* a read's ingest does not
+  write, the metric write, or the round stamp -- rather than carrying on
+  with a round that can record nothing. A death met *inside* a read's ingest does not
   reach it: `ingest_history()` records that message as failed and ends
   the batch, and the read returns normally. The listener still stops,
   through the writer door; the poll simply finishes its round first.
@@ -124,7 +133,7 @@ from xaucopier.ingest.edits import (
     validate_window,
 )
 from xaucopier.ingest.listener import DEFAULT_RPC_TIMEOUT, HistoryIngest, Listener
-from xaucopier.store import db
+from xaucopier.store import db, heartbeats
 
 logger = logging.getLogger(__name__)
 
@@ -223,10 +232,33 @@ class HistoryPoll:
         while True:
             await self.sleep(self.interval)
             await self._probe_writer(listener)
-            for channel in listener.enabled_channels:
-                await self._poll_channel(
+            channels = listener.enabled_channels
+            read: list[int] = []
+            for channel in channels:
+                if await self._poll_channel(
                     listener, channel, flood_until, TERMINAL_AUTH_ERRORS, absences
-                )
+                ):
+                    read.append(channel.channel_id)
+            await self._stamp_round(listener, read=tuple(read), total=len(channels))
+
+    async def _stamp_round(
+        self, listener: Listener, *, read: tuple[int, ...], total: int
+    ) -> None:
+        """Step 5: record that this round finished, and which channels it
+        read, for `xaucopier status`. One writer job. Never raises except
+        `WriterDeadError` (and cancellation): a stamp is a report, and
+        failing to write one must not stop the poll that recovers trades."""
+        beats: dict[str, str | None] = {
+            heartbeats.POLL_ROUND: f"{len(read)} of {total} channel(s) read"
+        }
+        for channel_id in read:
+            beats[heartbeats.channel_read_name(channel_id)] = None
+        try:
+            await listener.record_heartbeats(beats)
+        except db.WriterDeadError:
+            raise
+        except Exception:  # noqa: BLE001 -- a lost stamp only makes status look stale
+            logger.exception("could not record the poll round for `status`; carrying on")
 
     async def _probe_writer(self, listener: Listener) -> None:
         try:
@@ -244,12 +276,13 @@ class HistoryPoll:
         flood_until: dict[tuple[str, int], float],
         terminal_errors: tuple[type[Exception], ...],
         absences: AbsenceTracker,
-    ) -> None:
+    ) -> bool:
         """One channel's step: its forward history read, then -- only if
         that read succeeded this round -- its window re-read. Each is
         guarded on its own (`_guarded`), so a flood wait on one never
-        defers the other. Never raises, except for the three stop
-        conditions (and cancellation)."""
+        defers the other. Returns whether the forward read succeeded.
+        Never raises, except for the three stop conditions (and
+        cancellation)."""
         read = await self._guarded(
             channel,
             flood_until,
@@ -258,7 +291,7 @@ class HistoryPoll:
             action=lambda: self._forward_read(listener, channel),
         )
         if not read:
-            return
+            return False
         await self._guarded(
             channel,
             flood_until,
@@ -272,6 +305,7 @@ class HistoryPoll:
                 absences=absences,
             ),
         )
+        return True
 
     async def _forward_read(self, listener: Listener, channel: ChannelCfg) -> None:
         results = await listener.read_history(

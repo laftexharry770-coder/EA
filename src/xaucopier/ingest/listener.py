@@ -112,7 +112,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -122,7 +122,7 @@ from telethon import events
 
 from xaucopier.config.accounts import AccountCfg
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.store import alerts, db, edits_repo, messages_repo, metrics
+from xaucopier.store import alerts, db, edits_repo, heartbeats, messages_repo, metrics
 from xaucopier.store.edits_repo import DeletionResult, EditResult
 from xaucopier.store.messages_repo import IngestResult
 
@@ -356,8 +356,9 @@ class Listener:
     `channel_cfg_for()`, `read_last_processed_message_id()`,
     `read_history()`, `ingest_history()`, `ingest_message()`,
     `ingest_edit()`, `ingest_deletion()`, `history_lock()`,
-    `record_handler_error()`, `record_alert()`, `probe_writer()`, `record_metric()` and
-    `poll_hook` -- rather than reaching into the internals. The poll
+    `record_handler_error()`, `record_alert()`, `probe_writer()`,
+    `record_metric()`, `record_heartbeats()` and `poll_hook` -- rather
+    than reaching into the internals. The poll
     (`ingest/poll.py`) is `read_history(channel, source="poll",
     limit=..., rpc_timeout=...)`: it is the one place the pointer is
     read, fetched from and advanced. Its window re-read
@@ -854,6 +855,21 @@ class Listener:
             metrics.bump(conn, day_key=day_key, name=name, value=value)
 
         await self._run_on_writer(bump)
+
+    async def record_heartbeats(self, beats: Mapping[str, str | None]) -> None:
+        """Stamp every `name -> detail` in `beats` at this listener's
+        injected "now" (`store.heartbeats.beat`), in one writer job -- so a
+        round's stamps land together or not at all. Through
+        `_run_on_writer()`, so a dead writer stops the listener here too.
+        `xaucopier status` reads them from its own process."""
+        now_utc = self._now()
+        items = tuple(beats.items())
+
+        def job(conn: Connection) -> None:
+            for name, detail in items:
+                heartbeats.beat(conn, name=name, now_utc=now_utc, detail=detail)
+
+        await self._run_on_writer(job)
 
     async def record_alert(
         self,

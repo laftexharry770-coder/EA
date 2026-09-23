@@ -54,7 +54,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, TypeVar
 
-from xaucopier.store.migrations import migrate
+from xaucopier.store.migrations import CURRENT_VERSION, migrate
 
 Role = Literal["writer", "reader"]
 
@@ -87,6 +87,49 @@ def connect(path: Path, *, role: Role) -> sqlite3.Connection:
     conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
     conn.execute(f"PRAGMA synchronous = {'FULL' if role == 'writer' else 'NORMAL'}")
     migrate(conn)
+    return conn
+
+
+class SchemaVersionError(RuntimeError):
+    """`connect_readonly()` found a database whose schema is not the one
+    this code reads. It never migrates (that would be a write), so the
+    caller must say what to do instead: run `watch` once to upgrade it."""
+
+
+def connect_readonly(path: Path) -> sqlite3.Connection:
+    """A connection that **cannot** write to the store at `path` -- for
+    `xaucopier status` and `export-fixtures`, which only report.
+
+    `connect(role="reader")` is not read-only in that sense: it creates a
+    missing file, sets `journal_mode` (a write on a new file), runs
+    `migrate()` (a write on an older one), and as a read-write connection
+    it checkpoints the WAL into the main file when it is the last one to
+    close. This one opens the file with SQLite's `mode=ro`, so the library
+    itself refuses every write ("attempt to write a readonly database"),
+    and sets `query_only` on top. SQLite may still create an empty `-wal`
+    and the `-shm` index beside a WAL database it reads; neither holds
+    data, and the main file is never touched.
+
+    Raises `FileNotFoundError` for a missing file (it is never created)
+    and `SchemaVersionError` for a schema other than `CURRENT_VERSION`
+    (it is never migrated).
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"no database at {path}")
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA query_only = ON")
+        (version,) = conn.execute("PRAGMA user_version").fetchone()
+        if version != CURRENT_VERSION:
+            raise SchemaVersionError(
+                f"the database at {path} is at schema version {version}; this "
+                f"version of xaucopier reads version {CURRENT_VERSION}"
+            )
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 

@@ -1,10 +1,20 @@
 """xaucopier command-line entry point.
 
-Task 7 adds exactly one subcommand: `setup-login`, the one-time
-interactive Telegram login that produces the DPAPI-encrypted secrets
-blob every later command (Task 11) depends on. It is built on an
-`argparse` subparser precisely so later commands slot in beside it
-without touching this wiring.
+The commands, in the order the user runs them (docs/RUNBOOK.md):
+
+- `setup-login` (Task 7) -- the one-time interactive Telegram login that
+  produces the DPAPI-encrypted session every other Telegram command uses.
+- `resolve-channels` (`cli/resolve.py`) -- look up each placeholder
+  channel's numeric id once and write it into `config/channels.toml`.
+- `watch` (`cli/watch.py`) -- the deliverable: record every signal,
+  place no order. Nothing reachable from here imports `MetaTrader5`.
+- `status` (`cli/status.py`) -- a read-only report on what `watch` has
+  recorded and whether it is healthy.
+- `export-fixtures` (`cli/fixtures.py`) -- write every recorded message
+  out as a replay fixture for the Plan 1 harness.
+
+Every exit code any of them returns is in `cli/exit_codes.py`, and is
+printed at the bottom of `--help`.
 
 **The login is interactive and cannot be automated.** `setup-login`
 prompts for `api_id`/`api_hash`/phone directly in the console via
@@ -24,6 +34,8 @@ import getpass
 import sys
 from pathlib import Path
 
+from xaucopier.cli import exit_codes, paths
+from xaucopier.cli.watch import cmd_watch
 from xaucopier.ingest.client import EXIT_TERMINAL_AUTH, TERMINAL_AUTH_ERRORS, build_client
 from xaucopier.ingest.secrets import DEFAULT_SECRETS_PATH, SecretsBlob, save
 
@@ -115,6 +127,7 @@ async def _run_setup_login(path: Path) -> int:
         "see a session named 'XAUCOPIER-TRADEBOX'. If you don't see it, "
         "something is wrong -- do not proceed to run the listener."
     )
+    print("Next: run `xaucopier resolve-channels`.")
     return 0
 
 
@@ -123,8 +136,43 @@ def _cmd_setup_login(args: argparse.Namespace) -> int:
     return asyncio.run(_run_setup_login(path))
 
 
+def _add_config_dir(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config-dir",
+        type=Path,
+        default=paths.DEFAULT_CONFIG_DIR,
+        help="Folder holding channels.toml and accounts.toml (default: %(default)s).",
+    )
+
+
+def _add_db(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=paths.DEFAULT_DB_PATH,
+        help="The recordings database (default: %(default)s).",
+    )
+
+
+def _add_secrets(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--secrets",
+        type=Path,
+        default=DEFAULT_SECRETS_PATH,
+        help="The encrypted Telegram session written by setup-login (default: %(default)s).",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="xaucopier")
+    parser = argparse.ArgumentParser(
+        prog="xaucopier",
+        description=(
+            "Records XAUUSD signals from Telegram. This version is WATCH-ONLY: "
+            "it places no orders. Start with docs/RUNBOOK.md."
+        ),
+        epilog=exit_codes.help_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     setup_login = subparsers.add_parser(
@@ -138,6 +186,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the secrets file path (default: config/secrets/session.dpapi).",
     )
     setup_login.set_defaults(func=_cmd_setup_login)
+
+    watch = subparsers.add_parser(
+        "watch",
+        help="Record every signal from the switched-on channels. Places NO orders.",
+        description=(
+            "Connects to Telegram and records every message from the channels "
+            "switched on in channels.toml, checking the channel's history every 5 "
+            "seconds for anything the live feed drops. WATCH-ONLY: it places no "
+            "orders and contains no code that could. Runs until stopped (Ctrl+C)."
+        ),
+        epilog=exit_codes.help_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_config_dir(watch)
+    _add_db(watch)
+    _add_secrets(watch)
+    watch.set_defaults(func=cmd_watch)
 
     return parser
 

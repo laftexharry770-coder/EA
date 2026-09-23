@@ -78,7 +78,7 @@ mode. (The newer 3.12+ ``conn.autocommit`` attribute would work too;
 arbitrary prior value with a plain assignment, which keeps the
 save/restore symmetric without caring which mode the caller was in.)
 
-Future schema changes add a branch below (``if current == 2: ...``)
+Future schema changes add a branch below (``if current == 3: ...``)
 and bump ``CURRENT_VERSION``; existing databases upgrade in place the
 next time ``migrate()`` runs against them. Every step a database needs
 runs inside the *same* transaction as the one ``user_version`` write, so
@@ -122,13 +122,24 @@ all in :data:`_MIGRATION_2`:
   copy of the *pre-edit* call as the same trade (``signals_repo.
   find_relay_duplicate`` matches either). Existing rows get
   ``first_trade_hash = trade_hash``.
+
+**Migration 3 (Plan 2 Task 11: `status`).** One new table,
+``heartbeats(name, at_utc, detail)``: "when did X last happen", one row
+per name, overwritten each time. ``metrics`` counts events per day and
+cannot say *when* the last one was; ``xaucopier status`` runs in a
+different process from ``watch`` and can only learn what ``watch`` wrote
+down. The poll stamps ``poll_round_completed`` (and each channel it read)
+at the end of every round, and ``watch`` stamps its own start and stop
+(with the exit code), which is how ``status`` tells "running" from
+"stopped" and "stopped because the Telegram session was logged out".
+``store/heartbeats.py`` is its one writer. Nothing else changes.
 """
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
 
-CURRENT_VERSION = 2
+CURRENT_VERSION = 3
 
 #: Migration 2 -- see the module docstring. Plain statements, run in
 #: order inside `migrate()`'s transaction. `CREATE ... IF NOT EXISTS`
@@ -173,6 +184,15 @@ _MIGRATION_2: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_signals_first_trade_hash ON signals(first_trade_hash)",
 )
 
+#: Migration 3 -- the `heartbeats` table; see the module docstring.
+_MIGRATION_3: tuple[str, ...] = (
+    """CREATE TABLE IF NOT EXISTS heartbeats (
+      name   TEXT PRIMARY KEY,
+      at_utc TEXT NOT NULL,
+      detail TEXT
+    )""",
+)
+
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 
@@ -205,6 +225,12 @@ def _migration_2_statements() -> tuple[str, ...]:
     return _MIGRATION_2
 
 
+def _migration_3_statements() -> tuple[str, ...]:
+    """Migration 3's statements; a function for the same reason as
+    `_migration_2_statements`."""
+    return _MIGRATION_3
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Bring `conn`'s schema up to CURRENT_VERSION. Safe to call repeatedly.
 
@@ -234,8 +260,13 @@ def migrate(conn: sqlite3.Connection) -> None:
                     conn.execute(statement)
                 current = 2
 
+            if current == 2:
+                for statement in _migration_3_statements():
+                    conn.execute(statement)
+                current = 3
+
             # Future migrations:
-            # `if current == 2: for stmt in ...: conn.execute(stmt); current = 3`
+            # `if current == 3: for stmt in ...: conn.execute(stmt); current = 4`
 
             conn.execute(f"PRAGMA user_version = {CURRENT_VERSION}")
         except BaseException:

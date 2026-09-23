@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import random
+import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -44,7 +45,7 @@ from xaucopier.ingest.poll import (
     HistoryPoll,
     WriterUnresponsiveError,
 )
-from xaucopier.store import db, messages_repo
+from xaucopier.store import db, heartbeats, messages_repo
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json"
 _FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -826,3 +827,113 @@ def test_the_default_poll_is_every_five_seconds_on_the_real_clock() -> None:
 def test_a_config_that_could_spin_or_read_nothing_is_refused(kwargs: dict) -> None:
     with pytest.raises(ValueError):
         HistoryPoll(**kwargs)
+
+
+# -- the round stamp `status` reads (Task 11) ----------------------------------------
+
+
+def _stamps(db_path: Path) -> dict[str, tuple[datetime, str | None]]:
+    conn = db.connect(db_path, role="reader")
+    try:
+        return {beat.name: (beat.at_utc, beat.detail) for beat in heartbeats.read_all(conn)}
+    finally:
+        conn.close()
+
+
+def test_each_round_stamps_its_completion_and_only_the_channels_it_read(
+    tmp_path: Path,
+) -> None:
+    """`status` runs in another process: the poll's own stamps are the only
+    way it can tell that `watch` is alive and that Telegram still answers.
+    A channel whose read failed must not be stamped as read."""
+    db_path = tmp_path / "store.db"
+    _seed_pointer(db_path, A, 9)
+    _seed_pointer(db_path, B, 19)
+    time = SteppedTime()
+    clock = {"now": NOW}
+
+    async def scenario():
+        client = ScriptedClient()
+        async with _polling(
+            db_path, client, time, channels=(CHANNEL_A, CHANNEL_B), now=lambda: clock["now"]
+        ) as listener:
+            client.failures[A] = [ConnectionError("blip")]
+            clock["now"] = NOW + timedelta(seconds=5)
+            await _run_rounds(listener, time)
+            first = _stamps(db_path)
+            clock["now"] = NOW + timedelta(seconds=10)
+            await _run_rounds(listener, time)
+            second = _stamps(db_path)
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    round_1 = NOW + timedelta(seconds=5)
+    round_2 = NOW + timedelta(seconds=10)
+    assert first == {
+        heartbeats.POLL_ROUND: (round_1, "1 of 2 channel(s) read"),
+        heartbeats.channel_read_name(B): (round_1, None),
+    }
+    assert second == {
+        heartbeats.POLL_ROUND: (round_2, "2 of 2 channel(s) read"),
+        heartbeats.channel_read_name(A): (round_2, None),
+        heartbeats.channel_read_name(B): (round_2, None),
+    }
+
+
+def test_a_stamp_that_cannot_be_written_does_not_stop_the_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stamp is a report: failing to write one makes `status` look stale
+    for a round. It must never stop the poll that recovers trades."""
+    db_path = tmp_path / "store.db"
+    _seed_pointer(db_path, A, 9)
+    time = SteppedTime()
+
+    async def scenario():
+        client = FakeTelegramClient()
+        async with _polling(db_path, client, time) as listener:
+            real = listener.record_heartbeats
+            failures = [sqlite3.OperationalError("database is locked")]
+
+            async def flaky(beats):
+                if failures:
+                    raise failures.pop()
+                await real(beats)
+
+            monkeypatch.setattr(listener, "record_heartbeats", flaky)
+            client.add_to_history(A, _chatter(10))
+            await _run_rounds(listener, time)
+            after_failed_stamp = (_stored_ids(db_path), _stamps(db_path))
+            client.add_to_history(A, _chatter(11))
+            await _run_rounds(listener, time)
+            poll_alive = not listener.poll_task.done()
+        return after_failed_stamp, _stored_ids(db_path), _stamps(db_path), poll_alive
+
+    after_failed_stamp, stored, stamps, poll_alive = asyncio.run(scenario())
+
+    assert after_failed_stamp == ([10], {})
+    assert stored == [10, 11] and poll_alive
+    assert stamps[heartbeats.POLL_ROUND] == (NOW, "1 of 1 channel(s) read")
+
+
+def test_a_writer_death_met_by_the_stamp_stops_the_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "store.db"
+    _seed_pointer(db_path, A, 9)
+    time = SteppedTime()
+
+    async def scenario():
+        client = FakeTelegramClient()
+        async with _polling(db_path, client, time) as listener:
+
+            async def dead(beats):
+                raise db.WriterDeadError("simulated")
+
+            monkeypatch.setattr(listener, "record_heartbeats", dead)
+            time.wake()
+            await _wait_for(lambda: listener.poll_task.done())
+            return listener.poll_task.exception()
+
+    assert isinstance(asyncio.run(scenario()), db.WriterDeadError)
