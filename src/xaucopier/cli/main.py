@@ -35,6 +35,7 @@ import sys
 from pathlib import Path
 
 from xaucopier.cli import exit_codes, paths
+from xaucopier.cli.resolve import cmd_resolve_channels
 from xaucopier.cli.status import cmd_status
 from xaucopier.cli.watch import cmd_watch
 from xaucopier.ingest.client import EXIT_TERMINAL_AUTH, TERMINAL_AUTH_ERRORS, build_client
@@ -187,6 +188,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the secrets file path (default: config/secrets/session.dpapi).",
     )
     setup_login.set_defaults(func=_cmd_setup_login)
+
+    resolve = subparsers.add_parser(
+        "resolve-channels",
+        help="One-time: look up each channel's numeric id and switch it on in channels.toml.",
+        description=(
+            "For every channel in channels.toml whose channel_id is still 0, look "
+            "up its numeric id -- from a t.me link or @username you paste, or by "
+            "choosing it from the channels you have joined -- and write it into "
+            "channels.toml, switching the channel on. Connects to Telegram once; "
+            "watch never looks channels up by name."
+        ),
+        epilog=exit_codes.help_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_config_dir(resolve)
+    _add_secrets(resolve)
+    resolve.add_argument(
+        "--link",
+        default=None,
+        help="The channel's t.me link or @username, instead of being asked "
+        "(only when exactly one channel needs resolving).",
+    )
+    resolve.add_argument(
+        "--yes",
+        action="store_true",
+        help="Save what was found without asking for confirmation.",
+    )
+    resolve.set_defaults(func=cmd_resolve_channels)
 
     watch = subparsers.add_parser(
         "watch",
