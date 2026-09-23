@@ -133,7 +133,7 @@ def collect(conn: sqlite3.Connection, *, today: str) -> StatusReport:
 
     unacked = sorted(
         alerts.unacked(conn), key=lambda alert: (alert.level != "CRITICAL", alert.alert_id)
-    )
+    )  # the same order as cli/status.critical_first()
 
     deleted_live = tuple(
         DeletedLiveSignal(

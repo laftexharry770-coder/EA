@@ -87,8 +87,10 @@ channel on. If `watch` is running, stop it first (step 4 says how).
 Type `.\xaucopier watch`. It prints which channel it is watching and then
 keeps running. **Leave the window open** — closing it stops the recording.
 
-- **To stop it:** click in the window and press **Ctrl+C**. Everything
-  recorded so far is kept.
+- **To stop it:** click in the window and press **Ctrl+C**. Windows then
+  asks `Terminate batch job (Y/N)?` — type **Y** and press Enter. (That
+  question comes from Windows, not from xaucopier; answering Y is always
+  safe.) Everything recorded so far is kept.
 - **After a restart of the PC**, or whenever it has stopped: run
   `.\xaucopier watch` again. It catches up on the posts made while it was off.
 - **Only one at a time.** Do not start a second `watch` in another window.
@@ -101,15 +103,18 @@ never changes anything, so you can run it as often as you like.
 
 What to look at, from the top:
 
-1. **ALERTS.** It should say `ALERTS: none`. An alert is something the
+1. **ALERTS.** Ideally it says `ALERTS: none`. An alert is something the
    program could not safely decide by itself — for example a signal the
    poster deleted, or edited from BUY to SELL. Nothing is traded in this
-   version, so an alert is never an emergency, but **copy the alert lines and
-   send them to whoever looks after xaucopier.** `CRITICAL` ones are listed
-   first.
+   version, so an alert is never an emergency. `CRITICAL` ones are listed
+   first. What to do is in **Clearing alerts** below.
 2. **WATCH.** It should say `RUNNING`, with the last check of the channel a
-   few seconds ago. `NOT HEALTHY` means watch is stuck or its window was
-   closed: start it again. `NOT RUNNING` says when it stopped and why.
+   few seconds ago. `NOT HEALTHY` means watch is stuck, cannot read the
+   channel, or its window was closed. If the watch window is still open,
+   click in it, press **Ctrl+C** and answer **Y** first — a stuck watch
+   still holds the login, so a second one would refuse to start (exit
+   code 6). Then start it again with `.\xaucopier watch`. `NOT RUNNING` says
+   when it stopped and why.
 3. **MISSED BY TELEGRAM'S LIVE FEED** — the most important number. Telegram
    sometimes fails to deliver posts to programs like this one; watch checks
    the channel every 5 seconds and picks up anything the live feed dropped.
@@ -122,6 +127,26 @@ What to look at, from the top:
 5. **SIGNALS** and **CHANNELS** show what has been recorded, and when the
    newest post in the channel arrived.
 
+### Clearing alerts: `.\xaucopier ack`
+
+An alert stays at the top of `status` until you clear it, so none is
+missed. Once you have dealt with one, clear it:
+
+- `.\xaucopier ack` lists the alerts, each with a number after `#`.
+- `.\xaucopier ack 7` clears alert number 7.
+- `.\xaucopier ack --all` clears them all.
+
+**Before you clear one, do what it needs:**
+
+- **TELEGRAM_SESSION_DEAD** — Telegram has logged this program out. Run
+  step 2 (`setup-login`) again, then `watch`. You do not need to clear this
+  one: it clears itself as soon as `watch` reads the channel again.
+- **TELEGRAM_API_ID_REJECTED** — Telegram will not accept your
+  api_id/api_hash. Get a **new** pair (step 1), run step 2 again, then
+  `watch`. This one also clears itself once `watch` reads the channel.
+- **Any other alert** — copy its two lines and send them to whoever looks
+  after xaucopier, then clear it.
+
 ## What the exit codes mean
 
 When `watch` (or any command) stops, it prints an exit code:
@@ -131,11 +156,11 @@ When `watch` (or any command) stops, it prints an exit code:
 | 0 | Finished normally. | Nothing. |
 | 1 | The command could not do what you asked. | Read the message above it. |
 | 2 | The command was typed wrong. | Check the spelling; try `.\xaucopier --help`. |
-| 3 | Telegram logged this program out. | Do **not** just restart. Run step 2 again, then `watch`. |
+| 3 | Telegram refuses this program's login: it was logged out (for example from Telegram → Settings → Devices), **a second copy of the session was used somewhere else at the same time**, or the account is deactivated, banned or frozen. | Do **not** just restart. Make sure nothing else uses this login, run step 2 again, then `watch`. A banned account cannot be fixed by any program. |
 | 4 | `watch` stopped unexpectedly (for example the internet dropped). | Safe to start `watch` again. |
-| 5 | Something in the setup is wrong (a config file, the channel number, the data folder, the session file). | Read the message. Restarting will not help until it is fixed. |
+| 5 | Something in the setup is wrong (a config file, the channel number, the data folder, the session file) — or Telegram rejected your api_id/api_hash. | Read the message. Restarting will not help until it is fixed. For a rejected api_id: get a **new** pair (step 1), then run step 2 again. |
 | 6 | `watch` is already running on this PC. | Find its window. Never run two. |
-| 130 | You pressed Ctrl+C. | Nothing — start it again when you want. |
+| 130 | You pressed Ctrl+C (and answered **Y**). | Nothing — start it again when you want. |
 
 ## Only if asked: `.\xaucopier export-fixtures`
 

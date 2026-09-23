@@ -10,6 +10,8 @@ The commands, in the order the user runs them (docs/RUNBOOK.md):
   place no order. Nothing reachable from here imports `MetaTrader5`.
 - `status` (`cli/status.py`) -- a read-only report on what `watch` has
   recorded and whether it is healthy.
+- `ack` (`cli/ack.py`) -- list the alerts `status` shows, and clear them
+  once dealt with.
 - `export-fixtures` (`cli/fixtures.py`) -- write every recorded message
   out as a replay fixture for the Plan 1 harness.
 
@@ -44,6 +46,7 @@ from pathlib import Path
 from telethon import errors
 
 from xaucopier.cli import exit_codes, paths
+from xaucopier.cli.ack import cmd_ack
 from xaucopier.cli.fixtures import cmd_export_fixtures
 from xaucopier.cli.resolve import cmd_resolve_channels
 from xaucopier.cli.status import cmd_status
@@ -377,6 +380,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_db(status)
     _add_secrets(status)
     status.set_defaults(func=cmd_status)
+
+    ack = subparsers.add_parser(
+        "ack",
+        help="List the alerts status shows; clear one (ack NUMBER) or all (ack --all).",
+        description=(
+            "With no arguments, lists every uncleared alert. `ack NUMBER` clears the "
+            "alert with that number (the one after # in the list); `ack --all` clears "
+            "them all. Clear an alert once you have dealt with it: TELEGRAM_... alerts "
+            "clear themselves once watch reads the channel again."
+        ),
+        epilog=exit_codes.help_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_db(ack)
+    which = ack.add_mutually_exclusive_group()
+    which.add_argument(
+        "alert_id", nargs="?", type=int, default=None, help="The alert's number, from the list."
+    )
+    which.add_argument("--all", action="store_true", help="Clear every uncleared alert.")
+    ack.set_defaults(func=cmd_ack)
 
     export = subparsers.add_parser(
         "export-fixtures",

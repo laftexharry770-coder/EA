@@ -23,7 +23,7 @@ def test_every_command_the_runbook_tells_the_user_to_type_exists() -> None:
     typed = set(re.findall(r"\.\\xaucopier ([a-z][a-z-]*)", RUNBOOK))  # a command, not --help
     assert typed, "the runbook names no command"
     assert typed <= commands, typed - commands
-    assert {"setup-login", "resolve-channels", "watch", "status"} <= typed
+    assert {"setup-login", "resolve-channels", "watch", "status", "ack"} <= typed
 
 
 def test_the_runbook_says_what_the_user_must_know() -> None:
@@ -34,5 +34,15 @@ def test_the_runbook_says_what_the_user_must_know() -> None:
         "Set time automatically",
         "session.dpapi",
         "Never use an api_id or api_hash you found in a tutorial",
+        # Fix round 1: a .cmd asks this on Ctrl+C; answering Y is the way out.
+        "Terminate batch job (Y/N)?",
+        # A stuck watch still holds the login: stop it before starting another.
+        "press **Ctrl+C** and answer **Y** first",
+        # Exit 3's likeliest silent cause.
+        "a second copy of the session was used somewhere else",
+        # How to clear alerts, and which need action first.
+        "ack --all",
+        "TELEGRAM_SESSION_DEAD",
+        "TELEGRAM_API_ID_REJECTED",
     ):
         assert phrase in RUNBOOK, phrase

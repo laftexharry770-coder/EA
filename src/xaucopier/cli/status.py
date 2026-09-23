@@ -31,7 +31,7 @@ from xaucopier.config.channels import ChannelCfg
 from xaucopier.ingest.client import EXIT_CONFIG_ERROR, EXIT_TERMINAL_AUTH
 from xaucopier.ingest.listener import HISTORY_SKIPPED_METRIC
 from xaucopier.ingest.poll import MISSED_BY_EVENTSTREAM_METRIC
-from xaucopier.store import db, heartbeats, metrics, report
+from xaucopier.store import alerts, db, heartbeats, metrics, report
 from xaucopier.store.edits_repo import (
     DELETE_MISSED_BY_EVENTSTREAM_METRIC,
     EDIT_MISSED_BY_EVENTSTREAM_METRIC,
@@ -121,16 +121,16 @@ def ago(now: datetime, value: datetime) -> str:
     return f"{hours // 24} days ago"
 
 
-def _alert_lines(rep: report.StatusReport) -> list[str]:
-    if not rep.alerts:
-        return ["ALERTS: none"]
-    critical = sum(1 for alert in rep.alerts if alert.level == "CRITICAL")
-    lines = [
-        "!" * 72,
-        f"ALERTS: {len(rep.alerts)} unacknowledged ({critical} CRITICAL, "
-        f"{len(rep.alerts) - critical} WARNING)",
-    ]
-    for alert in rep.alerts:
+def critical_first(items: tuple[alerts.Alert, ...]) -> tuple[alerts.Alert, ...]:
+    """CRITICAL before WARNING; each level oldest first."""
+    return tuple(sorted(items, key=lambda alert: (alert.level != "CRITICAL", alert.alert_id)))
+
+
+def alert_lines(items: tuple[alerts.Alert, ...]) -> list[str]:
+    """Each alert as two lines -- level, number, time, code, where; then
+    what it says. Shared by `status` and `ack`."""
+    lines: list[str] = []
+    for alert in items:
         where = ", ".join(
             f"{label} {value}"
             for label, value in (
@@ -145,10 +145,25 @@ def _alert_lines(rep: report.StatusReport) -> list[str]:
             + (f"  ({where})" if where else "")
         )
         lines.append(f"      {alert.detail}")
+    return lines
+
+
+def _alert_lines(rep: report.StatusReport) -> list[str]:
+    if not rep.alerts:
+        return ["ALERTS: none"]
+    critical = sum(1 for alert in rep.alerts if alert.level == "CRITICAL")
+    lines = [
+        "!" * 72,
+        f"ALERTS: {len(rep.alerts)} unacknowledged ({critical} CRITICAL, "
+        f"{len(rep.alerts) - critical} WARNING)",
+    ]
+    lines.extend(alert_lines(rep.alerts))
     lines.append(
         "  An alert is something xaucopier could not settle safely on its own. This "
-        "version places no orders, so nothing is at risk right now -- but send these "
-        "lines to whoever maintains xaucopier."
+        "version places no orders, so nothing is at risk right now. Do what a "
+        "TELEGRAM_... alert says (it clears itself once watch reads the channel "
+        "again); send any other to whoever looks after xaucopier. Then clear it with "
+        f"`{_CMD} ack --all` (or `{_CMD} ack NUMBER` for one)."
     )
     lines.append("!" * 72)
     return lines
