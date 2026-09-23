@@ -257,6 +257,30 @@ def test_a_failure_at_any_point_of_the_write_leaves_the_file_exactly_as_it_was(
     assert rig.lock.released == 1 and "disconnect" in rig.client.calls
 
 
+def test_an_edit_that_changes_anything_else_is_caught_before_the_file_is_replaced(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The last line of defence against a text edit gone wrong: the new
+    file is loaded back and compared with the old one, and anything but
+    the one channel's id and switch differing -- here, the edit also
+    renamed the other channel, which the loader would happily accept --
+    stops the write."""
+    real = resolve_module.set_id_then_enable
+
+    def sloppy(text: str, **kwargs: Any) -> str:
+        return real(text, **kwargs).replace('"Already Resolved"', '"Renamed By Accident"')
+
+    monkeypatch.setattr(resolve_module, "set_id_then_enable", sloppy)
+    before = rig.channels_path.read_bytes()
+
+    code = cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes"))
+
+    assert code == exit_codes.EXIT_CONFIG_ERROR
+    assert rig.channels_path.read_bytes() == before
+    assert _no_temp_files(rig.config_dir)
+    assert "differs from the original" in capsys.readouterr().err
+
+
 def test_the_id_is_written_before_the_channel_is_switched_on(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

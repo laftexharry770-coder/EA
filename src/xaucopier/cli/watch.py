@@ -290,8 +290,8 @@ def _print_banner(setup: WatchSetup, log_path: Path) -> None:
 
 
 def _run(setup: WatchSetup, blob: SecretsBlob) -> int:
-    client = build_client(blob)
     try:
+        client = build_client(blob)
         return asyncio.run(run_watch(client, setup))
     except KeyboardInterrupt:
         return exit_codes.EXIT_INTERRUPTED
