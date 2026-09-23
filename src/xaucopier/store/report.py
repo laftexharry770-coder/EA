@@ -191,14 +191,25 @@ def collect(conn: sqlite3.Connection, *, today: str) -> StatusReport:
         alerts=tuple(unacked),
         deleted_live_signals=deleted_live,
         skipped_outbox=skipped,
-        channels=_channels(conn),
+        channels=channel_activity(conn),
         heartbeats=heartbeats.read_all(conn),
     )
 
 
-def _channels(conn: sqlite3.Connection) -> tuple[ChannelActivity, ...]:
+def signals_per_channel(conn: sqlite3.Connection) -> tuple[tuple[int, int], ...]:
+    """(channel id, signals recorded as trades) for every channel that has
+    produced one -- `xaucopier channels` shows it beside each channel."""
+    return tuple(
+        (int(row[0]), int(row[1]))
+        for row in conn.execute(
+            "SELECT channel_id, COUNT(*) FROM signals GROUP BY channel_id ORDER BY channel_id"
+        ).fetchall()
+    )
+
+
+def channel_activity(conn: sqlite3.Connection) -> tuple[ChannelActivity, ...]:
     """One entry per channel the store knows of -- from its messages or its
-    pointer row -- ordered by id."""
+    pointer row -- ordered by id. Used by `status` and `channels`."""
     ids = sorted(
         {row[0] for row in conn.execute("SELECT DISTINCT channel_id FROM messages")}
         | {row[0] for row in conn.execute("SELECT channel_id FROM channel_state")}

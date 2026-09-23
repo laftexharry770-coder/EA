@@ -6,6 +6,8 @@ The commands, in the order the user runs them (docs/RUNBOOK.md):
   produces the DPAPI-encrypted session every other Telegram command uses.
 - `resolve-channels` (`cli/resolve.py`) -- look up each placeholder
   channel's numeric id once and write it into `config/channels.toml`.
+- `channels` (`cli/channels.py`) -- list the channels signals are taken
+  from; add one, or switch one on or off.
 - `watch` (`cli/watch.py`) -- the deliverable: record every signal,
   place no order. Nothing reachable from here imports `MetaTrader5`.
 - `status` (`cli/status.py`) -- a read-only report on what `watch` has
@@ -47,6 +49,7 @@ from telethon import errors
 
 from xaucopier.cli import exit_codes, paths
 from xaucopier.cli.ack import cmd_ack
+from xaucopier.cli.channels import cmd_channels
 from xaucopier.cli.fixtures import cmd_export_fixtures
 from xaucopier.cli.resolve import cmd_resolve_channels
 from xaucopier.cli.status import cmd_status
@@ -408,6 +411,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Save what was found without asking for confirmation.",
     )
     resolve.set_defaults(func=cmd_resolve_channels)
+
+    channels = subparsers.add_parser(
+        "channels",
+        help="List the channels signals are taken from. Read-only.",
+        description=(
+            "Lists every channel in channels.toml: its number, name, ON or OFF, "
+            "whether its id has been looked up, its parser, its newest recorded "
+            "message and how many signals it produced. Only reads: nothing is "
+            "changed and Telegram is not contacted."
+        ),
+        epilog=exit_codes.help_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_config_dir(channels)
+    _add_db(channels)
+    channels.set_defaults(func=cmd_channels)
 
     watch = subparsers.add_parser(
         "watch",

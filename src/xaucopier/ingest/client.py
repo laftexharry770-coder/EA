@@ -39,7 +39,9 @@ from __future__ import annotations
 
 from typing import Literal
 
+import pywintypes
 import win32api
+import win32con
 import win32event
 import winerror
 from telethon import TelegramClient, errors
@@ -123,6 +125,28 @@ def acquire_single_instance_lock() -> SingleInstanceLock:
             "permanently invalidates the session."
         )
     return SingleInstanceLock(handle)
+
+
+def session_in_use() -> bool:
+    """True if some process holds the `Global\\xaucopier_listener` mutex
+    right now -- `watch`, `resolve-channels` or `channels add`.
+
+    For commands that only *report* whether `watch` is running (`channels`):
+    it never creates the mutex and never takes it. `OpenMutex` finds it
+    only if another process has it open, and the handle is closed at once.
+    With no mutex there is no handle at all, so a `watch` starting at that
+    moment is unaffected; with one, a second `watch` would be refused
+    anyway."""
+    try:
+        handle = win32event.OpenMutex(win32con.SYNCHRONIZE, False, _MUTEX_NAME)
+    except pywintypes.error as exc:
+        if exc.winerror == winerror.ERROR_FILE_NOT_FOUND:
+            return False
+        if exc.winerror == winerror.ERROR_ACCESS_DENIED:
+            return True  # it exists; a process of another user holds it
+        raise
+    win32api.CloseHandle(handle)
+    return True
 
 
 def build_client(blob: SecretsBlob) -> TelegramClient:

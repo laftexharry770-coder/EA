@@ -22,6 +22,7 @@ from xaucopier.ingest.client import (
     acquire_single_instance_lock,
     build_client,
     classify_auth_error,
+    session_in_use,
 )
 from xaucopier.ingest.secrets import SecretsBlob
 
@@ -76,6 +77,21 @@ def test_releasing_first_lock_lets_a_new_one_succeed() -> None:
     lock.release()
     lock2 = acquire_single_instance_lock()
     lock2.release()
+
+
+def test_session_in_use_sees_the_lock_without_taking_it() -> None:
+    """`channels` asks whether watch is running; asking must never
+    create or hold the mutex, or a watch starting then would be refused."""
+    assert session_in_use() is False
+    # The probe left nothing behind: the lock can still be taken.
+    lock = acquire_single_instance_lock()
+    try:
+        assert session_in_use() is True
+        assert session_in_use() is True  # and asking twice does not change it
+    finally:
+        lock.release()
+    assert session_in_use() is False
+    acquire_single_instance_lock().release()
 
 
 # ---------------------------------------------------------------------
