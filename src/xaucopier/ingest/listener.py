@@ -60,7 +60,15 @@ never makes an RPC on the update path.
    and a process that keeps running anyway looks healthy to its
    supervisor while recording nothing.
 
-**The handler does exactly four things: route, normalise, submit,
+**Edits (Task 10).** `MessageEdited` gets a handler of its own, under
+the same four-step contract as `NewMessage` below. It is a hint, like
+`NewMessage`: the source of truth is the poll's window re-read
+(`ingest/edits.py`), which fetches the recent stored messages by id and
+finds the edits the stream dropped. What an edit *does* is decided in
+one writer job by `store/edits_repo.py`, so one seen by both paths is
+applied once.
+
+**Each handler does exactly four things: route, normalise, submit,
 return.** Routing comes first -- one dict lookup on `event.chat_id` --
 so a message from a chat nobody watches is dropped before any other
 work. No `get_entity`, no `get_reply_message`, no RPC of any kind --
@@ -114,7 +122,8 @@ from telethon import events
 
 from xaucopier.config.accounts import AccountCfg
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.store import db, messages_repo, metrics
+from xaucopier.store import db, edits_repo, messages_repo, metrics
+from xaucopier.store.edits_repo import EditResult
 from xaucopier.store.messages_repo import IngestResult
 
 logger = logging.getLogger(__name__)
@@ -206,8 +215,10 @@ class IncomingMessage:
 class HandlerError:
     """A per-message failure on any ingest path, kept so a test (and an
     operator) can see that one happened rather than inferring it from a
-    missing row. `source` is the path it happened on: `"live"` (the
-    update handler) or a history read (`"backfill"`, `"poll"`)."""
+    missing row. `source` is the path it happened on: `"live"` (an
+    update handler -- new message or edit), a history read
+    (`"backfill"`, `"poll"`), or `"window"` (the poll's by-id re-read of
+    the recent window, `ingest/edits.py`)."""
 
     channel_id: int | None
     message_id: int | None
@@ -271,9 +282,11 @@ def normalise_message(message: Any, *, channel_id: int) -> IncomingMessage:
 
 
 def normalise_event(event: Any) -> IncomingMessage:
-    """Flatten a `NewMessage` event. `event.chat_id` is the marked
-    channel id (`-100...`) that `channels.toml` already uses, so no
-    `get_entity()` round trip is needed to identify the channel."""
+    """Flatten a `NewMessage` event -- or a `MessageEdited` one, which in
+    Telethon is a `NewMessage.Event` carrying the edited message.
+    `event.chat_id` is the marked channel id (`-100...`) that
+    `channels.toml` already uses, so no `get_entity()` round trip is
+    needed to identify the channel."""
     return normalise_message(event.message, channel_id=event.chat_id)
 
 
@@ -320,14 +333,17 @@ class Listener:
     opened (see the module docstring). `aclose()` owns the whole
     teardown, including stopping the writer.
 
-    Task 9 and Task 11 build on the public surface here --
+    Tasks 9, 10 and 11 build on the public surface here --
     `client`, `channels`, `enabled_channels`, `reader`,
     `channel_cfg_for()`, `read_last_processed_message_id()`,
     `read_history()`, `ingest_history()`, `ingest_message()`,
-    `probe_writer()`, `record_metric()` and `poll_hook` -- rather than
-    reaching into the internals. The poll (`ingest/poll.py`) is
-    `read_history(channel, source="poll", limit=..., rpc_timeout=...)`:
-    it is the one place the pointer is read, fetched from and advanced.
+    `ingest_edit()`, `history_lock()`,
+    `record_handler_error()`, `probe_writer()`, `record_metric()` and
+    `poll_hook` -- rather than reaching into the internals. The poll
+    (`ingest/poll.py`) is `read_history(channel, source="poll",
+    limit=..., rpc_timeout=...)`: it is the one place the pointer is
+    read, fetched from and advanced. Its window re-read
+    (`ingest/edits.py`) reads the pointer too, and never writes it.
     """
 
     def __init__(
@@ -493,6 +509,57 @@ class Listener:
             return result
 
         return await self._run_on_writer(job)
+
+    async def ingest_edit(
+        self,
+        incoming: IncomingMessage,
+        *,
+        channel_cfg: ChannelCfg,
+        detected_by: str,
+    ) -> EditResult:
+        """Hand the current version of a message -- from a `MessageEdited`
+        event (`detected_by="event"`) or the window re-read (`"window"`)
+        -- to `edits_repo.apply_edit()` on the writer thread, and await
+        the result. One job, one transaction, decided against the stored
+        row, so an edit seen by both paths is applied once. A message
+        never stored is left alone: this path never creates one. Never
+        touches the pointer."""
+        now_utc = self._now()
+        accounts = self.accounts
+
+        def job(conn: Connection) -> EditResult:
+            return edits_repo.apply_edit(
+                conn,
+                channel_cfg=channel_cfg,
+                message_id=incoming.message_id,
+                text=incoming.text,
+                posted_at_utc=incoming.posted_at_utc,
+                edit_date_utc=incoming.edit_date_utc,
+                reply_to_message_id=incoming.reply_to_message_id,
+                now_utc=now_utc,
+                accounts=accounts,
+                detected_by=detected_by,
+            )
+
+        return await self._run_on_writer(job)
+
+    def history_lock(self, channel_id: int) -> asyncio.Lock:
+        """The per-channel lock every history read holds for its whole
+        length (see `read_history`). The window re-read takes it too, so
+        it never interleaves with a read of the same channel."""
+        return self._history_locks.setdefault(channel_id, asyncio.Lock())
+
+    def record_handler_error(
+        self,
+        channel_id: int | None,
+        message_id: int | None,
+        exc: Exception,
+        *,
+        source: str,
+    ) -> None:
+        """Record (and log) a per-message failure in `handler_errors`, for
+        paths outside this module -- the window re-read."""
+        self._record_handler_error(channel_id, message_id, exc, source=source)
 
     async def _run_on_writer(self, job: Callable[[Connection], Any]) -> Any:
         """Run `job` on the writer thread and await it -- the one door
@@ -709,8 +776,7 @@ class Listener:
         ):
             raise ValueError(f"rpc_timeout must be a positive number, got {rpc_timeout!r}")
         channel_id = channel_cfg.channel_id
-        lock = self._history_locks.setdefault(channel_id, asyncio.Lock())
-        async with lock:
+        async with self.history_lock(channel_id):
             pointer = self.read_last_processed_message_id(channel_id)
             if pointer == 0 and channel_id not in self._pointer_seeded:
                 pointer = await self._seed_pointer(channel_cfg, rpc_timeout=rpc_timeout)
@@ -895,8 +961,9 @@ class Listener:
     def _register_handlers(self) -> None:
         # No `chats=` filter on purpose: resolving it puts a potential
         # get_input_entity() RPC on Telethon's dispatch path. The
-        # channel filter is the dict lookup in the handler instead.
+        # channel filter is the dict lookup in each handler instead.
         self.client.add_event_handler(self._on_new_message, events.NewMessage())
+        self.client.add_event_handler(self._on_message_edited, events.MessageEdited())
 
     def _start_poll_task(self) -> None:
         if self.poll_hook is None:
@@ -933,6 +1000,28 @@ class Listener:
             )  # 4. return
         except Exception as exc:  # noqa: BLE001 -- recorded, never fatal
             # Error path only: a plain attribute read for the record.
+            message_id = getattr(getattr(event, "message", None), "id", None)
+            self._record_handler_error(channel_id, message_id, exc, source=LIVE_SOURCE)
+
+    async def _on_message_edited(self, event: Any) -> None:
+        """Route, normalise, submit, return -- `_on_new_message`'s
+        contract, for `MessageEdited`. A hint: the window re-read is the
+        source of truth, and whichever of the two gets there first
+        applies the edit, once. No RPC, no `sqlite3`; every failure is
+        recorded, never raised into the client."""
+        channel_id: int | None = None
+        try:
+            channel_id = event.chat_id
+            channel_cfg = self.channel_cfg_for(channel_id)  # 1. route
+            if channel_cfg is None:
+                return
+
+            incoming = normalise_event(event)  # 2. normalise
+
+            await self.ingest_edit(  # 3. submit
+                incoming, channel_cfg=channel_cfg, detected_by=edits_repo.EVENT_DETECTOR
+            )  # 4. return
+        except Exception as exc:  # noqa: BLE001 -- recorded, never fatal
             message_id = getattr(getattr(event, "message", None), "id", None)
             self._record_handler_error(channel_id, message_id, exc, source=LIVE_SOURCE)
 

@@ -1,10 +1,16 @@
 """Persistence for `signals`, `followups`, and the `channel_state`
 parse-failure counter.
 
-`messages_repo.ingest()` is the only caller and owns the transaction (it
-runs inside a `Writer.submit()` job -- see store/db.py); every function
-here just executes statements against the `conn` it is given and never
-commits or rolls back.
+`messages_repo.ingest()` and `edits_repo` (Task 10) are the callers and
+own the transaction (each runs inside a `Writer.submit()` job -- see
+store/db.py); every function here just executes statements against the
+`conn` it is given and never commits or rolls back.
+
+`followups` holds two kinds of row since migration 2 (see migrations.py):
+a message's *own* follow-up, `edit_seq = 0`, and the `AMEND_SL`/`AMEND_TP`
+rows an edit of an executed signal derives, `edit_seq = 1, 2, ...`, keyed
+by that signal's message. Everything that means "this message's
+follow-up" filters on `edit_seq = 0`.
 
 JSON serialisation lives here rather than on the domain types themselves,
 because `domain/signal.py` must stay pure (no `json` import) -- see
@@ -119,6 +125,26 @@ def update_signal_on_edit(
     )
 
 
+def get_signal(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> sqlite3.Row | None:
+    """The whole `signals` row for a message, or None."""
+    return conn.execute(
+        "SELECT * FROM signals WHERE channel_id = ? AND message_id = ?",
+        (channel_id, message_id),
+    ).fetchone()
+
+
+def set_signal_state(
+    conn: sqlite3.Connection, *, signal_id: int, state: str, from_state: str = "NEW"
+) -> bool:
+    """Move a signal from `from_state` to `state`; False if it was not in
+    `from_state` (so a terminal state is never overwritten)."""
+    cursor = conn.execute(
+        "UPDATE signals SET state = ? WHERE signal_id = ? AND state = ?",
+        (state, signal_id, from_state),
+    )
+    return cursor.rowcount == 1
+
+
 def get_signal_id(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> int | None:
     row = conn.execute(
         "SELECT signal_id FROM signals WHERE channel_id = ? AND message_id = ?",
@@ -131,8 +157,8 @@ def insert_followup(
     conn: sqlite3.Connection, *, channel_id: int, message_id: int, followup: FollowUp
 ) -> int:
     cursor = conn.execute(
-        "INSERT INTO followups (channel_id, message_id, op, parsed_json, reply_to_message_id) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO followups (channel_id, message_id, op, parsed_json, reply_to_message_id, "
+        "edit_seq) VALUES (?, ?, ?, ?, ?, 0)",
         (
             channel_id,
             message_id,
@@ -144,12 +170,45 @@ def insert_followup(
     return cursor.lastrowid
 
 
+def insert_edit_amendment(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    message_id: int,
+    followup: FollowUp,
+    target_signal_id: int,
+) -> int:
+    """Store an AMEND_* follow-up derived from an edit of signal message
+    `message_id`, as the next `edit_seq` under that message. Its target is
+    known exactly -- the edited signal -- so `target_signal_id` is set and
+    `resolution_path` is `'edit'`; Plan 3 need not resolve it by reply."""
+    (next_seq,) = conn.execute(
+        "SELECT COALESCE(MAX(edit_seq), 0) + 1 FROM followups "
+        "WHERE channel_id = ? AND message_id = ?",
+        (channel_id, message_id),
+    ).fetchone()
+    cursor = conn.execute(
+        "INSERT INTO followups (channel_id, message_id, op, parsed_json, reply_to_message_id, "
+        "target_signal_id, resolution_path, edit_seq) VALUES (?, ?, ?, ?, ?, ?, 'edit', ?)",
+        (
+            channel_id,
+            message_id,
+            followup.op.value,
+            followup_to_json(followup),
+            followup.reply_to_message_id,
+            target_signal_id,
+            next_seq,
+        ),
+    )
+    return cursor.lastrowid
+
+
 def update_followup_on_edit(
     conn: sqlite3.Connection, *, channel_id: int, message_id: int, followup: FollowUp
 ) -> None:
     conn.execute(
         "UPDATE followups SET op = ?, parsed_json = ?, reply_to_message_id = ? "
-        "WHERE channel_id = ? AND message_id = ?",
+        "WHERE channel_id = ? AND message_id = ? AND edit_seq = 0",
         (
             followup.op.value,
             followup_to_json(followup),
@@ -162,7 +221,8 @@ def update_followup_on_edit(
 
 def get_followup_id(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> int | None:
     row = conn.execute(
-        "SELECT followup_id FROM followups WHERE channel_id = ? AND message_id = ?",
+        "SELECT followup_id FROM followups "
+        "WHERE channel_id = ? AND message_id = ? AND edit_seq = 0",
         (channel_id, message_id),
     ).fetchone()
     return row["followup_id"] if row is not None else None

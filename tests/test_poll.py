@@ -135,7 +135,11 @@ class ScriptedClient(FakeTelegramClient):
     `failures[channel_id]` is a queue: each read of that channel pops one
     entry and raises it (or, for `HANG`, never answers). `read_attempts`
     logs every read attempt's channel, including failed ones, which the
-    fake's own `get_messages_calls` does not. `before_read` runs first."""
+    fake's own `get_messages_calls` does not. `before_read` runs first.
+
+    Only *history* reads are scripted and counted. Task 10's window
+    re-read (`get_messages(ids=...)`) passes straight through to the fake:
+    its own failures are scripted in tests/test_edits.py."""
 
     failures: dict[int, list[BaseException | str]] = field(default_factory=dict)
     read_attempts: list[int] = field(default_factory=list)
@@ -143,6 +147,8 @@ class ScriptedClient(FakeTelegramClient):
     before_read: Callable[[int], Awaitable[None]] | None = None
 
     async def get_messages(self, *args, **kwargs):
+        if kwargs.get("ids") is not None:
+            return await super().get_messages(*args, **kwargs)
         channel_id = self._channel_id_of(args[0])
         self.read_attempts.append(channel_id)
         if self.before_read is not None:
@@ -312,9 +318,13 @@ def test_d1_blackout_then_live_then_one_round_recovers_the_whole_gap(tmp_path: P
 
     assert hidden == [False, False, False] and live is True
     assert pointer_before_poll == 9, "a live message moved the history pointer"
-    # One read, from the pointer, asking for a bounded batch -- not
-    # Telethon's default of ONE message.
-    assert [(c.min_id, c.limit, c.reverse) for c in poll_calls] == [(9, DEFAULT_POLL_LIMIT, True)]
+    # One history read, from the pointer, asking for a bounded batch --
+    # not Telethon's default of ONE message...
+    history_calls = [c for c in poll_calls if c.ids is None]
+    assert [(c.min_id, c.limit, c.reverse) for c in history_calls] == [(9, DEFAULT_POLL_LIMIT, True)]
+    # ...then (Task 10) one by-id re-read of what is now at or below the
+    # pointer, in which edits and deletions would show.
+    assert [c.ids for c in poll_calls if c.ids is not None] == [(10, 11, 12, 13)]
     assert _stored(db_path) == [(10, "poll"), (11, "poll"), (12, "poll"), (13, "live")]
     assert _pointer(db_path) == 13
     assert _missed(db_path) == 3

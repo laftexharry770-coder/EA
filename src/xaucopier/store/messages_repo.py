@@ -17,6 +17,19 @@ correction a poster makes, forever. So instead:
 - seen, content_hash changed, edit_date_utc set -> "edited", record the
   correction in place (Task 10 decides what to *do* about it)
 
+**Task 10: a seen message goes through the edit policy.** Every version
+of an already-stored message -- whether the forward read, backfill or a
+re-delivered update brought it -- is handed to `edits_repo.reconcile()`,
+the same policy the `MessageEdited`/`MessageDeleted` paths use: a
+direction change invalidates, an SL change on an executed signal queues
+an `AMEND_SL`, a signal edited into chatter is a retraction, and so on
+(see that module). Before Task 10 this branch re-parsed in place and
+bumped the version whatever changed, so a BUY flipped to SELL during a
+blackout and first seen by the poll's forward read was quietly re-aimed.
+`ingest()` reports `"edited"` when the new version changed something
+and `"duplicate"` otherwise (a cosmetic edit, an older version, or no
+`edit_date`), so its three outcomes are the same ones as before.
+
 `content_hash` for that comparison is computed from the *normalised
 parse*, never the raw text: for a routed signal it is `Signal.content_hash`
 (identity of the trade -- side/zone/sl/tps -- so decoration never counts
@@ -59,8 +72,9 @@ care about the outbox) now passes `accounts=` explicitly.
 Round 2 found a second, more likely door to that same silent shape: an
 `accounts` tuple that is non-empty but every account in it is disabled
 -- a realistic operator misconfiguration (someone flips every account
-off in accounts.toml), not just a forgotten argument. `_fan_out_and_guard`
-below therefore checks `fan_out()`'s actual *return value*
+off in accounts.toml), not just a forgotten argument. `outbox.fan_out_checked`
+(until Task 10 `_fan_out_and_guard`, here) therefore checks `fan_out()`'s
+actual *return value*
 (`fanout_count == 0`) rather than guessing from the *input* (`not
 accounts`), so the `ingest_new_no_accounts` metric fires for every route
 to a zero-row fan-out, whichever one produced it -- and a `fanout_count`
@@ -70,15 +84,13 @@ under- or over-fanning-out.
 """
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol
 
-from xaucopier.parsing.normalize import normalize
 from xaucopier.parsing.router import RouteResult, route
-from xaucopier.store import metrics, outbox, signals_repo
+from xaucopier.store import edits_repo, outbox, signals_repo
 
 IngestOutcome = Literal["new", "duplicate", "edited", "relay_duplicate"]
 
@@ -110,16 +122,6 @@ class IngestResult:
     followup_id: int | None
     kind: str
     detail: str
-
-
-def _text_content_hash(text: str) -> str:
-    """Identity for anything that is not a routed signal: sha1 of the
-    normalised text. Normalised, not raw, so a cosmetic edit (an added
-    emoji, reflowed whitespace) is never mistaken for a real correction --
-    normalize() is exactly the fold every parser already applies before
-    matching.
-    """
-    return hashlib.sha1(normalize(text).encode("utf-8")).hexdigest()
 
 
 def _get_message(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> sqlite3.Row | None:
@@ -161,71 +163,6 @@ def _insert_message(
     )
 
 
-def _fan_out_and_guard(
-    conn: sqlite3.Connection,
-    *,
-    kind: Literal["ENTRY", "FOLLOWUP"],
-    signal_id: int | None,
-    followup_id: int | None,
-    accounts: tuple[_AccountCfgLike, ...],
-    now_utc: datetime,
-) -> None:
-    """Wraps outbox.fan_out() with the two guards against the
-    silent-no-op-fan-out failure mode:
-
-    - `fanout_count == 0` -- for *any* reason -- records the
-      `ingest_new_no_accounts` metric. Task 6 review round 1 only checked
-      `not accounts`, which missed the more likely door review round 2
-      found: an `accounts` tuple that is non-empty but every account in
-      it is disabled (a realistic operator misconfiguration, unlike a
-      forgotten `accounts` argument, which is a TypeError at the call
-      site now that it's required). Checking the actual output
-      (`fanout_count`) rather than guessing from the input
-      (`not accounts`) catches every route to the same silent shape.
-    - `fanout_count != enabled_count` -- any mismatch, not just "0 when
-      some were expected" -- is a contradiction of fan_out()'s own
-      one-row-per-enabled-account contract and raises. The narrower
-      `enabled_count > 0 and fanout_count == 0` check from round 1 would
-      have missed a subtler bug shape ("2 written when 3 expected");
-      comparing the counts directly catches any discrepancy.
-    """
-    fanout_count = outbox.fan_out(
-        conn, kind=kind, signal_id=signal_id, followup_id=followup_id, accounts=accounts
-    )
-    enabled_count = sum(1 for account in accounts if account.enabled)
-
-    if fanout_count == 0:
-        metrics.bump(
-            conn, day_key=metrics.day_key_for(now_utc), name="ingest_new_no_accounts"
-        )
-
-    if fanout_count != enabled_count:
-        raise RuntimeError(
-            f"fan_out(kind={kind!r}) wrote {fanout_count} outbox row(s) but "
-            f"{enabled_count} of the accounts passed to ingest() were "
-            "enabled -- fan_out() guarantees exactly one row per enabled "
-            "account, so this mismatch should be impossible. Refusing to "
-            "let this signal/follow-up silently end up with the wrong "
-            "number of workers assigned."
-        )
-
-
-def _update_message_edit(
-    conn: sqlite3.Connection,
-    *,
-    channel_id: int,
-    message_id: int,
-    raw_text: str,
-    content_hash: str,
-    edit_date_utc: datetime,
-) -> None:
-    conn.execute(
-        "UPDATE messages SET raw_text = ?, content_hash = ?, edit_date_utc = ? "
-        "WHERE channel_id = ? AND message_id = ?",
-        (raw_text, content_hash, edit_date_utc.isoformat(), channel_id, message_id),
-    )
-
-
 def ingest(
     conn: sqlite3.Connection,
     *,
@@ -249,10 +186,7 @@ def ingest(
         posted_at_utc=posted_at_utc,
         reply_to_message_id=reply_to_message_id,
     )
-    kind = route_result.kind
-    new_hash = (
-        route_result.signal.content_hash if kind == "signal" else _text_content_hash(text)
-    )
+    new_hash = edits_repo.content_hash_for(route_result, text)
 
     existing = _get_message(conn, channel_id=channel_id, message_id=message_id)
 
@@ -272,45 +206,25 @@ def ingest(
             relay_window_seconds=relay_window_seconds,
         )
 
-    if existing["content_hash"] == new_hash:
-        return _duplicate_result(conn, channel_id=channel_id, message_id=message_id, route_result=route_result)
-
-    if edit_date_utc is None:
-        # content_hash changed for a (channel_id, message_id) Telegram
-        # never marked as edited. Under normal operation this cannot
-        # happen -- message_id is immutable and content only changes via
-        # a real Telegram edit, which always carries edit_date. Rather
-        # than silently overwrite an audit-trail row on an unverified
-        # change, treat it as a no-op: no write, flagged in `detail`.
-        result = _duplicate_result(conn, channel_id=channel_id, message_id=message_id, route_result=route_result)
-        return IngestResult(
-            outcome=result.outcome,
-            signal_id=result.signal_id,
-            followup_id=result.followup_id,
-            kind=result.kind,
-            detail="content_hash changed with no edit_date_utc; ignored",
-        )
-
-    return _ingest_edit(
+    edit = edits_repo.reconcile(
         conn,
+        existing=existing,
         channel_id=channel_id,
         message_id=message_id,
         text=text,
         route_result=route_result,
         new_hash=new_hash,
         edit_date_utc=edit_date_utc,
+        now_utc=now_utc,
+        accounts=accounts,
+        detected_by=source,
     )
-
-
-def _duplicate_result(
-    conn: sqlite3.Connection, *, channel_id: int, message_id: int, route_result: RouteResult
-) -> IngestResult:
     return IngestResult(
-        outcome="duplicate",
-        signal_id=signals_repo.get_signal_id(conn, channel_id=channel_id, message_id=message_id),
-        followup_id=signals_repo.get_followup_id(conn, channel_id=channel_id, message_id=message_id),
+        outcome="edited" if edit.changed else "duplicate",
+        signal_id=edit.signal_id,
+        followup_id=edit.followup_id,
         kind=route_result.kind,
-        detail=route_result.detail,
+        detail=edit.detail,
     )
 
 
@@ -367,7 +281,7 @@ def _ingest_new(
         )
         # Same transaction as the followup insert above -- see the module
         # docstring and tests/test_outbox.py's atomicity tests.
-        _fan_out_and_guard(
+        outbox.fan_out_checked(
             conn,
             kind="FOLLOWUP",
             signal_id=None,
@@ -403,7 +317,7 @@ def _ingest_new(
     )
     # Same transaction as the signal insert above -- see the module
     # docstring and tests/test_outbox.py's atomicity tests.
-    _fan_out_and_guard(
+    outbox.fan_out_checked(
         conn,
         kind="ENTRY",
         signal_id=signal_id,
@@ -413,43 +327,4 @@ def _ingest_new(
     )
     return IngestResult(
         outcome="new", signal_id=signal_id, followup_id=None, kind=kind, detail=route_result.detail
-    )
-
-
-def _ingest_edit(
-    conn: sqlite3.Connection,
-    *,
-    channel_id: int,
-    message_id: int,
-    text: str,
-    route_result: RouteResult,
-    new_hash: str,
-    edit_date_utc: datetime,
-) -> IngestResult:
-    _update_message_edit(
-        conn,
-        channel_id=channel_id,
-        message_id=message_id,
-        raw_text=text,
-        content_hash=new_hash,
-        edit_date_utc=edit_date_utc,
-    )
-
-    kind = route_result.kind
-    signal_id: int | None = None
-    followup_id: int | None = None
-
-    if kind == "signal":
-        signals_repo.update_signal_on_edit(
-            conn, channel_id=channel_id, message_id=message_id, signal=route_result.signal
-        )
-        signal_id = signals_repo.get_signal_id(conn, channel_id=channel_id, message_id=message_id)
-    elif kind == "followup":
-        signals_repo.update_followup_on_edit(
-            conn, channel_id=channel_id, message_id=message_id, followup=route_result.followup
-        )
-        followup_id = signals_repo.get_followup_id(conn, channel_id=channel_id, message_id=message_id)
-
-    return IngestResult(
-        outcome="edited", signal_id=signal_id, followup_id=followup_id, kind=kind, detail=route_result.detail
     )

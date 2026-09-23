@@ -353,3 +353,100 @@ def sweep_expired(
         conn.isolation_level = previous_isolation_level
 
     return reclaimed
+
+
+def fan_out_checked(
+    conn: sqlite3.Connection,
+    *,
+    kind: OutboxKind,
+    signal_id: int | None,
+    followup_id: int | None,
+    accounts: tuple[_AccountCfgLike, ...],
+    now_utc: datetime,
+) -> int:
+    """:func:`fan_out`, guarded against the silent zero-row fan-out.
+    Returns the number of rows written. Never commits.
+
+    - ``fanout_count == 0`` -- for *any* reason -- records the
+      ``ingest_new_no_accounts`` metric. Task 6 review round 1 only
+      checked ``not accounts``, which missed the more likely door round 2
+      found: an ``accounts`` tuple that is non-empty but every account in
+      it is disabled. Checking the actual output catches every route to
+      the same silent shape.
+    - ``fanout_count != enabled_count`` -- any mismatch -- contradicts
+      :func:`fan_out`'s one-row-per-enabled-account contract and raises,
+      rather than let a signal or follow-up silently end up with the
+      wrong number of workers assigned.
+
+    This was ``messages_repo._fan_out_and_guard`` until Task 10, when the
+    AMEND_* follow-ups an edit derives (``store/edits_repo.py``) had to
+    fan out under the same guard. It calls :func:`fan_out` through this
+    module's globals, so a test that monkeypatches ``outbox.fan_out``
+    still reaches every caller.
+    """
+    fanout_count = fan_out(
+        conn, kind=kind, signal_id=signal_id, followup_id=followup_id, accounts=accounts
+    )
+    enabled_count = sum(1 for account in accounts if account.enabled)
+
+    if fanout_count == 0:
+        metrics.bump(conn, day_key=metrics.day_key_for(now_utc), name="ingest_new_no_accounts")
+
+    if fanout_count != enabled_count:
+        raise RuntimeError(
+            f"fan_out(kind={kind!r}) wrote {fanout_count} outbox row(s) but "
+            f"{enabled_count} of the accounts passed were enabled -- fan_out() "
+            "guarantees exactly one row per enabled account, so this mismatch "
+            "should be impossible. Refusing to let this signal/follow-up silently "
+            "end up with the wrong number of workers assigned."
+        )
+    return fanout_count
+
+
+def skip_queued(
+    conn: sqlite3.Connection,
+    *,
+    kind: OutboxKind,
+    signal_id: int | None = None,
+    followup_id: int | None = None,
+    reason: str,
+) -> int:
+    """Move one signal's (or follow-up's) ``QUEUED`` rows of ``kind`` to
+    ``SKIPPED`` with ``reason``; returns how many. Used when a signal is
+    invalidated or retracted, or a follow-up withdrawn, before a worker
+    has taken it.
+
+    Only ``QUEUED``: a ``CLAIMED`` row belongs to a worker that may be
+    mid-send, and ``DONE``/``SKIPPED`` are final. Plan 3's worker must
+    therefore re-check the signal's state after it claims (see the Task
+    10 report). Never commits."""
+    if (signal_id is None) == (followup_id is None):
+        raise ValueError("skip_queued requires exactly one of signal_id or followup_id")
+    if not reason:
+        raise ValueError("skip_queued requires a reason")
+    column = "signal_id" if signal_id is not None else "followup_id"
+    cursor = conn.execute(
+        f"UPDATE outbox SET state = 'SKIPPED', reason = ? "
+        f"WHERE kind = ? AND {column} = ? AND state = 'QUEUED'",
+        (reason, kind, signal_id if signal_id is not None else followup_id),
+    )
+    return cursor.rowcount
+
+
+def state_counts(
+    conn: sqlite3.Connection,
+    *,
+    kind: OutboxKind,
+    signal_id: int | None = None,
+    followup_id: int | None = None,
+) -> dict[str, int]:
+    """``{state: count}`` over one signal's (or follow-up's) rows of
+    ``kind``. States with no rows are absent."""
+    if (signal_id is None) == (followup_id is None):
+        raise ValueError("state_counts requires exactly one of signal_id or followup_id")
+    column = "signal_id" if signal_id is not None else "followup_id"
+    rows = conn.execute(
+        f"SELECT state, COUNT(*) FROM outbox WHERE kind = ? AND {column} = ? GROUP BY state",
+        (kind, signal_id if signal_id is not None else followup_id),
+    ).fetchall()
+    return {row[0]: row[1] for row in rows}

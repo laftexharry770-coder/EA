@@ -26,6 +26,15 @@ Every `interval` (5 s) the poll runs one *round*:
    ingests as `"new"` is one the update stream had not delivered, and is
    added to the durable `metrics(day, 'missed_by_eventstream')` counter
    -- the system's real reliability metric, which `status` must show.
+4. **Re-read that channel's recent window by id** (Task 10,
+   `ingest/edits.py`'s `reconcile_window`), right after its forward
+   read: the `edit_window` (50) newest stored messages at or below the
+   pointer, fetched with `get_messages(ids=...)`. The forward read only
+   ever sees ids above the pointer, so this is the only history read
+   that can find an edit the `MessageEdited` stream dropped. It runs in
+   the same per-channel step, under the same `rpc_timeout` and the same
+   error handling below, and it never moves the pointer. Edits it finds
+   are counted in `edit_missed_by_eventstream`.
 
 Why 5 s and not 30: spec section 9 G6 gates a signal on its own
 timestamp, and the Plan 1 review found that a slow poll behind a tight
@@ -100,6 +109,7 @@ from typing import NoReturn
 from telethon import errors
 
 from xaucopier.config.channels import ChannelCfg
+from xaucopier.ingest.edits import DEFAULT_EDIT_WINDOW, reconcile_window, validate_window
 from xaucopier.ingest.listener import DEFAULT_RPC_TIMEOUT, HistoryIngest, Listener
 from xaucopier.store import db
 
@@ -151,13 +161,16 @@ class HistoryPoll:
     round at a time without waiting real seconds. `clock` is a monotonic
     seconds counter (never a wall-clock datetime) and is only used to
     honour flood waits. `rpc_timeout` and `writer_probe_timeout` are real
-    `asyncio.wait_for` bounds.
+    `asyncio.wait_for` bounds; `rpc_timeout` bounds the window re-read's
+    by-id RPC too. `edit_window` is how many recent stored messages each
+    channel's window re-read covers (1 to `edits.MAX_EDIT_WINDOW`).
     """
 
     interval: float = DEFAULT_POLL_INTERVAL
     limit: int = DEFAULT_POLL_LIMIT
     rpc_timeout: float = DEFAULT_RPC_TIMEOUT
     writer_probe_timeout: float = DEFAULT_WRITER_PROBE_TIMEOUT
+    edit_window: int = DEFAULT_EDIT_WINDOW
     sleep: Callable[[float], Awaitable[object]] = asyncio.sleep
     clock: Callable[[], float] = time.monotonic
 
@@ -168,6 +181,7 @@ class HistoryPoll:
                 raise ValueError(f"{name} must be a positive number, got {getattr(self, name)!r}")
         if isinstance(self.limit, bool) or not isinstance(self.limit, int) or self.limit < 1:
             raise ValueError(f"limit must be a positive int, got {self.limit!r}")
+        validate_window(self.edit_window, name="edit_window")
 
     async def __call__(self, listener: Listener) -> NoReturn:
         """Poll forever: sleep one interval, run one round, repeat. Only
@@ -207,8 +221,10 @@ class HistoryPoll:
         flood_until: dict[int, float],
         terminal_errors: tuple[type[Exception], ...],
     ) -> None:
-        """One history read of one channel. Never raises, except for the
-        three stop conditions (and cancellation)."""
+        """One channel's step: its forward history read, then its window
+        re-read. Never raises, except for the three stop conditions (and
+        cancellation). If the forward read fails, the window waits for the
+        next round, like the forward read itself."""
         channel_id = channel.channel_id
         resume_at = flood_until.get(channel_id)
         if resume_at is not None:
@@ -231,6 +247,9 @@ class HistoryPoll:
                     channel.name,
                     [o.message_id for o in results if o.result is not None and o.result.outcome == "new"],
                 )
+            await reconcile_window(
+                listener, channel, window=self.edit_window, rpc_timeout=self.rpc_timeout
+            )
         except db.WriterDeadError:
             raise
         except terminal_errors:

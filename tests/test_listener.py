@@ -1453,7 +1453,8 @@ def test_poll_hook_starts_only_after_backfill_and_handler_registration(
         "connect",
         "get_dialogs",
         "get_messages",
-        "add_event_handler",
+        "add_event_handler",  # NewMessage
+        "add_event_handler",  # MessageEdited (Task 10)
     ]
     # Backfill had *finished* -- its write landed -- not merely started.
     assert seen_by_poll["pointer"] == SIGNAL_MESSAGE_ID
