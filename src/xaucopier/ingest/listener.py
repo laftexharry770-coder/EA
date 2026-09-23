@@ -33,8 +33,13 @@ never makes an RPC on the update path.
    this channel has never been read: rather than ingest the channel's
    *oldest* messages (which is what `get_messages(min_id=0,
    reverse=True)` returns -- possibly years-old signals, each queuing
-   ENTRY outbox rows), the first run seeds the pointer from the newest
-   message and ingests nothing historical. Backfill runs
+   ENTRY outbox rows), the first run seeds the pointer at the newest
+   message dated before the listener started (less a 60 s clock-skew
+   margin) and ingests only what came after it -- see
+   `Listener._seed_pointer` for why the cutoff is the *start* time and
+   not the moment the seed happens to succeed. Every history RPC here
+   is bounded (`rpc_timeout`), so a hung read cannot hold `start()`
+   before handlers exist. Backfill runs
    *before* handlers are registered, so a message can never be ingested
    by backfill and the update stream at the same instant (and even if it
    were, `ingest()`'s dedup would make the second one a no-op).
@@ -101,7 +106,7 @@ import collections
 import logging
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -120,6 +125,13 @@ logger = logging.getLogger(__name__)
 EXIT_LISTENER_STOPPED = 4
 
 DEFAULT_BACKFILL_LIMIT = 500
+#: Hard bound on every history `get_messages()` RPC `read_history()`
+#: makes -- backfill's, and the poll's by default.
+DEFAULT_RPC_TIMEOUT = 20.0
+#: How far before the listener's start a first-run seed still ingests
+#: from. Absorbs skew between this machine's clock (the start time) and
+#: Telegram's (message dates); see `Listener._seed_pointer`.
+FIRST_RUN_SEED_MARGIN = timedelta(seconds=60)
 DEFAULT_WRITER_STOP_TIMEOUT = 15.0
 #: How long `start()` waits for the writer thread to have connected.
 #: Connecting and migrating a local SQLite file takes milliseconds; 30 s
@@ -329,6 +341,7 @@ class Listener:
         now: Callable[[], datetime] | None = None,
         poll_hook: PollHook | None = None,
         backfill_limit: int = DEFAULT_BACKFILL_LIMIT,
+        backfill_rpc_timeout: float = DEFAULT_RPC_TIMEOUT,
         writer_stop_timeout: float = DEFAULT_WRITER_STOP_TIMEOUT,
         writer_ready_timeout: float = DEFAULT_WRITER_READY_TIMEOUT,
     ) -> None:
@@ -342,6 +355,10 @@ class Listener:
 
         self._now = now if now is not None else _utcnow
         self._backfill_limit = backfill_limit
+        self._backfill_rpc_timeout = backfill_rpc_timeout
+        # When start() began, from the injected clock. The first-run seed
+        # keeps everything posted after it (less FIRST_RUN_SEED_MARGIN).
+        self._started_at: datetime | None = None
         self._writer_stop_timeout = writer_stop_timeout
         self._writer_ready_timeout = writer_ready_timeout
         self._channels_by_id: dict[int, ChannelCfg] = {
@@ -633,7 +650,7 @@ class Listener:
         *,
         source: str,
         limit: int,
-        rpc_timeout: float | None = None,
+        rpc_timeout: float,
     ) -> tuple[HistoryIngest, ...]:
         """One history read for one channel: fetch everything after the
         pointer (oldest first, at most `limit`) and ingest it.
@@ -650,17 +667,22 @@ class Listener:
 
         A pointer of 0 on a channel this process has not yet seeded
         means the channel has never been read. Reading from 0 would
-        return its *oldest* messages, so this call instead seeds the
-        pointer from the newest message and ingests nothing (returns
-        `()`). If that seed fails at startup, the next call -- the poll's
-        -- seeds instead, never reads from 0.
+        return its *oldest* messages, so this call first seeds the
+        pointer just below everything posted since the listener started
+        (`_seed_pointer`) and then reads on from there as usual. If that
+        seed fails at startup, the next call -- the poll's -- seeds
+        instead, from the same start time, and never reads from 0 unless
+        the channel verifiably has nothing older.
 
-        `rpc_timeout`, when given, bounds each `get_messages()` RPC with
-        `asyncio.wait_for` (`TimeoutError` propagates). It bounds the RPC
-        only, never the writes that follow: cancelling a batch half-way
-        through its ingest would discard the outcomes of messages already
-        stored (the poll counts `missed_by_eventstream` from them) and
-        could land between a skip's write and its CRITICAL log.
+        `rpc_timeout` is required: it bounds every `get_messages()` RPC
+        this call makes (`asyncio.wait_for`; `TimeoutError` propagates),
+        so no history read -- and no holder of the per-channel lock
+        below -- can wait on Telegram forever. Backfill passes the
+        listener's `backfill_rpc_timeout`. It bounds the RPCs only, never
+        the writes that follow: cancelling a batch half-way through its
+        ingest would discard the outcomes of messages already stored (the
+        poll counts `missed_by_eventstream` from them) and could land
+        between a skip's write and its CRITICAL log.
 
         **At most one history read per channel runs at a time.** A read
         takes a per-channel lock for its whole length -- pointer read,
@@ -677,7 +699,7 @@ class Listener:
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError(f"limit must be a positive int, got {limit!r}")
-        if rpc_timeout is not None and (
+        if (
             isinstance(rpc_timeout, bool)
             or not isinstance(rpc_timeout, int | float)
             or rpc_timeout <= 0
@@ -688,10 +710,9 @@ class Listener:
         async with lock:
             pointer = self.read_last_processed_message_id(channel_id)
             if pointer == 0 and channel_id not in self._pointer_seeded:
-                await self._seed_pointer_from_newest(channel_cfg, rpc_timeout=rpc_timeout)
-                return ()
+                pointer = await self._seed_pointer(channel_cfg, rpc_timeout=rpc_timeout)
             self._pointer_seeded.add(channel_id)
-            messages = await _bounded(
+            messages = await asyncio.wait_for(
                 self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
                 rpc_timeout,
             )
@@ -722,30 +743,79 @@ class Listener:
 
         await self._run_on_writer(bump)
 
-    async def _seed_pointer_from_newest(
-        self, channel_cfg: ChannelCfg, *, rpc_timeout: float | None = None
-    ) -> int:
-        """First run for this channel: point it at the newest message, so
-        only what is posted from now on is ingested. One RPC, newest
-        first (`limit=1`, not reversed)."""
+    async def _seed_pointer(self, channel_cfg: ChannelCfg, *, rpc_timeout: float) -> int:
+        """First run for this channel: set the pointer just below
+        everything posted since the listener started, and return it.
+
+        The anchor is the newest message dated before `cutoff =
+        started_at - FIRST_RUN_SEED_MARGIN` -- one RPC,
+        `get_messages(limit=1, offset_date=cutoff)` (Telegram's
+        `getHistory` returns only messages sent before `offset_date`).
+        The pointer is set to it, and the read that follows in the same
+        `read_history()` call ingests everything after it.
+
+        **Why the start time, and not "now".** Seeding at whatever is
+        newest when the seed finally succeeds is only harmless at
+        startup. If the startup seed fails (a connection blip, a long
+        flood wait, a timeout), the poll seeds later -- and "newest" by
+        then includes messages posted after the listener started, which
+        the update stream may well have dropped. Seeding above them would
+        skip them for good: never stored, never counted, with a log line
+        claiming nothing after the seed was lost (fix round 1's
+        Critical, probe 1f). With the cutoff tied to the start, a late
+        seed lands where a prompt one would have, and those messages are
+        ingested by the poll (`source="poll"`, so they count as missed).
+        At startup it finds only what was posted in the margin or during
+        startup itself -- messages the update stream could not have
+        delivered either, since handlers are not registered yet.
+
+        The margin absorbs skew between this machine's clock (the start
+        time) and Telegram's (the message dates).
+
+        No anchor -- the channel is empty, or everything in it is after
+        the cutoff -- leaves the pointer at 0 and the read goes from 0.
+        That is safe only if the channel really has nothing older, so it
+        is verified: the oldest message is fetched, and if *it* predates
+        the cutoff the anchor query was wrong and this raises
+        `RuntimeError` rather than ingest the channel's ancient history
+        (the reviewer's D3). The next read retries the seed.
+        """
         channel_id = channel_cfg.channel_id
-        newest = await _bounded(self.client.get_messages(channel_id, limit=1), rpc_timeout)
-        newest_id = max((message.id for message in newest), default=0)
-        if newest_id:
+        if self._started_at is None:
+            raise RuntimeError("a first-run seed needs the start time Listener.start() records")
+        cutoff = self._started_at - FIRST_RUN_SEED_MARGIN
+        before_cutoff = await asyncio.wait_for(
+            self.client.get_messages(channel_id, limit=1, offset_date=cutoff), rpc_timeout
+        )
+        anchor_id = max((message.id for message in before_cutoff), default=0)
+        if anchor_id:
 
             def seed(conn: Connection) -> None:
-                _advance_last_processed(conn, channel_id=channel_id, message_id=newest_id)
+                _advance_last_processed(conn, channel_id=channel_id, message_id=anchor_id)
 
             await self._run_on_writer(seed)
+        else:
+            oldest = await asyncio.wait_for(
+                self.client.get_messages(channel_id, limit=1, reverse=True), rpc_timeout
+            )
+            if any(message.date < cutoff for message in oldest):
+                raise RuntimeError(
+                    f"channel {channel_id} ({channel_cfg.name}): Telegram reported no "
+                    f"message before {cutoff.isoformat()}, yet its oldest message "
+                    f"({oldest[0].id}) is older; refusing to read its history from 0"
+                )
         self._pointer_seeded.add(channel_id)
         logger.warning(
-            "first run for channel %s (%s): pointer seeded at message_id %s; "
-            "nothing posted before it will be ingested",
+            "first run for channel %s (%s): pointer seeded at message_id %s, the newest "
+            "message dated before %s (listener start minus %ss). Everything after it is "
+            "ingested; nothing before it is.",
             channel_id,
             channel_cfg.name,
-            newest_id,
+            anchor_id,
+            cutoff.isoformat(),
+            int(FIRST_RUN_SEED_MARGIN.total_seconds()),
         )
-        return newest_id
+        return anchor_id
 
     # -- startup ------------------------------------------------------------
 
@@ -755,6 +825,12 @@ class Listener:
         if self._started:
             raise RuntimeError("Listener.start() called twice")
         self._started = True
+        # Before anything else, so before handlers are registered: the
+        # first-run seed keeps everything posted after this instant.
+        started_at = self._now()
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            raise ValueError(f"the injected clock returned a naive datetime: {started_at!r}")
+        self._started_at = started_at.astimezone(UTC)
         self._writer_death = asyncio.get_running_loop().create_future()
 
         await self._start_writer_and_wait_for_connection()  # 0
@@ -794,7 +870,10 @@ class Listener:
     async def _backfill_channel(self, channel: ChannelCfg) -> None:
         try:
             await self.read_history(
-                channel, source="backfill", limit=self._backfill_limit
+                channel,
+                source="backfill",
+                limit=self._backfill_limit,
+                rpc_timeout=self._backfill_rpc_timeout,
             )
         except Exception as exc:  # noqa: BLE001 -- one bad channel must not block the rest
             # Failing the whole startup here would crash-loop the process
@@ -998,12 +1077,6 @@ def _writer_noop(conn: Connection) -> None:
     """`probe_writer()`'s job: touches the connection, writes nothing."""
     conn.execute("SELECT 1").fetchone()
 
-
-async def _bounded(awaitable: Awaitable[Any], timeout: float | None) -> Any:
-    """`await awaitable`, under `asyncio.wait_for` when `timeout` is set."""
-    if timeout is None:
-        return await awaitable
-    return await asyncio.wait_for(awaitable, timeout)
 
 
 def _utcnow() -> datetime:

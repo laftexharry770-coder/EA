@@ -44,7 +44,7 @@ from xaucopier.ingest.listener import (
     normalise_event,
     run_listener,
 )
-from xaucopier.store import db, messages_repo
+from xaucopier.store import db, messages_repo, metrics
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json"
 _FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -63,6 +63,8 @@ DISABLED_CHANNEL = ChannelCfg(
     channel_id=-1009999999999, name="Channel Off", parser="mmh", ordinal=2, enabled=False
 )
 UNKNOWN_CHANNEL_ID = -1003333333333
+#: `read_history`'s required RPC bound, for tests that do not exercise it.
+RPC_TIMEOUT = 5.0
 
 
 def _account(account_id: str, *, enabled: bool = True, ordinal: int = 1) -> AccountCfg:
@@ -431,7 +433,7 @@ def test_live_message_after_a_blackout_does_not_carry_the_pointer_past_the_misse
             visible = await client.get_messages(
                 CHANNEL_ID, min_id=pointer_after_live, reverse=True, limit=None
             )
-            results = await listener.read_history(CHANNEL, source="poll", limit=100)
+            results = await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
             pointer_after_read = listener.read_last_processed_message_id(CHANNEL_ID)
         return (
             (delivered_10, delivered_11, delivered_12),
@@ -474,7 +476,7 @@ def test_live_message_after_a_partial_backfill_does_not_skip_the_rest_of_the_gap
             await client.emit(CHANNEL_ID, _chatter_message(1013))
             after_live = listener.read_last_processed_message_id(CHANNEL_ID)
             assert after_live == 1005, "a live message moved the history pointer"
-            await listener.read_history(CHANNEL, source="poll", limit=100)
+            await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
             after_read = listener.read_last_processed_message_id(CHANNEL_ID)
         return after_backfill, after_live, after_read
 
@@ -513,7 +515,7 @@ def test_live_message_that_fails_is_recovered_by_the_next_history_read(
             errors = listener.handler_error_count
             pointer_after_live = listener.read_last_processed_message_id(CHANNEL_ID)
             assert pointer_after_live == 9, "a live message moved the history pointer"
-            await listener.read_history(CHANNEL, source="poll", limit=100)
+            await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
             pointer_after_read = listener.read_last_processed_message_id(CHANNEL_ID)
         return errors, pointer_after_live, pointer_after_read
 
@@ -632,8 +634,9 @@ def test_first_run_seeds_the_pointer_from_the_newest_message_and_ingests_no_hist
     """The reviewer's D3: with the pointer at 0, `get_messages(min_id=0,
     reverse=True, limit=N)` returns the first N messages the channel ever
     posted -- possibly years-old signals, each queuing ENTRY outbox rows.
-    A first run must instead start from *now*: seed the pointer from the
-    newest message and ingest nothing historical."""
+    A first run must instead start from the listener's start: seed the
+    pointer at the newest message dated before it (all of this history
+    is 15 minutes old) and ingest nothing historical."""
     db_path = tmp_path / "store.db"
     old_history = [_chatter_message(i) for i in range(1, 21)]
     old_history[2] = _signal_message(3)  # an ancient signal, never to be traded
@@ -650,19 +653,21 @@ def test_first_run_seeds_the_pointer_from_the_newest_message_and_ingests_no_hist
             await client.emit(CHANNEL_ID, _chatter_message(21))
             with client.blackout():
                 await client.emit(CHANNEL_ID, _chatter_message(22))
-            await listener.read_history(CHANNEL, source="poll", limit=100)
+            await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
         return rows_after_start, pointer_after_start, seed_calls
 
     rows_after_start, pointer_after_start, seed_calls = asyncio.run(scenario())
 
     assert rows_after_start == 0, "first run ingested the channel's old history"
     assert pointer_after_start == 20
-    assert len(seed_calls) == 1
-    assert (seed_calls[0].entity, seed_calls[0].limit, seed_calls[0].reverse) == (
+    anchor, forward = seed_calls
+    assert (anchor.entity, anchor.limit, anchor.reverse, anchor.offset_date) == (
         CHANNEL_ID,
         1,
         False,
-    ), "the seed must ask for exactly the newest message"
+        NOW - listener_module.FIRST_RUN_SEED_MARGIN,
+    ), "the seed must ask for exactly the newest message before the start cutoff"
+    assert (forward.min_id, forward.reverse) == (20, True), "then read on from the anchor"
     assert _rows(db_path, "SELECT message_id, source FROM messages ORDER BY message_id") == [
         (21, "live"),
         (22, "poll"),
@@ -684,7 +689,7 @@ def test_first_run_on_an_empty_channel_does_not_reseed_past_the_first_message(
             pointer_after_start = listener.read_last_processed_message_id(CHANNEL_ID)
             with client.blackout():
                 await client.emit(CHANNEL_ID, _chatter_message(1))
-            await listener.read_history(CHANNEL, source="poll", limit=100)
+            await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
             return pointer_after_start, listener.read_last_processed_message_id(CHANNEL_ID)
 
     pointer_after_start, pointer_after_read = asyncio.run(scenario())
@@ -716,7 +721,7 @@ def test_a_failed_first_run_seed_is_retried_as_a_seed_not_a_read_from_zero(
         client.get_messages = flaky_get_messages
         async with _started(db_path, client) as listener:
             pointer_after_start = listener.read_last_processed_message_id(CHANNEL_ID)
-            results = await listener.read_history(CHANNEL, source="poll", limit=100)
+            results = await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
             return (
                 pointer_after_start,
                 results,
@@ -729,6 +734,135 @@ def test_a_failed_first_run_seed_is_retried_as_a_seed_not_a_read_from_zero(
     assert results == ()
     assert _count(db_path, "messages") == 0
     assert pointer_after_read == 20
+
+
+def _dated(message_id: int, date: datetime, text: str = CHATTER_TEXT) -> FakeMessage:
+    return FakeMessage(id=message_id, message=text, date=date)
+
+
+def test_the_first_run_seed_keeps_everything_since_the_start_less_the_margin(
+    tmp_path: Path,
+) -> None:
+    """The seed's cutoff is the listener's start minus the clock-skew
+    margin: a message 1 s inside the margin is ingested, one 1 s outside
+    it is not, and so is one posted while startup was still under way
+    (handlers were not registered yet, so the stream could not have
+    delivered it)."""
+    db_path = tmp_path / "store.db"
+    cutoff = NOW - listener_module.FIRST_RUN_SEED_MARGIN
+    history = [
+        _dated(1, NOW - timedelta(hours=2)),
+        _dated(2, cutoff - timedelta(seconds=1)),
+        _dated(3, cutoff + timedelta(seconds=1)),
+        _dated(4, NOW + timedelta(seconds=1)),
+    ]
+
+    async def scenario() -> None:
+        async with _started(db_path, FakeTelegramClient(history={CHANNEL_ID: history})):
+            pass
+
+    asyncio.run(scenario())
+
+    assert _rows(db_path, "SELECT message_id, source FROM messages ORDER BY message_id") == [
+        (3, "backfill"),
+        (4, "backfill"),
+    ]
+    assert _last_processed(db_path, CHANNEL_ID) == 4
+
+
+class _NoAnchorClient(FakeTelegramClient):
+    """Answers every `offset_date` query with nothing -- as a server quirk
+    or a hidden message might -- while its history is really there."""
+
+    async def get_messages(self, *args, **kwargs):
+        if "offset_date" in kwargs:
+            self.calls.append("get_messages")
+            return []
+        return await super().get_messages(*args, **kwargs)
+
+
+@pytest.mark.parametrize("history_age", ["ancient", "all_after_the_start"])
+def test_a_seed_with_no_anchor_reads_from_zero_only_if_nothing_is_older(
+    tmp_path: Path, history_age: str
+) -> None:
+    """No message before the cutoff means the read goes from 0. That is
+    right for a channel whose every post is newer than the start, and the
+    D3 disaster for one with years of history -- so it is verified
+    against the channel's oldest message, never assumed."""
+    db_path = tmp_path / "store.db"
+    if history_age == "ancient":
+        client = _NoAnchorClient(
+            history={
+                CHANNEL_ID: [
+                    _dated(1, NOW - timedelta(days=400)),
+                    _dated(2, NOW - timedelta(days=400), SIGNAL_TEXT),
+                ]
+            }
+        )
+    else:
+        client = FakeTelegramClient(
+            history={CHANNEL_ID: [_dated(1, NOW + timedelta(seconds=1)), _dated(2, NOW)]}
+        )
+
+    async def scenario():
+        async with _started(db_path, client) as listener:  # the startup seed
+            if history_age == "ancient":
+                with pytest.raises(RuntimeError, match="refusing to read its history from 0"):
+                    await listener.read_history(
+                        CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT
+                    )
+
+    asyncio.run(scenario())
+
+    stored = _rows(db_path, "SELECT message_id FROM messages ORDER BY message_id")
+    if history_age == "ancient":
+        assert stored == [], "a first run read the channel's ancient history"
+        assert _count(db_path, "outbox") == 0
+        assert _last_processed(db_path, CHANNEL_ID) == 0
+    else:
+        assert stored == [(1,), (2,)]
+        assert _last_processed(db_path, CHANNEL_ID) == 2
+
+
+@pytest.mark.parametrize("path", ["read", "seed"])
+def test_a_hung_backfill_read_cannot_hold_start(tmp_path: Path, path: str) -> None:
+    """Backfill runs before handlers are registered and before the poll
+    starts: a read hung there would leave a live process that hears
+    nothing, forever. `rpc_timeout` is required, so it is bounded; the
+    channel is picked up by the next read once Telegram answers again."""
+    db_path = tmp_path / "store.db"
+    if path == "read":
+        _seed_last_processed(db_path, CHANNEL_ID, 9)
+
+    async def scenario():
+        client = _ScriptedReadsClient()
+        client.script = ["hang"]
+        listener = _build_listener(db_path, client, backfill_rpc_timeout=0.1)
+        try:
+            await asyncio.wait_for(listener.start(), timeout=2.0)
+            calls_after_start = list(client.calls)
+            client.add_to_history(CHANNEL_ID, _dated(10, NOW + timedelta(seconds=10)))
+            await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
+        finally:
+            await listener.aclose()
+        return calls_after_start
+
+    calls_after_start = asyncio.run(scenario())
+
+    assert "add_event_handler" in calls_after_start
+    assert _rows(db_path, "SELECT message_id, source FROM messages") == [(10, "poll")]
+    assert _last_processed(db_path, CHANNEL_ID) == 10
+
+
+def test_read_history_requires_an_rpc_timeout(tmp_path: Path) -> None:
+    db_path = tmp_path / "store.db"
+
+    async def scenario() -> None:
+        async with _started(db_path, FakeTelegramClient()) as listener:
+            with pytest.raises(TypeError, match="rpc_timeout"):
+                await listener.read_history(CHANNEL, source="poll", limit=100)
+
+    asyncio.run(scenario())
 
 
 # -- a history message that fails -------------------------------------------
@@ -795,7 +929,7 @@ def test_a_transient_history_failure_stops_the_batch_and_the_next_read_retries_i
         )
         async with _started(db_path, client) as listener:  # backfill is read 1
             after_backfill = (listener.read_last_processed_message_id(CHANNEL_ID), _stored(db_path))
-            second = await listener.read_history(CHANNEL, source="poll", limit=100)
+            second = await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
             after_second = (listener.read_last_processed_message_id(CHANNEL_ID), _stored(db_path))
             errors = listener.handler_errors
         return after_backfill, second, after_second, errors
@@ -854,7 +988,7 @@ def test_a_message_that_always_fails_is_skipped_after_exactly_three_reads(
         async with _started(db_path, client) as listener:  # backfill is read 1
             states.append((listener.read_last_processed_message_id(CHANNEL_ID), _stored(db_path)))
             for _ in range(3):  # reads 2, 3 and a 4th that finds nothing new
-                await listener.read_history(CHANNEL, source="poll", limit=100)
+                await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
                 states.append(
                     (listener.read_last_processed_message_id(CHANNEL_ID), _stored(db_path))
                 )
@@ -926,14 +1060,14 @@ def test_a_dead_writer_never_counts_toward_a_skip(
             client.add_to_history(CHANNEL_ID, _chatter_message(11))  # after backfill
             writer.dead = True
             for _ in range(listener_module.MAX_HISTORY_ATTEMPTS - 1):
-                results = await listener.read_history(CHANNEL, source="poll", limit=100)
+                results = await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
                 assert [(r.message_id, r.result) for r in results] == [(11, None)]
             writer.dead = False
             genuine_failures.append(1)
-            failed = await listener.read_history(CHANNEL, source="poll", limit=100)
+            failed = await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
             assert [(r.message_id, r.result) for r in failed] == [(11, None)]
             assert listener.read_last_processed_message_id(CHANNEL_ID) == 9
-            await listener.read_history(CHANNEL, source="poll", limit=100)
+            await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
 
     asyncio.run(scenario())
 
@@ -985,9 +1119,9 @@ def test_history_reads_of_one_channel_never_overlap_but_other_channels_do(
                 asyncio.Event(), {}, {}, 0
             )
             reads = [
-                asyncio.create_task(listener.read_history(CHANNEL, source="poll", limit=100)),
-                asyncio.create_task(listener.read_history(CHANNEL, source="poll", limit=100)),
-                asyncio.create_task(listener.read_history(other, source="poll", limit=100)),
+                asyncio.create_task(listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)),
+                asyncio.create_task(listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)),
+                asyncio.create_task(listener.read_history(other, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)),
             ]
             await _wait_for(lambda: sum(client.in_flight.values()) == 2)
             await asyncio.sleep(0.05)  # every chance for a second read of A to get in
@@ -1029,7 +1163,7 @@ def test_a_skip_raced_by_an_overlapping_batch_does_not_raise(
     async def scenario():
         client = FakeTelegramClient(history={CHANNEL_ID: [_chatter_message(11)]})
         async with _started(db_path, client) as listener:  # backfill: attempt 1
-            await listener.read_history(CHANNEL, source="poll", limit=100)  # attempt 2
+            await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)  # attempt 2
             batch = [_chatter_message(11)]
             return await asyncio.gather(
                 listener.ingest_history(CHANNEL, batch, min_id=9, source="poll"),
@@ -1082,13 +1216,14 @@ class _ScriptedReadsClient(FakeTelegramClient):
         return await super().get_messages(*args, **kwargs)
 
 
-@pytest.mark.parametrize("path", ["read", "seed"])
+@pytest.mark.parametrize("path", ["read", "seed_anchor", "seed_oldest_check"])
 def test_read_history_rpc_timeout_bounds_the_read_and_the_first_run_seed(
     tmp_path: Path, path: str
 ) -> None:
-    """The poll passes `rpc_timeout`; both RPCs `read_history` can make --
-    the history read, and the first-run seed of a channel whose startup
-    backfill failed -- must honour it, or one hung RPC hangs the poll."""
+    """Every RPC `read_history` can make must honour `rpc_timeout`, or one
+    hung RPC hangs the poll: the history read; the first-run seed's anchor
+    query; and, when there is no anchor, the seed's check of the oldest
+    message."""
     db_path = tmp_path / "store.db"
     if path == "read":
         _seed_last_processed(db_path, CHANNEL_ID, 9)
@@ -1096,8 +1231,14 @@ def test_read_history_rpc_timeout_bounds_the_read_and_the_first_run_seed(
     async def scenario() -> float:
         client = _ScriptedReadsClient()
         # Startup backfill: a normal read, or a failed seed (so the
-        # channel is still unseeded and the next call seeds).
-        client.script = [None if path == "read" else ConnectionError("startup blip"), "hang"]
+        # channel is still unseeded and the next call seeds). Then the
+        # step that hangs; for the oldest check, the (empty) channel's
+        # anchor query answers first.
+        client.script = {
+            "read": [None, "hang"],
+            "seed_anchor": [ConnectionError("startup blip"), "hang"],
+            "seed_oldest_check": [ConnectionError("startup blip"), None, "hang"],
+        }[path]
         async with _started(db_path, client) as listener:
             started = asyncio.get_running_loop().time()
             with pytest.raises(TimeoutError):
@@ -1468,7 +1609,7 @@ def test_a_writer_death_seen_by_a_history_read_stops_the_listener(tmp_path: Path
 
     async def polling(listener: Listener) -> None:
         while True:
-            await listener.read_history(CHANNEL, source="poll", limit=100)
+            await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
             await asyncio.sleep(0.01)
 
     async def scenario():

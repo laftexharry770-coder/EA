@@ -21,7 +21,7 @@ import json
 import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -30,7 +30,12 @@ from telethon import errors
 from fakes.telegram import FakeMessage, FakeTelegramClient
 from xaucopier.config.accounts import AccountCfg
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.ingest.listener import EXIT_LISTENER_STOPPED, Listener, run_listener
+from xaucopier.ingest.listener import (
+    EXIT_LISTENER_STOPPED,
+    FIRST_RUN_SEED_MARGIN,
+    Listener,
+    run_listener,
+)
 from xaucopier.ingest.poll import (
     DEFAULT_POLL_INTERVAL,
     DEFAULT_POLL_LIMIT,
@@ -160,6 +165,7 @@ def _build(
     *,
     channels: tuple[ChannelCfg, ...] = (CHANNEL_A,),
     writer: db.Writer | None = None,
+    now: Callable[[], datetime] = lambda: NOW,
     **poll_kwargs,
 ) -> Listener:
     poll = HistoryPoll(sleep=time.sleep, clock=time.clock, **poll_kwargs)
@@ -169,7 +175,7 @@ def _build(
         accounts=ACCOUNTS,
         writer=writer if writer is not None else db.Writer(db_path),
         db_path=db_path,
-        now=lambda: NOW,
+        now=now,
         poll_hook=poll,
     )
 
@@ -377,6 +383,56 @@ def test_two_channels_one_blacked_out_one_live_recover_independently(tmp_path: P
     assert _stored(db_path, B) == [(20, "live"), (21, "poll"), (22, "live")]
     assert (_pointer(db_path, A), _pointer(db_path, B)) == (12, 22)
     assert _missed(db_path) == 4
+
+
+def test_a_late_first_run_seed_recovers_what_was_posted_after_the_listener_started(
+    tmp_path: Path,
+) -> None:
+    """Fix round 1's Critical (probe 1f), in the D1 order. A first run
+    whose startup seed fails; then a signal is posted during a blackout;
+    then a live message arrives; only minutes later does the poll get to
+    seed. Seeding at "whatever is newest now" would jump over the
+    blacked-out signal for good. The seed is anchored at the listener's
+    start instead, so the signal is stored and counted as missed -- and
+    the channel's old history, including an old signal, is not."""
+    db_path = tmp_path / "store.db"  # no pointer: a first run
+    time = SteppedTime()
+    clock = {"now": NOW}
+    an_hour_ago = NOW - timedelta(hours=1)
+    old_history = [
+        FakeMessage(id=i, message=SIGNAL_TEXT if i == 3 else CHATTER_TEXT, date=an_hour_ago)
+        for i in range(1, 6)
+    ]
+
+    async def scenario():
+        client = ScriptedClient(history={A: old_history})
+        client.failures[A] = [ConnectionError("blip during the startup seed")]
+        async with _polling(db_path, client, time, now=lambda: clock["now"]) as listener:
+            after_start = (_pointer(db_path), _stored(db_path))
+            clock["now"] = NOW + timedelta(seconds=30)
+            with client.blackout():
+                hidden = await client.emit(
+                    A, FakeMessage(id=6, message=SIGNAL_TEXT, date=clock["now"])
+                )
+            clock["now"] = NOW + timedelta(seconds=45)
+            live = await client.emit(A, FakeMessage(id=7, message=CHATTER_TEXT, date=clock["now"]))
+            clock["now"] = NOW + timedelta(minutes=5)  # the seed is late
+            calls_before = len(client.get_messages_calls)
+            await _run_rounds(listener, time)
+            poll_calls = client.get_messages_calls[calls_before:]
+        return after_start, hidden, live, poll_calls
+
+    after_start, hidden, live, poll_calls = asyncio.run(scenario())
+
+    assert after_start == (0, []), "the startup seed was supposed to fail"
+    assert (hidden, live) == (False, True)
+    assert _stored(db_path) == [(6, "poll"), (7, "live")]
+    assert _pointer(db_path) == 7
+    assert _missed(db_path) == 1
+    assert _rows(db_path, "SELECT message_id FROM signals") == [(6,)]  # never old signal 3
+    assert _rows(db_path, "SELECT COUNT(*) FROM outbox")[0][0] == len(ACCOUNTS)
+    # Anchored at the listener's start, not at the moment the seed ran.
+    assert poll_calls[0].offset_date == NOW - FIRST_RUN_SEED_MARGIN
 
 
 # -- one channel's trouble stays that channel's ----------------------------------

@@ -74,7 +74,7 @@ DeliveryRoute = Literal["event", "history"]
 #: what Telethon returns, so the fake refuses it rather than silently
 #: returning something production never would.
 _SUPPORTED_GET_MESSAGES_KWARGS = frozenset(
-    {"entity", "limit", "min_id", "max_id", "reverse", "wait_time"}
+    {"entity", "limit", "min_id", "max_id", "offset_date", "reverse", "wait_time"}
 )
 
 
@@ -179,6 +179,7 @@ class GetMessagesCall:
     max_id: int
     limit: int | None
     reverse: bool
+    offset_date: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +272,13 @@ class FakeTelegramClient:
         `tests/test_fakes_telegram.py` pins this against the installed
         Telethon's own `get_messages` so the two cannot drift.
 
+        `offset_date` (not reversed) returns only messages dated strictly
+        before it, newest first -- Telegram's `messages.getHistory`
+        "only return messages sent before the specified date", which is
+        what Telethon sends for a non-reversed `offset_date`. Reversed, or
+        combined with `min_id`/`max_id`, its semantics are not modelled
+        here, so the fake refuses them.
+
         History is *not* affected by a blackout or a dropped socket --
         that asymmetry is the whole point of the fake.
         """
@@ -296,11 +304,21 @@ class FakeTelegramClient:
         *,
         min_id: int = 0,
         max_id: int = 0,
+        offset_date: datetime | None = None,
         reverse: bool = False,
         wait_time: float | None = None,
     ) -> list[FakeMessage]:
         """`iter_messages()`'s signature and defaults (`limit=None` means
         everything), applied to the scripted history."""
+        if offset_date is not None and (reverse or min_id or max_id):
+            raise NotImplementedError(
+                "FakeTelegramClient.get_messages() models offset_date only without "
+                "reverse/min_id/max_id"
+            )
+        if offset_date is not None and (
+            offset_date.tzinfo is None or offset_date.utcoffset() is None
+        ):
+            raise ValueError(f"offset_date must be timezone-aware, got {offset_date!r}")
         self.calls.append("get_messages")
         self.get_messages_calls.append(
             GetMessagesCall(
@@ -309,6 +327,7 @@ class FakeTelegramClient:
                 max_id=max_id,
                 limit=limit,
                 reverse=reverse,
+                offset_date=offset_date,
             )
         )
 
@@ -316,7 +335,9 @@ class FakeTelegramClient:
         messages = [
             message
             for message in self.history.get(channel_id, [])
-            if message.id > min_id and (max_id == 0 or message.id < max_id)
+            if message.id > min_id
+            and (max_id == 0 or message.id < max_id)
+            and (offset_date is None or message.date < offset_date)
         ]
         messages.sort(key=lambda m: m.id, reverse=not reverse)
         if limit is not None:

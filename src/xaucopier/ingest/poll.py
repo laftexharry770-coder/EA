@@ -88,7 +88,7 @@ from typing import NoReturn
 from telethon import errors
 
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.ingest.listener import HistoryIngest, Listener
+from xaucopier.ingest.listener import DEFAULT_RPC_TIMEOUT, HistoryIngest, Listener
 from xaucopier.store import db
 
 logger = logging.getLogger(__name__)
@@ -98,8 +98,9 @@ DEFAULT_POLL_INTERVAL = 5.0
 #: Messages fetched per channel per round. A longer gap is fine: the
 #: pointer stops at the last id read and the next round continues.
 DEFAULT_POLL_LIMIT = 100
-#: Hard bound on each `get_messages()` RPC.
-DEFAULT_RPC_TIMEOUT = 20.0
+#: Hard bound on each `get_messages()` RPC: `listener.DEFAULT_RPC_TIMEOUT`,
+#: re-exported here (backfill uses the same bound).
+DEFAULT_RPC_TIMEOUT = DEFAULT_RPC_TIMEOUT
 #: Hard bound on the per-round writer probe. Generous: the probe queues
 #: behind whatever the writer is doing, and each job may legitimately wait
 #: out a 10 s `busy_timeout`. Only a hung writer takes a full minute.

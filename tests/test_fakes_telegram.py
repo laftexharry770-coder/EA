@@ -272,6 +272,42 @@ def test_get_messages_refuses_arguments_it_does_not_implement() -> None:
     asyncio.run(scenario())
 
 
+def test_get_messages_offset_date_returns_the_newest_messages_dated_before_it() -> None:
+    """Non-reversed `offset_date` is Telegram's `getHistory` "only return
+    messages sent before the specified date": strictly before, newest
+    first. The listener's first-run seed finds its anchor this way."""
+    from datetime import timedelta
+
+    history = [
+        FakeMessage(id=i, message="hi", date=POSTED + timedelta(minutes=i)) for i in range(1, 6)
+    ]
+    cutoff = POSTED + timedelta(minutes=3)  # message 3 is dated exactly at it
+
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL: history})
+        before = await client.get_messages(CHANNEL, limit=2, offset_date=cutoff)
+        anchor = await client.get_messages(CHANNEL, limit=1, offset_date=cutoff)
+        none = await client.get_messages(CHANNEL, limit=1, offset_date=POSTED)
+        return before, anchor, none, client.get_messages_calls[-1]
+
+    before, anchor, none, last_call = asyncio.run(scenario())
+
+    assert [m.id for m in before] == [2, 1]
+    assert [m.id for m in anchor] == [2]
+    assert none == []
+    assert last_call.offset_date == POSTED
+
+
+@pytest.mark.parametrize("extra", [{"reverse": True}, {"min_id": 1}, {"max_id": 5}])
+def test_get_messages_refuses_offset_date_combinations_it_does_not_model(extra) -> None:
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL: [_msg(1)]})
+        with pytest.raises(NotImplementedError, match="offset_date"):
+            await client.get_messages(CHANNEL, limit=1, offset_date=POSTED, **extra)
+
+    asyncio.run(scenario())
+
+
 def test_get_messages_records_its_call_arguments() -> None:
     async def scenario():
         client = FakeTelegramClient(history={CHANNEL: [_msg(1)]})
