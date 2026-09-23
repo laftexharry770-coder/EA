@@ -20,10 +20,11 @@ import pytest
 
 from xaucopier.store import db as store_db
 from xaucopier.store.db import Writer, WriterMisuseError, connect
+from xaucopier.store.migrations import CURRENT_VERSION
 
 EXPECTED_TABLES = {
     "messages", "signals", "followups", "outbox",
-    "channel_state", "metrics",
+    "channel_state", "metrics", "alerts",
 }
 
 
@@ -42,7 +43,7 @@ def test_connect_migrates_fresh_file(tmp_path: Path):
     conn = connect(tmp_path / "store.db", role="writer")
     try:
         (version,) = conn.execute("PRAGMA user_version").fetchone()
-        assert version == 1
+        assert version == CURRENT_VERSION
         tables = {
             row[0]
             for row in conn.execute(

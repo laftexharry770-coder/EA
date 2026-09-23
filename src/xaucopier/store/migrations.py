@@ -78,16 +78,85 @@ mode. (The newer 3.12+ ``conn.autocommit`` attribute would work too;
 arbitrary prior value with a plain assignment, which keeps the
 save/restore symmetric without caring which mode the caller was in.)
 
-Future schema changes add a branch below (``elif current == 1: ...``)
+Future schema changes add a branch below (``if current == 2: ...``)
 and bump ``CURRENT_VERSION``; existing databases upgrade in place the
-next time ``migrate()`` runs against them.
+next time ``migrate()`` runs against them. Every step a database needs
+runs inside the *same* transaction as the one ``user_version`` write, so
+a version-0 file goes to the current version in one atomic step, and a
+version-1 file likewise.
+
+**Migration 2 (Plan 2 Task 10: edits and deletions).** Three changes,
+all in :data:`_MIGRATION_2`:
+
+- ``alerts``: one durable row per thing an operator must look at. Plan 3
+  builds the notifier; until then an alert that only went to a log
+  would scroll away. ``store/alerts.py`` is its one writer.
+- ``messages.deleted_at_utc`` / ``deleted_detected_by``: the durable mark
+  that a message was deleted, and which mechanism saw it (the
+  ``MessageDeleted`` event or the poll's window re-read). It is what
+  makes a deletion seen by both mechanisms processed exactly once, and
+  what keeps an executed signal's deletion (whose ``state`` deliberately
+  does not change) from being re-alerted every poll round.
+- ``followups.edit_seq`` and ``UNIQUE(channel_id, message_id, edit_seq)``
+  in place of ``UNIQUE(channel_id, message_id)``. A material SL/TP edit
+  of an *executed* signal enqueues ``AMEND_SL``/``AMEND_TP`` follow-ups,
+  keyed by the signal's own message: one edit can need several (SL and
+  a TP), and a signal can be edited more than once. Under the old key
+  the second one could not be stored at all -- the writer job would fail
+  every round, forever. ``edit_seq`` 0 is a message's own follow-up
+  (everything migration 1 stored); 1, 2, ... are amendments derived from
+  edits. SQLite cannot drop a table constraint in place, so this is the
+  standard rebuild (create, copy, drop, rename), which keeps every
+  ``followup_id`` -- ``outbox.followup_id`` still points at the same row.
+  Nothing references ``followups`` by foreign key, so the rebuild needs
+  no ``PRAGMA foreign_keys`` change (which SQLite would ignore inside a
+  transaction anyway).
 """
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
+
+#: Migration 2 -- see the module docstring. Plain statements, run in
+#: order inside `migrate()`'s transaction. `CREATE ... IF NOT EXISTS`
+#: where SQLite allows it, like schema.sql; the `ALTER`s and the rebuild
+#: rely on `user_version` gating plus that one transaction instead.
+_MIGRATION_2: tuple[str, ...] = (
+    """CREATE TABLE IF NOT EXISTS alerts (
+      alert_id       INTEGER PRIMARY KEY,
+      created_at_utc TEXT    NOT NULL,
+      level          TEXT    NOT NULL CHECK (level IN ('WARNING', 'CRITICAL')),
+      code           TEXT    NOT NULL,
+      channel_id     INTEGER,
+      message_id     INTEGER,
+      signal_id      INTEGER,
+      detail         TEXT    NOT NULL,
+      acked          INTEGER NOT NULL DEFAULT 0 CHECK (acked IN (0, 1))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_alerts_unacked ON alerts(acked, alert_id)",
+    "ALTER TABLE messages ADD COLUMN deleted_at_utc TEXT",
+    "ALTER TABLE messages ADD COLUMN deleted_detected_by TEXT",
+    """CREATE TABLE followups_v2 (
+      followup_id         INTEGER PRIMARY KEY,
+      channel_id          INTEGER NOT NULL,
+      message_id          INTEGER NOT NULL,
+      op                  TEXT    NOT NULL,
+      parsed_json         TEXT    NOT NULL,
+      reply_to_message_id INTEGER,
+      target_signal_id    INTEGER,
+      resolution_path     TEXT,
+      edit_seq            INTEGER NOT NULL DEFAULT 0,
+      UNIQUE (channel_id, message_id, edit_seq)
+    )""",
+    "INSERT INTO followups_v2 (followup_id, channel_id, message_id, op, parsed_json, "
+    "reply_to_message_id, target_signal_id, resolution_path, edit_seq) "
+    "SELECT followup_id, channel_id, message_id, op, parsed_json, "
+    "reply_to_message_id, target_signal_id, resolution_path, 0 FROM followups",
+    "DROP TABLE followups",
+    "ALTER TABLE followups_v2 RENAME TO followups",
+)
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
@@ -114,6 +183,13 @@ def _schema_statements() -> list[str]:
     return [stmt.strip() for stmt in script.split(";") if stmt.strip()]
 
 
+def _migration_2_statements() -> tuple[str, ...]:
+    """Migration 2's statements. A function, like `_schema_sql`, so a
+    test can inject a failure part-way through and prove the whole step
+    rolls back."""
+    return _MIGRATION_2
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Bring `conn`'s schema up to CURRENT_VERSION. Safe to call repeatedly.
 
@@ -138,8 +214,13 @@ def migrate(conn: sqlite3.Connection) -> None:
                     conn.execute(statement)
                 current = 1
 
+            if current == 1:
+                for statement in _migration_2_statements():
+                    conn.execute(statement)
+                current = 2
+
             # Future migrations:
-            # `if current == 1: for stmt in ...: conn.execute(stmt); current = 2`
+            # `if current == 2: for stmt in ...: conn.execute(stmt); current = 3`
 
             conn.execute(f"PRAGMA user_version = {CURRENT_VERSION}")
         except BaseException:

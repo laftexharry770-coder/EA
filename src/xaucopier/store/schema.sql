@@ -1,3 +1,6 @@
+-- Migration 1: the original schema. Later migrations change it in
+-- migrations.py (migration 2: the alerts table, messages deletion marks,
+-- followups.edit_seq) -- read both for the current shape.
 CREATE TABLE IF NOT EXISTS messages (
   channel_id      INTEGER NOT NULL,
   message_id      INTEGER NOT NULL,

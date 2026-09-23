@@ -15,7 +15,7 @@ from xaucopier.store.migrations import CURRENT_VERSION, migrate
 
 EXPECTED_TABLES = {
     "messages", "signals", "followups", "outbox",
-    "channel_state", "metrics",
+    "channel_state", "metrics", "alerts",
 }
 
 
@@ -77,7 +77,10 @@ def test_schema_applies_to_fresh_database(tmp_path):
 
 
 def test_no_extra_tables_beyond_the_brief(tmp_path):
-    """Plan 3 adds legs, fills, account_state, alerts -- not this task."""
+    """Plan 3 adds legs, fills, account_state -- not Plan 2. (`alerts`
+    moved into Plan 2 with Task 10's migration 2: edits and deletions
+    must be able to record an operator alert durably before Plan 3's
+    notifier exists.)"""
     conn = _connect(tmp_path)
     tables = {
         row[0]
@@ -86,7 +89,7 @@ def test_no_extra_tables_beyond_the_brief(tmp_path):
         )
     }
     assert tables == EXPECTED_TABLES
-    for future_table in ("legs", "fills", "account_state", "alerts"):
+    for future_table in ("legs", "fills", "account_state"):
         assert future_table not in tables
     conn.close()
 
@@ -334,3 +337,182 @@ def test_migrate_rolls_back_cleanly_on_mid_ddl_failure(tmp_path, monkeypatch):
     (version,) = conn2.execute("PRAGMA user_version").fetchone()
     assert version == CURRENT_VERSION
     conn2.close()
+
+
+# -- migration 2 (Task 10): alerts, messages deletion marks, followups.edit_seq
+
+
+def _v1_database(db_path):
+    """A database exactly as migration 1 left it -- schema.sql, applied
+    the way `migrate()` applied it, and `user_version = 1` -- holding one
+    row in every table, so an upgrade has something to lose."""
+    import xaucopier.store.migrations as migrations_module
+
+    conn = sqlite3.connect(db_path)
+    conn.isolation_level = None
+    conn.execute("BEGIN")
+    for statement in migrations_module._schema_statements():
+        conn.execute(statement)
+    conn.execute("PRAGMA user_version = 1")
+    conn.execute("COMMIT")
+    conn.isolation_level = ""
+    _insert_message(conn, channel_id=1, message_id=100)
+    _insert_signal(conn, channel_id=1, message_id=100)
+    _insert_message(conn, channel_id=1, message_id=200)
+    conn.execute(
+        "INSERT INTO followups (followup_id, channel_id, message_id, op, parsed_json, "
+        "reply_to_message_id, target_signal_id, resolution_path) "
+        "VALUES (41, 1, 200, 'amend_sl', '{\"price_hint\": 4460.0}', 100, 5, 'reply')"
+    )
+    conn.execute(
+        "INSERT INTO outbox (account_id, kind, signal_id, followup_id, state, attempts) "
+        "VALUES ('acct-1', 'FOLLOWUP', NULL, 41, 'DONE', 1)"
+    )
+    conn.execute(
+        "INSERT INTO channel_state (channel_id, last_processed_message_id, "
+        "consecutive_parse_failures) VALUES (1, 200, 2)"
+    )
+    conn.execute("INSERT INTO metrics (day_key, name, value) VALUES ('2026-09-05', 'x', 3)")
+    conn.commit()
+    return conn
+
+
+def _dump(conn):
+    """Every row of every migration-1 table, in migration-1 columns."""
+    return {
+        "messages": conn.execute(
+            "SELECT channel_id, message_id, kind, content_hash, raw_text, edit_date_utc, "
+            "received_at_utc, posted_at_utc, source FROM messages ORDER BY 1, 2"
+        ).fetchall(),
+        "signals": conn.execute("SELECT * FROM signals ORDER BY signal_id").fetchall(),
+        "followups": conn.execute(
+            "SELECT followup_id, channel_id, message_id, op, parsed_json, "
+            "reply_to_message_id, target_signal_id, resolution_path FROM followups "
+            "ORDER BY followup_id"
+        ).fetchall(),
+        "outbox": conn.execute("SELECT * FROM outbox ORDER BY outbox_id").fetchall(),
+        "channel_state": conn.execute("SELECT * FROM channel_state").fetchall(),
+        "metrics": conn.execute("SELECT * FROM metrics").fetchall(),
+    }
+
+
+def _columns(conn, table):
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def test_current_version_is_two():
+    assert CURRENT_VERSION == 2
+
+
+def test_upgrading_a_version_1_database_to_2_preserves_every_row(tmp_path):
+    conn = _v1_database(tmp_path / "store.db")
+    before = _dump(conn)
+    assert "edit_seq" not in _columns(conn, "followups")
+
+    migrate(conn)
+
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 2
+    assert _dump(conn) == before
+    # followup_id survives the table rebuild, so outbox.followup_id still
+    # points at the same follow-up.
+    assert conn.execute(
+        "SELECT f.op FROM outbox o JOIN followups f ON f.followup_id = o.followup_id"
+    ).fetchall() == [("amend_sl",)]
+    assert conn.execute("SELECT edit_seq FROM followups").fetchall() == [(0,)]
+    assert conn.execute(
+        "SELECT deleted_at_utc, deleted_detected_by FROM messages"
+    ).fetchall() == [(None, None), (None, None)]
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert tables == EXPECTED_TABLES
+    conn.close()
+
+
+def test_migration_2_is_idempotent(tmp_path):
+    db_path = tmp_path / "store.db"
+    conn = _v1_database(db_path)
+    migrate(conn)
+    after_first = _dump(conn)
+    migrate(conn)  # a no-op, not "table alerts already exists"
+    conn.close()
+
+    conn = sqlite3.connect(db_path)
+    migrate(conn)  # a fresh connection, likewise
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 2
+    assert _dump(conn) == after_first
+    conn.close()
+
+
+def test_migration_2_rolls_back_whole_on_a_failure_after_the_rebuild(tmp_path, monkeypatch):
+    """The failure is injected *after* `DROP TABLE followups` and the
+    rename -- the worst place: were the statements not one transaction
+    with the `user_version` write, the old followups table would be gone
+    and the database stuck at version 1 with a half-applied migration 2."""
+    import xaucopier.store.migrations as migrations_module
+
+    db_path = tmp_path / "store.db"
+    conn = _v1_database(db_path)
+    before = _dump(conn)
+    real = migrations_module._migration_2_statements
+
+    def broken():
+        statements = real()
+        assert any(s.startswith("DROP TABLE followups") for s in statements)
+        return (*statements, "CREATE TABLE this is not valid sql")
+
+    monkeypatch.setattr(migrations_module, "_migration_2_statements", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        migrations_module.migrate(conn)
+    monkeypatch.undo()
+
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 1
+    assert _dump(conn) == before
+    assert "edit_seq" not in _columns(conn, "followups")
+    assert "deleted_at_utc" not in _columns(conn, "messages")
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "alerts" not in tables and "followups_v2" not in tables
+
+    migrate(conn)  # and the next, unpatched, attempt completes
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 2
+    assert _dump(conn) == before
+    conn.close()
+
+
+def test_a_fresh_database_goes_straight_to_version_2(tmp_path):
+    conn = _connect(tmp_path)
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 2
+    assert "edit_seq" in _columns(conn, "followups")
+    assert {"deleted_at_utc", "deleted_detected_by"} <= set(_columns(conn, "messages"))
+    assert {
+        "alert_id", "created_at_utc", "level", "code", "channel_id",
+        "message_id", "signal_id", "detail", "acked",
+    } <= set(_columns(conn, "alerts"))
+    conn.close()
+
+
+def test_followups_are_unique_per_message_and_edit_seq(tmp_path):
+    """A message's own follow-up is edit_seq 0; the AMEND_* rows an edit
+    of a *signal* derives are 1, 2, ... under that signal's message id.
+    Before migration 2 the key was (channel_id, message_id) alone, and a
+    second amendment of one signal could not be stored at all."""
+    conn = _connect(tmp_path)
+    _insert_followup(conn, message_id=200)
+    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_followup(conn, message_id=200)
+    for seq in (1, 2):
+        conn.execute(
+            "INSERT INTO followups (channel_id, message_id, op, parsed_json, edit_seq) "
+            "VALUES (1, 200, 'amend_sl', '{}', ?)",
+            (seq,),
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO followups (channel_id, message_id, op, parsed_json, edit_seq) "
+            "VALUES (1, 200, 'amend_tp', '{}', 2)"
+        )
+    conn.close()
