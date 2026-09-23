@@ -19,6 +19,8 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[1] / "src" / "xaucopier"
 COMMANDS = "setup-login|resolve-channels|watch|status|ack|export-fixtures"
 WRONG = re.compile(rf"(`|with: |run )xaucopier ({COMMANDS})\b")
+#: A bare "run setup-login" -- no `.\xaucopier` at all -- is the same mistake.
+BARE = re.compile(rf"\b[Rr]un `?({COMMANDS})\b")
 
 
 def _docstrings(tree: ast.AST) -> set[int]:
@@ -41,7 +43,7 @@ def _offences() -> list[str]:
                 isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
                 and id(node) not in skip
-                and WRONG.search(node.value)
+                and (WRONG.search(node.value) or BARE.search(node.value))
             ):
                 found.append(f"{path.relative_to(SRC)}:{node.lineno}: {node.value.strip()[:70]}")
     return found
@@ -56,3 +58,6 @@ def test_the_check_bites() -> None:
     assert WRONG.search("Check on it with: xaucopier status")
     assert not WRONG.search("Run `.\\xaucopier setup-login` again")
     assert not WRONG.search("xaucopier watch cannot start: ...")  # a title, not an instruction
+    assert BARE.search("Run setup-login in an ordinary PowerShell window")
+    assert BARE.search("then run resolve-channels again")
+    assert not BARE.search("Run `.\\xaucopier setup-login` again")

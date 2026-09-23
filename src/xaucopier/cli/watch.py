@@ -296,7 +296,8 @@ def _print_setup_error(exc: SetupError) -> None:
     print(f"xaucopier watch cannot start: {exc}", file=sys.stderr)
     print(
         "Nothing was started. This is a setup problem that restarting will not fix "
-        f"(exit code {exit_codes.EXIT_CONFIG_ERROR}); fix it and run watch again. "
+        f"(exit code {exit_codes.EXIT_CONFIG_ERROR}); fix it and run "
+        f"`{paths.USER_COMMAND} watch` again. "
         "See docs/RUNBOOK.md.",
         file=sys.stderr,
     )

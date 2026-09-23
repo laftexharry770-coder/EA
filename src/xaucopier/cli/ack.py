@@ -18,6 +18,7 @@ by hand does not fix the login -- the command says so.
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 
 from xaucopier.cli import exit_codes, paths
@@ -64,6 +65,26 @@ def cmd_ack(args: argparse.Namespace) -> int:
     if args.alert_id is None and not args.all:
         return _list(args)
 
+    try:
+        return _clear(args)
+    except sqlite3.OperationalError as exc:
+        # SQLite waited out its 10 s busy timeout (or could not write at
+        # all): whatever this call did was rolled back with the connection.
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            print(
+                "The database is busy -- watch is probably writing to it. Nothing was "
+                "cleared; try again in a moment.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"The database could not be changed ({exc}). Nothing was cleared.",
+                file=sys.stderr,
+            )
+        return exit_codes.EXIT_FAILED
+
+
+def _clear(args: argparse.Namespace) -> int:
     conn = db.connect(args.db, role="writer")
     try:
         uncleared = {alert.alert_id: alert for alert in alerts.unacked(conn)}
@@ -75,7 +96,8 @@ def cmd_ack(args: argparse.Namespace) -> int:
             return exit_codes.EXIT_OK
         try:
             alerts.ack(conn, alert_id=args.alert_id)
-        except ValueError:
+        except (ValueError, OverflowError):
+            # OverflowError: a number too big for SQLite -- so no such alert.
             conn.rollback()
             print(
                 f"There is no uncleared alert #{args.alert_id}. Run `{_CMD} ack` to see them.",

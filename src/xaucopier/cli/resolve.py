@@ -272,8 +272,8 @@ async def resolve_link(client: Any, text: str) -> Resolved:
     if _PRIVATE_POST_LINK.search(link):
         raise ResolveError(
             "that is a link to a post in a private channel, which cannot be looked up "
-            "by link; run resolve-channels again and just press Enter to choose the "
-            "channel from the list"
+            f"by link; run `{paths.USER_COMMAND} resolve-channels` again and just press "
+            "Enter to choose the channel from the list"
         )
     if link.lstrip("+-").isdigit():
         raise ResolveError(
@@ -430,8 +430,8 @@ def cmd_resolve_channels(args: argparse.Namespace) -> int:
     except AlreadyRunningError:
         print(
             "xaucopier watch is running. Stop it first -- click in its window, press "
-            "Ctrl+C and answer Y -- then run resolve-channels again: two programs must "
-            "never use the Telegram session at once.",
+            f"Ctrl+C and answer Y -- then run `{paths.USER_COMMAND} resolve-channels` "
+            "again: two programs must never use the Telegram session at once.",
             file=sys.stderr,
         )
         return exit_codes.EXIT_ALREADY_RUNNING

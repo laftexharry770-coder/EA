@@ -7,6 +7,7 @@ runbook tells the user to expect.
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -79,7 +80,9 @@ def test_ack_a_number_clears_that_alert_only(
     assert "Cleared alert #2." in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("number", ["4", "99"])  # already cleared; never existed
+@pytest.mark.parametrize(
+    "number", ["4", "99", str(2**63), str(10**30)]
+)  # already cleared; never existed; too big for SQLite
 def test_ack_of_a_number_that_is_not_uncleared_changes_nothing(
     store: Path, capsys: pytest.CaptureFixture[str], number: str
 ) -> None:
@@ -139,3 +142,21 @@ def test_alerts_ack_all_by_code_touches_only_those_codes(store: Path) -> None:
     finally:
         conn.close()
     assert _uncleared(store) == [1, 2]
+
+
+def test_a_database_locked_past_the_timeout_is_explained_and_changes_nothing(
+    store: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Another writer holds the lock longer than SQLite's busy timeout
+    (10 s; shortened here). One sentence, exit 1 -- not a traceback."""
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 50)
+    holder = sqlite3.connect(store)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        for args in (("--all",), ("2",)):
+            assert _ack(store, *args) == exit_codes.EXIT_FAILED
+            assert "The database is busy" in capsys.readouterr().err
+    finally:
+        holder.rollback()
+        holder.close()
+    assert _uncleared(store) == [1, 2, 3]

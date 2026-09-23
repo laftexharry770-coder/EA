@@ -13,6 +13,7 @@ ever differ.
 """
 from __future__ import annotations
 
+from xaucopier.cli.paths import USER_COMMAND
 from xaucopier.ingest.client import EXIT_CONFIG_ERROR, EXIT_TERMINAL_AUTH
 from xaucopier.ingest.listener import EXIT_LISTENER_STOPPED
 
@@ -51,7 +52,7 @@ MEANINGS: tuple[tuple[int, str], ...] = (
     (
         EXIT_TERMINAL_AUTH,
         "Telegram refuses this login (logged out, used twice at once, or the account "
-        "is banned) -- do not restart; run setup-login again",
+        f"is banned) -- do not restart; run `{USER_COMMAND} setup-login` again",
     ),
     (EXIT_LISTENER_STOPPED, "watch stopped unexpectedly -- safe to start it again"),
     (
