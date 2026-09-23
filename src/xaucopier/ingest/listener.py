@@ -122,7 +122,7 @@ from telethon import events
 
 from xaucopier.config.accounts import AccountCfg
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.store import db, edits_repo, messages_repo, metrics
+from xaucopier.store import alerts, db, edits_repo, messages_repo, metrics
 from xaucopier.store.edits_repo import DeletionResult, EditResult
 from xaucopier.store.messages_repo import IngestResult
 
@@ -356,7 +356,7 @@ class Listener:
     `channel_cfg_for()`, `read_last_processed_message_id()`,
     `read_history()`, `ingest_history()`, `ingest_message()`,
     `ingest_edit()`, `ingest_deletion()`, `history_lock()`,
-    `record_handler_error()`, `probe_writer()`, `record_metric()` and
+    `record_handler_error()`, `record_alert()`, `probe_writer()`, `record_metric()` and
     `poll_hook` -- rather than reaching into the internals. The poll
     (`ingest/poll.py`) is `read_history(channel, source="poll",
     limit=..., rpc_timeout=...)`: it is the one place the pointer is
@@ -854,6 +854,35 @@ class Listener:
             metrics.bump(conn, day_key=day_key, name=name, value=value)
 
         await self._run_on_writer(bump)
+
+    async def record_alert(
+        self,
+        level: alerts.AlertLevel,
+        code: str,
+        detail: str,
+        *,
+        channel_id: int | None = None,
+        message_id: int | None = None,
+        signal_id: int | None = None,
+    ) -> int:
+        """Record one operator alert (`store.alerts.record`) on the writer
+        thread, at this listener's injected "now"; returns its id. Through
+        `_run_on_writer()`, so a dead writer stops the listener here too."""
+        now_utc = self._now()
+
+        def job(conn: Connection) -> int:
+            return alerts.record(
+                conn,
+                now_utc=now_utc,
+                level=level,
+                code=code,
+                detail=detail,
+                channel_id=channel_id,
+                message_id=message_id,
+                signal_id=signal_id,
+            )
+
+        return await self._run_on_writer(job)
 
     async def _seed_pointer(self, channel_cfg: ChannelCfg, *, rpc_timeout: float) -> int:
         """First run for this channel: set the pointer just below

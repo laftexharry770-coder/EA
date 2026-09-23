@@ -363,8 +363,14 @@ class FakeTelegramClient:
           are all ignored (`**ignored` here);
         - :288 -- `reverse=True` reverses the ids;
         - :316-318 and :332-335 -- a `MessageEmpty` (a deleted or
-          never-existing id) becomes `None` in its place, so the result
-          zips one-to-one with the ids asked for, in the same order;
+          never-existing id) becomes `None` in its place, in the order
+          the ids were asked for. That is what the fake always does. It
+          is NOT a guarantee production code may rely on: Telethon's own
+          comment (:324-327) warns that Telegram may leave an invalid id
+          out of its answer altogether, and :309-318 turn a
+          `MessageIdsEmptyError` into `None` for every id -- so
+          `ingest/edits.py` matches results by id, never by position,
+          and does not trust a mass of `None`s (a test scripts both);
         - :598-604 -- a scalar `ids` returns the one message (or `None`)
           rather than a list.
 

@@ -12,43 +12,80 @@ which:
 
 1. takes that channel's history lock (`Listener.history_lock`), so it
    never interleaves with a history read of the same channel;
-2. reads the pointer and picks the **window**: the `window` newest stored,
-   not-yet-deleted messages at or below it (`edits_repo.window_versions`,
-   one indexed read on the reader connection). Messages above the
-   pointer belong to the forward read, which meets their current version
-   anyway when it passes them;
+2. reads the pointer and picks the **window**: the `window` newest stored
+   messages at or below it (`edits_repo.window_versions`, one indexed
+   read on the reader connection) -- leaving out those a `MessageDeleted`
+   event deleted, keeping those an earlier window re-read only *inferred*
+   deleted. Messages above the pointer belong to the forward read, which
+   meets their current version anyway when it passes them;
 3. fetches them by id in one bounded RPC -- `get_messages(channel,
    ids=[...])` under `asyncio.wait_for(..., rpc_timeout)` -- which
    returns each message's *current* version, or `None` for one that is
    gone;
-4. hands each message whose `edit_date` is newer than the stored one to
-   `Listener.ingest_edit` (`detected_by="window"`), and each id that came
-   back missing -- a deletion found by **absence** -- to
-   `Listener.ingest_deletion`.
+4. hands every message that came back changed -- a newer `edit_date`, or
+   the same `edit_date` with different text (two edits in one second) --
+   to `Listener.ingest_edit` (`detected_by="window"`), and every message
+   an earlier read had inferred deleted, which proves that inference
+   wrong (`edits_repo` clears the mark and raises CRITICAL
+   `DELETION_REVERSED`);
+5. infers deletions from **absence** -- guarded, below -- and hands them
+   to `Listener.ingest_deletion`.
 
 What an edit or deletion then *does* is `store/edits_repo.py`'s policy,
 decided in one writer job against the stored row, so a change the event
 already delivered is a no-op here, and vice versa.
 
-**It never moves the pointer.** It writes only through `ingest_edit` /
-`ingest_deletion`, neither of which touches `channel_state`, and it only
-reads ids at or below the pointer. The pointer is `read_history`'s alone:
-a read that advanced it past an id it had not ingested would lose that
-message for good (the reviewer's D1).
+**Absence is evidence, not proof** (Task 10 review). Telethon turns a
+`MessageIdsEmptyError` into `None` for *every* id (telethon/client/
+messages.py:309-318), Telegram may leave ids out altogether
+(:324-327), and a single stray `None` is possible. Treating each as a
+deletion voided every unexecuted signal in the window at once. So:
 
-**Matched by id, never by position.** Telethon documents that Telegram
-may leave an invalid id out of its answer altogether instead of sending
-`MessageEmpty` for it (telethon/client/messages.py:324-327), so the list
-need not zip one-to-one with the ids asked for. A message counts as
-present only if a returned message carries its id.
+- **Circuit breaker.** Count the missing ids among those the window
+  expected to be present (not already marked deleted). If *all* of them
+  are missing, or at least `SUSPECT_MIN_ABSENT` (3) are and they are more
+  than half, the answer is suspect: no deletion is inferred from it at
+  all, one CRITICAL `WINDOW_READ_SUSPECT` alert is raised for the channel
+  (once per run of suspect reads, not every round), and the edits of the
+  messages that *did* come back are still applied. A consequence worth
+  knowing: in a window of one or two messages, deleting all of them trips
+  the breaker too; the alert says so, and the `MessageDeleted` event is
+  still acted on.
+- **Two reads, not one.** An id missing from a read that passed the
+  breaker becomes *pending*. It is treated as deleted only if the next
+  read that passes the breaker is missing it too; the moment any read
+  returns it, it is no longer pending. Chosen over an immediate
+  single-id re-read because a fault that swallowed a message a moment
+  ago will very likely swallow it again a millisecond later -- the
+  reviewer's own probe injects exactly such a fault -- while a read one
+  poll interval (5 s) later is a far more independent witness, and it
+  costs no extra RPC. The price is one more round (about 5 s) before an
+  absence-only deletion acts; the `MessageDeleted` event, which names its
+  ids explicitly, still acts at once. Pending state lives in memory
+  (`AbsenceTracker`, one per poll run); a restart simply starts over.
+- A window re-read that voids any signal raises one CRITICAL
+  `WINDOW_VOIDED_SIGNALS` alert with the count and the signal ids, on top
+  of each signal's own WARNING -- a mass void must not read as noise.
+
+**It never moves the pointer.** It writes only through `ingest_edit`,
+`ingest_deletion` and `record_alert`, none of which touches
+`channel_state`, and it only reads ids at or below the pointer. The
+pointer is `read_history`'s alone: a read that advanced it past an id it
+had not ingested would lose that message for good (the reviewer's D1).
+
+**Matched by id, never by position.** Because Telegram may leave an id
+out of its answer (telethon/client/messages.py:324-327), the list need not
+zip one-to-one with the ids asked for. A message counts as present only
+if a returned message carries its id.
 
 **Failures.** The RPC's errors -- a flood wait, the `rpc_timeout`, a
-dropped connection -- propagate to the poll, which handles them exactly
-as it handles the forward read's (per channel, retried next round). One
-message whose job fails is recorded in `handler_errors` (`source=
-"window"`) and the rest of the window still runs; it is retried next
-round. `WriterDeadError` always propagates: with no writer nothing can be
-stored, and the listener must stop.
+dropped connection -- propagate to the poll, which handles them as it
+handles the forward read's (per channel, retried next round; a flood wait
+on this read defers only this step). One message whose job fails is
+recorded in `handler_errors` (`source="window"`) and the rest of the
+window still runs; it is retried next round (a failed deletion stays
+pending). `WriterDeadError` always propagates: with no writer nothing can
+be stored, and the listener must stop.
 
 No `sqlite3` here and no `MetaTrader5` (tests enforce both).
 """
@@ -56,13 +93,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
 
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.ingest.listener import Listener, normalise_message
+from xaucopier.ingest.listener import IncomingMessage, Listener, normalise_message
 from xaucopier.store import db, edits_repo
-from xaucopier.store.edits_repo import DeletionResult, EditResult
+from xaucopier.store.edits_repo import DeletionResult, EditResult, StoredVersion
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +111,65 @@ DEFAULT_EDIT_WINDOW = 50
 #: waits 10 s between requests past 300, so up to 100 keeps each re-read
 #: to exactly one RPC.
 MAX_EDIT_WINDOW = 100
+#: The circuit breaker: a read missing every expected id, or at least
+#: this many and more than half of them, is suspect (module docstring).
+SUSPECT_MIN_ABSENT = 3
 
 #: `handler_errors` source, and `edits_repo` detector, for this path.
 WINDOW_SOURCE = edits_repo.WINDOW_DETECTOR
+
+
+class AbsenceTracker:
+    """What the window re-read remembers between rounds, per channel: the
+    ids missing from the last read that passed the circuit breaker (each
+    becomes a deletion only if the next such read misses it too), and
+    whether the channel's reads are currently suspect (so the CRITICAL
+    alert is raised once per run of suspect reads, not every round).
+
+    Mutable, in memory, one per poll run -- deliberately not persisted: a
+    restart re-observes, which only ever delays an absence-only deletion.
+    """
+
+    __slots__ = ("_pending", "_suspect")
+
+    def __init__(self) -> None:
+        self._pending: dict[int, frozenset[int]] = {}
+        self._suspect: set[int] = set()
+
+    def pending(self, channel_id: int) -> frozenset[int]:
+        return self._pending.get(channel_id, frozenset())
+
+    def seen(self, channel_id: int, present: Iterable[int]) -> None:
+        """Ids a read returned: none of them is pending any more."""
+        self._pending[channel_id] = self.pending(channel_id) - frozenset(present)
+
+    def settle(self, channel_id: int, absent: Iterable[int]) -> frozenset[int]:
+        """A read that passed the breaker missed `absent`. Returns those
+        missed by the previous such read too -- confirmed deletions -- and
+        keeps the rest pending."""
+        absent = frozenset(absent)
+        confirmed = absent & self.pending(channel_id)
+        self._pending[channel_id] = absent - confirmed
+        return confirmed
+
+    def keep_pending(self, channel_id: int, message_ids: Iterable[int]) -> None:
+        """A confirmed deletion whose job failed: it stays pending, so the
+        next read that misses it confirms it again."""
+        self._pending[channel_id] = self.pending(channel_id) | frozenset(message_ids)
+
+    def enter_suspect(self, channel_id: int) -> bool:
+        """True the first time in a run of suspect reads."""
+        if channel_id in self._suspect:
+            return False
+        self._suspect.add(channel_id)
+        return True
+
+    def leave_suspect(self, channel_id: int) -> bool:
+        """True if the channel's reads had been suspect until now."""
+        if channel_id not in self._suspect:
+            return False
+        self._suspect.discard(channel_id)
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +183,10 @@ class WindowResult:
     requested: tuple[int, ...]
     edits: tuple[EditResult, ...]
     deletions: tuple[DeletionResult, ...]
+    #: Missing ids waiting for a second read before they count as deleted.
+    pending: tuple[int, ...]
+    #: The read tripped the circuit breaker: no deletion was inferred.
+    suspect: bool
     #: Ids whose job failed (recorded in `handler_errors`; retried next round).
     failed: tuple[int, ...]
 
@@ -114,17 +211,28 @@ def validate_window(window: object, *, name: str = "edit_window") -> int:
     return window
 
 
+def is_suspect(absent: int, expected: int) -> bool:
+    """The circuit breaker: `absent` of the `expected` ids came back
+    missing. Every one missing, or at least `SUSPECT_MIN_ABSENT` and more
+    than half, is not believed."""
+    if expected == 0 or absent == 0:
+        return False
+    return absent == expected or (absent >= SUSPECT_MIN_ABSENT and absent * 2 > expected)
+
+
 async def reconcile_window(
     listener: Listener,
     channel_cfg: ChannelCfg,
     *,
     window: int,
     rpc_timeout: float,
+    absences: AbsenceTracker,
 ) -> WindowResult:
     """Re-read `channel_cfg`'s recent window by id and apply every edit
-    and deletion found (see the module docstring). `rpc_timeout` is
-    required and bounds the one RPC; its `TimeoutError`, like any RPC
-    error, propagates to the caller."""
+    found, and every deletion the guards confirm (see the module
+    docstring). `rpc_timeout` is required and bounds the one RPC; its
+    `TimeoutError`, like any RPC error, propagates to the caller.
+    `absences` carries pending absences from one call to the next."""
     validate_window(window)
     if (
         isinstance(rpc_timeout, bool)
@@ -141,7 +249,7 @@ async def reconcile_window(
         )
         requested = tuple(version.message_id for version in stored)
         if not requested:
-            return WindowResult(channel_id, pointer, (), (), (), ())
+            return WindowResult(channel_id, pointer, (), (), (), (), False, ())
 
         fetched = await asyncio.wait_for(
             listener.client.get_messages(channel_id, ids=list(requested)), rpc_timeout
@@ -152,22 +260,22 @@ async def reconcile_window(
             for message in fetched
             if message is not None and message.id in wanted
         }
+        expected = [v for v in stored if not v.deleted_by_window]
+        absent = tuple(v.message_id for v in expected if v.message_id not in current)
+        suspect = is_suspect(len(absent), len(expected))
+        absences.seen(channel_id, current)
 
         edits: list[EditResult] = []
-        deletions: list[DeletionResult] = []
         failed: list[int] = []
+
+        # Whatever came back -- even in a suspect read -- is a real version.
         for version in stored:
             message = current.get(version.message_id)
+            if message is None:
+                continue
             try:
-                if message is None:
-                    deletions.append(
-                        await listener.ingest_deletion(
-                            channel_cfg, version.message_id, detected_by=WINDOW_SOURCE
-                        )
-                    )
-                    continue
                 incoming = normalise_message(message, channel_id=channel_id)
-                if not _newer(incoming.edit_date_utc, version.edit_date_utc):
+                if not _worth_a_job(incoming, version):
                     continue  # unchanged since it was stored: no job at all
                 edits.append(
                     await listener.ingest_edit(
@@ -182,12 +290,47 @@ async def reconcile_window(
                 )
                 failed.append(version.message_id)
 
+        deletions: list[DeletionResult] = []
+        if suspect:
+            await _suspect_read(listener, channel_cfg, absences, absent, len(expected))
+        else:
+            if absences.leave_suspect(channel_id):
+                logger.warning(
+                    "window re-read of channel %s (%s) looks normal again", channel_id, channel_cfg.name
+                )
+            confirmed = absences.settle(channel_id, absent)
+            for message_id in sorted(confirmed):
+                try:
+                    deletions.append(
+                        await listener.ingest_deletion(
+                            channel_cfg, message_id, detected_by=WINDOW_SOURCE
+                        )
+                    )
+                except db.WriterDeadError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 -- recorded; stays pending
+                    listener.record_handler_error(channel_id, message_id, exc, source=WINDOW_SOURCE)
+                    absences.keep_pending(channel_id, (message_id,))
+                    failed.append(message_id)
+            await _report_voids(listener, channel_cfg, deletions)
+            newly_pending = sorted(absences.pending(channel_id))
+            if newly_pending:
+                logger.info(
+                    "window re-read of channel %s (%s): %s missing; each is treated as deleted "
+                    "only if the next read misses it too",
+                    channel_id,
+                    channel_cfg.name,
+                    newly_pending,
+                )
+
     result = WindowResult(
         channel_id=channel_id,
         pointer=pointer,
         requested=requested,
         edits=tuple(edits),
         deletions=tuple(deletions),
+        pending=tuple(sorted(absences.pending(channel_id))),
+        suspect=suspect,
         failed=tuple(failed),
     )
     if result.changed:
@@ -203,11 +346,80 @@ async def reconcile_window(
     return result
 
 
-def _newer(fetched: datetime | None, stored: datetime | None) -> bool:
-    """Whether the fetched version is newer than the stored one. Only an
-    `edit_date` can make it so (a message's content changes only by an
-    edit). This is a filter to spare the writer a job per message per
+async def _suspect_read(
+    listener: Listener,
+    channel_cfg: ChannelCfg,
+    absences: AbsenceTracker,
+    absent: tuple[int, ...],
+    expected: int,
+) -> None:
+    channel_id = channel_cfg.channel_id
+    logger.error(
+        "window re-read of channel %s (%s) is missing %d of the %d messages it expected; "
+        "not believed, so no deletion is inferred from it",
+        channel_id,
+        channel_cfg.name,
+        len(absent),
+        expected,
+    )
+    if not absences.enter_suspect(channel_id):
+        return  # alerted when this run of suspect reads began
+    shown = ", ".join(str(message_id) for message_id in absent[:10])
+    more = f" and {len(absent) - 10} more" if len(absent) > 10 else ""
+    try:
+        await listener.record_alert(
+            "CRITICAL",
+            edits_repo.WINDOW_READ_SUSPECT,
+            f"the window re-read of channel {channel_id} ({channel_cfg.name}) did not return "
+            f"{len(absent)} of the {expected} messages it expected (ids {shown}{more}). "
+            "That looks like a bad answer rather than that many deletions, so no deletion "
+            "is inferred while reads look like this; edits of the messages that did come "
+            "back are still applied, and MessageDeleted events still act. If those "
+            "messages really were deleted, check the channel by hand. Raised once until a "
+            "read looks normal again.",
+            channel_id=channel_id,
+        )
+    except db.WriterDeadError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- recorded; the error log above stands
+        absences.leave_suspect(channel_id)  # so the next suspect read tries the alert again
+        listener.record_handler_error(channel_id, None, exc, source=WINDOW_SOURCE)
+
+
+async def _report_voids(
+    listener: Listener, channel_cfg: ChannelCfg, deletions: list[DeletionResult]
+) -> None:
+    voided = [d.signal_id for d in deletions if d.outcome == "voided"]
+    if not voided:
+        return
+    channel_id = channel_cfg.channel_id
+    try:
+        await listener.record_alert(
+            "CRITICAL",
+            edits_repo.WINDOW_VOIDED_SIGNALS,
+            f"one window re-read of channel {channel_id} ({channel_cfg.name}) voided "
+            f"{len(voided)} signal(s): {voided}. Each had stopped coming back in two reads "
+            "in a row and was never executed. Check they really were deleted.",
+            channel_id=channel_id,
+        )
+    except db.WriterDeadError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- recorded; each void has its own alert
+        listener.record_handler_error(channel_id, None, exc, source=WINDOW_SOURCE)
+
+
+def _worth_a_job(incoming: IncomingMessage, version: StoredVersion) -> bool:
+    """Whether a message the read returned needs a writer job: it had
+    been inferred deleted (reading it back reverses that), or it changed
+    since it was stored -- a newer `edit_date`, or the same `edit_date`
+    with different text (Telegram's `edit_date` has one-second
+    resolution). A filter to spare the writer a job per message per
     round; `edits_repo` makes the real decision inside the job."""
+    if version.deleted_by_window:
+        return True
+    fetched, stored = incoming.edit_date_utc, version.edit_date_utc
     if fetched is None:
         return False
-    return stored is None or fetched > stored
+    if stored is None or fetched > stored:
+        return True
+    return fetched == stored and incoming.text != version.raw_text

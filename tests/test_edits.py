@@ -132,7 +132,10 @@ class ScriptedClient(FakeTelegramClient):
     """The fake, plus scripted trouble for by-id reads only."""
 
     ids_failures: list[BaseException | str] = field(default_factory=list)
+    #: Rewrites every by-id answer while set.
     ids_answer: Callable[[list], list] | None = None
+    #: One-shot rewrites: each by-id read uses (and drops) the first.
+    ids_answers: list[Callable[[list], list]] = field(default_factory=list)
     before_ids_read: Callable[[], Awaitable[None]] | None = None
 
     async def get_messages(self, *args, **kwargs):
@@ -146,6 +149,8 @@ class ScriptedClient(FakeTelegramClient):
                 await asyncio.Event().wait()
             raise failure
         result = await super().get_messages(*args, **kwargs)
+        if self.ids_answers:
+            return self.ids_answers.pop(0)(result)
         return self.ids_answer(result) if self.ids_answer is not None else result
 
 
@@ -287,6 +292,54 @@ async def _stored_signal(client: FakeTelegramClient, listener: Listener, time: S
     assert await client.emit(A, _msg(SIGNAL_ID_MSG, SIGNAL_TEXT))
     await _round(listener, time)
     assert listener.read_last_processed_message_id(A) == SIGNAL_ID_MSG
+
+
+CHATTER_IDS = (SIGNAL_ID_MSG + 1, SIGNAL_ID_MSG + 2, SIGNAL_ID_MSG + 3)
+
+
+async def _stored_signal_among_chatter(
+    client: FakeTelegramClient, listener: Listener, time: SteppedTime
+) -> None:
+    """The signal and three chatter messages after it, all stored and at
+    or below the pointer: a window of four. A deletion found by absence
+    needs company -- a read missing *every* message it expected trips the
+    circuit breaker and is not believed."""
+    assert await client.emit(A, _msg(SIGNAL_ID_MSG, SIGNAL_TEXT))
+    for message_id in CHATTER_IDS:
+        assert await client.emit(A, _msg(message_id, CHATTER_TEXT))
+    await _round(listener, time)
+    assert listener.read_last_processed_message_id(A) == CHATTER_IDS[-1]
+
+
+def _without(*message_ids: int) -> Callable[[list], list]:
+    """A scripted by-id fault: these ids come back None although the
+    messages exist."""
+
+    def answer(result: list) -> list:
+        return [None if m is not None and m.id in message_ids else m for m in result]
+
+    return answer
+
+
+def _signals_and_chatter(n_signals: int, n_chatter: int) -> list[FakeMessage]:
+    """Distinct signals (distinct SLs, so no relay dedup) then chatter."""
+    messages = [
+        _msg(SIGNAL_ID_MSG + i, SIGNAL_TEXT.replace("4470", str(4461 + i)))
+        for i in range(n_signals)
+    ]
+    messages += [
+        _msg(SIGNAL_ID_MSG + n_signals + j, f"chatter number {j}") for j in range(n_chatter)
+    ]
+    return messages
+
+
+def _withdrawn(db_path: Path, message_id: int = SIGNAL_ID_MSG) -> bool:
+    rows = _rows(
+        db_path,
+        "SELECT withdrawn_at_utc FROM signals WHERE channel_id = ? AND message_id = ?",
+        (A, message_id),
+    )
+    return rows[0][0] is not None
 
 
 def _run(db_path: Path, body, *, client: FakeTelegramClient | None = None, **poll_kwargs):
@@ -717,6 +770,8 @@ def test_an_edit_handler_failure_is_recorded_not_raised(
 
 
 def test_deleting_an_unexecuted_signal_via_the_event_voids_it(tmp_path: Path) -> None:
+    """The event names its ids explicitly, so it acts at once -- no
+    second read, no circuit breaker (they guard inferences only)."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -727,6 +782,7 @@ def test_deleting_an_unexecuted_signal_via_the_event_voids_it(tmp_path: Path) ->
     assert _run(db_path, body) == 0
 
     assert _signal(db_path)["state"] == "VOIDED"
+    assert _withdrawn(db_path)
     assert _outbox(db_path, "ENTRY") == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
     message = _message(db_path)
     assert (message["deleted_at_utc"], message["detected_by"]) == (NOW.isoformat(), "event")
@@ -736,23 +792,31 @@ def test_deleting_an_unexecuted_signal_via_the_event_voids_it(tmp_path: Path) ->
 def test_a_deletion_the_event_stream_dropped_is_found_by_absence(tmp_path: Path) -> None:
     """The case absence detection exists for: the MessageDeleted event
     never fires (a blackout), and only the window re-read -- a `None`
-    where the message used to be -- can see the deletion."""
+    where the message used to be -- can see the deletion. The first read
+    that misses it only makes it pending; the second read confirms it,
+    and only then is anything voided."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
-        await _stored_signal(client, listener, time)
+        await _stored_signal_among_chatter(client, listener, time)
         with client.blackout():
             assert not await client.emit_delete(A, SIGNAL_ID_MSG)
-            state_before_round = _signal(db_path)["state"]
             await _round(listener, time)
-        return state_before_round
+            after_one_read = (_signal(db_path)["state"], _message(db_path)["deleted_at_utc"])
+            await _round(listener, time)
+        return after_one_read
 
-    assert _run(db_path, body) == "NEW"
+    assert _run(db_path, body) == ("NEW", None)
 
     assert _signal(db_path)["state"] == "VOIDED"
+    assert _withdrawn(db_path)
     assert _message(db_path)["detected_by"] == "window"
     assert _outbox(db_path, "ENTRY") == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
     assert _metric(db_path, edits_repo.DELETE_MISSED_BY_EVENTSTREAM_METRIC) == 1
+    assert _alerts(db_path) == [
+        ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION),
+        ("CRITICAL", edits_repo.WINDOW_VOIDED_SIGNALS),
+    ]
 
 
 @pytest.mark.parametrize("path", ["event", "window"])
@@ -761,13 +825,14 @@ def test_deleting_an_executed_signal_flags_and_alerts_and_closes_nothing(
     tmp_path: Path, path: str, entry_state: str
 ) -> None:
     """A deletion can be cosmetic (a repost, a tidy-up), so a live trade
-    is never closed on one: the deletion is marked on the message, a
-    CRITICAL alert names the signal, the signal stays NEW so its legs are
-    still managed, and only entries not yet taken are skipped."""
+    is never closed on one: the deletion is marked on the message, the
+    signal is marked withdrawn, a CRITICAL alert names it, it stays NEW so
+    its legs are still managed, and only entries not yet taken are
+    skipped."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
-        await _stored_signal(client, listener, time)
+        await _stored_signal_among_chatter(client, listener, time)
         _mark_entry(db_path, "acct-1", entry_state)
         if path == "event":
             assert await client.emit_delete(A, SIGNAL_ID_MSG)
@@ -775,12 +840,14 @@ def test_deleting_an_executed_signal_flags_and_alerts_and_closes_nothing(
             with client.blackout():
                 await client.emit_delete(A, SIGNAL_ID_MSG)
             await _round(listener, time)
+            await _round(listener, time)
         await _round(listener, time)  # and again: not re-alerted
 
     _run(db_path, body)
 
     signal = _signal(db_path)
     assert signal["state"] == "NEW"
+    assert _withdrawn(db_path)
     assert _alerts(db_path) == [("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED)]
     assert _rows(db_path, "SELECT signal_id FROM alerts") == [(signal["signal_id"],)]
     assert _outbox(db_path, "ENTRY") == [("acct-1", entry_state), ("acct-2", "SKIPPED")]
@@ -796,7 +863,7 @@ def test_a_deletion_seen_by_both_the_event_and_the_window_is_processed_once(
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
-        await _stored_signal(client, listener, time)
+        await _stored_signal_among_chatter(client, listener, time)
         _mark_entry(db_path, "acct-1", "DONE")
         if first == "event":
             assert await client.emit_delete(A, SIGNAL_ID_MSG)
@@ -807,18 +874,25 @@ def test_a_deletion_seen_by_both_the_event_and_the_window_is_processed_once(
             with client.blackout():
                 await client.emit_delete(A, SIGNAL_ID_MSG)
             await _round(listener, time)
+            await _round(listener, time)
             window_ids = []
             late = FakeMessageDeletedEvent(chat_id=A, deleted_ids=(SIGNAL_ID_MSG,), client=client)
             assert await client.dispatch(late, filter_type=events.MessageDeleted)
+            calls_before = len(client.get_messages_calls)
+            await _round(listener, time)
+            window_ids = [c.ids for c in client.get_messages_calls[calls_before:] if c.ids]
         return window_ids, listener.handler_error_count
 
     window_ids, errors = _run(db_path, body)
 
     assert errors == 0
     assert _alerts(db_path) == [("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED)]
-    assert _message(db_path)["detected_by"] == first
-    # A message already known deleted is not asked for again.
-    assert all(SIGNAL_ID_MSG not in ids for ids in window_ids)
+    assert _rows(db_path, "SELECT detail LIKE ? FROM alerts", (f"%[found by {first}]",)) == [(1,)]
+    # Telegram's explicit word is final: a window-inferred mark the event
+    # then confirms becomes an event mark, and the message leaves the
+    # window -- in both orders it is not asked for again.
+    assert _message(db_path)["detected_by"] == "event"
+    assert window_ids and all(SIGNAL_ID_MSG not in ids for ids in window_ids)
 
 
 def test_deleting_a_follow_up_withdraws_its_queued_instruction(tmp_path: Path) -> None:
@@ -848,6 +922,252 @@ def test_deleting_chatter_is_only_marked(tmp_path: Path) -> None:
 
     assert _message(db_path)["deleted_at_utc"] == NOW.isoformat()
     assert _alerts(db_path) == []
+
+
+# -- absence is evidence, not proof (Task 10 review) --------------------------------
+
+
+def _keep_only_last(result: list) -> list:
+    out = [None] * len(result)
+    out[-1] = result[-1]
+    return out
+
+
+@pytest.mark.parametrize(
+    ("answer", "n_chatter"),
+    [
+        (lambda result: [None] * len(result), 3),
+        (lambda result: [], 3),
+        (_keep_only_last, 45),
+    ],
+    ids=["all-none", "empty-list", "49-of-50-none"],
+)
+def test_a_suspect_window_read_voids_nothing_and_raises_one_critical_alert(
+    tmp_path: Path, answer, n_chatter: int
+) -> None:
+    """Telethon turns `MessageIdsEmptyError` into `None` for every id
+    (messages.py:309-318); Telegram may omit ids altogether. Before the
+    circuit breaker, one such answer voided every unexecuted signal in the
+    window. Three bad reads in a row: nothing voided, nothing marked, no
+    entry skipped, one CRITICAL alert -- and an edit of a message that did
+    come back is still applied."""
+    db_path = tmp_path / "store.db"
+    client = ScriptedClient(history={A: _signals_and_chatter(5, n_chatter)})
+    last = SIGNAL_ID_MSG + 5 + n_chatter - 1
+
+    async def body(client, listener, time):
+        await _round(listener, time)  # backfill stored all of it; one clean window read
+        with client.blackout():
+            await client.emit_edit(A, last, "chatter, edited", edit_date=EDIT_1)
+        client.ids_answer = answer
+        for _ in range(3):
+            await _round(listener, time)
+        during = _message(db_path, last)["raw_text"]
+        client.ids_answer = None
+        await _round(listener, time)  # a good read: all there
+        return during
+
+    during = _run(db_path, body, client=client)
+
+    assert _rows(db_path, "SELECT DISTINCT state FROM signals") == [("NEW",)]
+    assert _rows(db_path, "SELECT COUNT(*) FROM signals WHERE withdrawn_at_utc IS NOT NULL") == [(0,)]
+    assert _rows(db_path, "SELECT COUNT(*) FROM messages WHERE deleted_at_utc IS NOT NULL") == [(0,)]
+    assert _rows(db_path, "SELECT DISTINCT state FROM outbox WHERE kind = 'ENTRY'") == [("QUEUED",)]
+    assert _alerts(db_path) == [("CRITICAL", edits_repo.WINDOW_READ_SUSPECT)]
+    returned = n_chatter == 45
+    assert during == ("chatter, edited" if returned else f"chatter number {n_chatter - 1}")
+    assert _message(db_path, last)["raw_text"] == "chatter, edited"
+
+
+def test_a_stray_none_is_only_pending_and_forgotten_once_the_message_is_back(
+    tmp_path: Path,
+) -> None:
+    """One `None` for a message that exists: pending, not deleted; the
+    next read returns it and it is forgotten. A second stray `None` later,
+    not consecutive with the first, is pending again -- still no void."""
+    db_path = tmp_path / "store.db"
+    client = ScriptedClient()
+
+    async def body(client, listener, time):
+        await _stored_signal_among_chatter(client, listener, time)
+        for _ in range(2):
+            client.ids_answers = [_without(SIGNAL_ID_MSG)]
+            await _round(listener, time)  # missing: pending
+            await _round(listener, time)  # back: forgotten
+
+    _run(db_path, body, client=client)
+
+    assert _signal(db_path)["state"] == "NEW"
+    assert not _withdrawn(db_path)
+    assert _message(db_path)["deleted_at_utc"] is None
+    assert _outbox(db_path, "ENTRY") == [("acct-1", "QUEUED"), ("acct-2", "QUEUED")]
+    assert _alerts(db_path) == []
+
+
+def test_a_window_read_that_voids_signals_raises_one_critical_summary(tmp_path: Path) -> None:
+    """Each void has its own WARNING; a window read that voids anything
+    also raises one CRITICAL naming how many and which, so a mass void
+    cannot pass as routine noise."""
+    db_path = tmp_path / "store.db"
+    client = ScriptedClient(history={A: _signals_and_chatter(2, 4)})
+
+    async def body(client, listener, time):
+        await _round(listener, time)
+        with client.blackout():
+            await client.emit_delete(A, SIGNAL_ID_MSG, SIGNAL_ID_MSG + 1)
+            await _round(listener, time)
+            await _round(listener, time)
+
+    _run(db_path, body, client=client)
+
+    signal_ids = [row[0] for row in _rows(db_path, "SELECT signal_id FROM signals ORDER BY 1")]
+    assert _rows(db_path, "SELECT DISTINCT state FROM signals") == [("VOIDED",)]
+    assert _alerts(db_path) == [
+        ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION),
+        ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION),
+        ("CRITICAL", edits_repo.WINDOW_VOIDED_SIGNALS),
+    ]
+    (detail,) = _rows(db_path, "SELECT detail FROM alerts WHERE level = 'CRITICAL'")[0]
+    assert "2 signal(s)" in detail and str(signal_ids) in detail
+
+
+def test_a_false_absence_void_is_reported_when_the_message_reads_back(tmp_path: Path) -> None:
+    """Two faulty reads in a row get past both guards and void a signal
+    that exists. Its mark stays in the window, so the next read that
+    returns it clears the mark and raises CRITICAL DELETION_REVERSED. The
+    void is not undone automatically (the alert says so), and it is
+    reported once."""
+    db_path = tmp_path / "store.db"
+    client = ScriptedClient()
+
+    async def body(client, listener, time):
+        await _stored_signal_among_chatter(client, listener, time)
+        client.ids_answers = [_without(SIGNAL_ID_MSG), _without(SIGNAL_ID_MSG)]
+        await _round(listener, time)
+        await _round(listener, time)
+        voided = (_signal(db_path)["state"], _message(db_path)["detected_by"])
+        await _round(listener, time)  # it reads back
+        await _round(listener, time)  # and again: nothing more
+        return voided
+
+    assert _run(db_path, body, client=client) == ("VOIDED", "window")
+
+    assert _message(db_path)["deleted_at_utc"] is None
+    assert _signal(db_path)["state"] == "VOIDED"
+    assert _alerts(db_path) == [
+        ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION),
+        ("CRITICAL", edits_repo.WINDOW_VOIDED_SIGNALS),
+        ("CRITICAL", edits_repo.DELETION_REVERSED),
+    ]
+
+
+@pytest.mark.parametrize("path", ["event", "window"])
+def test_an_sl_edit_after_an_absence_mark_on_an_executed_signal_still_amends(
+    tmp_path: Path, path: str
+) -> None:
+    """The reviewer's probe 7: a false absence mark on an executed signal
+    used to make every later edit of it 'already deleted' -- the live
+    position kept the wrong stop and nothing said so. Now the edit is the
+    proof the message exists: the mark is reversed (CRITICAL) and the SL
+    change gets its AMEND_SL, fanned out."""
+    db_path = tmp_path / "store.db"
+    client = ScriptedClient()
+
+    async def body(client, listener, time):
+        await _stored_signal_among_chatter(client, listener, time)
+        _mark_entry(db_path, "acct-1", "DONE")
+        client.ids_answers = [_without(SIGNAL_ID_MSG), _without(SIGNAL_ID_MSG)]
+        await _round(listener, time)
+        await _round(listener, time)
+        marked = _message(db_path)["detected_by"]
+        if path == "event":
+            assert await client.emit_edit(A, SIGNAL_ID_MSG, SL_EDIT, edit_date=EDIT_1)
+        else:
+            with client.blackout():
+                await client.emit_edit(A, SIGNAL_ID_MSG, SL_EDIT, edit_date=EDIT_1)
+            await _round(listener, time)
+        return marked
+
+    assert _run(db_path, body, client=client) == "window"
+
+    signal = _signal(db_path)
+    assert (signal["state"], signal["sl"], signal["version"]) == ("NEW", 4460.0, 2)
+    assert [a[:2] for a in _amendments(db_path)] == [("amend_sl", 4460.0)]
+    assert _outbox(db_path, "FOLLOWUP") == [("acct-1", "QUEUED"), ("acct-2", "QUEUED")]
+    assert _message(db_path)["deleted_at_utc"] is None
+    assert _alerts(db_path) == [
+        ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED),
+        ("CRITICAL", edits_repo.DELETION_REVERSED),
+    ]
+
+
+@pytest.mark.parametrize("dies_by", ["direction-edit", "deletion"])
+def test_a_claimed_entry_of_a_dead_signal_is_never_handed_out_again(
+    tmp_path: Path, dies_by: str
+) -> None:
+    """The reviewer's probe 3: acct-1's worker claims the ENTRY, the
+    poster re-aims or deletes the signal while it holds it, the worker
+    dies, the lease expires. The sweep must not re-queue it and the next
+    claim must not hand it out -- for a deletion in flight the signal
+    stays NEW (it may be live), so only the withdrawal mark can say so."""
+    from xaucopier.store import outbox
+
+    db_path = tmp_path / "store.db"
+
+    def claim(now):
+        conn = db.connect(db_path, role="writer")
+        try:
+            return outbox.claim(conn, account_id="acct-1", pid=4242, now_utc=now)
+        finally:
+            conn.close()
+
+    async def body(client, listener, time):
+        await _stored_signal(client, listener, time)
+        assert claim(NOW) is not None
+        if dies_by == "direction-edit":
+            assert await client.emit_edit(A, SIGNAL_ID_MSG, DIRECTION_EDIT, edit_date=EDIT_1)
+        else:
+            assert await client.emit_delete(A, SIGNAL_ID_MSG)
+
+    _run(db_path, body)
+
+    later = NOW + timedelta(days=1)
+    conn = db.connect(db_path, role="writer")
+    try:
+        reclaimed = outbox.sweep_expired(conn, now_utc=later)
+    finally:
+        conn.close()
+    assert reclaimed == 0
+    assert claim(later) is None
+    assert _outbox(db_path, "ENTRY") == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+    if dies_by == "deletion":
+        assert _signal(db_path)["state"] == "NEW" and _withdrawn(db_path)
+
+
+@pytest.mark.parametrize("second_by", ["event", "window"])
+def test_two_edits_inside_one_second_are_both_applied(tmp_path: Path, second_by: str) -> None:
+    """Telegram's edit_date has one-second resolution. A second edit in
+    the same second shares the first's edit_date; treating that as 'not
+    newer' dropped it for good."""
+    db_path = tmp_path / "store.db"
+    second = SL_EDIT.replace("4460", "4455")
+
+    async def body(client, listener, time):
+        await _stored_signal(client, listener, time)
+        assert await client.emit_edit(A, SIGNAL_ID_MSG, SL_EDIT, edit_date=EDIT_1)
+        if second_by == "event":
+            assert await client.emit_edit(A, SIGNAL_ID_MSG, second, edit_date=EDIT_1)
+        else:
+            with client.blackout():
+                await client.emit_edit(A, SIGNAL_ID_MSG, second, edit_date=EDIT_1)
+        await _round(listener, time)
+        await _round(listener, time)  # nothing more to do
+
+    _run(db_path, body)
+
+    signal = _signal(db_path)
+    assert (signal["sl"], signal["version"]) == (4455.0, 3)
+    assert _message(db_path)["raw_text"] == second
 
 
 def test_the_deletion_handler_makes_no_rpc_and_ignores_what_it_cannot_route(
@@ -894,7 +1214,9 @@ def test_the_window_re_read_never_moves_the_pointer(tmp_path: Path) -> None:
             await client.emit(A, _msg(SIGNAL_ID_MSG + 1, CHATTER_TEXT))
         assert await client.emit(A, _msg(SIGNAL_ID_MSG + 2, CHATTER_TEXT))
         calls_before = len(client.get_messages_calls)
-        result = await reconcile_window(listener, CHANNEL, window=10, rpc_timeout=5.0)
+        result = await reconcile_window(
+            listener, CHANNEL, window=10, rpc_timeout=5.0, absences=edits.AbsenceTracker()
+        )
         pointer_after_window = _pointer(db_path)
         requested = [c.ids for c in client.get_messages_calls[calls_before:]]
         await _round(listener, time)
@@ -928,7 +1250,9 @@ def test_the_window_leaves_a_pointer_on_an_unstored_id_where_it_is(tmp_path: Pat
         assert await client.emit(A, _msg(SIGNAL_ID_MSG - 3, CHATTER_TEXT))
         with client.blackout():
             await client.emit_edit(A, SIGNAL_ID_MSG - 2, "Good evening", edit_date=EDIT_1)
-        result = await reconcile_window(listener, CHANNEL, window=10, rpc_timeout=5.0)
+        result = await reconcile_window(
+            listener, CHANNEL, window=10, rpc_timeout=5.0, absences=edits.AbsenceTracker()
+        )
         pointer_after_window = _pointer(db_path)
         await _round(listener, time)
         return result, pointer_after_window
@@ -973,6 +1297,7 @@ def test_the_window_matches_what_it_read_by_id_not_by_position(tmp_path: Path) -
         with client.blackout():
             await client.emit_delete(A, SIGNAL_ID_MSG + 1)
         await _round(listener, time)
+        await _round(listener, time)  # absence confirmed by a second read
 
     _run(db_path, body, client=client)
 

@@ -117,7 +117,12 @@ from typing import NoReturn
 from telethon import errors
 
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.ingest.edits import DEFAULT_EDIT_WINDOW, reconcile_window, validate_window
+from xaucopier.ingest.edits import (
+    DEFAULT_EDIT_WINDOW,
+    AbsenceTracker,
+    reconcile_window,
+    validate_window,
+)
 from xaucopier.ingest.listener import DEFAULT_RPC_TIMEOUT, HistoryIngest, Listener
 from xaucopier.store import db
 
@@ -207,6 +212,9 @@ class HistoryPoll:
         # that channel is not run again (a flood wait). Local: it belongs
         # to this run.
         flood_until: dict[tuple[str, int], float] = {}
+        # Absences the window re-read is waiting to see confirmed, and
+        # which channels' reads are suspect (ingest/edits.py). Local too.
+        absences = AbsenceTracker()
         logger.info(
             "history poll started: every %gs, up to %d messages per channel per round",
             self.interval,
@@ -216,7 +224,9 @@ class HistoryPoll:
             await self.sleep(self.interval)
             await self._probe_writer(listener)
             for channel in listener.enabled_channels:
-                await self._poll_channel(listener, channel, flood_until, TERMINAL_AUTH_ERRORS)
+                await self._poll_channel(
+                    listener, channel, flood_until, TERMINAL_AUTH_ERRORS, absences
+                )
 
     async def _probe_writer(self, listener: Listener) -> None:
         try:
@@ -233,6 +243,7 @@ class HistoryPoll:
         channel: ChannelCfg,
         flood_until: dict[tuple[str, int], float],
         terminal_errors: tuple[type[Exception], ...],
+        absences: AbsenceTracker,
     ) -> None:
         """One channel's step: its forward history read, then -- only if
         that read succeeded this round -- its window re-read. Each is
@@ -254,7 +265,11 @@ class HistoryPoll:
             terminal_errors,
             step=WINDOW_STEP,
             action=lambda: reconcile_window(
-                listener, channel, window=self.edit_window, rpc_timeout=self.rpc_timeout
+                listener,
+                channel,
+                window=self.edit_window,
+                rpc_timeout=self.rpc_timeout,
+                absences=absences,
             ),
         )
 

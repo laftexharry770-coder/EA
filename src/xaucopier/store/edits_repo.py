@@ -13,9 +13,15 @@ decided against the stored row -- so a change seen by two paths is
 processed exactly once: the second finds it already recorded.
 
 **Which version is newer.** A version is acted on only when its
-`edit_date` is set and later than the stored one. No `edit_date` and a
-different parse is Task 5's "unverified" case (ignored); an older
-`edit_date` is a late event (ignored, "stale"). A newer version is always
+`edit_date` is set and not earlier than the stored one. No `edit_date`
+and a different parse is Task 5's "unverified" case (ignored); an older
+`edit_date` is a late event (ignored, "stale"). An *equal* `edit_date`
+with different content counts as newer: Telegram's `edit_date` has
+one-second resolution, so two edits inside one second share it, and
+dropping the second would lose it for good. The price is that a late
+event carrying the first of two same-second versions is applied too --
+and the window re-read, which fetches the current version, re-applies
+the second at its next round. A newer version is always
 recorded verbatim on `messages` -- text, hash, `edit_date`, and `kind`,
 which now follows the latest classification -- and then:
 
@@ -48,8 +54,23 @@ which now follows the latest classification -- and then:
 one is *flagged* -- `messages.deleted_at_utc` plus a CRITICAL alert naming
 the signal -- and **not** closed: a deletion can be cosmetic (a repost, a
 tidy-up). Its `state` stays `NEW` so Plan 3 keeps managing the live legs.
-Either way, entries not yet taken (`QUEUED`) are skipped. A deleted
-follow-up's queued rows are skipped. Everything else is only marked.
+Either way the signal is marked withdrawn (`signals.withdrawn_at_utc`, so
+`outbox.claim()` never hands out one of its entries again, even one whose
+worker died holding it), and entries not yet taken (`QUEUED`) are
+skipped. A deleted follow-up's queued rows are skipped. Everything else
+is only marked. A signal edited into chatter is withdrawn the same way.
+
+**A deletion inferred from absence can be reversed.** The window re-read
+(`ingest/edits.py`) infers a deletion when a message stops coming back --
+guarded there by a circuit breaker and a second read, but still an
+inference. So a mark it made (`deleted_detected_by = 'window'`) is never
+final: its row stays in the window, and any later version of the message
+-- the window reading it back, or an edit event -- clears the mark, raises
+a CRITICAL `DELETION_REVERSED`, and is then handled like any version,
+so an SL edit of an executed signal still gets its AMEND. What the
+deletion did (a void, skipped entries, the withdrawal) is not undone
+automatically; the alert says what to review. A `MessageDeleted` event
+names its ids explicitly and is final.
 
 **"Executed" is the outbox, for now.** Plan 3's legs table does not exist
 yet, so `trade_status()` reads the signal's ENTRY outbox rows: one `DONE`
@@ -64,6 +85,7 @@ and deletion counterparts of the poll's `missed_by_eventstream`.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -106,6 +128,14 @@ FOLLOWUP_EDITED_AFTER_DISPATCH = "FOLLOWUP_EDITED_AFTER_DISPATCH"
 FOLLOWUP_RETRACTED_BY_EDIT = "FOLLOWUP_RETRACTED_BY_EDIT"
 #: WARNING: a follow-up message was deleted.
 FOLLOWUP_DELETED = "FOLLOWUP_DELETED"
+#: CRITICAL: a message the window re-read had inferred deleted is back.
+DELETION_REVERSED = "DELETION_REVERSED"
+#: CRITICAL: a window re-read's answer looks wrong (too many ids missing);
+#: no deletion was inferred from it. Raised by ingest/edits.py.
+WINDOW_READ_SUSPECT = "WINDOW_READ_SUSPECT"
+#: CRITICAL: one window re-read voided signals; the count and the ids.
+#: Raised by ingest/edits.py.
+WINDOW_VOIDED_SIGNALS = "WINDOW_VOIDED_SIGNALS"
 
 # -- metrics ------------------------------------------------------------------
 EDIT_MISSED_BY_EVENTSTREAM_METRIC = "edit_missed_by_eventstream"
@@ -190,10 +220,12 @@ class EditResult:
     #: QUEUED outbox rows this call skipped (a withdrawn signal's entries,
     #: a withdrawn follow-up's instructions).
     skipped: int = 0
+    #: This version proved a window-inferred deletion wrong, and cleared it.
+    reversed_deletion: bool = False
 
     @property
     def changed(self) -> bool:
-        return self.outcome in CHANGED_OUTCOMES
+        return self.outcome in CHANGED_OUTCOMES or self.reversed_deletion
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +246,12 @@ class StoredVersion:
 
     message_id: int
     edit_date_utc: datetime | None
+    #: The verbatim text stored for it (two edits in one second share an
+    #: `edit_date`; only the text can tell them apart).
+    raw_text: str
+    #: Marked deleted by an earlier window re-read -- kept in the window
+    #: so the mark can be reversed if the message is seen again.
+    deleted_by_window: bool
 
 
 def content_hash_for(route_result: RouteResult, text: str) -> str:
@@ -241,18 +279,26 @@ def trade_status(conn: sqlite3.Connection, *, signal_id: int) -> TradeStatus:
 def window_versions(
     conn: sqlite3.Connection, *, channel_id: int, at_or_below: int, limit: int
 ) -> tuple[StoredVersion, ...]:
-    """The `limit` newest stored, not-deleted messages of a channel with
-    ids at or below `at_or_below` (the poll pointer), oldest first. A
-    message already known deleted is not asked for again. Read-only: the
-    listener calls this on its reader connection."""
+    """The `limit` newest stored messages of a channel with ids at or
+    below `at_or_below` (the poll pointer), oldest first. A message a
+    `MessageDeleted` event deleted is not asked for again -- Telegram named
+    it. One the window itself inferred deleted *is*: that inference may be
+    wrong, and reading the message back is how it is reversed. Read-only:
+    the listener calls this on its reader connection."""
     rows = conn.execute(
-        "SELECT message_id, edit_date_utc FROM messages "
-        "WHERE channel_id = ? AND message_id <= ? AND deleted_at_utc IS NULL "
+        "SELECT message_id, edit_date_utc, raw_text, deleted_detected_by FROM messages "
+        "WHERE channel_id = ? AND message_id <= ? "
+        "  AND (deleted_at_utc IS NULL OR deleted_detected_by = ?) "
         "ORDER BY message_id DESC LIMIT ?",
-        (channel_id, at_or_below, limit),
+        (channel_id, at_or_below, WINDOW_DETECTOR, limit),
     ).fetchall()
     return tuple(
-        StoredVersion(message_id=row[0], edit_date_utc=_parse_utc(row[1]))
+        StoredVersion(
+            message_id=row[0],
+            edit_date_utc=_parse_utc(row[1]),
+            raw_text=row[2],
+            deleted_by_window=row[3] == WINDOW_DETECTOR,
+        )
         for row in reversed(rows)
     )
 
@@ -352,8 +398,41 @@ def reconcile(
         ),
     )
 
+    reversal: tuple[int, ...] = ()
     if existing["deleted_at_utc"] is not None:
-        return ctx.result("deleted", stored_kind, "already deleted; an edit of it is ignored")
+        if existing["deleted_detected_by"] != WINDOW_DETECTOR:
+            # Telegram said so (a MessageDeleted event): final.
+            return ctx.result("deleted", stored_kind, "already deleted; an edit of it is ignored")
+        # Only inferred, from absence -- and here the message is.
+        reversal = (_reverse_window_deletion(ctx, existing),)
+    result = _reconcile_version(
+        ctx, existing, text=text, route_result=route_result, new_hash=new_hash
+    )
+    if reversal:
+        result = dataclasses.replace(
+            result, alert_ids=(*reversal, *result.alert_ids), reversed_deletion=True
+        )
+    return result
+
+
+def _reconcile_version(
+    ctx: _Ctx,
+    existing: sqlite3.Row,
+    *,
+    text: str,
+    route_result: RouteResult,
+    new_hash: str,
+) -> EditResult:
+    """The version rules and the policy -- `reconcile()` minus the
+    deletion mark."""
+    conn = ctx.conn
+    channel_id = ctx.channel_id
+    message_id = ctx.message_id
+    edit_date_utc = ctx.edit_date_utc
+    detected_by = ctx.detected_by
+    now_utc = ctx.now_utc
+    stored_kind = existing["kind"]
+    stored_hash = existing["content_hash"]
     if edit_date_utc is None:
         if new_hash == stored_hash:
             return ctx.result("duplicate", stored_kind, route_result.detail)
@@ -361,7 +440,12 @@ def reconcile(
             "unverified", stored_kind, "content_hash changed with no edit_date_utc; ignored"
         )
     stored_edit = _parse_utc(existing["edit_date_utc"])
-    if stored_edit is not None and edit_date_utc <= stored_edit:
+    if stored_edit is not None and edit_date_utc == stored_edit:
+        # One-second resolution: an equal edit_date with different content
+        # is a second edit inside the same second (module docstring).
+        if new_hash == stored_hash and text == existing["raw_text"]:
+            return ctx.result("duplicate", stored_kind, route_result.detail)
+    elif stored_edit is not None and edit_date_utc < stored_edit:
         if new_hash == stored_hash:
             return ctx.result("duplicate", stored_kind, route_result.detail)
         logger.info(
@@ -401,6 +485,42 @@ def reconcile(
     if stored_kind == "followup":
         return _edit_of_followup(ctx, route_result)
     return _edit_of_other(ctx, stored_kind, route_result)
+
+
+def _reverse_window_deletion(ctx: _Ctx, existing: sqlite3.Row) -> int:
+    """Clear a deletion the window inferred for a message that turns out
+    to exist, and raise a CRITICAL alert saying what that deletion did --
+    none of which is undone here."""
+    ctx.conn.execute(
+        "UPDATE messages SET deleted_at_utc = NULL, deleted_detected_by = NULL "
+        "WHERE channel_id = ? AND message_id = ?",
+        (ctx.channel_id, ctx.message_id),
+    )
+    row = (
+        signals_repo.get_signal(ctx.conn, channel_id=ctx.channel_id, message_id=ctx.message_id)
+        if ctx.signal_id is not None
+        else None
+    )
+    if row is not None:
+        consequence = (
+            f"signal {row['signal_id']} is {row['state']}"
+            f"{' and marked withdrawn' if row['withdrawn_at_utc'] else ''}; entries skipped "
+            "when it was withdrawn stay skipped, and claim() will not hand out its "
+            "remaining ones. Trade status: "
+            f"{trade_status(ctx.conn, signal_id=row['signal_id'])}"
+        )
+    elif ctx.followup_id is not None:
+        consequence = f"follow-up {ctx.followup_id}'s queued instructions stay skipped"
+    else:
+        consequence = f"nothing -- it is {existing['kind']}"
+    return ctx.alert(
+        "CRITICAL",
+        DELETION_REVERSED,
+        f"message {ctx.message_id} was marked deleted at {existing['deleted_at_utc']} "
+        "because the window re-read stopped returning it, but it exists after all. "
+        f"The mark is cleared; what the deletion did is NOT undone: {consequence}. "
+        "Review by hand.",
+    )
 
 
 def _edit_of_signal(ctx: _Ctx, route_result: RouteResult) -> EditResult:
@@ -607,6 +727,7 @@ def _withdraw_signal(
     CRITICAL alert and *not* closed; `state` stays NEW so its live legs
     are still managed."""
     signal_id = row["signal_id"]
+    signals_repo.mark_withdrawn(ctx.conn, signal_id=signal_id, now_utc=ctx.now_utc)
     skipped = outbox.skip_queued(
         ctx.conn, kind="ENTRY", signal_id=signal_id, reason=f"signal withdrawn: {via}"
     )
@@ -752,6 +873,13 @@ def apply_deletion(
     signal_id = signals_repo.get_signal_id(conn, channel_id=channel_id, message_id=message_id)
     followup_id = signals_repo.get_followup_id(conn, channel_id=channel_id, message_id=message_id)
     if existing["deleted_at_utc"] is not None:
+        if detected_by == EVENT_DETECTOR and existing["deleted_detected_by"] == WINDOW_DETECTOR:
+            # Telegram now confirms what the window inferred: make it final,
+            # so the row leaves the window. Nothing else to do again.
+            conn.execute(
+                "UPDATE messages SET deleted_detected_by = ? WHERE channel_id = ? AND message_id = ?",
+                (EVENT_DETECTOR, channel_id, message_id),
+            )
         return DeletionResult(
             "already_deleted", message_id, kind, signal_id, followup_id, 0, ()
         )
