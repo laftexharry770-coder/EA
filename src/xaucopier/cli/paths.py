@@ -24,3 +24,8 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "state.db"
 LOG_FILE_NAME = "watch.log"
 
 DEFAULT_FIXTURES_DIR = PROJECT_ROOT / "tests" / "fixtures" / "messages"
+
+#: How the user types a command: PowerShell, in the project folder, runs
+#: the `xaucopier.cmd` launcher only as `.\xaucopier`. Every message that
+#: tells the user to run something says it this way.
+USER_COMMAND = ".\\xaucopier"

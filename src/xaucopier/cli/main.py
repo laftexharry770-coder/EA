@@ -16,6 +16,13 @@ The commands, in the order the user runs them (docs/RUNBOOK.md):
 Every exit code any of them returns is in `cli/exit_codes.py`, and is
 printed at the bottom of `--help`.
 
+**`setup-login` never shows a traceback.** The user is not a developer:
+every way a login can fail -- a rejected or published api_id (exit 5),
+a banned phone number or account (3), a mistyped phone number, three
+wrong codes or passwords, too many attempts, no network (1), Ctrl+C
+(130) -- ends in one plain sentence saying what happened and what to do
+(`login_failure()`), and nothing is saved.
+
 **The login is interactive and cannot be automated.** `setup-login`
 prompts for `api_id`/`api_hash`/phone directly in the console via
 `input()`/`getpass.getpass()`, and hands Telethon's own `code_callback`
@@ -34,13 +41,22 @@ import getpass
 import sys
 from pathlib import Path
 
+from telethon import errors
+
 from xaucopier.cli import exit_codes, paths
 from xaucopier.cli.fixtures import cmd_export_fixtures
 from xaucopier.cli.resolve import cmd_resolve_channels
 from xaucopier.cli.status import cmd_status
 from xaucopier.cli.watch import cmd_watch
-from xaucopier.ingest.client import EXIT_TERMINAL_AUTH, TERMINAL_AUTH_ERRORS, build_client
+from xaucopier.ingest.client import API_CREDENTIAL_ERRORS, TERMINAL_AUTH_ERRORS, build_client
 from xaucopier.ingest.secrets import DEFAULT_SECRETS_PATH, SecretsBlob, save
+
+#: How the user runs setup-login again, from PowerShell in the project folder.
+_AGAIN = f"run `{paths.USER_COMMAND} setup-login` again"
+_SUPPORT = "No program can fix this; only Telegram support can (https://telegram.org/support)."
+#: Telethon's own words when the login code was wrong `max_attempts` (3)
+#: times in a row (telethon/client/auth.py, `_start`).
+_THREE_WRONG_CODES = "consecutive sign-in attempts failed"
 
 
 def _prompt_login_code() -> str:
@@ -52,6 +68,109 @@ def _prompt_2fa_password() -> str:
         "Enter your Telegram 2FA (cloud) password, or leave blank if you "
         "don't have one: "
     )
+
+
+def login_failure(exc: BaseException) -> tuple[int, str]:
+    """What a failed login means to the user: an exit code and one plain
+    sentence saying what happened and what to do. Never the phone number
+    or any secret -- only fixed text, and Telegram's own fixed error text."""
+    name = type(exc).__name__
+    if isinstance(exc, API_CREDENTIAL_ERRORS):
+        return exit_codes.EXIT_CONFIG_ERROR, (
+            f"Telegram rejected this api_id/api_hash ({name}): it is wrong, or it was "
+            "published somewhere (for example copied from a tutorial) and is now "
+            "banned. Get your OWN pair at https://my.telegram.org (API development "
+            f"tools), then {_AGAIN}."
+        )
+    if isinstance(exc, errors.PhoneNumberBannedError):
+        return exit_codes.EXIT_TERMINAL_AUTH, (
+            f"Telegram has banned this phone number, so it cannot log in. {_SUPPORT}"
+        )
+    if isinstance(exc, (errors.UserDeactivatedError, errors.UserDeactivatedBanError)):
+        return exit_codes.EXIT_TERMINAL_AUTH, (
+            f"Telegram says this account is deactivated or banned ({name}), so it "
+            f"cannot log in. {_SUPPORT}"
+        )
+    if isinstance(exc, errors.FrozenMethodInvalidError):
+        return exit_codes.EXIT_TERMINAL_AUTH, (
+            f"Telegram has frozen this account, so it cannot log in. {_SUPPORT}"
+        )
+    if isinstance(exc, TERMINAL_AUTH_ERRORS):
+        return exit_codes.EXIT_TERMINAL_AUTH, (
+            f"Telegram refused the login ({name}). Wait a minute and {_AGAIN}; if it "
+            "happens again, close any other program using this Telegram login first."
+        )
+    if isinstance(exc, errors.PhoneNumberInvalidError):
+        return exit_codes.EXIT_FAILED, (
+            "Telegram says that phone number is not valid. Type it starting with + "
+            f"and your country code, with no spaces, and {_AGAIN}."
+        )
+    if isinstance(exc, errors.PhoneNumberUnoccupiedError):
+        return exit_codes.EXIT_FAILED, (
+            f"No Telegram account uses that phone number. Check it and {_AGAIN}."
+        )
+    if isinstance(exc, RuntimeError) and _THREE_WRONG_CODES in str(exc):
+        return exit_codes.EXIT_FAILED, (
+            "The login code was wrong 3 times, so Telegram stopped this attempt. "
+            f"{_AGAIN[0].upper()}{_AGAIN[1:]} and type the newest code Telegram sends to "
+            "your Telegram app."
+        )
+    if isinstance(exc, errors.PasswordHashInvalidError):
+        return exit_codes.EXIT_FAILED, (
+            "The 2FA password was wrong 3 times. "
+            f"{_AGAIN[0].upper()}{_AGAIN[1:]}; if you have forgotten it, reset it in "
+            "Telegram -> Settings -> Privacy and Security -> Two-Step Verification."
+        )
+    if isinstance(
+        exc,
+        (
+            errors.FloodError,
+            errors.PhoneNumberFloodError,
+            errors.PhonePasswordFloodError,
+            errors.SendCodeUnavailableError,
+        ),
+    ):
+        seconds = getattr(exc, "seconds", None)
+        wait = (
+            f"about {max(1, round(seconds / 60))} minute(s)"
+            if isinstance(seconds, int | float)
+            else "a while (an hour is safe)"
+        )
+        return exit_codes.EXIT_FAILED, (
+            f"Telegram says there have been too many login attempts. Wait {wait}, "
+            f"then {_AGAIN}."
+        )
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return exit_codes.EXIT_FAILED, (
+            f"Could not reach Telegram ({name}). Check the internet connection, then "
+            f"{_AGAIN}."
+        )
+    if isinstance(exc, EOFError):
+        return exit_codes.EXIT_FAILED, (
+            "No answer could be read: the input was closed. Run setup-login in an "
+            "ordinary PowerShell window and type the answers there."
+        )
+    # Telegram's own error text is fixed wording; anything else might hold
+    # something the user typed, so only its type is named.
+    detail = f"{name}: {exc}" if isinstance(exc, errors.RPCError) else name
+    return exit_codes.EXIT_FAILED, (
+        f"The login failed ({detail}). {_AGAIN[0].upper()}{_AGAIN[1:]}; if it keeps "
+        "failing, send this line to whoever looks after xaucopier."
+    )
+
+
+def _print_failure(exc: BaseException) -> int:
+    code, message = login_failure(exc)
+    print(message, file=sys.stderr)
+    print("Nothing was saved.", file=sys.stderr)
+    return code
+
+
+async def _disconnect_quietly(client: object) -> None:
+    try:
+        await client.disconnect()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 -- the login's own outcome is what matters
+        pass
 
 
 async def _run_setup_login(path: Path) -> int:
@@ -67,8 +186,12 @@ async def _run_setup_login(path: Path) -> int:
     try:
         api_id = int(api_id_raw)
     except ValueError:
-        print("api_id must be an integer.", file=sys.stderr)
-        return 1
+        print(
+            "api_id must be a whole number -- the api_id shown at "
+            f"https://my.telegram.org. Nothing was saved; {_AGAIN}.",
+            file=sys.stderr,
+        )
+        return exit_codes.EXIT_FAILED
 
     api_hash = getpass.getpass("api_hash (hidden): ").strip()
     phone = input("Phone number, with country code (e.g. +15551234567): ").strip()
@@ -86,21 +209,15 @@ async def _run_setup_login(path: Path) -> int:
                 code_callback=_prompt_login_code,
                 password=_prompt_2fa_password,
             )
-        except TERMINAL_AUTH_ERRORS as exc:
-            print(
-                f"Login failed with a terminal error ({type(exc).__name__}): "
-                "this cannot be retried. Check the account is not banned or "
-                "restricted, then run `setup-login` again.",
-                file=sys.stderr,
-            )
-            return EXIT_TERMINAL_AUTH
+        except Exception as exc:  # noqa: BLE001 -- every failure is explained, none escapes
+            return _print_failure(exc)
 
         session_string = client.session.save()
     finally:
         # Always disconnect -- the terminal-error branch above used to
         # return without this, leaking a connection and producing a
         # noisy "Task was destroyed but it is pending" warning on exit.
-        await client.disconnect()
+        await _disconnect_quietly(client)
 
     blob = SecretsBlob(api_id=api_id, api_hash=api_hash, session_string=session_string)
     try:
@@ -119,10 +236,10 @@ async def _run_setup_login(path: Path) -> int:
             "IMPORTANT: a live 'XAUCOPIER-TRADEBOX' session now exists on "
             "your Telegram account with no local copy of its credential. "
             "Go to Telegram -> Settings -> Devices and terminate that "
-            "session by hand, then run `setup-login` again.",
+            f"session by hand, then {_AGAIN}.",
             file=sys.stderr,
         )
-        return 1
+        return exit_codes.EXIT_FAILED
 
     print(f"Login succeeded. Session saved (DPAPI-encrypted, this user only) to: {path}")
     print(
@@ -130,13 +247,24 @@ async def _run_setup_login(path: Path) -> int:
         "see a session named 'XAUCOPIER-TRADEBOX'. If you don't see it, "
         "something is wrong -- do not proceed to run the listener."
     )
-    print("Next: run `xaucopier resolve-channels`.")
-    return 0
+    print(f"Next: run `{paths.USER_COMMAND} resolve-channels`.")
+    return exit_codes.EXIT_OK
 
 
 def _cmd_setup_login(args: argparse.Namespace) -> int:
     path = args.path if args.path is not None else DEFAULT_SECRETS_PATH
-    return asyncio.run(_run_setup_login(path))
+    try:
+        return asyncio.run(_run_setup_login(path))
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print(
+            "\nCancelled with Ctrl+C. Nothing was saved. If you had already typed the "
+            "login code, open Telegram -> Settings -> Devices and, if "
+            f"XAUCOPIER-TRADEBOX is listed, terminate it before you {_AGAIN}.",
+            file=sys.stderr,
+        )
+        return exit_codes.EXIT_INTERRUPTED
+    except Exception as exc:  # noqa: BLE001 -- the last line of defence: never a traceback
+        return _print_failure(exc)
 
 
 def _add_config_dir(parser: argparse.ArgumentParser) -> None:
