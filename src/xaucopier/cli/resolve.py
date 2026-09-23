@@ -338,7 +338,7 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
         if not await client.is_user_authorized():
             print(
                 "This Telegram session is not logged in (it may have been logged out). "
-                "Run `xaucopier setup-login` again.",
+                f"Run `{paths.USER_COMMAND} setup-login` again.",
                 file=sys.stderr,
             )
             return exit_codes.EXIT_TERMINAL_AUTH
@@ -407,7 +407,7 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
     finally:
         await client.disconnect()
 
-    print(f"\nDone: {saved} channel(s) resolved. Next: run `xaucopier watch`.")
+    print(f"\nDone: {saved} channel(s) resolved. Next: run `{paths.USER_COMMAND} watch`.")
     return exit_codes.EXIT_OK
 
 
@@ -429,8 +429,9 @@ def cmd_resolve_channels(args: argparse.Namespace) -> int:
         lock = acquire_single_instance_lock()
     except AlreadyRunningError:
         print(
-            "xaucopier watch is running. Stop it (Ctrl+C in its window) before running "
-            "resolve-channels: two programs must never use the Telegram session at once.",
+            "xaucopier watch is running. Stop it first -- click in its window, press "
+            "Ctrl+C and answer Y -- then run resolve-channels again: two programs must "
+            "never use the Telegram session at once.",
             file=sys.stderr,
         )
         return exit_codes.EXIT_ALREADY_RUNNING

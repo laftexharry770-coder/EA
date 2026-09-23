@@ -194,7 +194,7 @@ def test_a_pasted_link_writes_the_id_and_switches_the_channel_on_touching_nothin
     assert rig.client.calls[0] == "connect" and rig.client.calls[-1] == "disconnect"
     assert rig.lock.acquired == rig.lock.released == 1
     assert _no_temp_files(rig.config_dir)
-    assert "Next: run `xaucopier watch`" in capsys.readouterr().out
+    assert "Next: run `.\\xaucopier watch`" in capsys.readouterr().out
 
 
 def test_pressing_enter_picks_the_channel_from_the_joined_list(rig: Rig) -> None:

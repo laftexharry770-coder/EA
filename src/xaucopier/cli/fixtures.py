@@ -33,7 +33,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from xaucopier.cli import exit_codes
+from xaucopier.cli import exit_codes, paths
 from xaucopier.store import db
 
 #: Exported files are named `captured_<channel_id>_<message_id, 10 digits>.json`,
@@ -129,7 +129,10 @@ def cmd_export_fixtures(args: argparse.Namespace) -> int:
         print(f"No recordings yet: there is no database at {args.db}.", file=sys.stderr)
         return exit_codes.EXIT_FAILED
     except db.SchemaVersionError as exc:
-        print(f"{exc}. Run `xaucopier watch` once to bring it up to date.", file=sys.stderr)
+        print(
+            f"{exc}. Run `{paths.USER_COMMAND} watch` once to bring it up to date.",
+            file=sys.stderr,
+        )
         return exit_codes.EXIT_FAILED
     try:
         result = export(conn, out_dir)

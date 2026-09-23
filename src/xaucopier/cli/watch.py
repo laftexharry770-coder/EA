@@ -150,8 +150,8 @@ def check_setup(config_dir: Path, db_path: Path) -> WatchSetup:
     if not enabled:
         raise SetupError(
             f"no channel is switched on in {channels_path}, so there is nothing to "
-            "watch. Run `xaucopier resolve-channels` to look up the channel's id and "
-            "switch it on."
+            f"watch. Run `{paths.USER_COMMAND} resolve-channels` to look up the channel's "
+            "id and switch it on."
         )
     seen: dict[int, str] = {}
     for channel in enabled:
@@ -308,7 +308,10 @@ def _print_banner(setup: WatchSetup, log_path: Path) -> None:
         print(f"  watching: {channel.name} (id {channel.channel_id})")
     print(f"  recording to: {setup.db_path}")
     print(f"  log file: {log_path}")
-    print("Leave this window open. Press Ctrl+C to stop. Check on it with: xaucopier status")
+    print(
+        "Leave this window open. To stop: press Ctrl+C, then answer Y. "
+        f"Check on it from another window with: {paths.USER_COMMAND} status"
+    )
 
 
 def _run(setup: WatchSetup, blob: SecretsBlob) -> int:
@@ -336,7 +339,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print(
             "xaucopier watch is already running on this computer (or resolve-channels "
             "is). Do not start a second one: two programs using the same Telegram "
-            "session at once can get it logged out for good.",
+            "session at once can get it logged out for good. Find its window; if it "
+            "is stuck, press Ctrl+C there and answer Y, then start watch again.",
             file=sys.stderr,
         )
         return exit_codes.EXIT_ALREADY_RUNNING

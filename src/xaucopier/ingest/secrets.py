@@ -180,7 +180,7 @@ def load(path: Path) -> SecretsBlob:
     """
     if not path.exists():
         raise SecretsError(
-            f"no secrets file at {path}. Run `xaucopier setup-login` first "
+            f"no secrets file at {path}. Run `.\\xaucopier setup-login` first "
             "to log in and create it."
         )
 
@@ -195,7 +195,7 @@ def load(path: Path) -> SecretsBlob:
             f"failed to decrypt secrets file at {path}. DPAPI blobs are "
             "tied to the Windows user account (and machine) that created "
             "them, so this usually means the file was copied from another "
-            "machine or user, or has been corrupted. Run `xaucopier "
+            "machine or user, or has been corrupted. Run `.\\xaucopier "
             "setup-login` again on this machine, under this account."
         ) from exc
 
@@ -209,5 +209,5 @@ def load(path: Path) -> SecretsBlob:
     except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as exc:
         raise SecretsError(
             f"secrets file at {path} decrypted but its contents are "
-            "malformed. Run `xaucopier setup-login` again to recreate it."
+            "malformed. Run `.\\xaucopier setup-login` again to recreate it."
         ) from exc
