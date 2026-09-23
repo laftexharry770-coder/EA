@@ -31,10 +31,12 @@ Every `interval` (5 s) the poll runs one *round*:
    read: the `edit_window` (50) newest stored messages at or below the
    pointer, fetched with `get_messages(ids=...)`. The forward read only
    ever sees ids above the pointer, so this is the only history read
-   that can find an edit the `MessageEdited` stream dropped. It runs in
+   that can find an edit, or -- by a message's absence -- a deletion,
+   that the `MessageEdited`/`MessageDeleted` stream dropped. It runs in
    the same per-channel step, under the same `rpc_timeout` and the same
-   error handling below, and it never moves the pointer. Edits it finds
-   are counted in `edit_missed_by_eventstream`.
+   error handling below, and it never moves the pointer. Edits and
+   deletions it finds are counted in `edit_missed_by_eventstream` /
+   `delete_missed_by_eventstream`.
 
 Why 5 s and not 30: spec section 9 G6 gates a signal on its own
 timestamp, and the Plan 1 review found that a slow poll behind a tight

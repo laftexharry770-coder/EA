@@ -1,5 +1,5 @@
-"""The window re-read: how edits the update stream dropped are found
-(spec 8.3; Plan 2 Task 10).
+"""The window re-read: how edits and deletions the update stream dropped
+are found (spec 8.3; Plan 2 Task 10).
 
 The history poll's forward read (`Listener.read_history`) fetches only ids
 *above* the per-channel pointer. An edited or deleted message is at or
@@ -22,16 +22,17 @@ which:
    returns each message's *current* version, or `None` for one that is
    gone;
 4. hands each message whose `edit_date` is newer than the stored one to
-   `Listener.ingest_edit` (`detected_by="window"`). An id that came back
-   missing is left alone for now.
+   `Listener.ingest_edit` (`detected_by="window"`), and each id that came
+   back missing -- a deletion found by **absence** -- to
+   `Listener.ingest_deletion`.
 
-What an edit then *does* is `store/edits_repo.py`'s policy, decided in
-one writer job against the stored row, so an edit the event already
-delivered is a no-op here, and vice versa.
+What an edit or deletion then *does* is `store/edits_repo.py`'s policy,
+decided in one writer job against the stored row, so a change the event
+already delivered is a no-op here, and vice versa.
 
-**It never moves the pointer.** It writes only through `ingest_edit`,
-which never touches `channel_state`, and it only reads ids at or below
-the pointer. The pointer is `read_history`'s alone:
+**It never moves the pointer.** It writes only through `ingest_edit` /
+`ingest_deletion`, neither of which touches `channel_state`, and it only
+reads ids at or below the pointer. The pointer is `read_history`'s alone:
 a read that advanced it past an id it had not ingested would lose that
 message for good (the reviewer's D1).
 
@@ -61,7 +62,7 @@ from datetime import datetime
 from xaucopier.config.channels import ChannelCfg
 from xaucopier.ingest.listener import Listener, normalise_message
 from xaucopier.store import db, edits_repo
-from xaucopier.store.edits_repo import EditResult
+from xaucopier.store.edits_repo import DeletionResult, EditResult
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +89,15 @@ class WindowResult:
     #: The ids asked for, oldest first; empty if there was nothing to ask.
     requested: tuple[int, ...]
     edits: tuple[EditResult, ...]
+    deletions: tuple[DeletionResult, ...]
     #: Ids whose job failed (recorded in `handler_errors`; retried next round).
     failed: tuple[int, ...]
 
     @property
     def changed(self) -> bool:
-        return any(e.changed for e in self.edits)
+        return any(e.changed for e in self.edits) or any(
+            d.outcome not in ("unknown", "already_deleted") for d in self.deletions
+        )
 
 
 def validate_window(window: object, *, name: str = "edit_window") -> int:
@@ -137,7 +141,7 @@ async def reconcile_window(
         )
         requested = tuple(version.message_id for version in stored)
         if not requested:
-            return WindowResult(channel_id, pointer, (), (), ())
+            return WindowResult(channel_id, pointer, (), (), (), ())
 
         fetched = await asyncio.wait_for(
             listener.client.get_messages(channel_id, ids=list(requested)), rpc_timeout
@@ -150,11 +154,17 @@ async def reconcile_window(
         }
 
         edits: list[EditResult] = []
+        deletions: list[DeletionResult] = []
         failed: list[int] = []
         for version in stored:
             message = current.get(version.message_id)
             try:
                 if message is None:
+                    deletions.append(
+                        await listener.ingest_deletion(
+                            channel_cfg, version.message_id, detected_by=WINDOW_SOURCE
+                        )
+                    )
                     continue
                 incoming = normalise_message(message, channel_id=channel_id)
                 if not _newer(incoming.edit_date_utc, version.edit_date_utc):
@@ -177,15 +187,18 @@ async def reconcile_window(
         pointer=pointer,
         requested=requested,
         edits=tuple(edits),
+        deletions=tuple(deletions),
         failed=tuple(failed),
     )
     if result.changed:
         logger.info(
-            "window re-read of channel %s (%s) at or below %s: %d edit(s) applied",
+            "window re-read of channel %s (%s) at or below %s: %d edit(s), %d deletion(s) "
+            "applied",
             channel_id,
             channel_cfg.name,
             pointer,
             sum(1 for e in result.edits if e.changed),
+            sum(1 for d in result.deletions if d.outcome not in ("unknown", "already_deleted")),
         )
     return result
 

@@ -33,7 +33,12 @@ from pathlib import Path
 import pytest
 from telethon import events
 
-from fakes.telegram import FakeMessage, FakeMessageEditedEvent, FakeTelegramClient
+from fakes.telegram import (
+    FakeMessage,
+    FakeMessageDeletedEvent,
+    FakeMessageEditedEvent,
+    FakeTelegramClient,
+)
 from xaucopier.config.accounts import AccountCfg
 from xaucopier.config.channels import ChannelCfg
 from xaucopier.ingest import edits
@@ -708,6 +713,170 @@ def test_an_edit_handler_failure_is_recorded_not_raised(
     assert _run(db_path, body) == [(SIGNAL_ID_MSG, "live")]
 
 
+# -- deletions ---------------------------------------------------------------------
+
+
+def test_deleting_an_unexecuted_signal_via_the_event_voids_it(tmp_path: Path) -> None:
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _stored_signal(client, listener, time)
+        assert await client.emit_delete(A, SIGNAL_ID_MSG)
+        return listener.handler_error_count
+
+    assert _run(db_path, body) == 0
+
+    assert _signal(db_path)["state"] == "VOIDED"
+    assert _outbox(db_path, "ENTRY") == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+    message = _message(db_path)
+    assert (message["deleted_at_utc"], message["detected_by"]) == (NOW.isoformat(), "event")
+    assert _alerts(db_path) == [("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)]
+
+
+def test_a_deletion_the_event_stream_dropped_is_found_by_absence(tmp_path: Path) -> None:
+    """The case absence detection exists for: the MessageDeleted event
+    never fires (a blackout), and only the window re-read -- a `None`
+    where the message used to be -- can see the deletion."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _stored_signal(client, listener, time)
+        with client.blackout():
+            assert not await client.emit_delete(A, SIGNAL_ID_MSG)
+            state_before_round = _signal(db_path)["state"]
+            await _round(listener, time)
+        return state_before_round
+
+    assert _run(db_path, body) == "NEW"
+
+    assert _signal(db_path)["state"] == "VOIDED"
+    assert _message(db_path)["detected_by"] == "window"
+    assert _outbox(db_path, "ENTRY") == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+    assert _metric(db_path, edits_repo.DELETE_MISSED_BY_EVENTSTREAM_METRIC) == 1
+
+
+@pytest.mark.parametrize("path", ["event", "window"])
+@pytest.mark.parametrize("entry_state", ["DONE", "CLAIMED"], ids=["executed", "in-flight"])
+def test_deleting_an_executed_signal_flags_and_alerts_and_closes_nothing(
+    tmp_path: Path, path: str, entry_state: str
+) -> None:
+    """A deletion can be cosmetic (a repost, a tidy-up), so a live trade
+    is never closed on one: the deletion is marked on the message, a
+    CRITICAL alert names the signal, the signal stays NEW so its legs are
+    still managed, and only entries not yet taken are skipped."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _stored_signal(client, listener, time)
+        _mark_entry(db_path, "acct-1", entry_state)
+        if path == "event":
+            assert await client.emit_delete(A, SIGNAL_ID_MSG)
+        else:
+            with client.blackout():
+                await client.emit_delete(A, SIGNAL_ID_MSG)
+            await _round(listener, time)
+        await _round(listener, time)  # and again: not re-alerted
+
+    _run(db_path, body)
+
+    signal = _signal(db_path)
+    assert signal["state"] == "NEW"
+    assert _alerts(db_path) == [("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED)]
+    assert _rows(db_path, "SELECT signal_id FROM alerts") == [(signal["signal_id"],)]
+    assert _outbox(db_path, "ENTRY") == [("acct-1", entry_state), ("acct-2", "SKIPPED")]
+    assert _outbox(db_path, "FOLLOWUP") == []  # no close, no cancel: nothing queued at all
+    assert _rows(db_path, "SELECT COUNT(*) FROM followups")[0][0] == 0
+    assert _message(db_path)["detected_by"] == path
+
+
+@pytest.mark.parametrize("first", ["event", "window"])
+def test_a_deletion_seen_by_both_the_event_and_the_window_is_processed_once(
+    tmp_path: Path, first: str
+) -> None:
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _stored_signal(client, listener, time)
+        _mark_entry(db_path, "acct-1", "DONE")
+        if first == "event":
+            assert await client.emit_delete(A, SIGNAL_ID_MSG)
+            calls_before = len(client.get_messages_calls)
+            await _round(listener, time)
+            window_ids = [c.ids for c in client.get_messages_calls[calls_before:] if c.ids]
+        else:
+            with client.blackout():
+                await client.emit_delete(A, SIGNAL_ID_MSG)
+            await _round(listener, time)
+            window_ids = []
+            late = FakeMessageDeletedEvent(chat_id=A, deleted_ids=(SIGNAL_ID_MSG,), client=client)
+            assert await client.dispatch(late, filter_type=events.MessageDeleted)
+        return window_ids, listener.handler_error_count
+
+    window_ids, errors = _run(db_path, body)
+
+    assert errors == 0
+    assert _alerts(db_path) == [("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED)]
+    assert _message(db_path)["detected_by"] == first
+    # A message already known deleted is not asked for again.
+    assert all(SIGNAL_ID_MSG not in ids for ids in window_ids)
+
+
+def test_deleting_a_follow_up_withdraws_its_queued_instruction(tmp_path: Path) -> None:
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _stored_signal(client, listener, time)
+        assert await client.emit(A, _msg(SIGNAL_ID_MSG + 1, FOLLOWUP_TEXT))
+        assert _outbox(db_path, "FOLLOWUP") == [("acct-1", "QUEUED"), ("acct-2", "QUEUED")]
+        assert await client.emit_delete(A, SIGNAL_ID_MSG + 1)
+
+    _run(db_path, body)
+
+    assert _outbox(db_path, "FOLLOWUP") == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+    assert _alerts(db_path) == [("WARNING", edits_repo.FOLLOWUP_DELETED)]
+    assert _signal(db_path)["state"] == "NEW"
+
+
+def test_deleting_chatter_is_only_marked(tmp_path: Path) -> None:
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        assert await client.emit(A, _msg(SIGNAL_ID_MSG, CHATTER_TEXT))
+        assert await client.emit_delete(A, SIGNAL_ID_MSG)
+
+    _run(db_path, body)
+
+    assert _message(db_path)["deleted_at_utc"] == NOW.isoformat()
+    assert _alerts(db_path) == []
+
+
+def test_the_deletion_handler_makes_no_rpc_and_ignores_what_it_cannot_route(
+    tmp_path: Path,
+) -> None:
+    """`MessageDeleted` outside a channel carries no chat at all
+    (Telethon: `UpdateDeleteMessages`, `peer=None`), so it is dropped, as
+    is one from a chat nobody watches."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _stored_signal(client, listener, time)
+        before = list(client.calls)
+        no_chat = FakeMessageDeletedEvent(chat_id=None, deleted_ids=(SIGNAL_ID_MSG,), client=client)
+        await client.dispatch(no_chat, filter_type=events.MessageDeleted)
+        other = FakeMessageDeletedEvent(chat_id=UNWATCHED, deleted_ids=(SIGNAL_ID_MSG,), client=client)
+        await client.dispatch(other, filter_type=events.MessageDeleted)
+        state_after_unroutable = _signal(db_path)["state"]
+        assert await client.emit_delete(A, SIGNAL_ID_MSG)
+        return client.calls[len(before):], state_after_unroutable, listener.handler_error_count
+
+    new_calls, state_after_unroutable, errors = _run(db_path, body)
+
+    assert new_calls == []
+    assert state_after_unroutable == "NEW"
+    assert errors == 0
+    assert _signal(db_path)["state"] == "VOIDED"
+
+
 # -- the window re-read ------------------------------------------------------------
 
 
@@ -760,6 +929,30 @@ def test_the_window_is_the_newest_n_stored_messages_at_or_below_the_pointer(
     requested = _run(db_path, body, edit_window=3)
 
     assert requested == [(SIGNAL_ID_MSG + 3, SIGNAL_ID_MSG + 4, SIGNAL_ID_MSG + 5)]
+
+
+def test_the_window_matches_what_it_read_by_id_not_by_position(tmp_path: Path) -> None:
+    """Telegram may leave an invalid id out of the answer altogether
+    rather than send `MessageEmpty` for it (telethon/client/messages.py:
+    324-327), so the answer need not zip with the ids asked for. Matching
+    by position would take 4003 for 4002 and 'find' 4003 deleted."""
+    db_path = tmp_path / "store.db"
+    client = ScriptedClient(ids_answer=lambda result: [m for m in result if m is not None])
+
+    async def body(client, listener, time):
+        for offset in range(3):
+            assert await client.emit(A, _msg(SIGNAL_ID_MSG + offset, CHATTER_TEXT))
+        await _round(listener, time)
+        with client.blackout():
+            await client.emit_delete(A, SIGNAL_ID_MSG + 1)
+        await _round(listener, time)
+
+    _run(db_path, body, client=client)
+
+    deleted = _rows(
+        db_path, "SELECT message_id FROM messages WHERE deleted_at_utc IS NOT NULL"
+    )
+    assert deleted == [(SIGNAL_ID_MSG + 1,)]
 
 
 @pytest.mark.parametrize("trouble", ["hang", ConnectionError("blip")], ids=["hang", "error"])
@@ -859,7 +1052,7 @@ def test_the_default_window_is_fifty() -> None:
 
 def test_the_listener_registers_one_handler_per_event_type(tmp_path: Path) -> None:
     """By exact builder type, as Telethon dispatches: an edit reaches
-    only the edit handler."""
+    only the edit handler, a deletion only the deletion handler."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -868,4 +1061,5 @@ def test_the_listener_registers_one_handler_per_event_type(tmp_path: Path) -> No
     assert _run(db_path, body) == [
         (events.NewMessage, "_on_new_message"),
         (events.MessageEdited, "_on_message_edited"),
+        (events.MessageDeleted, "_on_message_deleted"),
     ]

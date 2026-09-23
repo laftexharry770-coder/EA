@@ -60,13 +60,13 @@ never makes an RPC on the update path.
    and a process that keeps running anyway looks healthy to its
    supervisor while recording nothing.
 
-**Edits (Task 10).** `MessageEdited` gets a handler of its own, under
-the same four-step contract as `NewMessage` below. It is a hint, like
-`NewMessage`: the source of truth is the poll's window re-read
-(`ingest/edits.py`), which fetches the recent stored messages by id and
-finds the edits the stream dropped. What an edit *does* is decided in
-one writer job by `store/edits_repo.py`, so one seen by both paths is
-applied once.
+**Edits and deletions (Task 10).** `MessageEdited` and `MessageDeleted`
+get handlers of their own, under the same four-step contract as
+`NewMessage` below. They are hints, like `NewMessage`: the source of truth
+is the poll's window re-read (`ingest/edits.py`), which fetches the recent
+stored messages by id and finds the edits and deletions the stream
+dropped. What an edit or deletion *does* is decided in one writer job by
+`store/edits_repo.py`, so one seen by both paths is processed once.
 
 **Each handler does exactly four things: route, normalise, submit,
 return.** Routing comes first -- one dict lookup on `event.chat_id` --
@@ -123,7 +123,7 @@ from telethon import events
 from xaucopier.config.accounts import AccountCfg
 from xaucopier.config.channels import ChannelCfg
 from xaucopier.store import db, edits_repo, messages_repo, metrics
-from xaucopier.store.edits_repo import EditResult
+from xaucopier.store.edits_repo import DeletionResult, EditResult
 from xaucopier.store.messages_repo import IngestResult
 
 logger = logging.getLogger(__name__)
@@ -212,11 +212,19 @@ class IncomingMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class IncomingDeletion:
+    """One `MessageDeleted` event, flattened: the channel and the ids."""
+
+    channel_id: int
+    message_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class HandlerError:
     """A per-message failure on any ingest path, kept so a test (and an
     operator) can see that one happened rather than inferring it from a
     missing row. `source` is the path it happened on: `"live"` (an
-    update handler -- new message or edit), a history read
+    update handler -- new message, edit or deletion), a history read
     (`"backfill"`, `"poll"`), or `"window"` (the poll's by-id re-read of
     the recent window, `ingest/edits.py`)."""
 
@@ -290,6 +298,16 @@ def normalise_event(event: Any) -> IncomingMessage:
     return normalise_message(event.message, channel_id=event.chat_id)
 
 
+def normalise_deletion_event(event: Any) -> IncomingDeletion:
+    """Flatten a `MessageDeleted` event: `chat_id` (the marked channel id
+    -- Telethon builds a channel's event with `PeerChannel`) and every id
+    in `deleted_ids`. Pure attribute reads."""
+    return IncomingDeletion(
+        channel_id=event.chat_id,
+        message_ids=tuple(int(message_id) for message_id in (event.deleted_ids or ())),
+    )
+
+
 def _advance_last_processed(
     conn: Connection, *, channel_id: int, message_id: int
 ) -> None:
@@ -337,7 +355,7 @@ class Listener:
     `client`, `channels`, `enabled_channels`, `reader`,
     `channel_cfg_for()`, `read_last_processed_message_id()`,
     `read_history()`, `ingest_history()`, `ingest_message()`,
-    `ingest_edit()`, `history_lock()`,
+    `ingest_edit()`, `ingest_deletion()`, `history_lock()`,
     `record_handler_error()`, `probe_writer()`, `record_metric()` and
     `poll_hook` -- rather than reaching into the internals. The poll
     (`ingest/poll.py`) is `read_history(channel, source="poll",
@@ -538,6 +556,31 @@ class Listener:
                 reply_to_message_id=incoming.reply_to_message_id,
                 now_utc=now_utc,
                 accounts=accounts,
+                detected_by=detected_by,
+            )
+
+        return await self._run_on_writer(job)
+
+    async def ingest_deletion(
+        self,
+        channel_cfg: ChannelCfg,
+        message_id: int,
+        *,
+        detected_by: str,
+    ) -> DeletionResult:
+        """Record that `message_id` is gone from its channel --
+        `edits_repo.apply_deletion()`, on the writer thread. Idempotent:
+        the second report of the same deletion finds it marked. Never
+        closes anything, never touches the pointer."""
+        now_utc = self._now()
+        channel_id = channel_cfg.channel_id
+
+        def job(conn: Connection) -> DeletionResult:
+            return edits_repo.apply_deletion(
+                conn,
+                channel_id=channel_id,
+                message_id=message_id,
+                now_utc=now_utc,
                 detected_by=detected_by,
             )
 
@@ -964,6 +1007,7 @@ class Listener:
         # channel filter is the dict lookup in each handler instead.
         self.client.add_event_handler(self._on_new_message, events.NewMessage())
         self.client.add_event_handler(self._on_message_edited, events.MessageEdited())
+        self.client.add_event_handler(self._on_message_deleted, events.MessageDeleted())
 
     def _start_poll_task(self) -> None:
         if self.poll_hook is None:
@@ -1024,6 +1068,34 @@ class Listener:
         except Exception as exc:  # noqa: BLE001 -- recorded, never fatal
             message_id = getattr(getattr(event, "message", None), "id", None)
             self._record_handler_error(channel_id, message_id, exc, source=LIVE_SOURCE)
+
+    async def _on_message_deleted(self, event: Any) -> None:
+        """Route, normalise, submit, return, for `MessageDeleted`.
+
+        Outside a channel Telegram does not say where a message was
+        deleted (Telethon builds the event with `peer=None`, so `chat_id`
+        is None); that routes to nothing and is dropped, like any chat
+        nobody watches. Each id is submitted as its own job, so one that
+        fails does not hold back the rest -- and the window re-read would
+        find it anyway."""
+        channel_id: int | None = None
+        try:
+            channel_id = event.chat_id
+            channel_cfg = self.channel_cfg_for(channel_id)  # 1. route
+            if channel_cfg is None:
+                return
+            deletion = normalise_deletion_event(event)  # 2. normalise
+        except Exception as exc:  # noqa: BLE001 -- recorded, never fatal
+            self._record_handler_error(channel_id, None, exc, source=LIVE_SOURCE)
+            return
+        for message_id in deletion.message_ids:
+            try:
+                await self.ingest_deletion(  # 3. submit
+                    channel_cfg, message_id, detected_by=edits_repo.EVENT_DETECTOR
+                )
+            except Exception as exc:  # noqa: BLE001 -- recorded, never fatal
+                self._record_handler_error(channel_id, message_id, exc, source=LIVE_SOURCE)
+        # 4. return
 
     def _record_handler_error(
         self,

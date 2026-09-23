@@ -31,11 +31,8 @@ which now follows the latest classification -- and then:
   fanned out (Plan 3 applies them). A ladder that changed length after
   entry cannot be amended and raises a WARNING.
 - **Signal -> unparseable** (`parse_failed`) -- `INVALID` + CRITICAL alert.
-- **Signal -> chatter or a follow-up** -- the call is withdrawn. Entries
-  not yet taken are skipped; an unexecuted signal is `VOIDED`; an
-  executed or in-flight one is flagged with a CRITICAL alert and **not**
-  closed (its `state` stays `NEW`, so its live legs are still managed).
-  The new follow-up is not dispatched.
+- **Signal -> chatter or a follow-up** -- the call is withdrawn: handled
+  exactly like a deletion (below). The new follow-up is not dispatched.
 - **Follow-up -> follow-up** -- updated in place (a worker reads it when it
   claims); WARNING if it had already been dispatched.
 - **Follow-up -> anything else** -- withdrawn: its queued rows are skipped.
@@ -47,16 +44,23 @@ which now follows the latest classification -- and then:
 - A signal already `INVALID` or `VOIDED` stays so; an edit of it is
   recorded with a WARNING.
 
+**Deletions.** An unexecuted signal is `VOIDED`. An executed or in-flight
+one is *flagged* -- `messages.deleted_at_utc` plus a CRITICAL alert naming
+the signal -- and **not** closed: a deletion can be cosmetic (a repost, a
+tidy-up). Its `state` stays `NEW` so Plan 3 keeps managing the live legs.
+Either way, entries not yet taken (`QUEUED`) are skipped. A deleted
+follow-up's queued rows are skipped. Everything else is only marked.
+
 **"Executed" is the outbox, for now.** Plan 3's legs table does not exist
 yet, so `trade_status()` reads the signal's ENTRY outbox rows: one `DONE`
 is executed; one `CLAIMED` (a worker holds it, possibly mid order-send)
 is *in flight*, and is treated like executed wherever that protects a
 live position. Replace it with the legs table when Plan 3 lands.
 
-**Durable counters.** A newer version found by a history read
-(`window`, `poll`, `backfill`) rather than the event stream bumps
-`edit_missed_by_eventstream`, the edit counterpart of the poll's
-`missed_by_eventstream`.
+**Durable counters.** A newer version or a deletion found by a history
+read (`window`, `poll`, `backfill`) rather than the event stream bumps
+`edit_missed_by_eventstream` / `delete_missed_by_eventstream`, the edit
+and deletion counterparts of the poll's `missed_by_eventstream`.
 """
 from __future__ import annotations
 
@@ -84,6 +88,10 @@ SIGNAL_UNPARSEABLE_AFTER_EDIT = "SIGNAL_UNPARSEABLE_AFTER_EDIT"
 SIGNAL_RETRACTED_BY_EDIT = "SIGNAL_RETRACTED_BY_EDIT"
 #: CRITICAL: the same, on a signal that is executed or in flight.
 LIVE_SIGNAL_RETRACTED_BY_EDIT = "LIVE_SIGNAL_RETRACTED_BY_EDIT"
+#: WARNING: an unexecuted signal was deleted; VOIDED.
+SIGNAL_VOIDED_BY_DELETION = "SIGNAL_VOIDED_BY_DELETION"
+#: CRITICAL: a signal that is executed or in flight was deleted.
+LIVE_SIGNAL_DELETED = "LIVE_SIGNAL_DELETED"
 #: WARNING: an edit turned a non-signal into a signal. Not traded.
 EDIT_CREATED_SIGNAL = "EDIT_CREATED_SIGNAL"
 #: WARNING: an edit turned chatter (or a broken signal) into a follow-up. Not dispatched.
@@ -96,9 +104,12 @@ TP_LADDER_CHANGED_AFTER_ENTRY = "TP_LADDER_CHANGED_AFTER_ENTRY"
 FOLLOWUP_EDITED_AFTER_DISPATCH = "FOLLOWUP_EDITED_AFTER_DISPATCH"
 #: WARNING: a follow-up edited into something that is no instruction.
 FOLLOWUP_RETRACTED_BY_EDIT = "FOLLOWUP_RETRACTED_BY_EDIT"
+#: WARNING: a follow-up message was deleted.
+FOLLOWUP_DELETED = "FOLLOWUP_DELETED"
 
 # -- metrics ------------------------------------------------------------------
 EDIT_MISSED_BY_EVENTSTREAM_METRIC = "edit_missed_by_eventstream"
+DELETE_MISSED_BY_EVENTSTREAM_METRIC = "delete_missed_by_eventstream"
 
 # -- who found the change ------------------------------------------------------
 #: The `MessageEdited` / `MessageDeleted` update handlers.
@@ -142,6 +153,15 @@ CHANGED_OUTCOMES = frozenset(
     }
 )
 
+DeletionOutcome = Literal[
+    "unknown",  # never stored: nothing to do
+    "already_deleted",  # processed before (by the other path): nothing to do
+    "voided",  # an unexecuted signal: VOIDED
+    "flagged",  # an executed / in-flight signal: alerted, NOT closed
+    "withdrawn",  # a follow-up: its queued rows skipped
+    "deleted",  # anything else: marked only
+]
+
 TradeStatus = Literal["pending", "in_flight", "executed"]
 
 
@@ -174,6 +194,18 @@ class EditResult:
     @property
     def changed(self) -> bool:
         return self.outcome in CHANGED_OUTCOMES
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionResult:
+    outcome: DeletionOutcome
+    message_id: int
+    kind: str | None
+    signal_id: int | None
+    followup_id: int | None
+    #: QUEUED outbox rows this deletion skipped.
+    skipped: int
+    alert_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -695,6 +727,101 @@ def _created_alert(ctx: _Ctx, route_result: RouteResult) -> int:
         f"({_describe(route_result)}). Edits never dispatch instructions: nothing was "
         "queued. If it is real, apply it by hand.",
     )
+
+
+# -- deletions ---------------------------------------------------------------
+
+
+def apply_deletion(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    message_id: int,
+    now_utc: datetime,
+    detected_by: str,
+) -> DeletionResult:
+    """A message is gone from its channel (the event said so, or the
+    window re-read found `None` where it used to be). Marks it deleted --
+    exactly once: a second report finds the mark -- and applies the
+    deletion policy in the module docstring. Never closes anything."""
+    _check_detector(detected_by)
+    existing = _get_message(conn, channel_id=channel_id, message_id=message_id)
+    if existing is None:
+        return DeletionResult("unknown", message_id, None, None, None, 0, ())
+    kind = existing["kind"]
+    signal_id = signals_repo.get_signal_id(conn, channel_id=channel_id, message_id=message_id)
+    followup_id = signals_repo.get_followup_id(conn, channel_id=channel_id, message_id=message_id)
+    if existing["deleted_at_utc"] is not None:
+        return DeletionResult(
+            "already_deleted", message_id, kind, signal_id, followup_id, 0, ()
+        )
+
+    conn.execute(
+        "UPDATE messages SET deleted_at_utc = ?, deleted_detected_by = ? "
+        "WHERE channel_id = ? AND message_id = ?",
+        (now_utc.isoformat(), detected_by, channel_id, message_id),
+    )
+    if detected_by in HISTORY_DETECTORS:
+        metrics.bump(
+            conn, day_key=metrics.day_key_for(now_utc), name=DELETE_MISSED_BY_EVENTSTREAM_METRIC
+        )
+    ctx = _Ctx(
+        conn=conn,
+        channel_id=channel_id,
+        message_id=message_id,
+        now_utc=now_utc,
+        edit_date_utc=None,
+        accounts=(),
+        detected_by=detected_by,
+        signal_id=signal_id,
+        followup_id=followup_id,
+    )
+
+    # Decided on the signals row, not on `kind`: a signal an earlier edit
+    # reclassified (INVALID, or withdrawn while live) can still have live
+    # legs, and its message going away is still worth saying.
+    row = (
+        signals_repo.get_signal(conn, channel_id=channel_id, message_id=message_id)
+        if signal_id is not None
+        else None
+    )
+    if row is not None:
+        status = trade_status(conn, signal_id=signal_id)
+        if row["state"] == "NEW" or status != "pending":
+            result = _withdraw_signal(
+                ctx,
+                row,
+                status,
+                via=f"message deleted, found by {detected_by}",
+                pending_code=SIGNAL_VOIDED_BY_DELETION,
+                live_code=LIVE_SIGNAL_DELETED,
+                new_kind=kind,
+            )
+            return DeletionResult(
+                result.outcome,  # "voided" or "flagged", both DeletionOutcomes
+                message_id,
+                kind,
+                signal_id,
+                followup_id,
+                result.skipped,
+                result.alert_ids,
+            )
+    elif kind == "followup" and followup_id is not None:
+        partial = _withdraw_followup(
+            ctx, followup_id, code=FOLLOWUP_DELETED, via=f"message deleted, found by {detected_by}"
+        )
+        return DeletionResult(
+            "withdrawn", message_id, kind, signal_id, followup_id, partial.skipped, partial.alert_ids
+        )
+
+    logger.info(
+        "channel %s message %s (%s) deleted, found by %s; marked",
+        channel_id,
+        message_id,
+        kind,
+        detected_by,
+    )
+    return DeletionResult("deleted", message_id, kind, signal_id, followup_id, 0, ())
 
 
 # -- helpers -----------------------------------------------------------------
