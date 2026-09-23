@@ -39,9 +39,9 @@ never makes an RPC on the update path.
    by backfill and the update stream at the same instant (and even if it
    were, `ingest()`'s dedup would make the second one a no-op).
 4. **Register handlers.**
-5. **Start the poll task** (Task 9 owns the poll itself; `poll_hook` is
-   its slot). It starts last because a poll racing backfill over the
-   same rows is pointless work.
+5. **Start the poll task** (`ingest/poll.py` is the poll itself;
+   `poll_hook` is its slot). It starts last because a poll racing
+   backfill over the same rows is pointless work.
 6. **`run_until_disconnected()`, wrapped so any return is non-zero.** A
    listener that returns cleanly has still stopped listening: for the
    supervisor there is no such thing as a successful exit here, so the
@@ -147,7 +147,8 @@ HISTORY_SKIPPED_METRIC = "history_skipped"
 #: import sqlite3 at all (see the module docstring), not even for a type.
 Connection = Any
 
-#: The poll slot Task 9 fills: `async def poll(listener) -> None`.
+#: The poll slot: `async def poll(listener)`, which must never return
+#: (see `wait_until_stopped`). `ingest.poll.HistoryPoll` fills it.
 PollHook = Callable[["Listener"], Awaitable[None]]
 
 #: `messages.source` for a message delivered by the update stream.
@@ -310,10 +311,11 @@ class Listener:
     Task 9 and Task 11 build on the public surface here --
     `client`, `channels`, `enabled_channels`, `reader`,
     `channel_cfg_for()`, `read_last_processed_message_id()`,
-    `read_history()`, `ingest_history()`, `ingest_message()` and
-    `poll_hook` -- rather than reaching into the internals. The poll
-    should be `read_history(channel, source="poll", limit=...)`: it is
-    the one place the pointer is read, fetched from and advanced.
+    `read_history()`, `ingest_history()`, `ingest_message()`,
+    `probe_writer()`, `record_metric()` and `poll_hook` -- rather than
+    reaching into the internals. The poll (`ingest/poll.py`) is
+    `read_history(channel, source="poll", limit=..., rpc_timeout=...)`:
+    it is the one place the pointer is read, fetched from and advanced.
     """
 
     def __init__(
@@ -620,7 +622,12 @@ class Listener:
         return True
 
     async def read_history(
-        self, channel_cfg: ChannelCfg, *, source: str, limit: int
+        self,
+        channel_cfg: ChannelCfg,
+        *,
+        source: str,
+        limit: int,
+        rpc_timeout: float | None = None,
     ) -> tuple[HistoryIngest, ...]:
         """One history read for one channel: fetch everything after the
         pointer (oldest first, at most `limit`) and ingest it.
@@ -642,29 +649,68 @@ class Listener:
         `()`). If that seed fails at startup, the next call -- the poll's
         -- seeds instead, never reads from 0.
 
+        `rpc_timeout`, when given, bounds each `get_messages()` RPC with
+        `asyncio.wait_for` (`TimeoutError` propagates). It bounds the RPC
+        only, never the writes that follow: cancelling a batch half-way
+        through its ingest would discard the outcomes of messages already
+        stored (the poll counts `missed_by_eventstream` from them) and
+        could land between a skip's write and its CRITICAL log.
+
         RPC errors propagate; the caller decides whether to retry.
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError(f"limit must be a positive int, got {limit!r}")
+        if rpc_timeout is not None and (
+            isinstance(rpc_timeout, bool)
+            or not isinstance(rpc_timeout, int | float)
+            or rpc_timeout <= 0
+        ):
+            raise ValueError(f"rpc_timeout must be a positive number, got {rpc_timeout!r}")
         channel_id = channel_cfg.channel_id
         pointer = self.read_last_processed_message_id(channel_id)
         if pointer == 0 and channel_id not in self._pointer_seeded:
-            await self._seed_pointer_from_newest(channel_cfg)
+            await self._seed_pointer_from_newest(channel_cfg, rpc_timeout=rpc_timeout)
             return ()
         self._pointer_seeded.add(channel_id)
-        messages = await self.client.get_messages(
-            channel_id, limit=limit, min_id=pointer, reverse=True
+        messages = await _bounded(
+            self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
+            rpc_timeout,
         )
         return await self.ingest_history(
             channel_cfg, messages, min_id=pointer, source=source
         )
 
-    async def _seed_pointer_from_newest(self, channel_cfg: ChannelCfg) -> int:
+    async def probe_writer(self) -> None:
+        """Run a no-op (`SELECT 1`) on the writer thread and await it.
+
+        A dead writer is otherwise noticed only by the next write, and a
+        quiet channel makes none -- so a writer that died at night would
+        go unnoticed until the morning's first signal, which it would then
+        fail to store. The poll calls this once per interval. It goes
+        through `_run_on_writer()`, so a `WriterDeadError` stops the
+        listener exactly as a failed ingest does (and is re-raised)."""
+        await self._run_on_writer(_writer_noop)
+
+    async def record_metric(self, name: str, value: int = 1) -> None:
+        """`metrics(today, name) += value`, on the writer thread, where
+        today is the UTC day of this listener's injected clock. Through
+        `_run_on_writer()`, so a dead writer stops the listener here too.
+        """
+        day_key = metrics.day_key_for(self._now())
+
+        def bump(conn: Connection) -> None:
+            metrics.bump(conn, day_key=day_key, name=name, value=value)
+
+        await self._run_on_writer(bump)
+
+    async def _seed_pointer_from_newest(
+        self, channel_cfg: ChannelCfg, *, rpc_timeout: float | None = None
+    ) -> int:
         """First run for this channel: point it at the newest message, so
         only what is posted from now on is ingested. One RPC, newest
         first (`limit=1`, not reversed)."""
         channel_id = channel_cfg.channel_id
-        newest = await self.client.get_messages(channel_id, limit=1)
+        newest = await _bounded(self.client.get_messages(channel_id, limit=1), rpc_timeout)
         newest_id = max((message.id for message in newest), default=0)
         if newest_id:
 
@@ -927,6 +973,18 @@ def _writer_ready_probe(conn: Connection) -> bool:
     """A job that writes nothing. Its only purpose is to have *run* on
     the writer thread, which proves `Writer._run` already connected."""
     return True
+
+
+def _writer_noop(conn: Connection) -> None:
+    """`probe_writer()`'s job: touches the connection, writes nothing."""
+    conn.execute("SELECT 1").fetchone()
+
+
+async def _bounded(awaitable: Awaitable[Any], timeout: float | None) -> Any:
+    """`await awaitable`, under `asyncio.wait_for` when `timeout` is set."""
+    if timeout is None:
+        return await awaitable
+    return await asyncio.wait_for(awaitable, timeout)
 
 
 def _utcnow() -> datetime:

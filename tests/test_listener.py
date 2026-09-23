@@ -962,6 +962,68 @@ def test_backfill_asks_only_for_messages_newer_than_last_processed(
     assert calls[0].limit == listener_module.DEFAULT_BACKFILL_LIMIT
 
 
+class _ScriptedReadsClient(FakeTelegramClient):
+    """Each `get_messages()` pops one step: None reads normally, "hang"
+    never answers (until cancelled), an exception is raised."""
+
+    script: list = []
+
+    async def get_messages(self, *args, **kwargs):
+        step = self.script.pop(0) if self.script else None
+        if step == "hang":
+            await asyncio.Event().wait()
+        if isinstance(step, BaseException):
+            raise step
+        return await super().get_messages(*args, **kwargs)
+
+
+@pytest.mark.parametrize("path", ["read", "seed"])
+def test_read_history_rpc_timeout_bounds_the_read_and_the_first_run_seed(
+    tmp_path: Path, path: str
+) -> None:
+    """The poll passes `rpc_timeout`; both RPCs `read_history` can make --
+    the history read, and the first-run seed of a channel whose startup
+    backfill failed -- must honour it, or one hung RPC hangs the poll."""
+    db_path = tmp_path / "store.db"
+    if path == "read":
+        _seed_last_processed(db_path, CHANNEL_ID, 9)
+
+    async def scenario() -> float:
+        client = _ScriptedReadsClient()
+        # Startup backfill: a normal read, or a failed seed (so the
+        # channel is still unseeded and the next call seeds).
+        client.script = [None if path == "read" else ConnectionError("startup blip"), "hang"]
+        async with _started(db_path, client) as listener:
+            started = asyncio.get_running_loop().time()
+            with pytest.raises(TimeoutError):
+                # The outer bound only keeps a broken read_history from
+                # hanging the suite; it takes 2 s, which fails `elapsed`.
+                await asyncio.wait_for(
+                    listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=0.05),
+                    timeout=2.0,
+                )
+            return asyncio.get_running_loop().time() - started
+
+    elapsed = asyncio.run(scenario())
+
+    assert elapsed < 1.0
+    assert _last_processed(db_path, CHANNEL_ID) == (9 if path == "read" else 0)
+
+
+@pytest.mark.parametrize("rpc_timeout", [0, -1, True, "20"])
+def test_read_history_refuses_a_nonsense_rpc_timeout(tmp_path: Path, rpc_timeout) -> None:
+    db_path = tmp_path / "store.db"
+
+    async def scenario() -> None:
+        async with _started(db_path, FakeTelegramClient()) as listener:
+            with pytest.raises(ValueError, match="rpc_timeout"):
+                await listener.read_history(
+                    CHANNEL, source="poll", limit=100, rpc_timeout=rpc_timeout
+                )
+
+    asyncio.run(scenario())
+
+
 def test_writer_connects_before_any_reader_connection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
