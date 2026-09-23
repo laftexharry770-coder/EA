@@ -35,6 +35,7 @@ import sys
 from pathlib import Path
 
 from xaucopier.cli import exit_codes, paths
+from xaucopier.cli.status import cmd_status
 from xaucopier.cli.watch import cmd_watch
 from xaucopier.ingest.client import EXIT_TERMINAL_AUTH, TERMINAL_AUTH_ERRORS, build_client
 from xaucopier.ingest.secrets import DEFAULT_SECRETS_PATH, SecretsBlob, save
@@ -203,6 +204,21 @@ def build_parser() -> argparse.ArgumentParser:
     _add_db(watch)
     _add_secrets(watch)
     watch.set_defaults(func=cmd_watch)
+
+    status = subparsers.add_parser(
+        "status",
+        help="Show what watch has recorded, any alerts, and whether it is healthy. Read-only.",
+        description=(
+            "Reports what watch has recorded and whether it is healthy. It only "
+            "reads: the database is opened read-only and nothing is changed."
+        ),
+        epilog=exit_codes.help_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_config_dir(status)
+    _add_db(status)
+    _add_secrets(status)
+    status.set_defaults(func=cmd_status)
 
     return parser
 

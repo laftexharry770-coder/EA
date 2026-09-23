@@ -136,6 +136,12 @@ _DEFAULT_LEASE_SECONDS = 90
 #: `metrics.name` for ENTRY rows claim()/sweep_expired() skipped because
 #: their signal is no longer tradeable.
 DEAD_ENTRY_SKIPPED_METRIC = "outbox_dead_entry_skipped"
+#: `metrics.name` for rows sweep_expired() re-queued after a claimant's
+#: lease expired -- a worker died mid-claim.
+LEASE_RECLAIMED_METRIC = "outbox_lease_reclaimed"
+#: `metrics.name` for a new signal or follow-up that fanned out to no
+#: account at all (see fan_out_checked).
+NO_ACCOUNTS_METRIC = "ingest_new_no_accounts"
 
 #: An ENTRY row whose signal must never be traded again: invalidated (or
 #: voided, or anything not NEW), or withdrawn by its poster. A signal_id
@@ -405,7 +411,7 @@ def sweep_expired(
                 # can monkeypatch `metrics.bump` to crash between the reset
                 # UPDATE and the metric write, and prove the pair is atomic.
                 metrics.bump(
-                    conn, day_key=day_key, name="outbox_lease_reclaimed", value=reclaimed
+                    conn, day_key=day_key, name=LEASE_RECLAIMED_METRIC, value=reclaimed
                 )
         except BaseException:
             conn.execute("ROLLBACK")
@@ -453,7 +459,7 @@ def fan_out_checked(
     enabled_count = sum(1 for account in accounts if account.enabled)
 
     if fanout_count == 0:
-        metrics.bump(conn, day_key=metrics.day_key_for(now_utc), name="ingest_new_no_accounts")
+        metrics.bump(conn, day_key=metrics.day_key_for(now_utc), name=NO_ACCOUNTS_METRIC)
 
     if fanout_count != enabled_count:
         raise RuntimeError(
