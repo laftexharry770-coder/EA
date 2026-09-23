@@ -360,6 +360,9 @@ class Listener:
         # Failed history-read attempts per (channel_id, message_id); see
         # ingest_history(). Cleared on success or skip.
         self._history_attempts: dict[tuple[int, int], int] = {}
+        # One lock per channel, held for a whole read_history() call: at
+        # most one history read per channel at a time (see read_history).
+        self._history_locks: dict[int, asyncio.Lock] = {}
         # Resolved (with the WriterDeadError) the first time any write
         # finds the writer thread dead; watched by wait_until_stopped().
         # Created in start(), where a running loop is guaranteed.
@@ -568,7 +571,10 @@ class Listener:
                     channel_cfg, message.id, attempts=attempts, last_error=exc
                 ):
                     break  # the skip itself failed; the next read tries again
-                del self._history_attempts[key]
+                # pop, not del: tolerant of a key already cleared, so even
+                # a caller that breaks the one-read-per-channel rule by
+                # calling ingest_history() concurrently gets no KeyError.
+                self._history_attempts.pop(key, None)
                 continue
             self._history_attempts.pop(key, None)
             outcomes.append(HistoryIngest(message_id=message.id, result=result))
@@ -656,6 +662,17 @@ class Listener:
         stored (the poll counts `missed_by_eventstream` from them) and
         could land between a skip's write and its CRITICAL log.
 
+        **At most one history read per channel runs at a time.** A read
+        takes a per-channel lock for its whole length -- pointer read,
+        fetch, ingest -- so a second call for the same channel waits for
+        the first to finish and then reads from wherever it left the
+        pointer. Two overlapping reads would each fetch the same batch
+        from the same pointer: a message that fails would then count two
+        attempts towards its skip in one round, and a skip raced by the
+        other read would be taken twice. Reads of *different* channels
+        do not wait for each other. (`ingest_history()` itself is not
+        locked; call it only from within a read.)
+
         RPC errors propagate; the caller decides whether to retry.
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
@@ -667,18 +684,20 @@ class Listener:
         ):
             raise ValueError(f"rpc_timeout must be a positive number, got {rpc_timeout!r}")
         channel_id = channel_cfg.channel_id
-        pointer = self.read_last_processed_message_id(channel_id)
-        if pointer == 0 and channel_id not in self._pointer_seeded:
-            await self._seed_pointer_from_newest(channel_cfg, rpc_timeout=rpc_timeout)
-            return ()
-        self._pointer_seeded.add(channel_id)
-        messages = await _bounded(
-            self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
-            rpc_timeout,
-        )
-        return await self.ingest_history(
-            channel_cfg, messages, min_id=pointer, source=source
-        )
+        lock = self._history_locks.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            pointer = self.read_last_processed_message_id(channel_id)
+            if pointer == 0 and channel_id not in self._pointer_seeded:
+                await self._seed_pointer_from_newest(channel_cfg, rpc_timeout=rpc_timeout)
+                return ()
+            self._pointer_seeded.add(channel_id)
+            messages = await _bounded(
+                self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
+                rpc_timeout,
+            )
+            return await self.ingest_history(
+                channel_cfg, messages, min_id=pointer, source=source
+            )
 
     async def probe_writer(self) -> None:
         """Run a no-op (`SELECT 1`) on the writer thread and await it.

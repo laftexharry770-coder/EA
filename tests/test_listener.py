@@ -941,6 +941,111 @@ def test_a_dead_writer_never_counts_toward_a_skip(
     assert _last_processed(db_path, CHANNEL_ID) == 11
     assert _history_skipped(db_path) == 0
 
+class _GatedReadsClient(FakeTelegramClient):
+    """Once `gate` is set, every `get_messages()` waits at it, and the
+    number of reads in flight per channel is tracked."""
+
+    gate: asyncio.Event | None = None
+
+    async def get_messages(self, *args, **kwargs):
+        if self.gate is None:
+            return await super().get_messages(*args, **kwargs)
+        channel_id = self._channel_id_of(args[0])
+        self.in_flight[channel_id] = self.in_flight.get(channel_id, 0) + 1
+        self.peak[channel_id] = max(self.peak.get(channel_id, 0), self.in_flight[channel_id])
+        self.peak_total = max(self.peak_total, sum(self.in_flight.values()))
+        try:
+            await self.gate.wait()
+            return await super().get_messages(*args, **kwargs)
+        finally:
+            self.in_flight[channel_id] -= 1
+
+
+def test_history_reads_of_one_channel_never_overlap_but_other_channels_do(
+    tmp_path: Path,
+) -> None:
+    """Two overlapping reads of one channel would fetch the same batch from
+    the same pointer and double-count a failure towards its skip. The
+    second must wait and then resume from where the first left the
+    pointer; a read of another channel must not wait at all."""
+    db_path = tmp_path / "store.db"
+    other = ChannelCfg(
+        channel_id=-1002222222222, name="Channel B", parser="mmh", ordinal=2, enabled=True
+    )
+    _seed_last_processed(db_path, CHANNEL_ID, 9)
+    _seed_last_processed(db_path, other.channel_id, 19)
+
+    async def scenario():
+        client = _GatedReadsClient()
+        async with _started(db_path, client, channels=(CHANNEL, other)) as listener:
+            client.add_to_history(CHANNEL_ID, _chatter_message(10))
+            client.add_to_history(CHANNEL_ID, _chatter_message(11))
+            client.add_to_history(other.channel_id, _chatter_message(20))
+            client.gate, client.in_flight, client.peak, client.peak_total = (
+                asyncio.Event(), {}, {}, 0
+            )
+            reads = [
+                asyncio.create_task(listener.read_history(CHANNEL, source="poll", limit=100)),
+                asyncio.create_task(listener.read_history(CHANNEL, source="poll", limit=100)),
+                asyncio.create_task(listener.read_history(other, source="poll", limit=100)),
+            ]
+            await _wait_for(lambda: sum(client.in_flight.values()) == 2)
+            await asyncio.sleep(0.05)  # every chance for a second read of A to get in
+            client.gate.set()
+            results = await asyncio.wait_for(asyncio.gather(*reads), timeout=2.0)
+        return client.peak, client.peak_total, results
+
+    peak, peak_total, results = asyncio.run(scenario())
+
+    assert peak[CHANNEL_ID] == 1, "two history reads of one channel overlapped"
+    assert peak_total == 2, "a read of one channel waited for another channel's"
+    first, second, of_other = (
+        [(r.message_id, r.result.outcome) for r in result] for result in results
+    )
+    assert first == [(10, "new"), (11, "new")]
+    assert second == []  # resumed from the pointer the first read left: nothing new
+    assert of_other == [(20, "new")]
+
+
+def test_a_skip_raced_by_an_overlapping_batch_does_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`read_history` never overlaps reads of one channel, but if a caller
+    runs two `ingest_history` batches at once anyway, both can reach the
+    skip of the same poison message. The second skip's bookkeeping must
+    not raise `KeyError` for a key the first already cleared (the Task 8
+    review's latent bug at `del self._history_attempts[key]`)."""
+    db_path = tmp_path / "store.db"
+    _seed_last_processed(db_path, CHANNEL_ID, 9)
+    real_ingest = messages_repo.ingest
+
+    def poisoned_ingest(conn, **kwargs):
+        if kwargs["message_id"] == 11:
+            raise ValueError("cannot ingest this one")
+        return real_ingest(conn, **kwargs)
+
+    monkeypatch.setattr(messages_repo, "ingest", poisoned_ingest)
+
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL_ID: [_chatter_message(11)]})
+        async with _started(db_path, client) as listener:  # backfill: attempt 1
+            await listener.read_history(CHANNEL, source="poll", limit=100)  # attempt 2
+            batch = [_chatter_message(11)]
+            return await asyncio.gather(
+                listener.ingest_history(CHANNEL, batch, min_id=9, source="poll"),
+                listener.ingest_history(CHANNEL, batch, min_id=9, source="poll"),
+            )
+
+    both = asyncio.run(scenario())
+
+    assert [[(r.message_id, r.result) for r in batch] for batch in both] == [
+        [(11, None)],
+        [(11, None)],
+    ]
+    assert _last_processed(db_path, CHANNEL_ID) == 11
+    assert _stored(db_path) == []
+
+
 def test_backfill_asks_only_for_messages_newer_than_last_processed(
     tmp_path: Path,
 ) -> None:
