@@ -1015,6 +1015,48 @@ def test_a_message_that_always_fails_is_skipped_after_exactly_three_reads(
     assert listener_module.MAX_HISTORY_ATTEMPTS == 3
 
 
+def test_a_skip_that_cannot_read_the_clock_is_retried_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The skip's day key is computed inside its `try`: if that fails, the
+    skip returns False and the next read tries again, instead of the
+    error escaping `ingest_history()` and the read."""
+    db_path = tmp_path / "store.db"
+    _seed_last_processed(db_path, CHANNEL_ID, 9)
+    real_ingest = messages_repo.ingest
+    real_day_key_for = metrics.day_key_for
+
+    def poisoned_ingest(conn, **kwargs):
+        if kwargs["message_id"] == 11:
+            raise ValueError("cannot ingest this one")
+        return real_ingest(conn, **kwargs)
+
+    def broken_day_key_for(now_utc):
+        raise RuntimeError("the clock broke")
+
+    monkeypatch.setattr(messages_repo, "ingest", poisoned_ingest)
+
+    async def scenario():
+        client = FakeTelegramClient(history={CHANNEL_ID: [_chatter_message(11)]})
+        async with _started(db_path, client) as listener:  # backfill: attempt 1
+            await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
+            monkeypatch.setattr(metrics, "day_key_for", broken_day_key_for)
+            third = await listener.read_history(  # attempt 3: the skip itself fails
+                CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT
+            )
+            pointer_after_third = listener.read_last_processed_message_id(CHANNEL_ID)
+            monkeypatch.setattr(metrics, "day_key_for", real_day_key_for)
+            await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
+        return third, pointer_after_third
+
+    third, pointer_after_third = asyncio.run(scenario())
+
+    assert [(r.message_id, r.result) for r in third] == [(11, None)]
+    assert pointer_after_third == 9, "a skip that failed still moved the pointer"
+    assert _last_processed(db_path, CHANNEL_ID) == 11  # the next read's skip worked
+    assert _history_skipped(db_path) == 1
+
+
 class _SwitchablyDeadWriter(db.Writer):
     """A writer that can be made to answer every job with WriterDeadError
     -- and then brought back. Real writers do not come back; this exists

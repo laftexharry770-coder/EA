@@ -30,6 +30,7 @@ from telethon import errors
 from fakes.telegram import FakeMessage, FakeTelegramClient
 from xaucopier.config.accounts import AccountCfg
 from xaucopier.config.channels import ChannelCfg
+from xaucopier.ingest.client import EXIT_TERMINAL_AUTH
 from xaucopier.ingest.listener import (
     EXIT_LISTENER_STOPPED,
     FIRST_RUN_SEED_MARGIN,
@@ -522,10 +523,12 @@ def test_one_channels_failed_read_does_not_stop_the_poll_or_the_other_channel(
     assert hung_reads_cancelled == (1 if failure == "timeout" else 0)
 
 
-def test_a_terminal_auth_error_is_not_swallowed(tmp_path: Path) -> None:
+def test_a_terminal_auth_error_is_not_swallowed_and_exits_3(tmp_path: Path) -> None:
     """A dead session never recovers. Retrying it every 5 s forever would
     leave a process that looks alive and can never read anything again,
-    so the poll stops (and with it, the listener)."""
+    so the poll stops at once -- and the listener exits 3 ("do not
+    restart"), not 4 ("restart me"), exactly as it does when
+    `run_until_disconnected()` raises the same error."""
     db_path = tmp_path / "store.db"
     _seed_pointer(db_path, A, 9)
     _seed_pointer(db_path, B, 19)
@@ -533,17 +536,21 @@ def test_a_terminal_auth_error_is_not_swallowed(tmp_path: Path) -> None:
 
     async def scenario():
         client = ScriptedClient()
-        async with _polling(db_path, client, time, channels=(CHANNEL_A, CHANNEL_B)) as listener:
-            client.failures[A] = [errors.AuthKeyUnregisteredError(request=None)]
-            attempts_before = len(client.read_attempts)
-            time.wake()
-            await _wait_for(lambda: listener.poll_task.done())
-            return listener.poll_task.exception(), client.read_attempts[attempts_before:]
+        listener = _build(db_path, client, time, channels=(CHANNEL_A, CHANNEL_B))
+        task = asyncio.create_task(run_listener(listener))
+        await _wait_for(lambda: "run_until_disconnected" in client.calls)
+        await _until_asleep(listener, time)
+        client.failures[A] = [errors.AuthKeyUnregisteredError(request=None)]
+        attempts_before = len(client.read_attempts)
+        time.wake()
+        exit_code = await asyncio.wait_for(task, timeout=2.0)
+        return exit_code, listener.poll_task.exception(), client.read_attempts[attempts_before:]
 
-    error, attempts = asyncio.run(scenario())
+    exit_code, error, attempts = asyncio.run(scenario())
 
+    assert exit_code == EXIT_TERMINAL_AUTH
     assert isinstance(error, errors.AuthKeyUnregisteredError)
-    assert attempts == [A]
+    assert attempts == [A], "the poll went on to the next channel with a dead session"
 
 
 # -- a dead (or hung) writer stops everything --------------------------------------

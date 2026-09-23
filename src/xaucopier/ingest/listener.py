@@ -612,13 +612,16 @@ class Listener:
         below this id and `MAX()` moves it past this one message only.
         Returns False (and skips nothing) if the job itself fails."""
         channel_id = channel_cfg.channel_id
-        day_key = metrics.day_key_for(self._now())
-
-        def skip(conn: Connection) -> None:
-            _advance_last_processed(conn, channel_id=channel_id, message_id=message_id)
-            metrics.bump(conn, day_key=day_key, name=HISTORY_SKIPPED_METRIC)
 
         try:
+            # Inside the try: a clock that fails here must make the skip
+            # return False (retried next read), not escape ingest_history.
+            day_key = metrics.day_key_for(self._now())
+
+            def skip(conn: Connection) -> None:
+                _advance_last_processed(conn, channel_id=channel_id, message_id=message_id)
+                metrics.bump(conn, day_key=day_key, name=HISTORY_SKIPPED_METRIC)
+
             await self._run_on_writer(skip)
         except Exception as exc:  # noqa: BLE001 -- the next read retries the skip
             logger.error(
@@ -972,7 +975,9 @@ class Listener:
         classify it). The poll finishing -- raising, returning, or being
         cancelled -- is `ListenerStopped` too: without it, a blackout's
         worth of messages is silently lost while the process looks
-        healthy, so the supervisor must restart it. And any write that
+        healthy, so the supervisor must restart it. The one exception is
+        a terminal auth error from the poll, re-raised as itself (like
+        one from `run_until_disconnected()`) so it exits 3, not 4. And any write that
         found the writer thread dead is `ListenerStopped`, chained from
         the `WriterDeadError`: a listener that cannot store anything must
         not keep looking healthy either.
@@ -1022,6 +1027,14 @@ class Listener:
             )
         poll_error = poll_task.exception()
         if poll_error is not None:
+            # Imported here for the same reason as in run_listener().
+            from xaucopier.ingest.client import TERMINAL_AUTH_ERRORS
+
+            if isinstance(poll_error, TERMINAL_AUTH_ERRORS):
+                # As `run_task.result()` does above: a dead session is
+                # not "restart me" but "stop trying", and run_listener()
+                # can only say so (exit 3) if it sees the error itself.
+                raise poll_error
             raise ListenerStopped(
                 f"the poll task died ({type(poll_error).__name__}: {poll_error}): "
                 "nothing is recovering messages the update stream drops"

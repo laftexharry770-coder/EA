@@ -38,12 +38,17 @@ listener with exit 4. So a channel's trouble is caught inside the round
 and never escapes it:
 
 - `FloodWaitError` (any `FloodError` carrying `seconds`): *that channel*
-  is not read again until the requested time has passed. The round goes
-  on to the other channels and the poll keeps its interval -- sleeping
-  the whole poll instead would also stop the other channels' recovery
-  and the writer probe for as long as Telegram asked (Telethon itself
-  already sleeps through any wait up to the client's
-  `flood_sleep_threshold`, so what reaches here is the long kind).
+  is not read again until the requested time has passed, and the poll
+  keeps its interval rather than sleeping the whole wait. In practice
+  every channel ends up waiting: Telethon records a flood wait per
+  *request type* (`_flood_waited_requests[CONSTRUCTOR_ID]`), so once
+  one channel's `GetHistory` is told to wait, every other channel's
+  `GetHistory` raises the same `FloodWaitError` locally, without being
+  sent, and is deferred in turn. The real gain is that the round -- and
+  with it the writer probe -- keeps running every interval instead of
+  going dark for as long as Telegram asked. (Telethon itself already
+  sleeps through any wait up to the client's `flood_sleep_threshold`,
+  120 s, so what reaches here is the long kind.)
 - `TimeoutError` from the `rpc_timeout` bound, connection errors, other
   RPC errors, and anything else a read raises: logged, and that channel
   is read again next round.
@@ -51,12 +56,19 @@ and never escapes it:
 Three things are *not* a channel's trouble, and end the poll (and so the
 listener) at once:
 
-- `WriterDeadError`: there is no writer, so nothing can be stored. The
-  listener already stops on it; the poll re-raises it rather than
-  carrying on with a round that can record nothing.
+- `WriterDeadError`: there is no writer, so nothing can be stored. Every
+  write goes through the listener's writer door, which stops the
+  listener on the first one, whoever meets it. The poll re-raises the
+  deaths that reach it -- from the probe, a first-run seed's pointer
+  write, or the metric write -- rather than carrying on with a round
+  that can record nothing. A death met *inside* a read's ingest does not
+  reach it: `ingest_history()` records that message as failed and ends
+  the batch, and the read returns normally. The listener still stops,
+  through the writer door; the poll simply finishes its round first.
 - A terminal auth error (`client.TERMINAL_AUTH_ERRORS`): the session is
   dead and no retry revives it. Swallowing it would leave a process that
-  looks alive and can never read anything again.
+  looks alive and can never read anything again. The listener re-raises
+  it as itself, so the process exits 3 ("do not restart"), not 4.
 - `WriterUnresponsiveError`: the writer did not run the probe within
   `writer_probe_timeout` -- a hung writer thread, which stores nothing
   and would hang the next ingest forever.
@@ -98,9 +110,8 @@ DEFAULT_POLL_INTERVAL = 5.0
 #: Messages fetched per channel per round. A longer gap is fine: the
 #: pointer stops at the last id read and the next round continues.
 DEFAULT_POLL_LIMIT = 100
-#: Hard bound on each `get_messages()` RPC: `listener.DEFAULT_RPC_TIMEOUT`,
-#: re-exported here (backfill uses the same bound).
-DEFAULT_RPC_TIMEOUT = DEFAULT_RPC_TIMEOUT
+#: The hard bound on each `get_messages()` RPC is `DEFAULT_RPC_TIMEOUT`,
+#: imported from the listener above: backfill uses the same bound.
 #: Hard bound on the per-round writer probe. Generous: the probe queues
 #: behind whatever the writer is doing, and each job may legitimately wait
 #: out a 10 s `busy_timeout`. Only a hung writer takes a full minute.
@@ -236,8 +247,9 @@ class HistoryPoll:
                 return
             flood_until[channel_id] = self.clock() + seconds
             logger.error(
-                "poll of channel %s (%s) must wait %ss (%s); the other channels are still "
-                "polled, this one is NOT until then",
+                "poll of channel %s (%s) must wait %ss (%s); it is NOT read again until "
+                "then. Telethon applies a flood wait to every channel's history read, so "
+                "the others will likely report the same; the writer probe keeps running",
                 channel_id,
                 channel.name,
                 seconds,
@@ -245,7 +257,9 @@ class HistoryPoll:
             )
         except TimeoutError:
             logger.warning(
-                "poll of channel %s (%s) timed out after %gs; retrying next round",
+                "poll of channel %s (%s) timed out after %gs; retrying next round (if "
+                "this repeats, Telethon may be sleeping through a flood wait of up to "
+                "its 120 s flood_sleep_threshold)",
                 channel_id,
                 channel.name,
                 self.rpc_timeout,
