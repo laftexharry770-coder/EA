@@ -33,9 +33,10 @@ Every `interval` (5 s) the poll runs one *round*:
    ever sees ids above the pointer, so this is the only history read
    that can find an edit, or -- by a message's absence -- a deletion,
    that the `MessageEdited`/`MessageDeleted` stream dropped. It runs in
-   the same per-channel step, under the same `rpc_timeout` and the same
-   error handling below, and it never moves the pointer. Edits and
-   deletions it finds are counted in `edit_missed_by_eventstream` /
+   the same per-channel step, only once that channel's forward read has
+   succeeded this round, under the same `rpc_timeout` and the same error
+   handling below, and it never moves the pointer. Edits and deletions
+   it finds are counted in `edit_missed_by_eventstream` /
    `delete_missed_by_eventstream`.
 
 Why 5 s and not 30: spec section 9 G6 gates a signal on its own
@@ -48,18 +49,23 @@ poll task: a poll that raises, returns or is cancelled stops the whole
 listener with exit 4. So a channel's trouble is caught inside the round
 and never escapes it:
 
-- `FloodWaitError` (any `FloodError` carrying `seconds`): *that channel*
-  is not read again until the requested time has passed, and the poll
-  keeps its interval rather than sleeping the whole wait. In practice
-  every channel ends up waiting: Telethon records a flood wait per
-  *request type* (`_flood_waited_requests[CONSTRUCTOR_ID]`), so once
-  one channel's `GetHistory` is told to wait, every other channel's
+- `FloodWaitError` (any `FloodError` carrying `seconds`): *that step of
+  that channel* -- its forward read, or its window re-read -- is not run
+  again until the requested time has passed, and the poll keeps its
+  interval rather than sleeping the whole wait. In practice every
+  channel ends up waiting: Telethon records a flood wait per *request
+  type* (`_flood_waited_requests[CONSTRUCTOR_ID]`), so once one
+  channel's `GetHistory` is told to wait, every other channel's
   `GetHistory` raises the same `FloodWaitError` locally, without being
   sent, and is deferred in turn. The real gain is that the round -- and
   with it the writer probe -- keeps running every interval instead of
   going dark for as long as Telegram asked. (Telethon itself already
   sleeps through any wait up to the client's `flood_sleep_threshold`,
-  120 s, so what reaches here is the long kind.)
+  120 s, so what reaches here is the long kind.) The two steps are
+  deferred separately for the same reason: the window re-read is a
+  different request type (`channels.GetMessages`), and a flood wait on
+  it must never hold back the forward read, which is how a message the
+  update stream dropped -- a trade -- is recovered.
 - `TimeoutError` from the `rpc_timeout` bound, connection errors, other
   RPC errors, and anything else a read raises: logged, and that channel
   is read again next round.
@@ -133,6 +139,10 @@ DEFAULT_WRITER_PROBE_TIMEOUT = 60.0
 POLL_SOURCE = "poll"
 #: `metrics.name` for messages the poll ingested before the update stream.
 MISSED_BY_EVENTSTREAM_METRIC = "missed_by_eventstream"
+#: The two steps of a channel's turn in a round, each flood-deferred on
+#: its own: the forward history read, then the window re-read.
+HISTORY_STEP = "history"
+WINDOW_STEP = "window"
 
 
 class WriterUnresponsiveError(RuntimeError):
@@ -193,9 +203,10 @@ class HistoryPoll:
         # does not load pywin32.
         from xaucopier.ingest.client import TERMINAL_AUTH_ERRORS
 
-        # channel_id -> clock() reading before which that channel is not
-        # read again (a flood wait). Local: it belongs to this run.
-        flood_until: dict[int, float] = {}
+        # (step, channel_id) -> clock() reading before which that step of
+        # that channel is not run again (a flood wait). Local: it belongs
+        # to this run.
+        flood_until: dict[tuple[str, int], float] = {}
         logger.info(
             "history poll started: every %gs, up to %d messages per channel per round",
             self.interval,
@@ -220,38 +231,73 @@ class HistoryPoll:
         self,
         listener: Listener,
         channel: ChannelCfg,
-        flood_until: dict[int, float],
+        flood_until: dict[tuple[str, int], float],
         terminal_errors: tuple[type[Exception], ...],
     ) -> None:
-        """One channel's step: its forward history read, then its window
-        re-read. Never raises, except for the three stop conditions (and
-        cancellation). If the forward read fails, the window waits for the
-        next round, like the forward read itself."""
+        """One channel's step: its forward history read, then -- only if
+        that read succeeded this round -- its window re-read. Each is
+        guarded on its own (`_guarded`), so a flood wait on one never
+        defers the other. Never raises, except for the three stop
+        conditions (and cancellation)."""
+        read = await self._guarded(
+            channel,
+            flood_until,
+            terminal_errors,
+            step=HISTORY_STEP,
+            action=lambda: self._forward_read(listener, channel),
+        )
+        if not read:
+            return
+        await self._guarded(
+            channel,
+            flood_until,
+            terminal_errors,
+            step=WINDOW_STEP,
+            action=lambda: reconcile_window(
+                listener, channel, window=self.edit_window, rpc_timeout=self.rpc_timeout
+            ),
+        )
+
+    async def _forward_read(self, listener: Listener, channel: ChannelCfg) -> None:
+        results = await listener.read_history(
+            channel, source=POLL_SOURCE, limit=self.limit, rpc_timeout=self.rpc_timeout
+        )
+        missed = count_missed(results)
+        if missed:
+            await listener.record_metric(MISSED_BY_EVENTSTREAM_METRIC, missed)
+            logger.warning(
+                "poll recovered %d message(s) on channel %s (%s) that the update "
+                "stream never delivered: %s",
+                missed,
+                channel.channel_id,
+                channel.name,
+                [o.message_id for o in results if o.result is not None and o.result.outcome == "new"],
+            )
+
+    async def _guarded(
+        self,
+        channel: ChannelCfg,
+        flood_until: dict[tuple[str, int], float],
+        terminal_errors: tuple[type[Exception], ...],
+        *,
+        step: str,
+        action: Callable[[], Awaitable[object]],
+    ) -> bool:
+        """Run one step of one channel; True if it ran and succeeded.
+        False if it is deferred by an earlier flood wait, or failed (which
+        is logged and handled here -- see the module docstring). Only the
+        three stop conditions propagate."""
         channel_id = channel.channel_id
-        resume_at = flood_until.get(channel_id)
+        key = (step, channel_id)
+        what = "poll" if step == HISTORY_STEP else "window re-read"
+        resume_at = flood_until.get(key)
         if resume_at is not None:
             if self.clock() < resume_at:
-                return
-            del flood_until[channel_id]
+                return False
+            del flood_until[key]
 
         try:
-            results = await listener.read_history(
-                channel, source=POLL_SOURCE, limit=self.limit, rpc_timeout=self.rpc_timeout
-            )
-            missed = count_missed(results)
-            if missed:
-                await listener.record_metric(MISSED_BY_EVENTSTREAM_METRIC, missed)
-                logger.warning(
-                    "poll recovered %d message(s) on channel %s (%s) that the update "
-                    "stream never delivered: %s",
-                    missed,
-                    channel_id,
-                    channel.name,
-                    [o.message_id for o in results if o.result is not None and o.result.outcome == "new"],
-                )
-            await reconcile_window(
-                listener, channel, window=self.edit_window, rpc_timeout=self.rpc_timeout
-            )
+            await action()
         except db.WriterDeadError:
             raise
         except terminal_errors:
@@ -260,32 +306,40 @@ class HistoryPoll:
             seconds = getattr(exc, "seconds", None)
             if not isinstance(seconds, int | float):
                 logger.exception(
-                    "poll of channel %s (%s) hit a flood error with no wait time; "
+                    "%s of channel %s (%s) hit a flood error with no wait time; "
                     "retrying next round",
+                    what,
                     channel_id,
                     channel.name,
                 )
-                return
-            flood_until[channel_id] = self.clock() + seconds
+                return False
+            flood_until[key] = self.clock() + seconds
             logger.error(
-                "poll of channel %s (%s) must wait %ss (%s); it is NOT read again until "
-                "then. Telethon applies a flood wait to every channel's history read, so "
-                "the others will likely report the same; the writer probe keeps running",
+                "%s of channel %s (%s) must wait %ss (%s); it is NOT run again until "
+                "then. Telethon applies a flood wait to every channel's request of the "
+                "same type, so the others will likely report the same; the writer probe "
+                "keeps running",
+                what,
                 channel_id,
                 channel.name,
                 seconds,
                 type(exc).__name__,
             )
+            return False
         except TimeoutError:
             logger.warning(
-                "poll of channel %s (%s) timed out after %gs; retrying next round (if "
+                "%s of channel %s (%s) timed out after %gs; retrying next round (if "
                 "this repeats, Telethon may be sleeping through a flood wait of up to "
                 "its 120 s flood_sleep_threshold)",
+                what,
                 channel_id,
                 channel.name,
                 self.rpc_timeout,
             )
+            return False
         except Exception:  # noqa: BLE001 -- one channel's failure must not stop the poll
             logger.exception(
-                "poll of channel %s (%s) failed; retrying next round", channel_id, channel.name
+                "%s of channel %s (%s) failed; retrying next round", what, channel_id, channel.name
             )
+            return False
+        return True

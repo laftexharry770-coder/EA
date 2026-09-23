@@ -31,7 +31,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from telethon import events
+from telethon import errors, events
 
 from fakes.telegram import (
     FakeMessage,
@@ -914,6 +914,33 @@ def test_the_window_re_read_never_moves_the_pointer(tmp_path: Path) -> None:
     assert _pointer(db_path) == SIGNAL_ID_MSG + 2
 
 
+def test_the_window_leaves_a_pointer_on_an_unstored_id_where_it_is(tmp_path: Path) -> None:
+    """The pointer can rest on an id that was never stored -- the
+    first-run seed's anchor, or a message skipped after three failed
+    reads. The window then reads only older ids; it must not pull the
+    pointer back to the newest of them (the next forward read would
+    re-read everything in between) any more than push it forward."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        # Stored live below the pointer (4000), which itself is not stored.
+        assert await client.emit(A, _msg(SIGNAL_ID_MSG - 2, CHATTER_TEXT))
+        assert await client.emit(A, _msg(SIGNAL_ID_MSG - 3, CHATTER_TEXT))
+        with client.blackout():
+            await client.emit_edit(A, SIGNAL_ID_MSG - 2, "Good evening", edit_date=EDIT_1)
+        result = await reconcile_window(listener, CHANNEL, window=10, rpc_timeout=5.0)
+        pointer_after_window = _pointer(db_path)
+        await _round(listener, time)
+        return result, pointer_after_window
+
+    result, pointer_after_window = _run(db_path, body)
+
+    assert result.requested == (SIGNAL_ID_MSG - 3, SIGNAL_ID_MSG - 2)
+    assert [e.outcome for e in result.edits] == ["recorded"]  # the window did its work...
+    assert pointer_after_window == SIGNAL_ID_MSG - 1  # ...and left the pointer alone
+    assert _pointer(db_path) == SIGNAL_ID_MSG - 1
+
+
 def test_the_window_is_the_newest_n_stored_messages_at_or_below_the_pointer(
     tmp_path: Path,
 ) -> None:
@@ -1063,3 +1090,35 @@ def test_the_listener_registers_one_handler_per_event_type(tmp_path: Path) -> No
         (events.MessageEdited, "_on_message_edited"),
         (events.MessageDeleted, "_on_message_deleted"),
     ]
+
+
+def test_a_flood_wait_on_the_window_never_defers_the_forward_read(tmp_path: Path) -> None:
+    """The window's `channels.GetMessages` is its own request type, and
+    Telethon records flood waits per type. A flood wait on it defers only
+    that channel's window; the forward read -- how a message the update
+    stream dropped, a trade, is recovered -- still runs every round. The
+    window resumes once the wait has passed."""
+    db_path = tmp_path / "store.db"
+    client = ScriptedClient(ids_failures=[errors.FloodWaitError(request=None, capture=12)])
+
+    def ids_reads() -> int:
+        return sum(1 for c in client.get_messages_calls if c.ids is not None)
+
+    async def body(client, listener, time):
+        await _stored_signal(client, listener, time)  # t=1005: the window is told to wait 12 s
+        with client.blackout():
+            await client.emit(A, _msg(SIGNAL_ID_MSG + 1, CHATTER_TEXT))
+        await _round(listener, time)  # t=1010
+        recovered = _rows(
+            db_path, "SELECT source FROM messages WHERE message_id = ?", (SIGNAL_ID_MSG + 1,)
+        )
+        reads_while_deferred = ids_reads()
+        await _round(listener, time)  # t=1015: still deferred
+        await _round(listener, time)  # t=1020: 12 s have passed
+        return recovered, reads_while_deferred, ids_reads()
+
+    recovered, reads_while_deferred, reads_after = _run(db_path, body, client=client)
+
+    assert recovered == [("poll",)]
+    assert reads_while_deferred == 0
+    assert reads_after == 1
