@@ -731,17 +731,101 @@ def test_a_failed_first_run_seed_is_retried_as_a_seed_not_a_read_from_zero(
     assert pointer_after_read == 20
 
 
-@pytest.mark.parametrize("failing_step", ["normalise", "ingest"])
-def test_one_poison_backfill_message_does_not_stop_the_rest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_step: str
+# -- a history message that fails -------------------------------------------
+#
+# A history read walks ids in ascending order and advances the pointer
+# per message. If it stepped past a message that failed, the pointer
+# would sit above an unstored message and no later read could ever see
+# it -- the Critical's failure shape. So a failure stops the batch; the
+# pointer rests at the last contiguous success and the next read retries.
+# Only a message that fails MAX_HISTORY_ATTEMPTS times is skipped, loudly.
+
+
+def _hold_a_real_write_lock_during_first_ingest_of(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch, message_id: int
+) -> list[int]:
+    """The first ingest of `message_id` runs while a second connection
+    holds `BEGIN IMMEDIATE`, so the writer's INSERT waits out a (shortened,
+    300 ms) busy_timeout and fails with a real `database is locked` --
+    the transient failure, not a mocked exception."""
+    import sqlite3
+
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 300)
+    real_ingest = messages_repo.ingest
+    locked_attempts: list[int] = []
+
+    def ingest_under_a_foreign_lock(conn, **kwargs):
+        if kwargs["message_id"] == message_id and not locked_attempts:
+            locked_attempts.append(message_id)
+            other = sqlite3.connect(db_path, timeout=0)
+            other.execute("BEGIN IMMEDIATE")
+            try:
+                return real_ingest(conn, **kwargs)
+            finally:
+                other.rollback()
+                other.close()
+        return real_ingest(conn, **kwargs)
+
+    monkeypatch.setattr(messages_repo, "ingest", ingest_under_a_foreign_lock)
+    return locked_attempts
+
+
+def _stored(db_path: Path) -> list[int]:
+    return [row[0] for row in _rows(db_path, "SELECT message_id FROM messages ORDER BY message_id")]
+
+
+def _history_skipped(db_path: Path) -> int:
+    rows = _rows(db_path, "SELECT SUM(value) FROM metrics WHERE name = 'history_skipped'")
+    return rows[0][0] or 0
+
+
+def test_a_transient_history_failure_stops_the_batch_and_the_next_read_retries_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A message that fails every time must not wedge its channel: the
-    live path records a failure and carries on, and a history read must
-    too. Otherwise every restart's backfill -- and every poll after it,
-    reading from the same pointer -- stops dead on the same message."""
+    """The re-reviewer's reproduction: a real SQLite lock on the first
+    ingest of 11. Shipped round 1 stepped past it -- pointer 12, store
+    [10, 12], and 11 was lost for good, even across a restart."""
     db_path = tmp_path / "store.db"
-    _seed_last_processed(db_path, CHANNEL_ID, 4000)
-    poison_id = 4002
+    _seed_last_processed(db_path, CHANNEL_ID, 9)
+    locked = _hold_a_real_write_lock_during_first_ingest_of(db_path, monkeypatch, 11)
+
+    async def scenario():
+        client = FakeTelegramClient(
+            history={CHANNEL_ID: [_chatter_message(i) for i in (10, 11, 12)]}
+        )
+        async with _started(db_path, client) as listener:  # backfill is read 1
+            after_backfill = (listener.read_last_processed_message_id(CHANNEL_ID), _stored(db_path))
+            second = await listener.read_history(CHANNEL, source="poll", limit=100)
+            after_second = (listener.read_last_processed_message_id(CHANNEL_ID), _stored(db_path))
+            errors = listener.handler_errors
+        return after_backfill, second, after_second, errors
+
+    after_backfill, second, after_second, errors = asyncio.run(scenario())
+
+    assert locked == [11], "the real lock never engaged"
+    assert after_backfill == (10, [10]), "the pointer moved past a message that failed"
+    assert [(r.message_id, r.result.outcome) for r in second] == [(11, "new"), (12, "new")]
+    assert after_second == (12, [10, 11, 12])
+    assert [(e.message_id, e.source) for e in errors] == [(11, "backfill")]
+    assert "database is locked" in errors[0].error
+    assert _history_skipped(db_path) == 0
+
+
+@pytest.mark.parametrize("failing_step", ["normalise", "ingest"])
+def test_a_message_that_always_fails_is_skipped_after_exactly_three_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failing_step: str,
+) -> None:
+    """A genuine poison message must not wedge its channel forever, and
+    must not be skipped on a single failure either: exactly
+    MAX_HISTORY_ATTEMPTS reads, then skip it -- pointer moved past that one
+    id, CRITICAL log, durable `history_skipped` metric -- and later
+    messages flow again."""
+    db_path = tmp_path / "store.db"
+    _seed_last_processed(db_path, CHANNEL_ID, 9)
+    poison_id = 11
 
     if failing_step == "normalise":
         real_normalise_message = listener_module.normalise_message
@@ -764,22 +848,98 @@ def test_one_poison_backfill_message_does_not_stop_the_rest(
 
     async def scenario():
         client = FakeTelegramClient(
-            history={CHANNEL_ID: [_chatter_message(i) for i in (4001, 4002, 4003)]}
+            history={CHANNEL_ID: [_chatter_message(i) for i in (10, 11, 12)]}
         )
-        async with _started(db_path, client) as listener:
-            return listener.handler_errors
+        states = []
+        async with _started(db_path, client) as listener:  # backfill is read 1
+            states.append((listener.read_last_processed_message_id(CHANNEL_ID), _stored(db_path)))
+            for _ in range(3):  # reads 2, 3 and a 4th that finds nothing new
+                await listener.read_history(CHANNEL, source="poll", limit=100)
+                states.append(
+                    (listener.read_last_processed_message_id(CHANNEL_ID), _stored(db_path))
+                )
+            errors = listener.handler_errors
+        return states, errors
 
-    errors = asyncio.run(scenario())
+    with caplog.at_level("CRITICAL", logger=listener_module.__name__):
+        states, errors = asyncio.run(scenario())
 
-    assert _rows(db_path, "SELECT message_id, source FROM messages ORDER BY message_id") == [
-        (4001, "backfill"),
-        (4003, "backfill"),
+    # Reads 1 and 2: the pointer never passes the failed id.
+    assert states[0] == (10, [10])
+    assert states[1] == (10, [10])
+    # Read 3: third failure -> skipped, and 12 flows in the same read.
+    assert states[2] == (12, [10, 12])
+    assert states[3] == (12, [10, 12])
+    assert [(e.message_id, e.source) for e in errors] == [
+        (poison_id, "backfill"),
+        (poison_id, "poll"),
+        (poison_id, "poll"),
     ]
-    assert [(e.channel_id, e.message_id, e.source) for e in errors] == [
-        (CHANNEL_ID, poison_id, "backfill")
-    ]
-    assert _last_processed(db_path, CHANNEL_ID) == 4003
+    assert _history_skipped(db_path) == 1
+    critical = [r for r in caplog.records if r.levelname == "CRITICAL"]
+    assert len(critical) == 1 and f"message_id {poison_id}" in critical[0].getMessage()
+    assert listener_module.MAX_HISTORY_ATTEMPTS == 3
 
+
+class _SwitchablyDeadWriter(db.Writer):
+    """A writer that can be made to answer every job with WriterDeadError
+    -- and then brought back. Real writers do not come back; this exists
+    only to observe that the dead-writer failures were never *counted*."""
+
+    dead = False
+
+    def submit(self, fn):
+        if self.dead:
+            import concurrent.futures
+
+            future = concurrent.futures.Future()
+            error = db.WriterDeadError("the writer thread died (simulated)")
+            future.set_exception(error)
+            return future
+        return super().submit(fn)
+
+
+def test_a_dead_writer_never_counts_toward_a_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WriterDeadError means "there is no writer", not "this message is
+    bad". Two dead-writer failures, then one genuine failure once the
+    writer is back: had the dead ones counted, that genuine failure would
+    be the third strike and 11 would be skipped for good."""
+    db_path = tmp_path / "store.db"
+    _seed_last_processed(db_path, CHANNEL_ID, 9)
+    writer = _SwitchablyDeadWriter(db_path)
+    genuine_failures: list[int] = []
+    real_ingest = messages_repo.ingest
+
+    def fails_when_told(conn, **kwargs):
+        if genuine_failures:
+            genuine_failures.pop()
+            raise ValueError("a genuine, transient failure")
+        return real_ingest(conn, **kwargs)
+
+    monkeypatch.setattr(messages_repo, "ingest", fails_when_told)
+
+    async def scenario():
+        client = FakeTelegramClient()
+        async with _started(db_path, client, writer=writer) as listener:
+            client.add_to_history(CHANNEL_ID, _chatter_message(11))  # after backfill
+            writer.dead = True
+            for _ in range(listener_module.MAX_HISTORY_ATTEMPTS - 1):
+                results = await listener.read_history(CHANNEL, source="poll", limit=100)
+                assert [(r.message_id, r.result) for r in results] == [(11, None)]
+            writer.dead = False
+            genuine_failures.append(1)
+            failed = await listener.read_history(CHANNEL, source="poll", limit=100)
+            assert [(r.message_id, r.result) for r in failed] == [(11, None)]
+            assert listener.read_last_processed_message_id(CHANNEL_ID) == 9
+            await listener.read_history(CHANNEL, source="poll", limit=100)
+
+    asyncio.run(scenario())
+
+    assert _rows(db_path, "SELECT message_id, source FROM messages") == [(11, "poll")]
+    assert _last_processed(db_path, CHANNEL_ID) == 11
+    assert _history_skipped(db_path) == 0
 
 def test_backfill_asks_only_for_messages_newer_than_last_processed(
     tmp_path: Path,

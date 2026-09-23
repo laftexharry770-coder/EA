@@ -76,7 +76,12 @@ history read walks ids in ascending order and so has seen everything
 below the id it advances to; the update stream can silently drop ids,
 so the handler ingests and never touches the pointer. The poll's re-read
 of a message the handler already stored is a `"duplicate"` no-op. See
-`_advance_last_processed` for the failure this prevents.
+`_advance_last_processed` for the failure this prevents. For the same
+reason a history read **stops at the first message that fails**: the
+pointer rests at the last contiguous success and the next read retries.
+Only a message that fails `MAX_HISTORY_ATTEMPTS` (3) reads in a row is
+skipped -- pointer moved past that one id, CRITICAL log, and the durable
+`history_skipped` metric -- so a poison message cannot wedge its channel.
 
 **No `sqlite3` anywhere in this package.** Writes go through
 `Writer.submit()`; the one read this module does (the per-channel
@@ -121,6 +126,18 @@ DEFAULT_WRITER_READY_TIMEOUT = 30.0
 #: dropped; `handler_error_count` keeps the true total. Bounded so a
 #: sustained failure cannot grow memory for the life of the process.
 MAX_RECORDED_HANDLER_ERRORS = 256
+
+#: How many history reads may fail on the same message before it is
+#: skipped (see `Listener.ingest_history`). Each attempt can already wait
+#: out the writer's 10 s busy_timeout, so three is patient with a
+#: transient lock and still bounded for a message that can never be
+#: stored. Counted in memory, so a restart allows at most three more.
+MAX_HISTORY_ATTEMPTS = 3
+
+#: `metrics.name` bumped once per history message skipped after
+#: `MAX_HISTORY_ATTEMPTS` failures. Every one is a message -- possibly a
+#: trade -- that was never stored, so `status` must surface it.
+HISTORY_SKIPPED_METRIC = "history_skipped"
 
 #: `sqlite3.Connection`, unannotated on purpose: this package must not
 #: import sqlite3 at all (see the module docstring), not even for a type.
@@ -191,7 +208,9 @@ class HistoryIngest:
     """
 
     message_id: int
-    #: None when this message failed; the failure is in `handler_errors`.
+    #: None when this message failed (the failure is in `handler_errors`):
+    #: either the batch stopped here and the next read retries it, or it
+    #: was skipped after `MAX_HISTORY_ATTEMPTS` failures.
     result: IngestResult | None
 
 
@@ -275,6 +294,18 @@ def _advance_last_processed(
     )
 
 
+def _bump_metric(conn: Connection, *, day_key: str, name: str) -> None:
+    """`metrics(day_key, name) += 1`. The same upsert as
+    `messages_repo._record_metric` / `outbox._bump_metric` (a duplication
+    already ledgered); kept local rather than reaching into another
+    module's private helper."""
+    conn.execute(
+        "INSERT INTO metrics (day_key, name, value) VALUES (?, ?, 1) "
+        "ON CONFLICT(day_key, name) DO UPDATE SET value = value + 1",
+        (day_key, name),
+    )
+
+
 class Listener:
     """Owns the Telegram client, the writer thread and the reader
     connection for one xaucopier process.
@@ -332,6 +363,9 @@ class Listener:
         # channel *not* in here may be seeded: re-seeding an empty
         # channel on the next read would jump past its first post.
         self._pointer_seeded: set[int] = set()
+        # Failed history-read attempts per (channel_id, message_id); see
+        # ingest_history(). Cleared on success or skip.
+        self._history_attempts: dict[tuple[int, int], int] = {}
         self._started = False
         self._closed = False
 
@@ -458,15 +492,26 @@ class Listener:
         handled. Anything at or below `min_id` is skipped (Telethon's
         `min_id` is already exclusive; this is a guard, not a filter).
 
-        A message that fails -- normalising or ingesting -- is recorded
-        in `handler_errors` (with this `source`), logged, returned with
-        `result=None`, and the batch carries on, exactly as the live
-        handler does. Stopping instead would wedge the channel: every
-        restart's backfill and every poll after it reads from the same
-        pointer and would stop dead on the same message. The cost is
-        that the pointer passes a failed message once a later one in the
-        channel succeeds, so it is not retried after that -- which is
-        why the failure is recorded and logged, never silent.
+        **A message that fails stops the batch.** It is recorded in
+        `handler_errors` (with this `source`), logged, returned with
+        `result=None`, and nothing after it in the batch is ingested. The
+        pointer therefore rests at the last contiguous success -- never
+        above an unstored message -- and the next read retries from
+        there. Carrying on instead would let the next success move the
+        pointer past the failed message, which no later read could then
+        see: a transient `database is locked` would lose a message for
+        good (fix round 1 did exactly that).
+
+        **A message that keeps failing is skipped, loudly.** After
+        `MAX_HISTORY_ATTEMPTS` failed reads of the same message, one
+        writer job advances the pointer past that one id and bumps the
+        durable `history_skipped` metric; the skip is logged at CRITICAL
+        and the batch carries on. So a genuine poison message delays its
+        channel by at most three reads per process lifetime and cannot
+        crash-loop anything.
+
+        A `WriterDeadError` stops the batch but is never counted: it means
+        there is no writer, not that the message is bad.
         """
         if source not in HISTORY_SOURCES:
             raise ValueError(
@@ -478,17 +523,80 @@ class Listener:
         for message in sorted(messages, key=lambda m: m.id):
             if message.id <= min_id:
                 continue
+            key = (channel_id, message.id)
             try:
                 incoming = normalise_message(message, channel_id=channel_id)
                 result = await self.ingest_message(
                     incoming, channel_cfg=channel_cfg, source=source
                 )
-            except Exception as exc:  # noqa: BLE001 -- recorded; one message must not wedge the channel
+            except db.WriterDeadError as exc:
+                # No writer: says nothing about this message. Never counted.
                 self._record_handler_error(channel_id, message.id, exc, source=source)
                 outcomes.append(HistoryIngest(message_id=message.id, result=None))
+                break
+            except Exception as exc:  # noqa: BLE001 -- recorded; retried, then skipped
+                self._record_handler_error(channel_id, message.id, exc, source=source)
+                outcomes.append(HistoryIngest(message_id=message.id, result=None))
+                attempts = self._history_attempts.get(key, 0) + 1
+                self._history_attempts[key] = attempts
+                if attempts < MAX_HISTORY_ATTEMPTS:
+                    break  # the pointer stays below this id; the next read retries it
+                if not await self._skip_history_message(
+                    channel_cfg, message.id, attempts=attempts, last_error=exc
+                ):
+                    break  # the skip itself failed; the next read tries again
+                del self._history_attempts[key]
                 continue
+            self._history_attempts.pop(key, None)
             outcomes.append(HistoryIngest(message_id=message.id, result=result))
         return tuple(outcomes)
+
+    async def _skip_history_message(
+        self,
+        channel_cfg: ChannelCfg,
+        message_id: int,
+        *,
+        attempts: int,
+        last_error: Exception,
+    ) -> bool:
+        """Give up on one history message: advance the pointer past just
+        this id and count it in `history_skipped`, in one transaction.
+        Only called from `ingest_history`, where every earlier message in
+        the batch has already succeeded -- so the pointer sits directly
+        below this id and `MAX()` moves it past this one message only.
+        Returns False (and skips nothing) if the job itself fails."""
+        channel_id = channel_cfg.channel_id
+        day_key = self._now().date().isoformat()
+
+        def skip(conn: Connection) -> None:
+            _advance_last_processed(conn, channel_id=channel_id, message_id=message_id)
+            _bump_metric(conn, day_key=day_key, name=HISTORY_SKIPPED_METRIC)
+
+        try:
+            await asyncio.wrap_future(self.writer.submit(skip))
+        except Exception as exc:  # noqa: BLE001 -- the next read retries the skip
+            logger.error(
+                "could not skip channel %s message_id %s (%s: %s); the next read "
+                "tries again",
+                channel_id,
+                message_id,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        logger.critical(
+            "SKIPPED channel %s (%s) message_id %s after %s failed history reads "
+            "(last: %s: %s). It is NOT stored and will not be retried; counted in "
+            "metrics %r.",
+            channel_id,
+            channel_cfg.name,
+            message_id,
+            attempts,
+            type(last_error).__name__,
+            last_error,
+            HISTORY_SKIPPED_METRIC,
+        )
+        return True
 
     async def read_history(
         self, channel_cfg: ChannelCfg, *, source: str, limit: int
