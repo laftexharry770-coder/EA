@@ -44,10 +44,15 @@
 // up, and the red arrow (over the candle, the sell signal) is a red triangle
 // pointing down. Only the look changed; the signals are the same.
 //
-// How the arrow is traded: a Williams fractal only exists once the n candles
-// after it have closed. The EA reads closed candles only, so when the green
-// (or red) arrow appears on the chart it buys (or sells) at market on the
-// next candle, the same moment the video places its long/short position.
+// How the arrow is traded: on live candles, like TradingView. The arrow shows
+// while the n-th candle after the fractal candle is still forming, as long as
+// that live candle stays above the fractal's low (below its high for the red
+// arrow). The EA checks every tick of the live candle, using the live EMA
+// values, and enters the moment the arrow appears and the rules are met. The
+// live candle's own dip under the 20 EMA counts as the pullback. If the live
+// candle breaks the fractal's low / high, TradingView takes the arrow away:
+// the EA erases it and drops any entry not sent yet. The "closes below the
+// 100 EMA" rule is about closes, so it still uses closed candles.
 //+------------------------------------------------------------------+
 #property copyright   "Sentinal"
 #property version     "1.00"
@@ -133,7 +138,7 @@ struct SideState
    bool              skipNext;   // a candle closed beyond the 100 EMA -> disregard the next arrow
   };
 
-//--- an arrow that qualified, waiting to be entered on the next candle
+//--- an arrow that qualified, waiting to be entered on the live candle
 struct PendingSignal
   {
    bool              active;
@@ -141,6 +146,7 @@ struct PendingSignal
    bool              deep;       // stop hangs off the 100 EMA instead of the 50 EMA
    double            stopEma;    // EMA value the stop is measured from
    datetime          arrowTime;  // candle the arrow sits under / over
+   double            arrowPrice; // that candle's low (buy) / high (sell): breaking it removes the arrow
    datetime          validBar;   // the entry is only taken inside this candle
    int               count;      // positions this entry opens (set on the first send)
    int               opened;     // positions opened so far
@@ -148,6 +154,14 @@ struct PendingSignal
    double            sl;         // stop shared by every position of the entry
    int               fails;      // failed order sends for this entry
    string            holdKey;    // last reason the entry was held back (logged once)
+  };
+
+//--- one arrow being watched on the live candle
+struct LiveArrow
+  {
+   bool              handled;    // traded, disregarded or used up: nothing more to decide
+   bool              gone;       // the live candle broke the fractal: no arrow this candle
+   bool              drawn;      // currently on the chart
   };
 
 CTrade          g_trade;
@@ -161,7 +175,11 @@ datetime        g_lastClosed = 0;       // open time of the newest closed candle
 SideState       g_long;
 SideState       g_short;
 PendingSignal   g_signal;
-bool            g_bullStack  = false;   // EMA order on the last closed candle, for the panel
+LiveArrow       g_liveGreen;            // arrow under the live candle's fractal (buy side)
+LiveArrow       g_liveRed;              // arrow over it (sell side)
+datetime        g_liveBar    = 0;       // live candle whose arrows are being watched
+datetime        g_startBar   = 0;       // candle the EA (re)built its state on: no trades on it
+bool            g_bullStack  = false;   // latest EMA order, for the panel
 bool            g_bearStack  = false;
 bool            g_draw       = true;    // false in optimisation / non-visual tests
 string          g_prefix     = "";
@@ -223,6 +241,7 @@ void ClearSignal()
    g_signal.deep      = false;
    g_signal.stopEma   = 0.0;
    g_signal.arrowTime = 0;
+   g_signal.arrowPrice = 0.0;
    g_signal.validBar  = 0;
    g_signal.count     = 0;
    g_signal.opened    = 0;
@@ -230,6 +249,13 @@ void ClearSignal()
    g_signal.sl        = 0.0;
    g_signal.fails     = 0;
    g_signal.holdKey   = "";
+  }
+
+void ResetLiveArrow(LiveArrow &arrow)
+  {
+   arrow.handled = false;
+   arrow.gone    = false;
+   arrow.drawn   = false;
   }
 
 void Note(const string text)
@@ -299,22 +325,34 @@ void Remember(string &ring[], int &next, const string name)
    next       = (slot + 1) % size;
   }
 
+string ArrowName(const bool under, const datetime t)
+  {
+   return g_prefix + (under ? "G" : "R") + IntegerToString((long)t);
+  }
+
+//--- an arrow the live candle took away again
+void EraseArrow(const bool under, const datetime t)
+  {
+   ObjectDelete(0, ArrowName(under, t));
+  }
+
 void DrawArrow(const bool under, const datetime t, const double price)
   {
    if(!g_draw || !InpDrawArrows || ArraySize(g_arrows) <= 0)
       return;
-   const string name = g_prefix + (under ? "G" : "R") + IntegerToString((long)t);
+   const string name = ArrowName(under, t);
    if(ObjectFind(0, name) >= 0)
       return;
-   if(!ObjectCreate(0, name, OBJ_TEXT, 0, t, price))
+   if(!ObjectCreate(0, name, OBJ_ARROW, 0, t, price))
       return;
    //--- as in the screen recording: a solid cyan triangle pointing up under the
-   //--- candle, a solid red triangle pointing down over it (Unicode U+25B2 / U+25BC)
-   ObjectSetString(0, name, OBJPROP_TEXT, ShortToString((ushort)(under ? 0x25B2 : 0x25BC)));
-   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
-   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 11);
+   //--- candle, a solid red triangle pointing down over it. Wingdings 217 / 218
+   //--- are solid equilateral arrowheads, the symbols MT5's own Fractals use, so
+   //--- they show on every terminal (text glyphs depend on the installed fonts)
+   ObjectSetInteger(0, name, OBJPROP_ARROWCODE, under ? 217 : 218);
    ObjectSetInteger(0, name, OBJPROP_COLOR, under ? CLR_FRACTAL_UNDER : CLR_FRACTAL_OVER);
-   ObjectSetInteger(0, name, OBJPROP_ANCHOR, under ? ANCHOR_UPPER : ANCHOR_LOWER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, under ? ANCHOR_TOP : ANCHOR_BOTTOM);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
    ObjectSetInteger(0, name, OBJPROP_BACK, false);
@@ -392,15 +430,17 @@ void UpdatePanel(const bool force)
 //+------------------------------------------------------------------+
 //| The rules                                                        |
 //+------------------------------------------------------------------+
-void QueueSignal(const int dir, const bool deep, const double stopEma, const datetime arrowTime, const datetime entryBar)
+void QueueSignal(const int dir, const bool deep, const double stopEma, const datetime arrowTime,
+                 const double arrowPrice, const datetime entryBar)
   {
    ClearSignal();
-   g_signal.active    = true;
-   g_signal.direction = dir;
-   g_signal.deep      = deep;
-   g_signal.stopEma   = stopEma;
-   g_signal.arrowTime = arrowTime;
-   g_signal.validBar  = entryBar;
+   g_signal.active     = true;
+   g_signal.direction  = dir;
+   g_signal.deep       = deep;
+   g_signal.stopEma    = stopEma;
+   g_signal.arrowTime  = arrowTime;
+   g_signal.arrowPrice = arrowPrice;
+   g_signal.validBar   = entryBar;
    Note(StringFormat("%s arrow at %s -> %s, stop %s the %d EMA (%s)",
                      dir > 0 ? "cyan" : "red",
                      TimeToString(arrowTime, TIME_DATE | TIME_MINUTES),
@@ -410,59 +450,153 @@ void QueueSignal(const int dir, const bool deep, const double stopEma, const dat
                      Px(stopEma)));
   }
 
-//--- a green arrow was just confirmed
-void OnGreenArrow(const bool bull, const double emaMid, const double emaSlow,
-                  const datetime arrowTime, const datetime entryBar, const bool live)
+//+------------------------------------------------------------------+
+//| A green (buy side) arrow is on the chart. pull / deep: price     |
+//| went under the 20 / 50 EMA since the setup started. trade = may  |
+//| enter now. Returns true once the arrow is dealt with (traded,    |
+//| disregarded or used up), false if it is not a setup (yet).       |
+//+------------------------------------------------------------------+
+bool OnGreenArrow(const bool bull, const bool pull, const bool deep, const double emaMid, const double emaSlow,
+                  const datetime arrowTime, const double arrowPrice, const datetime entryBar, const bool trade)
   {
    if(g_long.skipNext)
      {
       //--- "if the price ever closes below the 100 day, just disregard the next green arrow"
-      if(live && bull && g_long.pullback)
+      if(trade && bull && pull)
          Note("cyan arrow at " + TimeToString(arrowTime, TIME_MINUTES) + " disregarded: price closed below the "
               + IntegerToString(InpEmaSlow) + " EMA");
       g_long.skipNext = false;
       g_long.pullback = false;
       g_long.deep     = false;
-      return;
+      return true;
      }
-   if(!bull || !g_long.pullback)
-      return;                           // EMAs not stacked or no pullback under the 20 EMA: no setup
-   const bool deep = g_long.deep;
+   if(!bull || !pull)
+      return false;                     // EMAs not stacked or no pullback under the 20 EMA: no setup
    g_long.pullback = false;             // this arrow uses up the pullback
    g_long.deep     = false;
-   if(live && InpTradeLongs)
-      QueueSignal(+1, deep, deep ? emaSlow : emaMid, arrowTime, entryBar);
+   if(trade && InpTradeLongs)
+      QueueSignal(+1, deep, deep ? emaSlow : emaMid, arrowTime, arrowPrice, entryBar);
+   return true;
   }
 
-//--- a red arrow was just confirmed (the complete opposite of the green one)
-void OnRedArrow(const bool bear, const double emaMid, const double emaSlow,
-                const datetime arrowTime, const datetime entryBar, const bool live)
+//--- a red (sell side) arrow is on the chart: the complete opposite of the green one
+bool OnRedArrow(const bool bear, const bool pull, const bool deep, const double emaMid, const double emaSlow,
+                const datetime arrowTime, const double arrowPrice, const datetime entryBar, const bool trade)
   {
    if(g_short.skipNext)
      {
-      if(live && bear && g_short.pullback)
+      if(trade && bear && pull)
          Note("red arrow at " + TimeToString(arrowTime, TIME_MINUTES) + " disregarded: price closed above the "
               + IntegerToString(InpEmaSlow) + " EMA");
       g_short.skipNext = false;
       g_short.pullback = false;
       g_short.deep     = false;
-      return;
+      return true;
      }
-   if(!bear || !g_short.pullback)
-      return;
-   const bool deep = g_short.deep;
+   if(!bear || !pull)
+      return false;
    g_short.pullback = false;
    g_short.deep     = false;
-   if(live && InpTradeShorts)
-      QueueSignal(-1, deep, deep ? emaSlow : emaMid, arrowTime, entryBar);
+   if(trade && InpTradeShorts)
+      QueueSignal(-1, deep, deep ? emaSlow : emaMid, arrowTime, arrowPrice, entryBar);
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Watch the live candle for arrows, like TradingView does: with    |
+//| n = 2 the arrow for the candle two back shows while the live     |
+//| candle stays above its low (green) / below its high (red), and   |
+//| goes away the moment the live candle breaks it. Runs every tick. |
+//+------------------------------------------------------------------+
+void CheckLiveArrows(const datetime barTime)
+  {
+   if(barTime == g_startBar)
+      return;                                  // the EA started on this candle: no live trades on it
+   if(barTime != g_liveBar)
+     {
+      g_liveBar = barTime;
+      ResetLiveArrow(g_liveGreen);
+      ResetLiveArrow(g_liveRed);
+     }
+   if(g_liveGreen.gone && g_liveRed.gone)
+      return;
+
+   const int n = InpFractalPeriods;
+   MqlRates  rates[];
+   double    emaF[];
+   double    emaM[];
+   double    emaS[];
+   if(!CopySeries(2 * n + 6, rates, emaF, emaM, emaS) || rates[0].time != barTime)
+      return;
+   const double e1   = emaF[0];
+   const double e2   = emaM[0];
+   const double e3   = emaS[0];
+   const bool   bull = (e1 > e2 && e2 > e3);
+   const bool   bear = (e1 < e2 && e2 < e3);
+   g_bullStack = bull;
+   g_bearStack = bear;
+
+   //--- green: the live candle's dip under the 20 / 50 EMA counts as the pullback too
+   if(!g_liveGreen.gone)
+     {
+      if(IsGreenFractal(rates, n, n))
+        {
+         if(!g_liveGreen.drawn)
+           {
+            DrawArrow(true, rates[n].time, rates[n].low);
+            g_liveGreen.drawn = true;
+           }
+         if(!g_liveGreen.handled)
+           {
+            const bool pull = g_long.pullback || (bull && rates[0].low < e1);
+            const bool deep = g_long.deep || (bull && rates[0].low < e2);
+            g_liveGreen.handled = OnGreenArrow(bull, pull, deep, e2, e3, rates[n].time, rates[n].low, barTime, true);
+           }
+        }
+      else
+        {
+         if(g_liveGreen.drawn)
+            EraseArrow(true, rates[n].time);   // the live candle broke the fractal's low
+         g_liveGreen.drawn = false;
+         g_liveGreen.gone  = true;
+        }
+     }
+
+   //--- red
+   if(!g_liveRed.gone)
+     {
+      if(IsRedFractal(rates, n, n))
+        {
+         if(!g_liveRed.drawn)
+           {
+            DrawArrow(false, rates[n].time, rates[n].high);
+            g_liveRed.drawn = true;
+           }
+         if(!g_liveRed.handled)
+           {
+            const bool pull = g_short.pullback || (bear && rates[0].high > e1);
+            const bool deep = g_short.deep || (bear && rates[0].high > e2);
+            g_liveRed.handled = OnRedArrow(bear, pull, deep, e2, e3, rates[n].time, rates[n].high, barTime, true);
+           }
+        }
+      else
+        {
+         if(g_liveRed.drawn)
+            EraseArrow(false, rates[n].time);  // the live candle broke the fractal's high
+         g_liveRed.drawn = false;
+         g_liveRed.gone  = true;
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
 //| Run one closed candle (series shift s >= 1) through the rules.   |
-//| live = false while replaying history: state only, no signals.    |
+//| Arrows are traded live (CheckLiveArrows). Here they are only     |
+//| handled for candles the EA did not watch live - history replayed |
+//| at start-up, or a candle it missed - to keep the state right.    |
 //+------------------------------------------------------------------+
 void ProcessClosedBar(const int s, const MqlRates &r[], const double &emaF[], const double &emaM[],
-                      const double &emaS[], const bool live)
+                      const double &emaS[], const bool replay)
   {
    const int    n    = InpFractalPeriods;
    const double e1   = emaF[s];
@@ -510,17 +644,20 @@ void ProcessClosedBar(const int s, const MqlRates &r[], const double &emaF[], co
      }
    DrawEmas(s, r, emaF, emaM, emaS);
 
-   //--- the arrow confirmed by this candle sits n candles back
+   //--- the arrow confirmed by this candle sits n candles back; if this candle
+   //--- was watched live, its arrows were already drawn and dealt with there
+   if(!replay && r[s].time == g_liveBar)
+      return;
    const int c = s + n;
    if(IsGreenFractal(r, c, n))
      {
       DrawArrow(true, r[c].time, r[c].low);
-      OnGreenArrow(bull, e2, e3, r[c].time, r[s - 1].time, live);
+      OnGreenArrow(bull, g_long.pullback, g_long.deep, e2, e3, r[c].time, r[c].low, r[s - 1].time, false);
      }
    if(IsRedFractal(r, c, n))
      {
       DrawArrow(false, r[c].time, r[c].high);
-      OnRedArrow(bear, e2, e3, r[c].time, r[s - 1].time, live);
+      OnRedArrow(bear, g_short.pullback, g_short.deep, e2, e3, r[c].time, r[c].high, r[s - 1].time, false);
      }
   }
 
@@ -584,9 +721,10 @@ bool SyncClosedBars()
       ResetSide(g_long);
       ResetSide(g_short);
       ClearSignal();
+      g_startBar = rates[0].time;              // only part of this candle was seen: no live trades on it
      }
    for(int s = from; s >= 1; s--)
-      ProcessClosedBar(s, rates, emaF, emaM, emaS, !rebuild && s == 1);
+      ProcessClosedBar(s, rates, emaF, emaM, emaS, rebuild);
    g_lastClosed = rates[1].time;
    if(rebuild && !g_ready)
       Print(EA_NAME, ": ready on ", _Symbol, " ", TfName(g_tf), ", history replayed from ",
@@ -789,11 +927,22 @@ void TryEntry(const datetime barTime)
   {
    if(g_signal.validBar != barTime)
      {
-      Drop("the candle after the arrow closed before an entry was possible");
+      Drop("the live candle the arrow appeared on closed before an entry was possible");
       return;
      }
    const bool isBuy  = (g_signal.direction > 0);
    const bool first  = (g_signal.opened == 0);     // nothing of this entry is open yet
+
+   //--- the arrow must still be on the chart: the live candle may not break the fractal
+   const double liveLow  = iLow(_Symbol, g_tf, 0);
+   const double liveHigh = iHigh(_Symbol, g_tf, 0);
+   if(isBuy ? (liveLow > 0.0 && liveLow <= g_signal.arrowPrice)
+            : (liveHigh > 0.0 && liveHigh >= g_signal.arrowPrice))
+     {
+      Drop(StringFormat("the arrow disappeared: the live candle broke the fractal's %s %s",
+                        isBuy ? "low" : "high", Px(g_signal.arrowPrice)));
+      return;
+     }
    string     reason = "";
    if(!TradingAllowed(isBuy, reason))
      {
@@ -1014,18 +1163,33 @@ int OnInit()
    ResetSide(g_long);
    ResetSide(g_short);
    ClearSignal();
+   ResetLiveArrow(g_liveGreen);
+   ResetLiveArrow(g_liveRed);
    g_ready      = false;
    g_barTime    = 0;
    g_lastClosed = 0;
+   g_liveBar    = 0;
+   g_startBar   = 0;
    g_bullStack  = false;
    g_bearStack  = false;
    g_lastAction = "waiting for the first signal";
    UpdatePanel(true);
+   //--- draw the EMAs and fractals straight away, without waiting for a tick
+   EventSetTimer(1);
    return INIT_SUCCEEDED;
+  }
+
+void OnTimer()
+  {
+   if(!g_ready && SyncClosedBars())
+      ChartRedraw();
+   if(g_ready)
+      EventKillTimer();
   }
 
 void OnDeinit(const int reason)
   {
+   EventKillTimer();
    if(g_hFast != INVALID_HANDLE)
       IndicatorRelease(g_hFast);
    if(g_hMid != INVALID_HANDLE)
@@ -1050,6 +1214,7 @@ void OnTick()
          return;                               // data not ready yet: try again next tick
       g_barTime = barTime;
      }
+   CheckLiveArrows(barTime);                   // arrows appear (and trade) on the live candle
    if(g_signal.active)
       TryEntry(barTime);
    UpdatePanel(false);
