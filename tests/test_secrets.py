@@ -154,3 +154,108 @@ def test_save_overwrite_replaces_atomically(tmp_path: Path) -> None:
 
     assert load(path) == other_blob
     assert not path.with_suffix(".tmp").exists()
+
+
+# ---------------------------------------------------------------------
+# Final review F35: load() never lets a bare OSError or TypeError out.
+# The realistic trigger is setup-login run under another Windows user
+# (e.g. "Run as administrator" with a separate admin account): the file's
+# ACL then refuses this user before DPAPI's own "wrong user" message can.
+# ---------------------------------------------------------------------
+
+def _encrypt(payload: bytes) -> bytes:
+    import win32crypt
+
+    return win32crypt.CryptProtectData(payload, "test", None, None, None, 0)
+
+
+def test_a_folder_at_the_secrets_path_is_a_secrets_error(tmp_path: Path) -> None:
+    folder = tmp_path / "session.dpapi"
+    folder.mkdir()
+    with pytest.raises(SecretsError, match="no secrets file") as caught:
+        load(folder)
+    assert "setup-login" in str(caught.value)
+
+
+def test_a_file_this_user_cannot_read_is_a_secrets_error_naming_the_other_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "session.dpapi"
+    save(_FAKE_BLOB, path)
+
+    def denied(self: Path) -> bytes:
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    with pytest.raises(SecretsError) as caught:
+        load(path)
+    message = str(caught.value)
+    assert "another Windows user" in message
+    assert "setup-login" in message and "this Windows account" in message
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"[1, 2, 3]",
+        b'"just a string"',
+        b"42",
+        b"null",
+        b'{"api_id": "12345", "api_hash": "0", "session_string": "x"}',
+        b'{"api_id": true, "api_hash": "0", "session_string": "x"}',
+        b'{"api_id": 12345, "api_hash": 0, "session_string": "x"}',
+        b'{"api_id": 12345, "api_hash": "0", "session_string": null}',
+        b'{"api_id": 12345, "api_hash": "0"}',
+    ],
+    ids=["array", "string", "number", "null", "api_id-str", "api_id-bool",
+         "api_hash-int", "session-null", "missing-key"],
+)
+def test_a_malformed_payload_is_a_secrets_error(tmp_path: Path, payload: bytes) -> None:
+    path = tmp_path / "session.dpapi"
+    path.write_bytes(_encrypt(payload))
+    with pytest.raises(SecretsError, match="malformed"):
+        load(path)
+
+
+# ---------------------------------------------------------------------
+# Final review F38: DPAPI *user* scope is pinned. A same-user round trip
+# decrypts a CRYPTPROTECT_LOCAL_MACHINE blob too, so no round-trip test
+# can tell -- but any local account could then decrypt the session.
+# ---------------------------------------------------------------------
+
+_CRYPTPROTECT_LOCAL_MACHINE = 0x4
+#: Offset of dwFlags in a DPAPI blob (after dwVersion, guidProvider,
+#: dwMasterKeyVersion, guidMasterKey).
+_DPAPI_FLAGS_OFFSET = 40
+
+
+def test_save_asks_dpapi_for_user_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple] = []
+    real = secrets_module.win32crypt.CryptProtectData
+
+    def spy(*args: object) -> bytes:
+        calls.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(secrets_module.win32crypt, "CryptProtectData", spy)
+    save(_FAKE_BLOB, tmp_path / "session.dpapi")
+    (args,) = calls
+    assert args[5] == 0, f"dwFlags {args[5]!r}: the blob must be for this Windows user only"
+
+
+def test_the_saved_blob_is_user_scoped_not_machine_scoped(tmp_path: Path) -> None:
+    import struct
+
+    path = tmp_path / "session.dpapi"
+    save(_FAKE_BLOB, path)
+    (flags,) = struct.unpack_from("<I", path.read_bytes(), _DPAPI_FLAGS_OFFSET)
+    assert flags & _CRYPTPROTECT_LOCAL_MACHINE == 0
+    # The check can tell: a machine-scoped blob carries the flag there.
+    import win32crypt
+
+    machine = win32crypt.CryptProtectData(
+        b"{}", "test", None, None, None, _CRYPTPROTECT_LOCAL_MACHINE
+    )
+    (machine_flags,) = struct.unpack_from("<I", machine, _DPAPI_FLAGS_OFFSET)
+    assert machine_flags & _CRYPTPROTECT_LOCAL_MACHINE

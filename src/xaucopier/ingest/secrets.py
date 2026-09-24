@@ -173,18 +173,34 @@ def save(blob: SecretsBlob, path: Path) -> None:
 def load(path: Path) -> SecretsBlob:
     """Read and decrypt the blob at `path`.
 
-    Raises `SecretsError` (never a bare `pywintypes.error` or `OSError`)
-    when the file is missing, malformed, or was encrypted under a
-    different Windows user/machine -- each with a message that tells the
-    user what to do about it.
+    Raises `SecretsError` (never a bare `pywintypes.error`, `OSError` or
+    `TypeError`) when the file is missing (or is not a file), cannot be
+    read, is malformed, or was encrypted under a different Windows
+    user/machine -- each with a message that tells the user what to do
+    about it (final review F35).
+
+    A file this user cannot *read* is usually one `setup-login` wrote
+    while running as another Windows user (an administrator window
+    logged in as a separate account): `save()` restricted its ACL to that
+    user, so the read fails before DPAPI's own "wrong user" check could
+    say so. The message says it instead.
     """
-    if not path.exists():
+    if not path.is_file():
         raise SecretsError(
             f"no secrets file at {path}. Run `.\\xaucopier setup-login` first "
             "to log in and create it."
         )
 
-    encrypted = path.read_bytes()
+    try:
+        encrypted = path.read_bytes()
+    except OSError as exc:
+        raise SecretsError(
+            f"cannot read the secrets file at {path} ({type(exc).__name__}). It "
+            "may belong to another Windows user -- for example if setup-login "
+            "was run in a window opened as a different account. Run "
+            "`.\\xaucopier setup-login` again, in a normal window under this "
+            "Windows account."
+        ) from exc
 
     try:
         _description, payload = win32crypt.CryptUnprotectData(
@@ -201,12 +217,20 @@ def load(path: Path) -> SecretsBlob:
 
     try:
         data = json.loads(payload.decode("utf-8"))
-        return SecretsBlob(
-            api_id=data["api_id"],
-            api_hash=data["api_hash"],
-            session_string=data["session_string"],
+        # A payload that is not a JSON object fails these lookups with
+        # TypeError (a list, a string, a number, null).
+        api_id, api_hash, session_string = (
+            data["api_id"],
+            data["api_hash"],
+            data["session_string"],
         )
-    except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as exc:
+        if isinstance(api_id, bool) or not isinstance(api_id, int):
+            raise TypeError("api_id is not an integer")
+        if not isinstance(api_hash, str) or not isinstance(session_string, str):
+            raise TypeError("api_hash or session_string is not text")
+        return SecretsBlob(api_id=api_id, api_hash=api_hash, session_string=session_string)
+    except (json.JSONDecodeError, KeyError, UnicodeDecodeError, TypeError) as exc:
+        # The exception names only the problem's shape, never a value.
         raise SecretsError(
             f"secrets file at {path} decrypted but its contents are "
             "malformed. Run `.\\xaucopier setup-login` again to recreate it."
