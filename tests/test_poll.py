@@ -39,6 +39,7 @@ from xaucopier.ingest.listener import (
     run_listener,
 )
 from xaucopier.ingest.poll import (
+    BACKLOG_RECOVERED_METRIC,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_POLL_LIMIT,
     MISSED_BY_EVENTSTREAM_METRIC,
@@ -84,12 +85,19 @@ ACCOUNTS = tuple(
 HANG = "hang"
 
 
+#: When the helpers below are posted: just after the listener's start, as
+#: every message these tests emit while it runs would be. (A date before
+#: the start would make the poll count it as backlog, not as missed --
+#: final review F17.)
+LIVE = NOW + timedelta(seconds=1)
+
+
 def _chatter(message_id: int) -> FakeMessage:
-    return FakeMessage(id=message_id, message=CHATTER_TEXT, date=POSTED)
+    return FakeMessage(id=message_id, message=CHATTER_TEXT, date=LIVE)
 
 
 def _signal(message_id: int) -> FakeMessage:
-    return FakeMessage(id=message_id, message=SIGNAL_TEXT, date=POSTED)
+    return FakeMessage(id=message_id, message=SIGNAL_TEXT, date=LIVE)
 
 
 # -- harness -------------------------------------------------------------------
@@ -615,7 +623,10 @@ def test_the_poll_never_swallows_a_writer_death(tmp_path: Path) -> None:
     time = SteppedTime()
 
     async def scenario():
-        client = ScriptedClient(history={A: [_chatter(50)]})
+        # Posted before the start, so the seed's one read (its anchor query)
+        # finds it and goes straight to the pointer write.
+        old_post = FakeMessage(id=50, message=CHATTER_TEXT, date=POSTED)
+        client = ScriptedClient(history={A: [old_post]})
         client.failures[A] = [ConnectionError("blip during startup backfill")]
         listener = _build(db_path, client, time, channels=(CHANNEL_A, CHANNEL_B))
         task = asyncio.create_task(run_listener(listener))
@@ -1180,3 +1191,63 @@ def test_a_writer_stuck_in_one_job_is_still_found_unresponsive(tmp_path: Path) -
 
     assert exit_code == EXIT_LISTENER_STOPPED
     assert isinstance(poll_task.exception(), WriterUnresponsiveError)
+
+
+# -- final review F17: backlog is not what the update stream missed -----------------
+
+
+def _metric(db_path: Path, name: str) -> int:
+    rows = _rows(db_path, "SELECT SUM(value) FROM metrics WHERE name = ?", (name,))
+    return rows[0][0] or 0
+
+
+def test_backlog_posted_before_this_watch_started_is_counted_apart_from_what_the_stream_missed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Backfill reads a bounded batch; the poll reads the rest of a long
+    downtime's backlog. The update stream could not have delivered posts
+    made while watch was stopped, so they are `backlog_recovered`, not
+    `missed_by_eventstream` -- which counts only posts dated from the
+    start (less the 60 s margin) on. Here: 10 is backfill's; 11 was posted
+    a second before the margin (backlog); 12 exactly at it and 13 after
+    the start, blacked out, are missed."""
+    db_path = tmp_path / "store.db"
+    _seed_pointer(db_path, A, 9)
+    time = SteppedTime()
+    live_from = NOW - FIRST_RUN_SEED_MARGIN
+    history = [
+        FakeMessage(id=10, message=CHATTER_TEXT, date=NOW - timedelta(hours=5)),
+        FakeMessage(id=11, message=CHATTER_TEXT, date=live_from - timedelta(seconds=1)),
+        FakeMessage(id=12, message=CHATTER_TEXT, date=live_from),
+    ]
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history})
+        listener = Listener(
+            client=client,
+            channels=(CHANNEL_A,),
+            accounts=ACCOUNTS,
+            writer=db.Writer(db_path),
+            db_path=db_path,
+            now=lambda: NOW,
+            poll_hook=HistoryPoll(sleep=time.sleep, clock=time.clock),
+            backfill_limit=1,
+        )
+        await listener.start()
+        try:
+            with client.blackout():
+                await client.emit(A, FakeMessage(id=13, message=SIGNAL_TEXT, date=LIVE))
+            await _run_rounds(listener, time)
+        finally:
+            await listener.aclose()
+
+    with caplog.at_level("INFO", logger="xaucopier.ingest.poll"):
+        asyncio.run(scenario())
+
+    assert _stored(db_path) == [(10, "backfill"), (11, "poll"), (12, "poll"), (13, "poll")]
+    assert _metric(db_path, BACKLOG_RECOVERED_METRIC) == 1
+    assert _missed(db_path) == 2
+    backlog_lines = [r.getMessage() for r in caplog.records if "while watch was not running" in r.getMessage()]
+    assert len(backlog_lines) == 1 and "[11]" in backlog_lines[0], backlog_lines
+    missed_lines = [r.getMessage() for r in caplog.records if "never delivered" in r.getMessage()]
+    assert len(missed_lines) == 1 and "[12, 13]" in missed_lines[0], missed_lines

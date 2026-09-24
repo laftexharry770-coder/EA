@@ -27,9 +27,16 @@ Every `interval` (5 s) the poll runs one *round*:
    itself (Telethon's `get_messages()` defaults to *one* message, which
    is exactly the kind of detail `read_history` exists to own).
 3. **Count what the update stream missed.** Every message a poll read
-   ingests as `"new"` is one the update stream had not delivered, and is
-   added to the durable `metrics(day, 'missed_by_eventstream')` counter
-   -- the system's real reliability metric, which `status` must show.
+   ingests as `"new"` is one the update stream had not delivered. If it
+   was posted while this watch ran -- dated at or after its start
+   (`Listener.started_at`) less the 60 s seed margin -- it is added to
+   the durable `metrics(day, 'missed_by_eventstream')` counter, the
+   system's real reliability metric, which `status` must show. One dated
+   before that is backlog from while watch was stopped (a long downtime
+   past backfill's 500, or a channel switched back on), which the stream
+   could not have delivered: it is counted apart, in
+   `backlog_recovered` (final review F17), so it cannot pass for dozens
+   of drops a day.
 4. **Re-read that channel's recent window by id** (Task 10,
    `ingest/edits.py`'s `reconcile_window`), right after its forward
    read: the `edit_window` (50) newest stored messages at or below the
@@ -121,7 +128,12 @@ the rule with a per-channel lock, for any other caller.
 stored the message before the update stream did. Almost always that is a
 message the stream dropped; occasionally the poll simply got there first
 (a message posted moments before a round, its update not yet
-dispatched). That race can only over-count, never hide a miss.
+dispatched). That race can only over-count, never hide a miss. A "new"
+message posted before this watch started (less the 60 s margin) is not
+counted as missed at all: it is backlog, `backlog_recovered` (F17).
+Posts from the margin itself still count as missed -- the margin exists
+because the two clocks may disagree by that much -- so that side, too,
+can only over-count.
 
 No `sqlite3` here (the `ingest/` package never touches it), and no
 `MetaTrader5`.
@@ -133,6 +145,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import NoReturn
 
 from telethon import errors
@@ -144,7 +157,12 @@ from xaucopier.ingest.edits import (
     reconcile_window,
     validate_window,
 )
-from xaucopier.ingest.listener import DEFAULT_RPC_TIMEOUT, HistoryIngest, Listener
+from xaucopier.ingest.listener import (
+    DEFAULT_RPC_TIMEOUT,
+    FIRST_RUN_SEED_MARGIN,
+    HistoryIngest,
+    Listener,
+)
 from xaucopier.store import alerts, db, heartbeats
 
 logger = logging.getLogger(__name__)
@@ -166,6 +184,10 @@ DEFAULT_WRITER_PROBE_TIMEOUT = 60.0
 POLL_SOURCE = "poll"
 #: `metrics.name` for messages the poll ingested before the update stream.
 MISSED_BY_EVENTSTREAM_METRIC = "missed_by_eventstream"
+#: `metrics.name` for messages the poll ingested that were posted before
+#: this watch started -- backlog from while it was stopped (final review
+#: F17), which the update stream could not have delivered.
+BACKLOG_RECOVERED_METRIC = "backlog_recovered"
 #: The two steps of a channel's turn in a round, each flood-deferred on
 #: its own: the forward history read, then the window re-read.
 HISTORY_STEP = "history"
@@ -187,12 +209,26 @@ def _retrieve_outcome(task: asyncio.Future[object]) -> None:
         task.exception()
 
 
-def count_missed(results: tuple[HistoryIngest, ...]) -> int:
-    """How many messages in one history read were `"new"` -- stored by
-    this read, not by the update stream first."""
-    return sum(
-        1 for outcome in results if outcome.result is not None and outcome.result.outcome == "new"
-    )
+def split_new(
+    results: tuple[HistoryIngest, ...], *, live_from: datetime | None
+) -> tuple[list[int], list[int]]:
+    """The ids of one history read's `"new"` messages, as (missed by the
+    update stream, backlog): a message dated at or after `live_from` was
+    posted while this watch ran and the stream should have delivered it;
+    one dated before it was posted while watch was stopped (final review
+    F17). With no `live_from`, or no date, a message counts as missed --
+    the side that can only over-count."""
+    missed: list[int] = []
+    backlog: list[int] = []
+    for outcome in results:
+        if outcome.result is None or outcome.result.outcome != "new":
+            continue
+        posted = outcome.posted_at_utc
+        if live_from is not None and posted is not None and posted < live_from:
+            backlog.append(outcome.message_id)
+        else:
+            missed.append(outcome.message_id)
+    return missed, backlog
 
 
 def _positive_number(value: object) -> bool:
@@ -355,16 +391,30 @@ class HistoryPoll:
         results = await listener.read_history(
             channel, source=POLL_SOURCE, limit=self.limit, rpc_timeout=self.rpc_timeout
         )
-        missed = count_missed(results)
+        started_at = listener.started_at
+        missed, backlog = split_new(
+            results,
+            live_from=None if started_at is None else started_at - FIRST_RUN_SEED_MARGIN,
+        )
         if missed:
-            await listener.record_metric(MISSED_BY_EVENTSTREAM_METRIC, missed)
+            await listener.record_metric(MISSED_BY_EVENTSTREAM_METRIC, len(missed))
             logger.warning(
                 "poll recovered %d message(s) on channel %s (%s) that the update "
                 "stream never delivered: %s",
-                missed,
+                len(missed),
                 channel.channel_id,
                 channel.name,
-                [o.message_id for o in results if o.result is not None and o.result.outcome == "new"],
+                missed,
+            )
+        if backlog:
+            await listener.record_metric(BACKLOG_RECOVERED_METRIC, len(backlog))
+            logger.info(
+                "read %d earlier message(s) on channel %s (%s), posted while watch was "
+                "not running: %s",
+                len(backlog),
+                channel.channel_id,
+                channel.name,
+                backlog,
             )
 
     async def _guarded(

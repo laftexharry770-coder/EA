@@ -295,7 +295,8 @@ class HistoryIngest:
 
     `result` is the `ingest()` outcome -- `"new"` means the update stream
     had not delivered it (yet), which is what Task 9's
-    `missed_by_eventstream` counter counts.
+    `missed_by_eventstream` counter counts, for a message posted while
+    this watch ran (`posted_at_utc`; final review F17).
     """
 
     message_id: int
@@ -303,6 +304,8 @@ class HistoryIngest:
     #: either the batch stopped here and the next read retries it, or it
     #: was skipped after `MAX_HISTORY_ATTEMPTS` failures.
     result: IngestResult | None
+    #: The message's own date (UTC), when it was stored; None when it failed.
+    posted_at_utc: datetime | None = None
 
 
 def _to_utc(value: datetime, *, field: str) -> datetime:
@@ -866,7 +869,13 @@ class Listener:
                 self._history_attempts.pop(key, None)
                 continue
             self._history_attempts.pop(key, None)
-            outcomes.append(HistoryIngest(message_id=message.id, result=result))
+            outcomes.append(
+                HistoryIngest(
+                    message_id=message.id,
+                    result=result,
+                    posted_at_utc=incoming.posted_at_utc,
+                )
+            )
         return tuple(outcomes)
 
     async def _skip_history_message(
