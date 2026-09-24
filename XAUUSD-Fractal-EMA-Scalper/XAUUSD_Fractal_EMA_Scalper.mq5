@@ -28,6 +28,8 @@
 //           next red arrow.
 //
 //  Manage : trust the strategy and stay in the trade: stop and target only.
+//           Each entry opens InpPositions positions with the same stop and
+//           target; in the risk modes they share the entry's risk.
 //
 //  Costs  : the one-minute chart gives a lot of signals, so use a broker with
 //           very low fees. (InpMaxSpread can skip wide-spread entries; it is
@@ -75,18 +77,19 @@ input double          InpStopBuffer     = 0.0;        // Extra distance past the
 input bool            InpSpreadOnSellSL = true;       // Measure sell stops on the chart price like the video (adds the spread)
 
 input group "Position size"
+input int             InpPositions      = 3;          // Positions opened on each entry (1-100)
 input ENUM_LOT_MODE   InpLotMode        = LOT_MODE_RISK_PERCENT; // Sizing mode
-input double          InpFixedLots      = 0.01;       // Lots per trade (fixed mode)
-input double          InpRiskPercent    = 1.0;        // Balance risked per trade, % (risk % mode)
-input double          InpRiskMoney      = 50.0;       // Money risked per trade (fixed money mode)
+input double          InpFixedLots      = 0.01;       // Lots for each position (fixed mode)
+input double          InpRiskPercent    = 1.0;        // Balance risked per entry, shared by its positions, %
+input double          InpRiskMoney      = 50.0;       // Money risked per entry, shared by its positions
 input double          InpCommissionLot  = 0.0;        // Round-turn commission per 1 lot, account currency
-input double          InpMaxLots        = 5.0;        // Largest position the EA may open, lots
+input double          InpMaxLots        = 5.0;        // Largest total size of one entry, lots
 input bool            InpMinLotFallback = false;      // Trade the minimum lot when the risk is too small for it
 
 input group "Execution and costs"
 input ulong           InpMagic          = 20260924;   // Magic number
 input double          InpSlippage       = 0.30;       // Maximum slippage, in price (0.30 = 30 cents)
-input bool            InpOnePosition    = true;       // One trade at a time: stay in it until stop or target
+input bool            InpOneEntry       = true;       // One entry at a time: stay in it until stop or target
 input bool            InpRetryInBar     = true;       // If the entry is blocked, keep trying until the candle closes
 
 input group "Optional filters (not in the video, off by default)"
@@ -106,7 +109,8 @@ input int             InpMaxArrows      = 500;        // Most arrows kept on the
 
 #define EA_NAME      "XAUUSD Fractal EMA Scalper"
 #define WARMUP_BARS  600      // closed candles replayed at start-up to rebuild the setup state
-#define MAX_SENDS    5        // order sends tried per signal before giving up
+#define MAX_FAILS    5        // failed order sends allowed per entry before giving up
+#define MAX_POSITIONS 100     // most positions one entry may open
 
 //--- the colours picked in the video (TradingView palette)
 const color CLR_GREEN  = C'76,175,80';    // 20 EMA and the green fractal
@@ -130,7 +134,11 @@ struct PendingSignal
    double            stopEma;    // EMA value the stop is measured from
    datetime          arrowTime;  // candle the arrow sits under / over
    datetime          validBar;   // the entry is only taken inside this candle
-   int               sends;      // order sends tried for this signal
+   int               count;      // positions this entry opens (set on the first send)
+   int               opened;     // positions opened so far
+   double            lotsEach;   // size of each position
+   double            sl;         // stop shared by every position of the entry
+   int               fails;      // failed order sends for this entry
    string            holdKey;    // last reason the entry was held back (logged once)
   };
 
@@ -208,7 +216,11 @@ void ClearSignal()
    g_signal.stopEma   = 0.0;
    g_signal.arrowTime = 0;
    g_signal.validBar  = 0;
-   g_signal.sends     = 0;
+   g_signal.count     = 0;
+   g_signal.opened    = 0;
+   g_signal.lotsEach  = 0.0;
+   g_signal.sl        = 0.0;
+   g_signal.fails     = 0;
    g_signal.holdKey   = "";
   }
 
@@ -362,6 +374,8 @@ void UpdatePanel(const bool force)
    text += "Spread " + Px(spread) + (InpMaxSpread > 0.0 ? " (max " + Px(InpMaxSpread) + ")" : "")
            + "   stop " + (InpStopBuffer > 0.0 ? Px(InpStopBuffer) + " past the EMA" : "right past the EMA")
            + "   target " + DoubleToString(InpRewardRisk, 2) + "R\n";
+   text += "Positions per entry " + IntegerToString(InpPositions) + "   open now "
+           + IntegerToString(CountMyPositions()) + "\n";
    text += "Last: " + g_lastAction;
    Comment(text);
   }
@@ -632,12 +646,17 @@ int CountMyPositions()
    return count;
   }
 
+bool IsHedging()
+  {
+   return AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING;
+  }
+
 bool BlockedByOpenTrade()
   {
    //--- netting accounts hold one position per symbol: never add to or flip someone else's
-   if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+   if(!IsHedging())
       return PositionSelect(_Symbol);
-   return InpOnePosition && CountMyPositions() > 0;
+   return InpOneEntry && CountMyPositions() > 0;
   }
 
 //--- money lost by 1 lot going from entry to the stop
@@ -654,18 +673,34 @@ double LossPerLot(const bool isBuy, const double entry, const double sl)
    return MathAbs(entry - sl) / TickSize() * tv;
   }
 
-double LotsFor(const bool isBuy, const double entry, const double sl)
+//+------------------------------------------------------------------+
+//| Size of each position of an entry, 0 if it cannot be traded.     |
+//| Risk modes: the entry's risk is shared by all its positions. If  |
+//| the share is below the minimum lot, fewer minimum-lot positions  |
+//| are opened so the entry never risks more than it should (unless  |
+//| InpMinLotFallback). Fixed mode: InpFixedLots for each position.  |
+//| InpMaxLots caps the whole entry. count may be lowered.           |
+//+------------------------------------------------------------------+
+double LotsPerPosition(const bool isBuy, const double entry, const double sl, int &count)
   {
-   const double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double       maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double       minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double       step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    if(step <= 0.0)
       step = (minLot > 0.0) ? minLot : 0.01;
-   if(maxLot <= 0.0)
-      maxLot = InpMaxLots;
+   if(minLot <= 0.0)
+      minLot = step;
+   if(count < 1)
+      return 0.0;
 
-   double lots = InpFixedLots;
-   if(InpLotMode != LOT_MODE_FIXED)
+   double each = 0.0;
+   if(InpLotMode == LOT_MODE_FIXED)
+     {
+      each = MathFloor(InpFixedLots / step + 1e-8) * step;
+      if(each < minLot)
+         each = minLot;
+     }
+   else
      {
       const double money  = (InpLotMode == LOT_MODE_RISK_PERCENT)
                             ? AccountInfoDouble(ACCOUNT_BALANCE) * InpRiskPercent / 100.0
@@ -673,28 +708,56 @@ double LotsFor(const bool isBuy, const double entry, const double sl)
       const double perLot = LossPerLot(isBuy, entry, sl) + MathMax(InpCommissionLot, 0.0);
       if(money <= 0.0 || perLot <= 0.0)
          return 0.0;
-      lots = money / perLot;
+      const double total = money / perLot;                  // lots for the whole entry
+      each = MathFloor(total / count / step + 1e-8) * step;
+      if(each < minLot)
+        {
+         if(InpMinLotFallback)
+            each = minLot;
+         else
+           {
+            //--- too small to split that many ways: fewer positions of the minimum lot
+            count = IMin(count, (int)MathFloor(total / minLot + 1e-8));
+            if(count < 1)
+               return 0.0;
+            each = minLot;
+           }
+        }
      }
-   lots = MathFloor(lots / step + 1e-8) * step;
-   if(lots < minLot)
+
+   //--- never more than InpMaxLots for the whole entry
+   if(each * count > InpMaxLots + 1e-8)
      {
-      if(InpLotMode == LOT_MODE_FIXED || InpMinLotFallback)
-         lots = minLot;
-      else
-         return 0.0;
+      each = MathFloor(InpMaxLots / count / step + 1e-8) * step;
+      if(each < minLot)
+        {
+         count = (int)MathFloor(InpMaxLots / minLot + 1e-8);
+         if(count < 1)
+            return 0.0;
+         each = minLot;
+        }
      }
-   const double cap = MathMin(maxLot, InpMaxLots);
-   if(lots > cap)
-      lots = MathFloor(cap / step + 1e-8) * step;
-   if(lots < minLot)
+   //--- nor more than the broker allows in one order
+   if(maxLot > 0.0 && each > maxLot)
+      each = MathFloor(maxLot / step + 1e-8) * step;
+   if(each < minLot)
       return 0.0;
-   return NormalizeDouble(lots, VolumeDigits(step));
+   return NormalizeDouble(each, VolumeDigits(step));
   }
 
-//--- give up on the current signal
+string Lots(const double lots)
+  {
+   return DoubleToString(lots, VolumeDigits(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP)));
+  }
+
+//--- give up on the current signal (positions already opened stay open)
 void Drop(const string reason)
   {
-   Note(StringFormat("%s signal skipped: %s", g_signal.direction > 0 ? "buy" : "sell", reason));
+   const string side = (g_signal.direction > 0) ? "buy" : "sell";
+   if(g_signal.opened > 0)
+      Note(StringFormat("%s entry stopped at %d of %d positions: %s", side, g_signal.opened, g_signal.count, reason));
+   else
+      Note(StringFormat("%s signal skipped: %s", side, reason));
    ClearSignal();
   }
 
@@ -721,18 +784,19 @@ void TryEntry(const datetime barTime)
       return;
      }
    const bool isBuy  = (g_signal.direction > 0);
+   const bool first  = (g_signal.opened == 0);     // nothing of this entry is open yet
    string     reason = "";
    if(!TradingAllowed(isBuy, reason))
      {
       Drop(reason);
       return;
      }
-   if(InpUseHours && !InsideHours())
+   if(first && InpUseHours && !InsideHours())
      {
       Drop("outside the trading hours");
       return;
      }
-   if(BlockedByOpenTrade())
+   if(first && BlockedByOpenTrade())
      {
       Drop("a trade is already open - staying in it");
       return;
@@ -748,28 +812,32 @@ void TryEntry(const datetime barTime)
       return;
      }
 
-   //--- stop on the first price right below / above the EMA, target 1.5 x the risk
+   //--- stop on the first price right below / above the EMA, shared by every position
    const double entry = isBuy ? tick.ask : tick.bid;
-   const double half  = TickSize() * 0.5;      // keeps the stop strictly past the EMA
-   double sl = 0.0;
-   if(isBuy)
-      sl = PriceDown(g_signal.stopEma - InpStopBuffer - half);
-   else
-      sl = PriceUp(g_signal.stopEma + InpStopBuffer + (InpSpreadOnSellSL ? spread : 0.0) + half);
+   if(first)
+     {
+      const double half = TickSize() * 0.5;      // keeps the stop strictly past the EMA
+      if(isBuy)
+         g_signal.sl = PriceDown(g_signal.stopEma - InpStopBuffer - half);
+      else
+         g_signal.sl = PriceUp(g_signal.stopEma + InpStopBuffer + (InpSpreadOnSellSL ? spread : 0.0) + half);
+     }
+   const double sl   = g_signal.sl;
    const double risk = isBuy ? entry - sl : sl - entry;
    if(risk <= 0.0)
      {
       Drop("price is already through the stop level " + Px(sl));
       return;
      }
+   //--- target 1.5 x the risk
    const double tp = PriceRound(isBuy ? entry + InpRewardRisk * risk : entry - InpRewardRisk * risk);
 
-   if(InpMinStopDist > 0.0 && risk < InpMinStopDist)
+   if(first && InpMinStopDist > 0.0 && risk < InpMinStopDist)
      {
       Drop("stop distance " + Px(risk) + " is below the minimum " + Px(InpMinStopDist));
       return;
      }
-   if(InpMaxStopDist > 0.0 && risk > InpMaxStopDist)
+   if(first && InpMaxStopDist > 0.0 && risk > InpMaxStopDist)
      {
       Drop("stop distance " + Px(risk) + " is above the maximum " + Px(InpMaxStopDist));
       return;
@@ -785,49 +853,69 @@ void TryEntry(const datetime barTime)
       return;
      }
 
-   const double lots = LotsFor(isBuy, entry, sl);
-   if(lots <= 0.0)
+   //--- how many positions and how big: decided once, on the first send
+   if(first)
      {
-      Drop("the risk is too small for the minimum lot size");
-      return;
+      //--- a netting account merges everything into one position: send it as one order
+      int count = IsHedging() ? InpPositions : 1;
+      const double each = LotsPerPosition(isBuy, entry, sl, count);
+      if(each <= 0.0)
+        {
+         Drop("the risk is too small for the minimum lot size");
+         return;
+        }
+      if(IsHedging() && count < InpPositions)
+         Print(EA_NAME, ": the risk only covers ", IntegerToString(count), " of ", IntegerToString(InpPositions),
+               " positions at the minimum lot size - opening ", IntegerToString(count));
+      double margin = 0.0;
+      if(OrderCalcMargin(isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, _Symbol, each * count, entry, margin)
+         && margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
+        {
+         Drop("not enough free margin for " + IntegerToString(count) + " x " + Lots(each) + " lots");
+         return;
+        }
+      g_signal.count    = count;
+      g_signal.lotsEach = each;
      }
-   double margin = 0.0;
-   if(OrderCalcMargin(isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, _Symbol, lots, entry, margin)
-      && margin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
+
+   //--- open the positions, all with the same stop and target
+   const int emaLen = g_signal.deep ? InpEmaSlow : InpEmaMid;
+   while(g_signal.opened < g_signal.count)
      {
-      Drop("not enough free margin for " + DoubleToString(lots, 2) + " lots");
+      const string comment = StringFormat("FES %s %d %d/%d", isBuy ? "buy" : "sell", emaLen,
+                                          g_signal.opened + 1, g_signal.count);
+      const bool sent = isBuy ? g_trade.Buy(g_signal.lotsEach, _Symbol, entry, sl, tp, comment)
+                              : g_trade.Sell(g_signal.lotsEach, _Symbol, entry, sl, tp, comment);
+      const uint rc   = g_trade.ResultRetcode();
+      if(sent && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_DONE_PARTIAL || rc == TRADE_RETCODE_PLACED))
+        {
+         g_signal.opened++;
+         continue;
+        }
+      g_signal.fails++;
+      const bool transient = (rc == TRADE_RETCODE_REQUOTE || rc == TRADE_RETCODE_PRICE_CHANGED
+                              || rc == TRADE_RETCODE_PRICE_OFF || rc == TRADE_RETCODE_TIMEOUT
+                              || rc == TRADE_RETCODE_CONNECTION || rc == TRADE_RETCODE_TOO_MANY_REQUESTS);
+      if(transient && InpRetryInBar && g_signal.fails < MAX_FAILS)
+        {
+         Print(EA_NAME, ": order not filled (", g_trade.ResultRetcodeDescription(), "), retrying on the next tick");
+         return;
+        }
+      Drop("order rejected: " + IntegerToString(rc) + " " + g_trade.ResultRetcodeDescription());
       return;
      }
 
-   const int    emaLen  = g_signal.deep ? InpEmaSlow : InpEmaMid;
-   const string comment = StringFormat("FES %s %d", isBuy ? "buy" : "sell", emaLen);
-   g_signal.sends++;
-   const bool sent = isBuy ? g_trade.Buy(lots, _Symbol, entry, sl, tp, comment)
-                           : g_trade.Sell(lots, _Symbol, entry, sl, tp, comment);
-   const uint rc   = g_trade.ResultRetcode();
-   if(sent && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_DONE_PARTIAL || rc == TRADE_RETCODE_PLACED))
-     {
-      Note(StringFormat("%s %s lots at %s, stop %s (%s the %d EMA), target %s (%.2fR)",
-                        isBuy ? "BUY" : "SELL",
-                        DoubleToString(lots, VolumeDigits(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP))),
-                        Px(g_trade.ResultPrice() > 0.0 ? g_trade.ResultPrice() : entry),
-                        Px(sl),
-                        isBuy ? "below" : "above",
-                        emaLen,
-                        Px(tp),
-                        InpRewardRisk));
-      ClearSignal();
-      return;
-     }
-   const bool transient = (rc == TRADE_RETCODE_REQUOTE || rc == TRADE_RETCODE_PRICE_CHANGED
-                           || rc == TRADE_RETCODE_PRICE_OFF || rc == TRADE_RETCODE_TIMEOUT
-                           || rc == TRADE_RETCODE_CONNECTION || rc == TRADE_RETCODE_TOO_MANY_REQUESTS);
-   if(transient && InpRetryInBar && g_signal.sends < MAX_SENDS)
-     {
-      Print(EA_NAME, ": order not filled (", g_trade.ResultRetcodeDescription(), "), retrying");
-      return;
-     }
-   Drop("order rejected: " + IntegerToString(rc) + " " + g_trade.ResultRetcodeDescription());
+   Note(StringFormat("%s %d x %s lots at %s, stop %s (%s the %d EMA), target %s (%.2fR)",
+                     isBuy ? "BUY" : "SELL",
+                     g_signal.count,
+                     Lots(g_signal.lotsEach),
+                     Px(entry),
+                     Px(sl),
+                     isBuy ? "below" : "above",
+                     emaLen,
+                     Px(tp),
+                     InpRewardRisk));
+   ClearSignal();
   }
 
 //+------------------------------------------------------------------+
@@ -867,6 +955,14 @@ int OnInit()
       Print(EA_NAME, ": distances, slippage and chart history cannot be negative");
       return INIT_PARAMETERS_INCORRECT;
      }
+   if(InpPositions < 1 || InpPositions > MAX_POSITIONS)
+     {
+      Print(EA_NAME, ": positions per entry must be between 1 and ", IntegerToString(MAX_POSITIONS));
+      return INIT_PARAMETERS_INCORRECT;
+     }
+   if(InpPositions > 1 && !IsHedging())
+      Print(EA_NAME, ": this is a netting account, which holds one position per symbol - each entry opens",
+            " one position with the combined size of ", IntegerToString(InpPositions), " positions");
 
    g_tf = (InpTimeframe == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpTimeframe;
 
