@@ -33,6 +33,11 @@ TELEGRAM_SESSION_DEAD = "TELEGRAM_SESSION_DEAD"
 #: CRITICAL, recorded by `xaucopier watch` when Telegram rejects the
 #: api_id/api_hash (exit 5). Fix: a new pair from my.telegram.org.
 TELEGRAM_API_ID_REJECTED = "TELEGRAM_API_ID_REJECTED"
+#: WARNING, recorded by `xaucopier watch` at start when it cancelled trade
+#: entries still waiting for signals of channels that are switched off
+#: (final review F15): nothing reads those channels any more, so nothing
+#: would see their posters withdraw or change those signals.
+CHANNEL_OFF_ENTRIES_SKIPPED = "CHANNEL_OFF_ENTRIES_SKIPPED"
 #: Alerts a successful read resolves: Telegram answering this session
 #: proves the condition is gone. The poll acknowledges them (poll.py).
 SESSION_ALERT_CODES: tuple[str, ...] = (TELEGRAM_SESSION_DEAD, TELEGRAM_API_ID_REJECTED)

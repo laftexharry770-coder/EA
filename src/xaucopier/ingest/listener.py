@@ -21,6 +21,11 @@ never makes an RPC on the update path.
    writer that died (`WriterDeadError`) or never connected makes
    `start()` raise `ListenerStartupError` -- a `ListenerStopped`, so a
    non-zero exit -- instead of hanging with the process looking alive.
+   Then, before Telegram is contacted, one writer job cancels (SKIPPED,
+   'channel switched off') every trade entry still waiting for a signal
+   of a channel that is no longer switched on, with one WARNING alert
+   naming how many (final review F15): nothing reads such a channel, so
+   nothing would see its poster withdraw the signal.
 1. **connect**, within a deadline (`client.STARTUP_TIMEOUT_SECONDS`,
    60 s). Telethon's own connect never gives up, so with no network --
    or a malformed reply making it reconnect in a tight loop -- `start()`
@@ -149,6 +154,7 @@ from xaucopier.store import (
     heartbeats,
     messages_repo,
     metrics,
+    outbox,
 )
 from xaucopier.store.edits_repo import DeletionResult, EditResult
 from xaucopier.store.messages_repo import IngestResult
@@ -1362,6 +1368,7 @@ class Listener:
 
         await self._start_writer_and_wait_for_connection()  # 0
         self._reader = db.connect(self.db_path, role="reader")
+        await self._skip_entries_of_channels_off()
 
         # Imported here for the same reason as in run_listener().
         from xaucopier.ingest import client as client_module
@@ -1412,6 +1419,58 @@ class Listener:
                 f"the writer thread could not connect to {self.db_path}: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
+
+    async def _skip_entries_of_channels_off(self) -> None:
+        """Startup, before Telegram is contacted (final review F15): one
+        writer job SKIPs every trade entry still QUEUED for a signal whose
+        channel is not switched on (`outbox.skip_entries_of_channels_off`,
+        reason 'channel switched off') and, if there were any, records one
+        WARNING alert, `CHANNEL_OFF_ENTRIES_SKIPPED`, naming how many.
+
+        OFF means the channel is not read at all -- neither its new posts
+        nor the edits, deletions and follow-ups of the signals it already
+        posted -- so nothing would see its poster withdraw or re-aim such a
+        signal before it was traded. A job that fails is logged and left
+        for the next start: it must not keep watch from starting."""
+        enabled_ids = tuple(self._channels_by_id)
+        names = {channel.channel_id: channel.name for channel in self.channels}
+        now_utc = self._now()
+
+        def job(conn: Connection) -> int:
+            skipped = outbox.skip_entries_of_channels_off(conn, enabled_channel_ids=enabled_ids)
+            total = sum(skipped.values())
+            if total:
+                where = "; ".join(
+                    f"{names[channel_id]} ({channel_id}): {count}"
+                    if channel_id in names
+                    else f"channel {channel_id}, no longer listed: {count}"
+                    for channel_id, count in sorted(skipped.items())
+                )
+                alerts.record(
+                    conn,
+                    now_utc=now_utc,
+                    level="WARNING",
+                    code=alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
+                    detail=(
+                        f"{total} waiting trade {'entry' if total == 1 else 'entries'} "
+                        f"from channels that are switched off "
+                        f"{'was' if total == 1 else 'were'} cancelled (reason "
+                        f"'{outbox.CHANNEL_OFF_REASON}') -- {where}. watch no longer "
+                        "reads those channels, so it could not see their posters "
+                        "withdraw, change or close those signals."
+                    ),
+                )
+            return total
+
+        try:
+            await self._run_on_writer(job)
+        except Exception as exc:  # noqa: BLE001 -- retried at the next start
+            logger.warning(
+                "Could not cancel the trade entries still waiting for channels that are "
+                "switched off (%s: %s); watch tries again when it next starts.",
+                type(exc).__name__,
+                exc,
+            )
 
     async def _read_telegram_clock(self) -> tuple[datetime, datetime] | None:
         """Ask Telegram for its time: one `updates.GetStateRequest()`,

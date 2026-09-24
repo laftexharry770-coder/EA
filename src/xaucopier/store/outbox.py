@@ -587,6 +587,43 @@ def skip_queued(
     return cursor.rowcount
 
 
+#: `outbox.reason` for an ENTRY skipped because its signal's channel is not
+#: switched on (final review F15).
+CHANNEL_OFF_REASON = "channel switched off"
+
+
+def skip_entries_of_channels_off(
+    conn: sqlite3.Connection, *, enabled_channel_ids: tuple[int, ...]
+) -> dict[int, int]:
+    """SKIP every ``QUEUED`` ENTRY row whose signal's channel is not in
+    `enabled_channel_ids`, with reason `CHANNEL_OFF_REASON`; returns how
+    many per channel (none: an empty dict).
+
+    `watch` runs this at start (final review F15): a channel switched off
+    is not read at all, so nobody would see its poster withdraw, re-aim or
+    close a signal still waiting to be traded. A ``CLAIMED`` row is left
+    to its worker, as in `skip_queued`; follow-ups are left alone. Never
+    commits."""
+    ids = tuple(int(channel_id) for channel_id in enabled_channel_ids)
+    marks = ", ".join("?" for _ in ids)
+    off = f"s.channel_id NOT IN ({marks})" if ids else "1 = 1"
+    rows = conn.execute(
+        "SELECT o.outbox_id, s.channel_id FROM outbox o "
+        "JOIN signals s ON s.signal_id = o.signal_id "
+        f"WHERE o.kind = 'ENTRY' AND o.state = 'QUEUED' AND {off}",
+        ids,
+    ).fetchall()
+    skipped: dict[int, int] = {}
+    for outbox_id, channel_id in rows:
+        conn.execute(
+            "UPDATE outbox SET state = 'SKIPPED', reason = ? "
+            "WHERE outbox_id = ? AND state = 'QUEUED'",
+            (CHANNEL_OFF_REASON, outbox_id),
+        )
+        skipped[channel_id] = skipped.get(channel_id, 0) + 1
+    return skipped
+
+
 def state_counts(
     conn: sqlite3.Connection,
     *,
