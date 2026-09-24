@@ -429,3 +429,41 @@ def test_malformed_provenance_is_refused_before_anything_is_stored(conn, kwargs,
         )
     assert _count(conn, "messages") == 0
     assert _count(conn, "signals") == 0
+
+
+# -- final review F39: parsed_json.source is where the message really came from
+
+
+def _parsed_source(conn) -> str:
+    (source,) = conn.execute(
+        "SELECT json_extract(parsed_json, '$.source') FROM signals "
+        "WHERE channel_id = ? AND message_id = ?",
+        (CHANNEL_A.channel_id, SIGNAL_MESSAGE_ID),
+    ).fetchone()
+    return source
+
+
+@pytest.mark.parametrize("source", ["live", "poll", "backfill"])
+def test_signal_parsed_json_records_the_messages_real_source(conn, source):
+    """The parser's Signal.source is always 'live' (routing takes no
+    source), and signals.parsed_json copied it -- so every signal the poll
+    or backfill recovered said 'live', the one provenance value Plan 3 is
+    told to read at claim time."""
+    assert _ingest(conn, source=source).outcome == "new"
+    assert _parsed_source(conn) == source
+    (stored,) = conn.execute("SELECT source FROM messages").fetchone()
+    assert stored == source
+
+
+def test_an_edit_keeps_the_signals_original_source(conn):
+    """An edit re-derives parsed_json in full; the message's provenance is
+    how it was first stored, whichever path brought the new version."""
+    assert _ingest(conn, source="poll").outcome == "new"
+    edited = _ingest(
+        conn, text=EDITED_SL_TEXT, edit_date_utc=POSTED + timedelta(minutes=2), source="live"
+    )
+    assert edited.outcome == "edited"
+    assert json.loads(
+        conn.execute("SELECT parsed_json FROM signals").fetchone()["parsed_json"]
+    )["sl"] == 4460.0
+    assert _parsed_source(conn) == "poll"

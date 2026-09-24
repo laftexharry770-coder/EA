@@ -973,3 +973,47 @@ def test_sender_columns_accept_only_their_values(tmp_path, column, bad):
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(f"UPDATE messages SET {column} = ?", (bad,))
     conn.close()
+
+
+def test_migration_4_corrects_parsed_json_source_of_recovered_signals(tmp_path):
+    """F39: signals stored before the fix say source 'live' whatever
+    recovered them. The upgrade writes the message's own source into
+    parsed_json; a row already right, a row without the key, and a row
+    that is not JSON at all are left byte-for-byte alone (the upgrade
+    must never fail on one odd row)."""
+    import json
+
+    conn = _v3_database(tmp_path / "store.db")
+    rows = {
+        300: ("poll", json.dumps({"side": "BUY", "source": "live"})),
+        301: ("backfill", json.dumps({"side": "SELL", "source": "live"})),
+        302: ("live", json.dumps({"side": "BUY", "source": "live"})),
+        303: ("poll", "not json at all"),
+    }
+    for message_id, (source, parsed_json) in rows.items():
+        conn.execute(
+            "INSERT INTO messages (channel_id, message_id, kind, content_hash, raw_text, "
+            "received_at_utc, posted_at_utc, source) VALUES (1, ?, 'signal', 'h', 't', "
+            "'2026-09-10T00:00:00+00:00', '2026-09-10T00:00:00+00:00', ?)",
+            (message_id, source),
+        )
+        conn.execute(
+            "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, state, "
+            "version) VALUES (1, ?, ?, ?, 'NEW', 1)",
+            (message_id, parsed_json, f"hash{message_id}"),
+        )
+    conn.commit()
+    untouched = dict(
+        conn.execute(
+            "SELECT message_id, parsed_json FROM signals WHERE message_id IN (100, 302, 303)"
+        ).fetchall()
+    )
+
+    migrate(conn)
+
+    after = dict(conn.execute("SELECT message_id, parsed_json FROM signals").fetchall())
+    assert json.loads(after[300]) == {"side": "BUY", "source": "poll"}
+    assert json.loads(after[301]) == {"side": "SELL", "source": "backfill"}
+    for message_id, parsed_json in untouched.items():
+        assert after[message_id] == parsed_json
+    conn.close()

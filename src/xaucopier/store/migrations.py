@@ -134,9 +134,9 @@ at the end of every round, and ``watch`` stamps its own start and stop
 "stopped" and "stopped because the Telegram session was logged out".
 ``store/heartbeats.py`` is its one writer. Nothing else changes.
 
-**Migration 4 (Plan 2 final review fix wave).** Only new NULL-able
-columns and one index, all in :data:`_MIGRATION_4`; every existing row
-keeps every value it had.
+**Migration 4 (Plan 2 final review fix wave).** New NULL-able columns,
+one index and two backfills, all in :data:`_MIGRATION_4`; apart from the
+two backfills every existing row keeps every value it had.
 
 - ``channel_state.seed_cutoff_utc``: when set, the channel must be
   (re)seeded at the newest message dated before this cutoff minus the
@@ -151,6 +151,11 @@ keeps every value it had.
   seeded at 0. Existing rows whose pointer is above 0 were seeded by an
   earlier run, so the migration marks them seeded as of the migration
   (ISO UTC, whole seconds).
+- ``signals.parsed_json``'s ``source`` key: rows stored before final
+  review F39 said ``'live'`` whatever recovered them; the migration
+  writes the message's own ``messages.source`` into each row whose key
+  holds a different value (a row that is not JSON, or has no such key,
+  is left alone). ``json_set`` re-serialises only those rows, compactly.
 - ``messages.relay_of_signal_id``: the signal a message was classified
   as a relay duplicate of, at ingest (F02).
 - ``messages.sender_kind`` (``'user'`` / ``'channel'`` / ``'chat'``),
@@ -299,6 +304,22 @@ _MIGRATION_4: tuple[str, ...] = (
     # that channel has been seeded. Pointer-0 rows stay unmarked.
     "UPDATE channel_state SET seeded_at_utc = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now') "
     "WHERE last_processed_message_id > 0 AND seeded_at_utc IS NULL",
+    # F39: parsed_json.source said 'live' for every signal, whatever
+    # recovered it. Write the message's own source into rows that carry
+    # the key with another value. CASE (evaluated lazily, unlike AND)
+    # keeps a row that is not valid JSON from failing the whole upgrade;
+    # such a row, and one without the key, is left as it is.
+    "UPDATE signals SET parsed_json = json_set(parsed_json, '$.source', "
+    "  (SELECT m.source FROM messages m "
+    "   WHERE m.channel_id = signals.channel_id AND m.message_id = signals.message_id)) "
+    "WHERE CASE WHEN json_valid(parsed_json) "
+    "  THEN json_type(parsed_json, '$.source') = 'text' "
+    "   AND json_extract(parsed_json, '$.source') IS NOT "
+    "    (SELECT m.source FROM messages m "
+    "     WHERE m.channel_id = signals.channel_id AND m.message_id = signals.message_id) "
+    "   AND EXISTS (SELECT 1 FROM messages m "
+    "     WHERE m.channel_id = signals.channel_id AND m.message_id = signals.message_id) "
+    "  ELSE 0 END",
 )
 
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"

@@ -15,6 +15,14 @@ follow-up" filters on `edit_seq = 0`.
 JSON serialisation lives here rather than on the domain types themselves,
 because `domain/signal.py` must stay pure (no `json` import) -- see
 tests/test_purity.py.
+
+`signals.parsed_json.source` is the signal message's own
+`messages.source` (live / poll / backfill), read from the stored message
+row whenever the JSON is written -- never the parsed `Signal.source`,
+which routing always leaves at 'live' (final review F39: every signal
+the poll or backfill recovered said 'live', and Plan 3 is told to read
+parsed_json at claim time). An edit keeps it: the message's provenance
+is how it was first stored.
 """
 from __future__ import annotations
 
@@ -25,10 +33,13 @@ from datetime import datetime, timedelta
 from xaucopier.domain.signal import FollowUp, Signal
 
 
-def signal_to_json(signal: Signal) -> str:
+def signal_to_json(signal: Signal, *, source: str) -> str:
     """The persisted form of a parsed signal. Re-derived in full on every
     edit (see update_signal_on_edit) so `signals.parsed_json` always
     reflects the latest accepted parse, never a stale first cut.
+
+    `source` is the message's real provenance (see the module docstring);
+    `signal.source` is not used.
     """
     return json.dumps(
         {
@@ -39,9 +50,24 @@ def signal_to_json(signal: Signal) -> str:
             "tps": list(signal.tps),
             "posted_at_utc": signal.posted_at_utc.isoformat(),
             "content_hash": signal.content_hash,
-            "source": signal.source,
+            "source": source,
         }
     )
+
+
+def _message_source(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> str:
+    """`messages.source` of a signal's own message. The message row is
+    always stored first (signals has a foreign key to it)."""
+    row = conn.execute(
+        "SELECT source FROM messages WHERE channel_id = ? AND message_id = ?",
+        (channel_id, message_id),
+    ).fetchone()
+    if row is None:
+        raise LookupError(
+            f"no stored message ({channel_id}, {message_id}) for this signal; the "
+            "message row must be written before its signal"
+        )
+    return row[0]
 
 
 def followup_to_json(followup: FollowUp) -> str:
@@ -105,13 +131,16 @@ def find_relay_duplicate(
 def insert_signal(
     conn: sqlite3.Connection, *, channel_id: int, message_id: int, signal: Signal
 ) -> int:
+    """A new NEW signal for an already-stored message; parsed_json's
+    `source` is that message's `messages.source` (F39)."""
+    source = _message_source(conn, channel_id=channel_id, message_id=message_id)
     cursor = conn.execute(
         "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, "
         "first_trade_hash, state, version) VALUES (?, ?, ?, ?, ?, 'NEW', 1)",
         (
             channel_id,
             message_id,
-            signal_to_json(signal),
+            signal_to_json(signal, source=source),
             signal.content_hash,
             signal.content_hash,
         ),
@@ -131,12 +160,14 @@ def update_signal_on_edit(
     There is nothing to correct in that case; nothing to fabricate either.
 
     `first_trade_hash` is left alone: relay dedup keeps matching the call
-    as it was first accepted (see `find_relay_duplicate`).
+    as it was first accepted (see `find_relay_duplicate`). So is
+    parsed_json's `source`: it stays the message's `messages.source`.
     """
+    source = _message_source(conn, channel_id=channel_id, message_id=message_id)
     conn.execute(
         "UPDATE signals SET parsed_json = ?, trade_hash = ?, version = version + 1 "
         "WHERE channel_id = ? AND message_id = ?",
-        (signal_to_json(signal), signal.content_hash, channel_id, message_id),
+        (signal_to_json(signal, source=source), signal.content_hash, channel_id, message_id),
     )
 
 
