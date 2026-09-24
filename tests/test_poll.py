@@ -683,12 +683,12 @@ class _HangingWriter(db.Writer):
 
     hang = False
 
-    def submit(self, fn):
+    def submit(self, fn, **kwargs):
         if self.hang:
             import concurrent.futures
 
             return concurrent.futures.Future()
-        return super().submit(fn)
+        return super().submit(fn, **kwargs)
 
 
 def test_a_hung_writer_stops_the_poll_instead_of_hanging_it(tmp_path: Path) -> None:
@@ -712,6 +712,92 @@ def test_a_hung_writer_stops_the_poll_instead_of_hanging_it(tmp_path: Path) -> N
 
     assert exit_code == EXIT_LISTENER_STOPPED
     assert isinstance(poll_task.exception(), WriterUnresponsiveError)
+
+
+
+# -- another program holding the write lock ---------------------------------------
+#
+# Group-1 review of the final fix wave: since F21 every Writer job opens
+# with BEGIN IMMEDIATE, so the writer probes -- which only check that the
+# writer thread answers -- waited for the write lock too. Another program
+# holding it longer than the busy timeout (a database browser with an
+# unsaved edit, later Plan 3's worker) then failed the per-round probe with
+# "database is locked", the poll task died, and `.\xaucopier watch`
+# stopped with exit 4: every later message missed until someone noticed.
+# The probes are read-only jobs now, which never wait for that lock.
+
+
+@contextlib.contextmanager
+def _write_lock_held_by_another_program(db_path: Path):
+    holder = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        yield
+    finally:
+        if holder.in_transaction:
+            holder.execute("ROLLBACK")
+        holder.close()
+
+
+def test_another_program_holding_the_write_lock_does_not_stop_the_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The round that meets the lock cannot store anything (its writes
+    wait out the busy timeout and fail) -- but the poll survives it, and
+    the next round, after the lock is released, recovers the message."""
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 100)
+    db_path = tmp_path / "store.db"
+    _seed_pointer(db_path, A, 9)
+    time = SteppedTime()
+
+    async def scenario():
+        client = FakeTelegramClient()
+        async with _polling(db_path, client, time) as listener:
+            with _write_lock_held_by_another_program(db_path):
+                client.add_to_history(A, _chatter(10))
+                await _run_rounds(listener, time)
+                stored_while_locked = _stored_ids(db_path)
+            await _run_rounds(listener, time)
+            return stored_while_locked, listener.poll_task.done()
+
+    stored_while_locked, poll_stopped = asyncio.run(scenario())
+
+    assert stored_while_locked == []
+    assert not poll_stopped
+    assert _stored_ids(db_path) == [10]
+    assert _pointer(db_path) == 10
+
+
+def test_watch_starts_while_another_program_holds_the_write_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The startup probe too: it proves the writer thread connected, and
+    must not turn someone else's write lock into "the writer thread could
+    not connect". The start-up read of the channel cannot be stored while
+    the lock is held; the first poll round after the release stores it."""
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 100)
+    db_path = tmp_path / "store.db"
+    _seed_pointer(db_path, A, 9)
+    time = SteppedTime()
+
+    async def scenario():
+        client = FakeTelegramClient()
+        client.add_to_history(A, _chatter(10))
+        with _write_lock_held_by_another_program(db_path):
+            listener = _build(db_path, client, time)
+            await listener.start()
+        try:
+            stored_before_the_poll = _stored_ids(db_path)
+            await _run_rounds(listener, time)
+            return stored_before_the_poll, listener.poll_task.done()
+        finally:
+            await listener.aclose()
+
+    stored_before_the_poll, poll_stopped = asyncio.run(scenario())
+
+    assert stored_before_the_poll == []
+    assert not poll_stopped
+    assert _stored_ids(db_path) == [10]
 
 
 # -- the pointer and the beat -------------------------------------------------------

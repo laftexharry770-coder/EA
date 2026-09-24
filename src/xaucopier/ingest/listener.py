@@ -605,15 +605,18 @@ class Listener:
         paths outside this module -- the window re-read."""
         self._record_handler_error(channel_id, message_id, exc, source=source)
 
-    async def _run_on_writer(self, job: Callable[[Connection], Any]) -> Any:
+    async def _run_on_writer(
+        self, job: Callable[[Connection], Any], *, read_only: bool = False
+    ) -> Any:
         """Run `job` on the writer thread and await it -- the one door
         every listener write goes through (the startup probe aside, which
         has its own handling). A `WriterDeadError` is re-raised to the
         caller *and* reported to `wait_until_stopped()`, so a writer that
         dies after startup stops the listener instead of leaving it
-        running with nothing able to record."""
+        running with nothing able to record. `read_only` is passed to
+        `Writer.submit`: such a job never waits for the write lock."""
         try:
-            return await asyncio.wrap_future(self.writer.submit(job))
+            return await asyncio.wrap_future(self.writer.submit(job, read_only=read_only))
         except db.WriterDeadError as exc:
             self._writer_died(exc)
             raise
@@ -841,8 +844,12 @@ class Listener:
         go unnoticed until the morning's first signal, which it would then
         fail to store. The poll calls this once per interval. It goes
         through `_run_on_writer()`, so a `WriterDeadError` stops the
-        listener exactly as a failed ingest does (and is re-raised)."""
-        await self._run_on_writer(_writer_noop)
+        listener exactly as a failed ingest does (and is re-raised).
+
+        A read-only job: it asks whether the writer thread answers, not
+        whether the write lock is free. Another program holding that lock
+        past the busy timeout must not fail it and stop `watch`."""
+        await self._run_on_writer(_writer_noop, read_only=True)
 
     async def record_metric(self, name: str, value: int = 1) -> None:
         """`metrics(today, name) += value`, on the writer thread, where
@@ -1024,7 +1031,9 @@ class Listener:
         # Bounded, because "wait for the writer" must never become "wait
         # forever": a supervisor cannot tell a hung start() from a
         # healthy listener, and a hung listener misses every trade.
-        probe = asyncio.wrap_future(self.writer.submit(_writer_ready_probe))
+        # Read-only: another program holding the write lock at this moment
+        # must not look like "the writer thread could not connect".
+        probe = asyncio.wrap_future(self.writer.submit(_writer_ready_probe, read_only=True))
         try:
             await asyncio.wait_for(probe, timeout=self._writer_ready_timeout)
         except TimeoutError as exc:

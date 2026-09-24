@@ -1064,7 +1064,7 @@ class _SwitchablyDeadWriter(db.Writer):
 
     dead = False
 
-    def submit(self, fn):
+    def submit(self, fn, **kwargs):
         if self.dead:
             import concurrent.futures
 
@@ -1072,7 +1072,7 @@ class _SwitchablyDeadWriter(db.Writer):
             error = db.WriterDeadError("the writer thread died (simulated)")
             future.set_exception(error)
             return future
-        return super().submit(fn)
+        return super().submit(fn, **kwargs)
 
 
 def test_a_dead_writer_never_counts_toward_a_skip(

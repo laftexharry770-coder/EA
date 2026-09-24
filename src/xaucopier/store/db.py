@@ -29,9 +29,20 @@ Design decisions (the brief specifies the interface, not the body):
   ``close()``, ``cursor()``, ``executescript()`` (which commits first),
   assigning ``isolation_level``, ``autocommit`` or any other attribute,
   and ``execute()``/``executemany()`` of ``BEGIN``, ``COMMIT``, ``END``,
-  ``ROLLBACK``, ``SAVEPOINT`` or ``RELEASE``. Each raises
-  ``WriterMisuseError``, and the job is rolled back and fails with it even
-  if ``fn`` caught it (final review F20). See ``WriterMisuseError``.
+  ``ROLLBACK``, ``SAVEPOINT`` or ``RELEASE``. The cursor ``execute()``
+  returns is a guarded stand-in too (``_JobCursor``): its own
+  ``execute()``/``executemany()`` are checked the same way, its
+  ``executescript()`` is refused, and it does not hand out the real
+  connection (``.connection``). Each refusal raises ``WriterMisuseError``,
+  and the job is rolled back and fails with it even if ``fn`` caught it
+  (final review F20). See ``WriterMisuseError``.
+- ``submit(fn, read_only=True)`` is for a job that only reads -- the
+  listener's writer probes, which prove the writer thread still answers.
+  No transaction is opened for it, so it never waits for the write lock:
+  another program holding that lock past the busy timeout must not make
+  a healthy writer look dead and stop ``watch`` (group-1 review of the
+  final fix wave). Such a job may run ``SELECT`` statements only; any
+  other statement is refused before it runs, with ``WriterMisuseError``.
 - ``stop()`` pushes a sentinel onto the queue rather than signalling the
   thread out-of-band. Because ``queue.Queue`` is FIFO, the sentinel is
   only ever processed after every job submitted before ``stop()`` was
@@ -173,15 +184,21 @@ class WriterMisuseError(RuntimeError):
     `autocommit` or any other attribute, or `execute()`/`executemany()`
     of a transaction-control statement (BEGIN, COMMIT, END, ROLLBACK,
     SAVEPOINT, RELEASE -- leading comments and case do not hide one).
-    The job is then rolled back and its future fails with this error,
-    even if `fn` caught it and carried on: nothing the job wrote is kept.
+    The same goes for the cursor `execute()` returns: its `execute()`/
+    `executemany()` of such a statement, its `executescript()`, and
+    asking it for `.connection`. In a read-only job (`submit(fn,
+    read_only=True)`), any statement other than a `SELECT` is refused
+    too. The job is then rolled back and its future fails with this
+    error, even if `fn` caught it and carried on: nothing the job wrote
+    is kept.
 
-    One backstop remains for a path the stand-in does not guard (a
-    cursor's own `execute("COMMIT")`, or reaching the real connection
-    through `cursor.connection`): if the Writer's transaction is found
-    closed after `fn` returns, and SQLite did not close it itself, the
-    future fails with this error too -- and in that case what `fn` wrote
-    before closing it may already be committed.
+    One backstop remains for reaching the real connection behind the
+    stand-in's back (its private attribute): if the Writer's transaction
+    is found closed after `fn` returns, and SQLite did not close it
+    itself, the future fails with this error too -- and in that case what
+    `fn` wrote before closing it may already be committed. A read-only
+    job found to have opened a transaction that way is rolled back and
+    fails with this error.
 
     Not raised for a rollback SQLite makes on its own (a full disk,
     `INSERT OR ROLLBACK`, a trigger's `RAISE(ROLLBACK)`): that job's future
@@ -259,7 +276,7 @@ class Writer:
         self._thread.start()
 
     def submit(
-        self, fn: Callable[[sqlite3.Connection], T]
+        self, fn: Callable[[sqlite3.Connection], T], *, read_only: bool = False
     ) -> concurrent.futures.Future[T]:
         """Queue `fn` to run on the writer thread. Returns a
         `concurrent.futures.Future` that resolves with `fn`'s return
@@ -272,13 +289,21 @@ class Writer:
         rolls back and fails the future with that exception. `fn` is
         given a stand-in for the connection that only runs statements:
         any attempt to commit, roll back or otherwise end or reshape the
-        transaction raises `WriterMisuseError` before it runs, and the
+        transaction -- through the stand-in or through a cursor it
+        returned -- raises `WriterMisuseError` before it runs, and the
         whole job is rolled back and fails with it (see that class). A
         rollback SQLite makes itself (a full disk, `INSERT OR ROLLBACK`,
         `RAISE(ROLLBACK)`) fails the future with the real `sqlite3`
         error, with nothing of the job kept. If the write lock cannot be
         had within the busy timeout, the future fails with SQLite's
         "database is locked" and `fn` never runs.
+
+        With `read_only=True`, no transaction is opened, so `fn` never
+        waits for the write lock -- for a job that only has to prove the
+        writer thread answers. `fn` may then run `SELECT` statements
+        only: any other statement raises `WriterMisuseError` before it
+        runs, and the job fails with it. The same refusals of
+        transaction control apply.
 
         If the returned future is cancelled before the writer thread
         reaches it, `fn` is never invoked -- no statement it would have
@@ -297,7 +322,7 @@ class Writer:
             if self._death is not None:
                 future.set_exception(self._dead_error(self._death))
                 return future
-            self._queue.put((fn, future))
+            self._queue.put((fn, future, read_only))
         return future
 
     def stop(self, timeout: float) -> None:
@@ -325,8 +350,8 @@ class Writer:
                 job = self._queue.get()
                 if job is None:
                     break
-                fn, in_flight = job
-                self._run_job(conn, fn, in_flight)
+                fn, in_flight, read_only = job
+                self._run_job(conn, fn, in_flight, read_only=read_only)
                 in_flight = None
         except BaseException as exc:  # noqa: BLE001 -- same: never orphan a future
             self._die(exc, in_flight=in_flight)
@@ -382,6 +407,8 @@ class Writer:
         conn: sqlite3.Connection,
         fn: Callable[[sqlite3.Connection], object],
         future: concurrent.futures.Future,
+        *,
+        read_only: bool = False,
     ) -> None:
         if not future.set_running_or_notify_cancel():
             # The caller cancelled this job before the writer thread
@@ -394,20 +421,25 @@ class Writer:
                 # Only if an earlier job's commit and rollback both
                 # failed: never start a job inside someone else's work.
                 conn.rollback()
-            # Before fn, so fn's reads are under the write lock too (F21).
-            conn.execute("BEGIN IMMEDIATE")
+            if not read_only:
+                # Before fn, so fn's reads are under the write lock too (F21).
+                conn.execute("BEGIN IMMEDIATE")
         except Exception as exc:  # noqa: BLE001 -- e.g. "database is locked"
             Writer._rollback_quietly(conn)
             future.set_exception(exc)
             return
 
-        job_conn = _JobConnection(conn)
+        job_conn = _JobConnection(conn, read_only=read_only)
         fn_exc: Exception | None = None
         result: object = None
         try:
             result = fn(job_conn)  # type: ignore[arg-type] -- a stand-in, see _JobConnection
         except Exception as exc:  # noqa: BLE001 -- must reach the future, never kill the thread
             fn_exc = exc
+
+        if read_only:
+            Writer._finish_read_only(conn, job_conn, future, fn_exc, result)
+            return
 
         sqlite_rollback = job_conn.sqlite_rollback
         if sqlite_rollback is None and isinstance(fn_exc, sqlite3.Error) and not conn.in_transaction:
@@ -458,6 +490,36 @@ class Writer:
         future.set_result(result)
 
     @staticmethod
+    def _finish_read_only(
+        conn: sqlite3.Connection,
+        job_conn: _JobConnection,
+        future: concurrent.futures.Future,
+        fn_exc: Exception | None,
+        result: object,
+    ) -> None:
+        """A read-only job has returned or raised. It opened no
+        transaction, so there is nothing to commit -- unless fn wrote
+        behind the stand-in's back, which opened one: that is rolled back
+        at once (it would hold the write lock) and the job is misuse."""
+        if conn.in_transaction:
+            Writer._rollback_quietly(conn)
+            misuse = WriterMisuseError(
+                "fn wrote in a read-only job, by a path the Writer does not guard; "
+                "what it wrote was rolled back. A read-only job may only run SELECT."
+            )
+            if fn_exc is not None:
+                misuse.__cause__ = fn_exc
+            future.set_exception(misuse)
+            return
+        if job_conn.misuse is not None:
+            future.set_exception(job_conn.misuse)
+            return
+        if fn_exc is not None:
+            future.set_exception(fn_exc)
+            return
+        future.set_result(result)
+
+    @staticmethod
     def _rollback_quietly(conn: sqlite3.Connection) -> None:
         try:
             conn.rollback()
@@ -495,26 +557,37 @@ class _JobConnection:
     """What a Writer job's `fn` gets instead of the connection: every
     read and every ordinary statement passes straight through, and every
     way of ending or reshaping the Writer's transaction raises
-    `WriterMisuseError` *before it runs* (see that class).
+    `WriterMisuseError` *before it runs* (see that class). In a read-only
+    job, so does every statement that is not a `SELECT`. The cursors
+    `execute()`/`executemany()` return are guarded the same way
+    (`_JobCursor`).
 
     It also notes, for `Writer._run_job`, the first misuse (so a job that
     catches the error still fails) and the first `sqlite3` error after
     which SQLite had ended the transaction itself (so a full disk is
     reported as a full disk, even if `fn` caught it)."""
 
-    __slots__ = ("_conn", "misuse", "sqlite_rollback")
+    __slots__ = ("_conn", "misuse", "read_only", "sqlite_rollback")
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, *, read_only: bool = False) -> None:
         object.__setattr__(self, "_conn", conn)
         object.__setattr__(self, "misuse", None)
+        object.__setattr__(self, "read_only", read_only)
         object.__setattr__(self, "sqlite_rollback", None)
 
     def _refuse(self, what: str) -> NoReturn:
-        error = WriterMisuseError(
-            f"fn {what}; the Writer owns the transaction for the whole submitted "
-            "job -- fn must only execute statements and let the Writer commit or "
-            "roll back. Nothing this job wrote was kept."
-        )
+        if self.read_only:
+            tail = (
+                "a read-only job may only run SELECT statements and must leave the "
+                "transaction to the Writer. Nothing was written."
+            )
+        else:
+            tail = (
+                "the Writer owns the transaction for the whole submitted job -- fn "
+                "must only execute statements and let the Writer commit or roll "
+                "back. Nothing this job wrote was kept."
+            )
+        error = WriterMisuseError(f"fn {what}; {tail}")
         if self.misuse is None:
             object.__setattr__(self, "misuse", error)
         raise error
@@ -522,6 +595,8 @@ class _JobConnection:
     def _check(self, sql: object, method: str) -> None:
         if isinstance(sql, str):
             keyword = _leading_keyword(sql)
+            if self.read_only and keyword != "SELECT":
+                self._refuse(f"ran {keyword or 'a statement'} through {method}() in a read-only job")
             if keyword in _TRANSACTION_CONTROL:
                 self._refuse(f"ran {keyword} through {method}()")
 
@@ -538,13 +613,13 @@ class _JobConnection:
                 object.__setattr__(self, "sqlite_rollback", exc)
             raise
 
-    def execute(self, sql: str, *args: object, **kwargs: object) -> sqlite3.Cursor:
+    def execute(self, sql: str, *args: object, **kwargs: object) -> _JobCursor:
         self._check(sql, "execute")
-        return self._run(self._conn.execute, sql, *args, **kwargs)
+        return _JobCursor(self._run(self._conn.execute, sql, *args, **kwargs), self)
 
-    def executemany(self, sql: str, *args: object, **kwargs: object) -> sqlite3.Cursor:
+    def executemany(self, sql: str, *args: object, **kwargs: object) -> _JobCursor:
         self._check(sql, "executemany")
-        return self._run(self._conn.executemany, sql, *args, **kwargs)
+        return _JobCursor(self._run(self._conn.executemany, sql, *args, **kwargs), self)
 
     def executescript(self, *args: object, **kwargs: object) -> NoReturn:
         self._refuse("called executescript(), which commits the open transaction first")
@@ -568,3 +643,51 @@ class _JobConnection:
         if name in ("isolation_level", "autocommit"):
             self._refuse(f"set {name}, which can commit or end the open transaction")
         self._refuse(f"set {name} on the Writer's connection, which every job shares")
+
+
+class _JobCursor:
+    """The cursor a Writer job gets back from `execute()`/`executemany()`:
+    fetching, iterating, `lastrowid`, `rowcount`, `description` and the
+    rest pass straight through. Its own `execute()`/`executemany()` are
+    checked exactly like the job connection's (they would otherwise run a
+    `COMMIT` unseen: final fix wave, group-1 review), its
+    `executescript()` is refused (it commits first), and it does not hand
+    out the real connection (`.connection`)."""
+
+    __slots__ = ("_cursor", "_job")
+
+    def __init__(self, cursor: sqlite3.Cursor, job: _JobConnection) -> None:
+        object.__setattr__(self, "_cursor", cursor)
+        object.__setattr__(self, "_job", job)
+
+    def execute(self, sql: str, *args: object, **kwargs: object) -> _JobCursor:
+        self._job._check(sql, "a cursor's execute")
+        self._job._run(self._cursor.execute, sql, *args, **kwargs)
+        return self
+
+    def executemany(self, sql: str, *args: object, **kwargs: object) -> _JobCursor:
+        self._job._check(sql, "a cursor's executemany")
+        self._job._run(self._cursor.executemany, sql, *args, **kwargs)
+        return self
+
+    def executescript(self, *args: object, **kwargs: object) -> NoReturn:
+        self._job._refuse(
+            "called a cursor's executescript(), which commits the open transaction first"
+        )
+
+    @property
+    def connection(self) -> NoReturn:
+        self._job._refuse("asked a cursor for the Writer's connection")
+
+    def __iter__(self) -> _JobCursor:
+        return self
+
+    def __next__(self) -> object:
+        return next(self._cursor)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._cursor, name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        # arraysize, row_factory: they only change this one cursor.
+        setattr(self._cursor, name, value)
