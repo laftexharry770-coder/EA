@@ -571,3 +571,178 @@ def test_real_accounts_toml_loads():
             enabled=True,
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Final review F10 + ledger minor 50: the gate fields must be real booleans.
+# A quoted "false" is a non-empty string, so it is *truthy*: before this
+# fix it loaded as-is and every `if enabled` / `if allow_live` treated it
+# as ON -- the gate failed open. `login` gets the same int-not-bool guard
+# ordinal and magic_base already have.
+# ---------------------------------------------------------------------------
+
+_CHANNEL_BLOCK = """
+[[channels]]
+channel_id = -1001234567890
+name       = "a"
+parser     = "mmh"
+ordinal    = 1
+enabled    = {enabled}
+"""
+
+
+@pytest.mark.parametrize("value", ['"false"', '"true"', "0", "1", '""'])
+def test_channel_enabled_must_be_a_real_boolean(tmp_path: Path, value: str):
+    p = _write(tmp_path, "channels.toml", _CHANNEL_BLOCK.format(enabled=value))
+    with pytest.raises(ConfigError, match=r"channel 'a': enabled must be true or false"):
+        load_channels(p)
+
+
+def test_placeholder_channel_with_quoted_enabled_names_the_real_problem(tmp_path: Path):
+    """The verifier's second observation: with channel_id = 0 a quoted
+    "false" used to be reported as 'enabled with channel_id=0', which is
+    the opposite of what the user wrote."""
+    p = _write(
+        tmp_path,
+        "channels.toml",
+        _CHANNEL_BLOCK.format(enabled='"false"').replace("-1001234567890", "0"),
+    )
+    with pytest.raises(ConfigError, match="enabled must be true or false"):
+        load_channels(p)
+
+
+def _account(**overrides: str) -> str:
+    fields = {
+        "account_id": '"a"',
+        "broker": '"ICMarkets"',
+        "terminal_path": "'C:\\MT5\\a.exe'",  # a TOML literal string: no escapes
+        "login": "1",
+        "server": '"s1"',
+        "symbol": '"XAUUSD"',
+        "fixed_lot": "0.01",
+        "magic_base": "1",
+        "ordinal": "1",
+        "enabled": "true",
+    }
+    fields.update(overrides)
+    lines = [f"{key} = {value}" for key, value in fields.items() if value is not None]
+    return "[[accounts]]\n" + "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize("value", ['"false"', '"true"', "0", "1"])
+def test_account_enabled_must_be_a_real_boolean(tmp_path: Path, value: str):
+    p = _write(tmp_path, "accounts.toml", _account(enabled=value))
+    with pytest.raises(ConfigError, match=r"account 'a': enabled must be true or false"):
+        load_accounts(p)
+
+
+@pytest.mark.parametrize("value", ['"false"', '"true"', "0", "1", '"no"'])
+def test_allow_live_must_be_a_real_boolean(tmp_path: Path, value: str):
+    """allow_live is the hard gate against a real-money account (spec G1);
+    a quoted "false" must never load as a truthy string."""
+    p = _write(tmp_path, "accounts.toml", _account(allow_live=value))
+    with pytest.raises(ConfigError, match=r"account 'a': allow_live must be true or false"):
+        load_accounts(p)
+
+
+@pytest.mark.parametrize("value", ["true", "false"])
+def test_allow_live_real_booleans_load_as_booleans(tmp_path: Path, value: str):
+    p = _write(tmp_path, "accounts.toml", _account(allow_live=value))
+    (account,) = load_accounts(p)
+    assert account.allow_live is (value == "true")
+
+
+@pytest.mark.parametrize("value", ["true", "false", '"53027243"', "5.0"])
+def test_account_login_must_be_an_integer_not_a_bool(tmp_path: Path, value: str):
+    p = _write(tmp_path, "accounts.toml", _account(login=value))
+    with pytest.raises(ConfigError, match=r"account 'a': login must be an integer"):
+        load_accounts(p)
+
+
+# ---------------------------------------------------------------------------
+# Ledger minor 46: a missing required key that is not the ordinal is named.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["account_id", "broker", "terminal_path", "login", "server", "symbol",
+     "fixed_lot", "magic_base", "enabled"],
+)
+def test_account_missing_required_key_is_a_load_error_naming_it(tmp_path: Path, key: str):
+    p = _write(tmp_path, "accounts.toml", _account(**{key: None}))
+    with pytest.raises(ConfigError, match=f"missing required key '{key}'"):
+        load_accounts(p)
+
+
+@pytest.mark.parametrize("key", ["channel_id", "name", "parser", "enabled"])
+def test_channel_missing_required_key_is_a_load_error_naming_it(tmp_path: Path, key: str):
+    text = "\n".join(
+        line for line in _CHANNEL_BLOCK.format(enabled="true").splitlines()
+        if not line.startswith(f"{key} ")
+    )
+    p = _write(tmp_path, "channels.toml", text)
+    with pytest.raises(ConfigError, match=f"missing required key '{key}'"):
+        load_channels(p)
+
+
+# ---------------------------------------------------------------------------
+# Final review F40: one Telegram channel listed twice is a load error. The
+# listener keeps one block per id (whichever enabled one comes last),
+# while `channels` lists both, and ordinals feed magic numbers.
+# ---------------------------------------------------------------------------
+
+_TWO_CHANNELS = """
+[[channels]]
+channel_id = {first_id}
+name       = "VIP"
+parser     = "mmh"
+ordinal    = 2
+enabled    = {first_enabled}
+
+[[channels]]
+channel_id = {second_id}
+name       = "VIP copy"
+parser     = "mmh"
+ordinal    = 3
+enabled    = {second_enabled}
+"""
+
+
+@pytest.mark.parametrize(
+    ("first_enabled", "second_enabled"),
+    [("true", "true"), ("true", "false"), ("false", "true"), ("false", "false")],
+)
+def test_duplicate_channel_id_is_a_load_error_naming_both_blocks(
+    tmp_path: Path, first_enabled: str, second_enabled: str
+):
+    p = _write(
+        tmp_path,
+        "channels.toml",
+        _TWO_CHANNELS.format(
+            first_id=-1001111111111,
+            second_id=-1001111111111,
+            first_enabled=first_enabled,
+            second_enabled=second_enabled,
+        ),
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_channels(p)
+    message = str(caught.value)
+    assert "'VIP copy' (ordinal 3)" in message
+    assert "'VIP' (ordinal 2)" in message
+    assert "-1001111111111" in message
+    assert "same Telegram channel" in message
+
+
+def test_two_placeholder_channels_waiting_for_their_ids_still_load(tmp_path: Path):
+    """channel_id = 0 is "not looked up yet", not an id: resolve-channels
+    fills in each placeholder in turn, so two may wait at once."""
+    p = _write(
+        tmp_path,
+        "channels.toml",
+        _TWO_CHANNELS.format(
+            first_id=0, second_id=0, first_enabled="false", second_enabled="false"
+        ),
+    )
+    assert [c.channel_id for c in load_channels(p)] == [0, 0]

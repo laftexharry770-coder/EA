@@ -4,6 +4,14 @@ which parser each one's messages are read.
 Not pure -- reads TOML from disk via config.loader. domain/ and parsing/
 must never import this module (see tests/test_purity.py); this module may
 freely import parsing.registry to validate a channel's parser name.
+
+`enabled` must be a real TOML boolean: a quoted `"false"` is a non-empty
+string, which Python treats as *true*, so it would switch the channel ON
+(final review F10). And one Telegram channel may be listed only once: the
+listener keeps one block per `channel_id` (whichever enabled one comes
+last) while `channels` would list both, and ordinals feed magic numbers
+(final review F40). `channel_id = 0` is the "not looked up yet"
+placeholder, not an id, so several placeholders may wait at once.
 """
 from __future__ import annotations
 
@@ -37,6 +45,7 @@ def load_channels(path: Path) -> tuple[ChannelCfg, ...]:
 
     channels: list[ChannelCfg] = []
     seen_ordinals: dict[int, str] = {}
+    seen_ids: dict[int, tuple[str, int]] = {}
 
     for index, entry in enumerate(raw_channels):
         name = _field(entry, "name", index)
@@ -80,11 +89,27 @@ def load_channels(path: Path) -> tuple[ChannelCfg, ...]:
         # fills in. A disabled placeholder is fine; an enabled one means
         # the listener would silently watch nothing.
         enabled = _field(entry, "enabled", index)
+        if not isinstance(enabled, bool):
+            raise ConfigError(
+                f"channel {name!r}: enabled must be true or false (without quotes), "
+                f"got {enabled!r}"
+            )
         if enabled and channel_id == 0:
             raise ConfigError(
                 f"channel {name!r}: enabled with channel_id=0 (placeholder) -- "
                 "resolve the real channel id before enabling it"
             )
+
+        if channel_id != 0:
+            if channel_id in seen_ids:
+                other_name, other_ordinal = seen_ids[channel_id]
+                raise ConfigError(
+                    f"channel {name!r} (ordinal {ordinal}) has channel_id {channel_id}, "
+                    f"the same Telegram channel as channel {other_name!r} (ordinal "
+                    f"{other_ordinal}). A channel may be listed only once in "
+                    "channels.toml: delete one of the two [[channels]] blocks."
+                )
+            seen_ids[channel_id] = (name, ordinal)
 
         channels.append(
             ChannelCfg(

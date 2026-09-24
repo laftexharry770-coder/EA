@@ -401,15 +401,21 @@ def test_on_refuses_a_channel_whose_parser_does_not_exist(
 def test_on_refuses_a_second_copy_of_a_channel_already_on(
     rig: Rig, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Since final review F40 a channels.toml that lists one Telegram
+    channel twice does not load at all (on or off), so `channels on`
+    stops at the file, names both blocks and changes nothing."""
     twin = EXTRA.split("[[channels]]")[1].replace("ordinal    = 7\nenabled    = true",
                                                  "ordinal    = 9\nenabled    = false")
     rig.channels_path.write_bytes((SEEDED_TOML + "\n[[channels]]" + twin).encode("utf-8"))
     before = rig.channels_path.read_bytes()
 
-    assert cli_main.main(rig.argv("on", "9")) == exit_codes.EXIT_FAILED
+    assert cli_main.main(rig.argv("on", "9")) == exit_codes.EXIT_CONFIG_ERROR
 
     assert rig.channels_path.read_bytes() == before
-    assert "same Telegram channel" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "same Telegram channel" in err
+    assert "(ordinal 9)" in err and "(ordinal 7)" in err
+    assert "Nothing was changed" in err
 
 
 @pytest.mark.parametrize(("argv", "code"), [(("on", "4"), 1), (("on",), 2), (("off",), 2)])
