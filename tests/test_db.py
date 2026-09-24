@@ -1401,3 +1401,22 @@ def test_a_caught_misuse_outranks_an_ordinary_sqlite_error_fn_raises_afterwards(
     (outcome,) = _run_jobs(db_path, job)
     assert isinstance(outcome, WriterMisuseError), repr(outcome)
     assert _channel_ids(db_path) == []
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (sqlite3.OperationalError("database is locked"), True),
+        (sqlite3.OperationalError("database table is locked"), True),
+        (sqlite3.OperationalError("database is busy"), True),
+        (sqlite3.OperationalError("no such table: nope"), False),
+        (sqlite3.IntegrityError("UNIQUE constraint failed"), False),
+        (ValueError("database is locked"), False),
+        (store_db.WriterDeadError("locked out"), False),
+    ],
+    ids=["locked", "table-locked", "busy", "no-such-table", "integrity", "not-sqlite", "dead"],
+)
+def test_is_lock_error_knows_a_lock_wait_from_everything_else(exc, expected):
+    """G1L-2's helper: the ingest package asks it whether a failure was
+    only another program holding the write lock."""
+    assert store_db.is_lock_error(exc) is expected

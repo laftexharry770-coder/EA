@@ -174,6 +174,17 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def is_lock_error(exc: BaseException) -> bool:
+    """True if `exc` is SQLite saying another connection holds the lock it
+    needed ("database is locked", "database is busy") -- a wait that ran
+    out, which says nothing about the data being written. For callers
+    that must not import `sqlite3` themselves (the `ingest/` package)."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
 class WriterMisuseError(RuntimeError):
     """A submitted `fn` tried to manage the transaction the `Writer` owns
     for the whole job.

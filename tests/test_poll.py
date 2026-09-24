@@ -1023,3 +1023,76 @@ def test_a_writer_death_met_by_the_stamp_stops_the_poll(
             return listener.poll_task.exception()
 
     assert isinstance(asyncio.run(scenario()), db.WriterDeadError)
+
+
+# -- group-1 review leftover G1L-2: a lock never skips a message ---------------------
+
+
+class _LockReleasingWriter(db.Writer):
+    """A real Writer that lets go of another program's lock (`holder`) the
+    moment the `release_after`-th ingest job has failed with "database is
+    locked" -- i.e. just before whatever the listener does next."""
+
+    def __init__(self, path: Path, holder: sqlite3.Connection, release_after: int) -> None:
+        super().__init__(path)
+        self.holder = holder
+        self.release_after = release_after
+        self.locked_ingests = 0
+
+    def submit(self, fn, **kwargs):
+        future = super().submit(fn, **kwargs)
+        if "ingest_message" in getattr(fn, "__qualname__", ""):
+            future.add_done_callback(self._count)
+        return future
+
+    def _count(self, future) -> None:  # runs on the writer thread, as the job fails
+        if future.cancelled() or future.exception() is None:
+            return
+        if "locked" in str(future.exception()):
+            self.locked_ingests += 1
+            if self.locked_ingests == self.release_after and self.holder.in_transaction:
+                self.holder.execute("ROLLBACK")
+
+
+def test_another_programs_lock_across_three_rounds_never_skips_the_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G1L-2. Another program holds the write lock for three rounds, and
+    lets go just after the third failed attempt. "database is locked"
+    says nothing about the message, so it must not count towards
+    MAX_HISTORY_ATTEMPTS: before, the third failure triggered the skip,
+    whose own write then found the lock free -- the message was skipped
+    for good (history_skipped 1, never stored)."""
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 100)
+    db_path = tmp_path / "store.db"
+    _seed_pointer(db_path, A, 9)
+    holder = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
+    writer = _LockReleasingWriter(db_path, holder, release_after=3)
+    time = SteppedTime()
+
+    async def scenario():
+        client = FakeTelegramClient()
+        async with _polling(db_path, client, time, writer=writer) as listener:
+            holder.execute("BEGIN IMMEDIATE")
+            client.add_to_history(A, _signal(10))
+            await _run_rounds(listener, time, rounds=3)
+            stored_after_the_lock = _stored_ids(db_path)
+            await _run_rounds(listener, time)
+            return stored_after_the_lock, listener.poll_task.done(), listener.handler_errors
+
+    try:
+        stored_after_the_lock, poll_stopped, errors = asyncio.run(scenario())
+    finally:
+        if holder.in_transaction:
+            holder.execute("ROLLBACK")
+        holder.close()
+
+    assert writer.locked_ingests == 3, "the lock did not hold for three rounds"
+    assert stored_after_the_lock == []
+    assert not poll_stopped
+    assert _stored(db_path) == [(10, "poll")]
+    assert _pointer(db_path) == 10
+    assert _rows(db_path, "SELECT COUNT(*) FROM metrics WHERE name = 'history_skipped'") == [(0,)]
+    assert _rows(db_path, "SELECT COUNT(*) FROM outbox")[0][0] == len(ACCOUNTS)
+    assert [e.message_id for e in errors] == [10, 10, 10]
+    assert all("locked" in e.error for e in errors)

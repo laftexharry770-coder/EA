@@ -153,10 +153,11 @@ DEFAULT_WRITER_READY_TIMEOUT = 30.0
 MAX_RECORDED_HANDLER_ERRORS = 256
 
 #: How many history reads may fail on the same message before it is
-#: skipped (see `Listener.ingest_history`). Each attempt can already wait
-#: out the writer's 10 s busy_timeout, so three is patient with a
-#: transient lock and still bounded for a message that can never be
-#: stored. Counted in memory, so a restart allows at most three more.
+#: skipped (see `Listener.ingest_history`). Only a failure that says
+#: something about the message counts: a dead writer or another program
+#: holding the database's write lock never does. Bounded for a message
+#: that can never be stored. Counted in memory, so a restart allows at
+#: most three more.
 MAX_HISTORY_ATTEMPTS = 3
 
 #: `metrics.name` bumped once per history message skipped after
@@ -668,7 +669,13 @@ class Listener:
         crash-loop anything.
 
         A `WriterDeadError` stops the batch but is never counted: it means
-        there is no writer, not that the message is bad.
+        there is no writer, not that the message is bad. Nor is SQLite's
+        "database is locked"/"busy" (`db.is_lock_error`): another program
+        holding the write lock says nothing about the message either, and
+        counting it let a lock held across three reads -- released just
+        before the skip's own write -- skip a message for good (group-1
+        review leftover G1L-2). Such a read is retried, uncounted, for as
+        long as the lock lasts.
         """
         if source not in HISTORY_SOURCES:
             raise ValueError(
@@ -686,13 +693,15 @@ class Listener:
                 result = await self.ingest_message(
                     incoming, channel_cfg=channel_cfg, source=source
                 )
-            except db.WriterDeadError as exc:
-                # No writer: says nothing about this message. Never counted.
-                self._record_handler_error(channel_id, message.id, exc, source=source)
-                outcomes.append(HistoryIngest(message_id=message.id, result=None))
-                break
             except Exception as exc:  # noqa: BLE001 -- recorded; retried, then skipped
                 self._record_handler_error(channel_id, message.id, exc, source=source)
+                if isinstance(exc, db.WriterDeadError) or db.is_lock_error(exc):
+                    # No writer, or another program holds the database's
+                    # write lock: either says nothing about this message.
+                    # Never counted -- a lock held across three reads must
+                    # not skip a message for good (G1L-2). Next read retries.
+                    outcomes.append(HistoryIngest(message_id=message.id, result=None))
+                    break
                 outcomes.append(HistoryIngest(message_id=message.id, result=None))
                 attempts = self._history_attempts.get(key, 0) + 1
                 self._history_attempts[key] = attempts
