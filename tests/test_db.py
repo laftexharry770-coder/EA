@@ -1286,3 +1286,118 @@ def test_a_read_only_job_never_runs_inside_a_transaction_a_failed_job_left_open(
     assert isinstance(failed, ValueError)
     assert seen == (False, 0)
     assert _channel_ids(db_path) == [9]
+
+
+# -- group-1 review leftovers G1L-3 / G1L-4 -----------------------------------------
+#
+# Since the Writer guards cursors too, the only way left to reach the real
+# connection is the stand-in's private attribute. Two branches of
+# _run_job are reachable only that way, and each is pinned here.
+
+
+def test_the_backstop_names_the_one_path_left_to_it(tmp_path: Path):
+    """G1L-3: the backstop's message no longer blames a cursor (cursors
+    are guarded); it names the stand-in's private connection -- and still
+    says what fn wrote may already be committed."""
+
+    def job(conn: sqlite3.Connection) -> str:
+        _insert_channel_state(conn, channel_id=1, last_id=1)
+        conn._conn.execute("COMMIT")
+        return "looked fine"
+
+    (outcome,) = _run_jobs(tmp_path / "store.db", job)
+    assert isinstance(outcome, WriterMisuseError), repr(outcome)
+    message = str(outcome)
+    assert "may already be committed" in message
+    assert "_conn" in message
+    assert "cursor" not in message
+
+
+def test_sqlites_own_rollback_met_through_the_private_connection_is_the_real_error(
+    tmp_path: Path,
+):
+    """G1L-4: the F31 fallback. An INSERT OR ROLLBACK run on the real
+    connection (behind the stand-in, so the stand-in never saw SQLite end
+    the transaction) raises IntegrityError out of fn: the job reports that
+    error -- not "fn ended the Writer's transaction" -- and keeps nothing."""
+
+    def job(conn: sqlite3.Connection) -> None:
+        _insert_channel_state(conn, channel_id=1, last_id=1)
+        conn._conn.execute("INSERT OR ROLLBACK INTO channel_state (channel_id) VALUES (1)")
+
+    db_path = tmp_path / "store.db"
+    (outcome,) = _run_jobs(db_path, job)
+    assert type(outcome) is sqlite3.IntegrityError, repr(outcome)
+    assert _channel_ids(db_path) == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [s for s in _WRITES if s.split()[0].upper() in {"INSERT", "UPDATE", "DELETE", "REPLACE", "WITH"}
+     or s.startswith("/*")],
+)
+def test_a_read_only_jobs_write_is_refused_before_it_runs(tmp_path: Path, sql):
+    """G1L-4: the refusal comes *before* the statement runs -- not only
+    the backstop that rolls a write back afterwards. fn swallows the
+    refusal and looks: no transaction was ever opened, so no write lock
+    was taken."""
+    db_path = tmp_path / "store.db"
+    seen: list[bool] = []
+
+    def swallowing(conn: sqlite3.Connection) -> None:
+        try:
+            conn.execute(sql)
+        except WriterMisuseError:
+            pass
+        seen.append(conn.in_transaction)
+
+    (outcome,) = _read_only(db_path, swallowing)
+    assert isinstance(outcome, WriterMisuseError), repr(outcome)
+    assert seen == [False]
+
+
+def test_a_read_only_insert_is_refused_at_once_while_another_program_holds_the_lock(
+    tmp_path: Path, monkeypatch
+):
+    """The same, measured: the refusal does not first wait out the busy
+    timeout for a lock another program holds."""
+    import time
+
+    monkeypatch.setattr(store_db, "_BUSY_TIMEOUT_MS", 3000)
+    db_path = tmp_path / "store.db"
+    connect(db_path, role="writer").close()
+    holder = sqlite3.connect(db_path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    writer = Writer(db_path)
+    writer.start()
+    try:
+        started = time.monotonic()
+        outcome = writer.submit(
+            lambda conn: conn.execute(_WRITES[0]), read_only=True
+        ).exception(timeout=10.0)
+        elapsed = time.monotonic() - started
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+        writer.stop(timeout=5.0)
+    assert isinstance(outcome, WriterMisuseError), repr(outcome)
+    assert elapsed < 1.5, f"the refusal waited {elapsed:.1f}s for the lock"
+
+
+def test_a_caught_misuse_outranks_an_ordinary_sqlite_error_fn_raises_afterwards(tmp_path: Path):
+    """The F31 fallback applies only when SQLite really ended the
+    transaction: an ordinary sqlite3 error with the transaction still open
+    does not hide a misuse fn caught earlier."""
+
+    def job(conn: sqlite3.Connection) -> None:
+        _insert_channel_state(conn, channel_id=1, last_id=1)
+        try:
+            conn.commit()
+        except WriterMisuseError:
+            pass
+        conn.execute("SELECT * FROM no_such_table")
+
+    db_path = tmp_path / "store.db"
+    (outcome,) = _run_jobs(db_path, job)
+    assert isinstance(outcome, WriterMisuseError), repr(outcome)
+    assert _channel_ids(db_path) == []

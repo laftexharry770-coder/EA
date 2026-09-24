@@ -442,6 +442,8 @@ class Writer:
             return
 
         sqlite_rollback = job_conn.sqlite_rollback
+        # Reachable only through the stand-in's private `_conn`: SQLite ended
+        # the transaction on a statement the stand-in never saw (F31, G1L-4).
         if sqlite_rollback is None and isinstance(fn_exc, sqlite3.Error) and not conn.in_transaction:
             sqlite_rollback = fn_exc
         if sqlite_rollback is not None:
@@ -461,14 +463,16 @@ class Writer:
             return
 
         if not conn.in_transaction:
-            # The Writer's transaction is gone, SQLite did not end it,
-            # and no guarded call did: fn reached the connection another
-            # way (a cursor's own execute("COMMIT"), cursor.connection).
+            # The Writer's transaction is gone, SQLite did not end it, and
+            # no guarded call did. The stand-in and its cursors guard every
+            # public path, so fn went behind them: the stand-in's private
+            # `_conn` attribute, the one way left to the real connection.
             misuse = WriterMisuseError(
-                "fn ended the Writer's transaction by a path the Writer does not "
-                "guard (a cursor's own execute('COMMIT'), or cursor.connection); "
-                "what fn wrote before that may already be committed. fn must only "
-                "execute statements and let the Writer commit or roll back."
+                "fn ended the Writer's transaction through the real connection "
+                "behind the stand-in (its private _conn attribute), which the "
+                "Writer cannot guard; what fn wrote before that may already be "
+                "committed. fn must only execute statements on the connection it "
+                "is given and let the Writer commit or roll back."
             )
             if fn_exc is not None:
                 misuse.__cause__ = fn_exc
