@@ -23,7 +23,7 @@ def test_every_command_the_runbook_tells_the_user_to_type_exists() -> None:
     typed = set(re.findall(r"\.\\xaucopier ([a-z][a-z-]*)", RUNBOOK))  # a command, not --help
     assert typed, "the runbook names no command"
     assert typed <= commands, typed - commands
-    assert {"setup-login", "resolve-channels", "watch", "status", "ack"} <= typed
+    assert {"setup-login", "resolve-channels", "watch", "status", "ack", "channels"} <= typed
 
 
 def test_the_runbook_never_invites_a_blank_2fa_password() -> None:
@@ -56,5 +56,14 @@ def test_the_runbook_says_what_the_user_must_know() -> None:
         "it cannot be left blank",
         "TELEGRAM_SESSION_DEAD",
         "TELEGRAM_API_ID_REJECTED",
+        # Task 12: choosing channels -- how, when it takes effect, and the
+        # format caveat for a new channel.
+        "## Choosing which channels to follow",
+        ".\\xaucopier channels add",
+        ".\\xaucopier channels off 2",
+        "A change takes effect the next time `watch` starts",
+        "If every channel is OFF, `watch` will not start",
+        "nothing will be traded from it",
+        "5–10 of its real messages",
     ):
         assert phrase in RUNBOOK, phrase

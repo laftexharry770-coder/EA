@@ -3,6 +3,8 @@
 This version only **records** the gold signals posted in the Telegram channel
 *MARKET MASTERY HUB / COMMUNITY*. It **does not place any trades**, and it
 contains no code that could. Your MetaTrader accounts are not touched.
+You can follow other channels as well, or instead: see **Choosing which
+channels to follow** below.
 
 You do steps 1–3 once. After that, step 4 is how you start it, and step 5 is
 how you check on it.
@@ -150,6 +152,46 @@ missed. Once you have dealt with one, clear it:
 - **Any other alert** — copy its two lines and send them to whoever looks
   after xaucopier, then clear it.
 
+## Choosing which channels to follow: `.\xaucopier channels`
+
+Signals can come from more than one Telegram channel, and you choose which.
+
+- **See them:** `.\xaucopier channels` lists every channel with its
+  **number**, whether it is **ON** or **OFF**, when its last message was
+  recorded, and how many signals it has produced. It only reads, so run it
+  whenever you like.
+- **Switch one off:** `.\xaucopier channels off 2` stops taking signals from
+  channel number 2. Nothing about it is deleted; you can switch it back on
+  later.
+- **Switch one on:** `.\xaucopier channels on 2`.
+- **Add a new channel:** first **join it in Telegram** on your phone. Then
+  stop `watch` (click in its window, press **Ctrl+C** and answer **Y**) and
+  type `.\xaucopier channels add`. Paste the channel's link, or just press
+  Enter and type the number next to it in the list of channels you have
+  joined. Then type `yes`. It is added **switched on**, with the next free
+  number. A channel that is already in the list is never added twice.
+
+The number to type is the one `.\xaucopier channels` shows next to the
+channel. It never changes, even when you add channels or switch them on and
+off.
+
+**A change takes effect the next time `watch` starts.** `watch` reads the
+list only when it starts. After switching a channel on or off, stop `watch`
+(**Ctrl+C**, then **Y**) and start it again with `.\xaucopier watch`. Adding a
+channel needs `watch` stopped anyway: only one program may use your Telegram
+login at a time.
+
+**If every channel is OFF, `watch` will not start** (exit code 5). Switch one
+back on first. A channel marked *NOT LOOKED UP YET* cannot be switched on
+until you run `.\xaucopier resolve-channels` for it (step 3).
+
+> **A new channel may be recorded but never traded.** So far the program can
+> only read signals written the way *MARKET MASTERY HUB / COMMUNITY* writes
+> them. A channel that writes its signals differently will still have its
+> messages recorded, but **nothing will be traded from it** until someone
+> builds a reader for that channel, which needs 5–10 of its real messages.
+> If you add such a channel, tell whoever looks after xaucopier.
+
 ## What the exit codes mean
 
 When `watch` (or any command) stops, it prints an exit code:
@@ -162,7 +204,7 @@ When `watch` (or any command) stops, it prints an exit code:
 | 3 | Telegram refuses this program's login: it was logged out (for example from Telegram → Settings → Devices), **a second copy of the session was used somewhere else at the same time**, or the account is deactivated, banned or frozen. | Do **not** just restart. Make sure nothing else uses this login, run step 2 again, then `watch`. A banned account cannot be fixed by any program. |
 | 4 | `watch` stopped unexpectedly (for example the internet dropped). | Safe to start `watch` again. |
 | 5 | Something in the setup is wrong (a config file, the channel number, the data folder, the session file) — or Telegram rejected your api_id/api_hash. | Read the message. Restarting will not help until it is fixed. For a rejected api_id: get a **new** pair (step 1), then run step 2 again. |
-| 6 | `watch` is already running on this PC. | Find its window. Never run two. |
+| 6 | `watch` is already running on this PC. (`channels add` and `resolve-channels` also stop with this code while `watch` runs.) | Find its window. Never run two. To add a channel, stop `watch` first. |
 | 130 | You pressed Ctrl+C (and answered **Y**). | Nothing — start it again when you want. |
 
 ## Only if asked: `.\xaucopier export-fixtures`
