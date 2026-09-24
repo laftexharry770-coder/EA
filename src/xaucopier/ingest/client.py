@@ -42,7 +42,9 @@ Two hazards this module exists to prevent:
 """
 from __future__ import annotations
 
-from typing import Literal
+import asyncio
+from collections.abc import Awaitable
+from typing import Any, Literal, TypeVar
 
 import pywintypes
 import win32api
@@ -55,6 +57,8 @@ from telethon.sessions import StringSession
 from xaucopier.ingest.secrets import SecretsBlob
 
 _MUTEX_NAME = r"Global\xaucopier_listener"
+
+T = TypeVar("T")
 
 #: The session or the account is dead and no retry can revive it (see
 #: the module docstring for why these and not `AuthKeyError`).
@@ -84,6 +88,45 @@ EXIT_TERMINAL_AUTH = 3
 #: Telegram rejects. The CLI uses the same code for every other permanent
 #: setup problem (cli/exit_codes.py). Do not restart.
 EXIT_CONFIG_ERROR = 5
+
+
+#: How long `watch` waits at startup for Telegram to answer -- the
+#: connect, then the chat list -- before it stops with exit 4 (ledger
+#: 145). The one-shot commands use a shorter wait of their own.
+STARTUP_TIMEOUT_SECONDS = 60.0
+
+
+class TelegramUnreachableError(Exception):
+    """Telegram did not answer within `seconds`: no network, or Telethon
+    reconnecting in a tight loop (a malformed reply makes `connect()`
+    retry for ever -- final review F06, side note). Its message is plain
+    words for the user; the caller adds what happens next."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        super().__init__(
+            f"Could not reach Telegram within {seconds:g} seconds. Check that this "
+            "computer is connected to the internet."
+        )
+
+
+async def telegram_within(awaitable: Awaitable[T], seconds: float) -> T:
+    """Await one call to Telegram, but for at most `seconds`; past that it
+    is cancelled and `TelegramUnreachableError` raised. Any error the call
+    itself raises passes through unchanged (a dead session must still be
+    recognised as one)."""
+    try:
+        return await asyncio.wait_for(awaitable, seconds)
+    except TimeoutError as exc:
+        raise TelegramUnreachableError(seconds) from exc
+
+
+async def connect_within(client: Any, seconds: float) -> None:
+    """`client.connect()`, bounded by `telegram_within`. Telethon's own
+    connect never gives up (`connection_retries=None`), which is right
+    for a running `watch` but leaves a start-up -- or a one-shot command
+    -- hanging for ever with no network."""
+    await telegram_within(client.connect(), seconds)
 
 
 class AlreadyRunningError(Exception):

@@ -21,8 +21,14 @@ never makes an RPC on the update path.
    writer that died (`WriterDeadError`) or never connected makes
    `start()` raise `ListenerStartupError` -- a `ListenerStopped`, so a
    non-zero exit -- instead of hanging with the process looking alive.
-1. **connect.**
-2. **`await client.get_dialogs()`.** This primes the per-channel `pts`
+1. **connect**, within a deadline (`client.STARTUP_TIMEOUT_SECONDS`,
+   60 s). Telethon's own connect never gives up, so with no network --
+   or a malformed reply making it reconnect in a tight loop -- `start()`
+   used to hang for ever (ledger 145). Past the deadline it raises
+   `ListenerStartupError` with a plain "Could not reach Telegram within
+   60 seconds", and `watch` exits 4.
+2. **`await client.get_dialogs()`**, within the same deadline. This
+   primes the per-channel `pts`
    state Telethon's update engine needs. It is not cosmetic -- skipping
    it degrades update delivery -- and it must happen before handlers
    exist, so the first update the engine dispatches is already against
@@ -380,6 +386,7 @@ class Listener:
         backfill_rpc_timeout: float = DEFAULT_RPC_TIMEOUT,
         writer_stop_timeout: float = DEFAULT_WRITER_STOP_TIMEOUT,
         writer_ready_timeout: float = DEFAULT_WRITER_READY_TIMEOUT,
+        telegram_timeout: float | None = None,
     ) -> None:
         self.client = client
         self.channels = tuple(channels)
@@ -397,6 +404,9 @@ class Listener:
         self._started_at: datetime | None = None
         self._writer_stop_timeout = writer_stop_timeout
         self._writer_ready_timeout = writer_ready_timeout
+        # The start-up deadline for connect() and get_dialogs(); None means
+        # client.STARTUP_TIMEOUT_SECONDS (60 s), read when start() runs.
+        self._telegram_timeout = telegram_timeout
         self._channels_by_id: dict[int, ChannelCfg] = {
             channel.channel_id: channel for channel in self.channels if channel.enabled
         }
@@ -1030,8 +1040,22 @@ class Listener:
         await self._start_writer_and_wait_for_connection()  # 0
         self._reader = db.connect(self.db_path, role="reader")
 
-        await self.client.connect()  # 1
-        await self.client.get_dialogs()  # 2
+        # Imported here for the same reason as in run_listener().
+        from xaucopier.ingest import client as client_module
+
+        timeout = (
+            self._telegram_timeout
+            if self._telegram_timeout is not None
+            else client_module.STARTUP_TIMEOUT_SECONDS
+        )
+        try:
+            await client_module.connect_within(self.client, timeout)  # 1
+            await client_module.telegram_within(self.client.get_dialogs(), timeout)  # 2
+        except client_module.TelegramUnreachableError as exc:
+            raise ListenerStartupError(
+                f"{exc} watch stops now (exit code 4); start it again once this "
+                "computer is back online."
+            ) from exc
 
         for channel in self.enabled_channels:  # 3
             await self._backfill_channel(channel)

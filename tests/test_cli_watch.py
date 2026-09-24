@@ -376,3 +376,38 @@ def test_the_real_single_instance_mutex_is_what_watch_takes(
     finally:
         held.release()
     assert rig.built == []
+
+
+# -- ledger 145: no network at start-up ------------------------------------------------
+
+
+@dataclass
+class _NoNetworkClient(ScriptedWatchClient):
+    """connect() never returns -- no network, or Telethon reconnecting in a
+    tight loop on a malformed reply (final review F06, side note)."""
+
+    async def connect(self) -> None:
+        self.calls.append("connect")
+        await asyncio.Event().wait()
+
+
+def test_watch_that_cannot_reach_telegram_stops_with_exit_4_and_says_so(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Before: start() waited on connect() for ever, `status` showing
+    STARTING. Now the start-up deadline (60 s; 0.1 s here) stops watch
+    with exit 4 -- restartable -- and a plain message."""
+    from xaucopier.ingest import client as client_module
+
+    monkeypatch.setattr(client_module, "STARTUP_TIMEOUT_SECONDS", 0.1)
+    client = _NoNetworkClient()
+    _use_client(rig, monkeypatch, client)
+
+    exit_code = cli_main.main(rig.argv())
+
+    assert exit_code == exit_codes.EXIT_LISTENER_STOPPED
+    assert _stamps(rig.db_path)[heartbeats.WATCH_STOPPED] == "4"
+    err = capsys.readouterr().err
+    assert "Could not reach Telegram within 0.1 seconds" in err
+    assert "add_event_handler" not in client.calls
+    assert rig.lock.released == 1

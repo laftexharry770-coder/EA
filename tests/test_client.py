@@ -159,3 +159,72 @@ def test_any_other_mutex_failure_is_not_mistaken_for_already_running(
     monkeypatch.setattr(client_module.win32event, "CreateMutex", broken)
     with pytest.raises(pywintypes.error):
         acquire_single_instance_lock()
+
+
+# ---------------------------------------------------------------------
+# Ledger 145 / final review F06 side note: a bounded connect
+# ---------------------------------------------------------------------
+
+class _Connecting:
+    """Just enough of a client for `connect_within`."""
+
+    def __init__(self, behaviour: str) -> None:
+        self.behaviour = behaviour
+        self.cancelled = False
+
+    async def connect(self) -> None:
+        import asyncio
+
+        if self.behaviour == "hang":
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+        if self.behaviour == "refused":
+            raise ConnectionRefusedError("refused")
+
+
+def test_connect_within_gives_up_after_its_deadline_in_plain_words() -> None:
+    """With no network (or Telethon reconnecting in a tight loop on a
+    malformed reply) connect() never returns. connect_within stops
+    waiting, cancels it, and says so plainly."""
+    import asyncio
+
+    from xaucopier.ingest.client import TelegramUnreachableError, connect_within
+
+    client = _Connecting("hang")
+    with pytest.raises(TelegramUnreachableError) as caught:
+        # The outer bound only keeps a broken deadline from hanging the suite.
+        asyncio.run(asyncio.wait_for(connect_within(client, 0.05), 5))
+    assert str(caught.value).startswith("Could not reach Telegram within 0.05 seconds.")
+    assert caught.value.seconds == 0.05
+    assert client.cancelled
+    assert "RPC" not in str(caught.value) and "client" not in str(caught.value)
+
+
+def test_connect_within_passes_through_success_and_any_other_error() -> None:
+    import asyncio
+
+    from xaucopier.ingest.client import connect_within
+
+    asyncio.run(connect_within(_Connecting("ok"), 5))
+    with pytest.raises(ConnectionRefusedError):
+        asyncio.run(connect_within(_Connecting("refused"), 5))
+
+
+def test_the_same_deadline_bounds_any_startup_call() -> None:
+    import asyncio
+
+    from xaucopier.ingest.client import TelegramUnreachableError, telegram_within
+
+    async def slow() -> str:
+        await asyncio.sleep(10)
+        return "late"
+
+    async def quick() -> str:
+        return "answered"
+
+    assert asyncio.run(telegram_within(quick(), 5)) == "answered"
+    with pytest.raises(TelegramUnreachableError, match="within 0.05 seconds"):
+        asyncio.run(telegram_within(slow(), 0.05))
