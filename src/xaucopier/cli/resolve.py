@@ -22,6 +22,11 @@ channel's `channel_id` and `enabled` may differ -- and only then
 always either exactly the old one or the fully checked new one; a
 failure at any step leaves it untouched and removes the temporary file.
 
+**`channels on` / `channels off` / `channels add` (`cli/channels.py`) write
+through the same path.** Their text edits (`set_enabled()`,
+`append_channel()`) live here beside `set_id_then_enable()`, and every one
+of them is saved by `write_config_atomically()`: there is one writer.
+
 **Comments and layout are kept.** Python ships a TOML reader but no
 writer, and no round-tripping TOML library is installed, so the edit is
 done on the text: inside the channel's own `[[channels]]` block, the
@@ -43,7 +48,7 @@ import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from telethon import utils
 from telethon.tl import types
@@ -65,8 +70,14 @@ PLACEHOLDER_ID = 0
 
 _HEADER = re.compile(r"^\s*\[")
 _CHANNELS_HEADER = re.compile(r"^\s*\[\[\s*channels\s*\]\]\s*(#.*)?$")
-_ID_LINE = re.compile(r"^(?P<lead>\s*channel_id\s*=\s*)0(?P<gap>\s*)(?:#.*)?$")
-_ENABLED_LINE = re.compile(r"^(?P<lead>\s*enabled\s*=\s*)false(?P<gap>\s*)(?:#.*)?$")
+_ID_LINE = re.compile(r"^(?P<lead>\s*channel_id\s*=\s*)(?P<value>0)(?P<gap>\s*)(?:#.*)?$")
+_ENABLED_LINE = re.compile(
+    r"^(?P<lead>\s*enabled\s*=\s*)(?P<value>false)(?P<gap>\s*)(?:#.*)?$"
+)
+#: The switch, either way (`channels on` / `channels off`).
+_SWITCH_LINE = re.compile(
+    r"^(?P<lead>\s*enabled\s*=\s*)(?P<value>true|false)(?P<gap>\s*)(?:#.*)?$"
+)
 #: A pasted post link (t.me/name/123) resolves as its channel (t.me/name).
 _POST_LINK = re.compile(
     r"^(?P<channel>(?:https?://)?(?:www\.)?t(?:elegram)?\.me/(?!joinchat/|c/)[A-Za-z0-9_]+)/\d+$"
@@ -118,23 +129,24 @@ def _rewrite_one(
     value: str,
     comment: str,
     key: str,
-    *,
-    old_value: str,
 ) -> list[str]:
+    """`lines` with the one line in `block` that `pattern` matches set to
+    `value` (replacing the pattern's `value` group), its trailing comment
+    replaced by `comment`. Anything but exactly one such line is refused."""
     matches = [
         number for number in range(*block) if pattern.match(_line_body(lines[number])[0])
     ]
     if len(matches) != 1:
         raise ResolveError(
-            f"channels.toml is laid out in a way resolve-channels cannot edit safely "
-            f"(found {len(matches)} plain `{key} = ...` placeholder lines in that "
+            f"channels.toml is laid out in a way xaucopier cannot edit safely "
+            f"(found {len(matches)} plain `{key} = ...` lines it could change in that "
             f"channel's section, expected exactly one)"
         )
     number = matches[0]
     body, ending = _line_body(lines[number])
     match = pattern.match(body)
     # Keep the trailing comment in its column when the new value fits.
-    gap = " " * max(1, len(match["gap"]) - (len(value) - len(old_value)))
+    gap = " " * max(1, len(match["gap"]) - (len(value) - len(match["value"])))
     updated = list(lines)
     updated[number] = f"{match['lead']}{value}{gap}# {comment}{ending}"
     return updated
@@ -173,7 +185,6 @@ def set_id_then_enable(text: str, *, index: int, channel_id: int, title: str, to
         str(channel_id),
         f"{_safe_comment(title)} -- looked up by resolve-channels on {today}",
         "channel_id",
-        old_value="0",
     )
     _check_no_enabled_placeholder("".join(lines))
     lines = _rewrite_one(
@@ -183,7 +194,26 @@ def set_id_then_enable(text: str, *, index: int, channel_id: int, title: str, to
         "true",
         "switched on by resolve-channels",
         "enabled",
-        old_value="false",
+    )
+    new_text = "".join(lines)
+    _check_no_enabled_placeholder(new_text)
+    return new_text
+
+
+def set_enabled(text: str, *, index: int, enabled: bool, comment: str) -> str:
+    """`text` with the `index`-th channel's `enabled = ...` line set to
+    `enabled` (for `channels on` / `channels off`), its trailing comment
+    replaced by `comment`. Checked against the loader's rule: switching on
+    a channel still at `channel_id = 0` raises instead of returning."""
+    lines = text.splitlines(keepends=True)
+    block = _channel_block(lines, index)
+    lines = _rewrite_one(
+        lines,
+        block,
+        _SWITCH_LINE,
+        "true" if enabled else "false",
+        _safe_comment(comment),
+        "enabled",
     )
     new_text = "".join(lines)
     _check_no_enabled_placeholder(new_text)
@@ -198,20 +228,29 @@ def _fsync_write(path: Path, data: bytes) -> None:
 
 
 def write_config_atomically(
-    path: Path, *, original: str, new_text: str, index: int, channel_id: int
+    path: Path,
+    *,
+    original: str,
+    new_text: str,
+    expect: Callable[[dict[str, Any]], None],
+    confirm: Callable[[tuple[ChannelCfg, ...]], bool],
+    change: str,
 ) -> None:
-    """Replace `path` with `new_text` -- all of it or none of it.
+    """Replace `path` (whose text was `original`) with `new_text` -- all of
+    it or none of it. The one way `channels.toml` is ever written.
 
+    `expect` makes the intended change -- and only it -- to a copy of
+    `original` as parsed; `change` says in words what that change is.
     `new_text` goes to a temporary file beside `path`, flushed to disk,
-    and is loaded back through the real loader (`load_channels`) and
-    compared with `original`: the parsed files must be identical except
-    the `index`-th channel's `channel_id` (now `channel_id`) and `enabled`
-    (now true). Only then is it `os.replace()`d over `path`, which is
+    and is read back: parsed, it must equal that copy exactly, so nothing
+    else in the file changed. It is then loaded through the real loader
+    (`load_channels`) and `confirm` must accept what loaded. Last, `path`
+    must still hold `original` -- nothing else changed it meanwhile. Only
+    then is the temporary file `os.replace()`d over `path`, which is
     atomic on NTFS. On any failure the temporary file is removed and
     `path` is exactly as it was."""
     expected = copy.deepcopy(tomllib.loads(original))
-    expected["channels"][index]["channel_id"] = channel_id
-    expected["channels"][index]["enabled"] = True
+    expect(expected)
 
     tmp = path.with_name(f".{path.name}.resolve-tmp")
     tmp.unlink(missing_ok=True)
@@ -221,11 +260,16 @@ def write_config_atomically(
         if written != expected:
             raise ResolveError(
                 "internal error: the edited channels.toml differs from the original in "
-                "more than the one channel's id and switch; nothing was written"
+                f"more than {change}; nothing was written"
             )
         loaded = load_channels(tmp)
-        if loaded[index].channel_id != channel_id or not loaded[index].enabled:
+        if not confirm(loaded):
             raise ResolveError("internal error: the edited channel did not load as expected")
+        if path.read_bytes() != original.encode("utf-8"):
+            raise ResolveError(
+                "channels.toml was changed by something else while this command ran; "
+                "nothing was written -- run the command again"
+            )
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
@@ -236,8 +280,48 @@ def save_resolved(path: Path, *, index: int, resolved: Resolved, today: str) -> 
     new_text = set_id_then_enable(
         original, index=index, channel_id=resolved.channel_id, title=resolved.title, today=today
     )
+
+    def expect(data: dict[str, Any]) -> None:
+        data["channels"][index]["channel_id"] = resolved.channel_id
+        data["channels"][index]["enabled"] = True
+
     write_config_atomically(
-        path, original=original, new_text=new_text, index=index, channel_id=resolved.channel_id
+        path,
+        original=original,
+        new_text=new_text,
+        expect=expect,
+        confirm=lambda loaded: (
+            loaded[index].channel_id == resolved.channel_id and loaded[index].enabled
+        ),
+        change="the one channel's id and switch",
+    )
+
+
+def save_switch(
+    path: Path, *, original: str, index: int, ordinal: int, enabled: bool, today: str
+) -> None:
+    """Switch the `index`-th channel -- number `ordinal` -- on or off in
+    `path`, whose text was `original`, through `write_config_atomically`."""
+    word = "on" if enabled else "off"
+    new_text = set_enabled(
+        original,
+        index=index,
+        enabled=enabled,
+        comment=f"switched {word} on {today} (channels {word} {ordinal})",
+    )
+
+    def expect(data: dict[str, Any]) -> None:
+        data["channels"][index]["enabled"] = enabled
+
+    write_config_atomically(
+        path,
+        original=original,
+        new_text=new_text,
+        expect=expect,
+        confirm=lambda loaded: (
+            loaded[index].ordinal == ordinal and loaded[index].enabled is enabled
+        ),
+        change=f"channel {ordinal}'s switch",
     )
 
 

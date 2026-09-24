@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "xaucopier"
-COMMANDS = "setup-login|resolve-channels|watch|status|ack|export-fixtures"
+COMMANDS = "setup-login|resolve-channels|channels|watch|status|ack|export-fixtures"
 WRONG = re.compile(rf"(`|with: |run )xaucopier ({COMMANDS})\b")
 #: A bare "run setup-login" -- no `.\xaucopier` at all -- is the same mistake.
 BARE = re.compile(rf"\b[Rr]un `?({COMMANDS})\b")
@@ -61,3 +61,6 @@ def test_the_check_bites() -> None:
     assert BARE.search("Run setup-login in an ordinary PowerShell window")
     assert BARE.search("then run resolve-channels again")
     assert not BARE.search("Run `.\\xaucopier setup-login` again")
+    assert WRONG.search("switch it on with `xaucopier channels on 2`")
+    assert BARE.search("then run channels add")
+    assert not WRONG.search("switch it on with `.\\xaucopier channels on 2`")

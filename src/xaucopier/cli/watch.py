@@ -150,8 +150,9 @@ def check_setup(config_dir: Path, db_path: Path) -> WatchSetup:
     if not enabled:
         raise SetupError(
             f"no channel is switched on in {channels_path}, so there is nothing to "
-            f"watch. Run `{paths.USER_COMMAND} resolve-channels` to look up the channel's "
-            "id and switch it on."
+            f"watch. See the channels with `{paths.USER_COMMAND} channels` and switch one "
+            f"on with `{paths.USER_COMMAND} channels on NUMBER` -- or, for a channel whose "
+            f"id has not been looked up yet, run `{paths.USER_COMMAND} resolve-channels`."
         )
     seen: dict[int, str] = {}
     for channel in enabled:

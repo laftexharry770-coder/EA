@@ -6,6 +6,19 @@
   produced. **Read-only**: the store is opened with `db.connect_readonly()`
   (as `status` does), `channels.toml` is only read, and Telegram is never
   contacted.
+- `channels on N` / `channels off N` switch channel number N on or off.
+  Neither contacts Telegram. `on` refuses a channel whose id has not been
+  looked up (`channel_id = 0`) and one whose parser xaucopier does not
+  have; `off` of the last channel still on is allowed, with a warning that
+  `watch` will then refuse to start.
+
+**Every write goes through `resolve.write_config_atomically()`**, the one
+writer `resolve-channels` also uses: the edited text is written to a
+temporary file, flushed to disk, parsed and compared with the original
+(only the intended change may differ), loaded through the real loader,
+checked against the file on disk once more, and only then `os.replace()`d
+over `channels.toml`. The file is always exactly the old one or the fully
+checked new one, with every other channel, comment and line ending kept.
 
 **A channel's number is its `ordinal`**, never its position in the file.
 The ordinal is explicit and unique (the Task 1 loader enforces both) and
@@ -22,16 +35,19 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from xaucopier.cli import exit_codes, paths
-from xaucopier.cli.resolve import PLACEHOLDER_ID
+from xaucopier.cli.resolve import PLACEHOLDER_ID, save_switch
 from xaucopier.cli.status import ago, when
 from xaucopier.cli.watch import SetupError, load_channels_config
 from xaucopier.config.channels import ChannelCfg
 from xaucopier.ingest.client import session_in_use
+from xaucopier.parsing.registry import parser_for
 from xaucopier.store import db, report
 
 _CMD = paths.USER_COMMAND
@@ -227,5 +243,163 @@ def cmd_list(args: argparse.Namespace) -> int:
     return exit_codes.EXIT_OK
 
 
+def parser_is_built(name: object) -> bool:
+    """Whether `name` is a parser xaucopier has (`parsing/registry.py`)."""
+    if not isinstance(name, str):
+        return False
+    try:
+        parser_for(name)
+    except KeyError:
+        return False
+    return True
+
+
+def _raw_channel(text: str, number: int) -> dict[str, Any] | None:
+    """Channel `number`'s own table, read leniently from the text -- so `on`
+    can say exactly what is wrong with that channel even where the loader
+    would reject the file as a whole. None if it cannot be found."""
+    try:
+        entries = tomllib.loads(text).get("channels")
+    except tomllib.TOMLDecodeError:
+        return None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        ordinal = entry.get("ordinal")
+        if isinstance(ordinal, int) and not isinstance(ordinal, bool) and ordinal == number:
+            return entry
+    return None
+
+
+def _takes_effect() -> str:
+    if session_in_use():
+        return WATCH_RUNNING_NOTE
+    return (
+        "watch reads this list when it starts, so this takes effect the next time "
+        f"you run `{_CMD} watch`."
+    )
+
+
+def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
+    """`channels on N` (`enabled`) or `channels off N`. Never contacts Telegram."""
+    number: int = args.number
+    path: Path = args.config_dir / paths.CHANNELS_FILE
+    word = "ON" if enabled else "OFF"
+    try:
+        original = path.read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return _config_problem(SetupError(f"{path} does not exist."))
+    except (OSError, UnicodeDecodeError) as exc:
+        return _config_problem(SetupError(f"{path} could not be read: {exc}"))
+
+    if enabled:
+        raw = _raw_channel(original, number)
+        if raw is not None and not parser_is_built(raw.get("parser")):
+            complain(
+                f"Channel {number} ({_printable(str(raw.get('name')))}) was NOT switched on: "
+                f"it is set to parser {raw.get('parser')!r}, which xaucopier does not have. "
+                "Nothing was changed.",
+                f"The only parser built so far is mmh ({PARSER_LAYOUTS['mmh']}). Set that "
+                f'channel\'s parser back to "mmh" in {path}, or remove the channel; until '
+                f"then `{_CMD} watch` will refuse to start.",
+            )
+            return exit_codes.EXIT_FAILED
+
+    try:
+        channels = load_channels_config(args.config_dir)
+    except SetupError as exc:
+        return _config_problem(exc)
+    found = [(index, cfg) for index, cfg in enumerate(channels) if cfg.ordinal == number]
+    if not found:
+        complain(
+            f"There is no channel number {number}. Nothing was changed. See the numbers "
+            f"with `{_CMD} channels`."
+        )
+        return exit_codes.EXIT_FAILED
+    index, cfg = found[0]
+    name = _printable(cfg.name)
+
+    if cfg.enabled == enabled:
+        say(f"Channel {number} ({name}) is already {word}. Nothing was changed.")
+        return exit_codes.EXIT_OK
+    if enabled and cfg.channel_id == PLACEHOLDER_ID:
+        complain(
+            f"Channel {number} ({name}) was NOT switched on: its numeric id has not been "
+            "looked up yet (channel_id is still 0). Nothing was changed.",
+            f"Run `{_CMD} resolve-channels` to look it up (that also switches it on), or "
+            f"add the channel with `{_CMD} channels add`.",
+        )
+        return exit_codes.EXIT_FAILED
+    if enabled:
+        twin = next(
+            (
+                other
+                for other in channels
+                if other.enabled and other.channel_id == cfg.channel_id and other is not cfg
+            ),
+            None,
+        )
+        if twin is not None:
+            complain(
+                f"Channel {number} ({name}) was NOT switched on: it is the same Telegram "
+                f"channel (id {cfg.channel_id}) as channel {twin.ordinal} "
+                f"({_printable(twin.name)}), which is already ON. Nothing was changed."
+            )
+            return exit_codes.EXIT_FAILED
+
+    try:
+        save_switch(
+            path,
+            original=original,
+            index=index,
+            ordinal=number,
+            enabled=enabled,
+            today=_utcnow().date().isoformat(),
+        )
+    except Exception as exc:  # noqa: BLE001 -- the writer leaves the file untouched on any failure
+        complain(
+            f"Could not save the change to {path}: {exc}",
+            f"The file was not changed: channel {number} is still "
+            f"{'OFF' if enabled else 'ON'}.",
+        )
+        return exit_codes.EXIT_CONFIG_ERROR
+
+    say(f"Channel {number} ({name}) is now {word}.")
+    if not enabled and not any(other.enabled for other in channels if other is not cfg):
+        say(
+            "WARNING: that was the last channel switched on. With no channel ON, "
+            f"`{_CMD} watch` will refuse to start (exit code {exit_codes.EXIT_CONFIG_ERROR}) "
+            f"until you switch one on with `{_CMD} channels on NUMBER`."
+        )
+    say(_takes_effect())
+    return exit_codes.EXIT_OK
+
+
+_ON_OFF_USAGE = (
+    "Say which channel, by the number `{cmd} channels` shows: "
+    "`{cmd} channels on NUMBER` or `{cmd} channels off NUMBER`."
+).format(cmd=_CMD)
+
+
 def cmd_channels(args: argparse.Namespace) -> int:
+    """`channels`, `channels on N`, `channels off N` or `channels add`."""
+    if args.action in ("on", "off"):
+        if args.number is None:
+            complain(_ON_OFF_USAGE)
+            return exit_codes.EXIT_USAGE
+        if args.link is not None or args.yes:
+            complain(f"--link and --yes only go with `{_CMD} channels add`.")
+            return exit_codes.EXIT_USAGE
+        return cmd_switch(args, enabled=args.action == "on")
+    if args.number is not None:
+        complain(
+            f"A number only goes with on or off: `{_CMD} channels on {args.number}` or "
+            f"`{_CMD} channels off {args.number}`."
+        )
+        return exit_codes.EXIT_USAGE
+    if args.link is not None or args.yes:
+        complain(f"--link and --yes only go with `{_CMD} channels add`.")
+        return exit_codes.EXIT_USAGE
     return cmd_list(args)
