@@ -142,4 +142,241 @@ def test_the_start_up_deadline_is_sixty_seconds_by_default(
         await listener.aclose()
 
     asyncio.run(scenario())
-    assert seen == [60.0, 60.0], "connect and get_dialogs are each bounded by 60 s"
+    # connect and get_dialogs are each bounded by 60 s; between them, the
+    # 10 s ask for Telegram's clock (ledger 143).
+    assert seen == [60.0, 10.0, 60.0]
+
+
+# -- ledger 143 (MF3): Telegram's clock ---------------------------------------------------
+
+
+def _clock_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records
+        if r.name == listener_module.__name__ and "clock" in r.getMessage().lower()
+        and r.levelno >= logging.WARNING
+    ]
+
+
+def _assert_plain(text: str) -> None:
+    for jargon in ("RPC", "client", "listener", "flood"):
+        assert jargon not in text, (jargon, text)
+
+
+def _start_and_report(db_path: Path, client: FakeTelegramClient, local_now: datetime):
+    async def scenario():
+        listener = Listener(
+            client=client,
+            channels=(CHANNEL,),
+            accounts=ACCOUNTS,
+            writer=db.Writer(db_path),
+            db_path=db_path,
+            now=lambda: local_now,
+        )
+        await listener.start()
+        try:
+            return listener.started_at, [
+                c.offset_date for c in client.get_messages_calls if c.offset_date is not None
+            ]
+        finally:
+            await listener.aclose()
+
+    return asyncio.run(scenario())
+
+
+def _old_history() -> list[FakeMessage]:
+    return [FakeMessage(id=i, message=CHATTER_TEXT, date=NOW - timedelta(hours=1)) for i in (1, 2)]
+
+
+def test_a_fast_computer_clock_is_overruled_by_telegrams(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """This computer's clock runs 5 minutes fast. The start is Telegram's
+    time, so the first read starts a minute before the real start -- not 4
+    minutes after it, which skipped every post of those minutes the update
+    stream dropped -- and the user is told, in plain words."""
+    client = FakeTelegramClient(history={CHANNEL_ID: _old_history()}, server_time=NOW)
+    with caplog.at_level(logging.WARNING):
+        started_at, anchors = _start_and_report(
+            tmp_path / "store.db", client, NOW + timedelta(minutes=5)
+        )
+
+    assert started_at == NOW
+    assert anchors == [NOW - listener_module.FIRST_RUN_SEED_MARGIN]
+    assert _rows(tmp_path / "store.db", "SELECT seed_cutoff_utc IS NULL FROM channel_state") == [
+        (1,)
+    ]
+    warnings = _clock_warnings(caplog)
+    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+    text = warnings[0].getMessage()
+    assert "300 seconds ahead" in text
+    _assert_plain(text)
+
+
+def test_a_slow_computer_clock_is_kept_and_named(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Behind Telegram: the earlier of the two is this computer's own, which
+    only makes the first read start earlier. Still worth fixing; said once."""
+    client = FakeTelegramClient(history={CHANNEL_ID: _old_history()}, server_time=NOW)
+    with caplog.at_level(logging.WARNING):
+        started_at, anchors = _start_and_report(
+            tmp_path / "store.db", client, NOW - timedelta(minutes=2)
+        )
+
+    assert started_at == NOW - timedelta(minutes=2)
+    assert anchors == [NOW - timedelta(minutes=2) - listener_module.FIRST_RUN_SEED_MARGIN]
+    warnings = _clock_warnings(caplog)
+    assert len(warnings) == 1 and "120 seconds behind" in warnings[0].getMessage()
+    _assert_plain(warnings[0].getMessage())
+
+
+@pytest.mark.parametrize("skew_seconds, warned", [(60, False), (-60, False), (61, True), (-61, True)])
+def test_clocks_within_a_minute_of_each_other_are_not_worth_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, skew_seconds: int, warned: bool
+) -> None:
+    client = FakeTelegramClient(server_time=NOW)
+    local = NOW + timedelta(seconds=skew_seconds)
+    with caplog.at_level(logging.WARNING):
+        started_at, _ = _start_and_report(tmp_path / "store.db", client, local)
+
+    assert started_at == min(NOW, local)
+    assert bool(_clock_warnings(caplog)) is warned
+
+
+def test_the_start_is_in_whole_seconds(tmp_path: Path) -> None:
+    client = FakeTelegramClient(server_time=NOW + timedelta(hours=1))
+    started_at, _ = _start_and_report(
+        tmp_path / "store.db", client, NOW + timedelta(milliseconds=999)
+    )
+    assert started_at == NOW
+
+
+@pytest.mark.parametrize("failure", ["error", "hang"])
+def test_no_answer_from_telegrams_clock_means_this_computers_clock_with_a_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """Never a refusal: watch starts on this computer's clock and says so."""
+    monkeypatch.setattr(listener_module, "TELEGRAM_CLOCK_TIMEOUT_SECONDS", 0.1)
+    client = FakeTelegramClient(
+        history={CHANNEL_ID: _old_history()},
+        get_state_failure=ConnectionError("no answer") if failure == "error" else "hang",
+    )
+    local = NOW + timedelta(minutes=5)
+    with caplog.at_level(logging.WARNING):
+        started_at, anchors = _start_and_report(tmp_path / "store.db", client, local)
+
+    assert started_at == local
+    assert anchors == [local - listener_module.FIRST_RUN_SEED_MARGIN]
+    assert client.calls.count("GetStateRequest") == 1
+    warnings = _clock_warnings(caplog)
+    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+    assert "this computer's clock" in warnings[0].getMessage()
+    _assert_plain(warnings[0].getMessage())
+
+
+def test_telegrams_clock_is_asked_once_within_ten_seconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert listener_module.TELEGRAM_CLOCK_TIMEOUT_SECONDS == 10.0
+    seen: list[float] = []
+    real = client_module.telegram_within
+
+    async def spy(awaitable, seconds):
+        seen.append(seconds)
+        return await real(awaitable, seconds)
+
+    monkeypatch.setattr(client_module, "telegram_within", spy)
+    client = FakeTelegramClient(server_time=NOW)
+    _start_and_report(tmp_path / "store.db", client, NOW)
+    assert seen == [60.0, 10.0, 60.0], "connect, Telegram's clock, then the chat list"
+    assert client.calls.count("GetStateRequest") == 1
+
+
+def test_a_dead_session_met_asking_the_time_still_exits_3(tmp_path: Path) -> None:
+    from telethon import errors
+
+    client = FakeTelegramClient(
+        get_state_failure=errors.AuthKeyUnregisteredError(request=None)
+    )
+
+    async def scenario():
+        listener = _build_listener(tmp_path / "store.db", client)
+        return await asyncio.wait_for(run_listener(listener), timeout=10.0)
+
+    assert asyncio.run(scenario()) == client_module.EXIT_TERMINAL_AUTH
+
+
+def test_the_time_telegram_took_to_answer_is_taken_off_its_clock(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """start() began at 11:01:30 on a clock 90 s fast; Telegram's answer came
+    30 s later (11:02:00 here) and said 11:00:30. Telegram's clock at the
+    moment start() began was therefore 11:00:00 -- that is the start."""
+    readings = iter([NOW + timedelta(seconds=90)])
+
+    def clock() -> datetime:
+        return next(readings, NOW + timedelta(seconds=120))
+
+    client = FakeTelegramClient(server_time=NOW + timedelta(seconds=30))
+
+    async def scenario():
+        listener = Listener(
+            client=client, channels=(CHANNEL,), accounts=ACCOUNTS,
+            writer=db.Writer(tmp_path / "store.db"), db_path=tmp_path / "store.db", now=clock,
+        )
+        await listener.start()
+        try:
+            return listener.started_at
+        finally:
+            await listener.aclose()
+
+    with caplog.at_level(logging.WARNING):
+        started_at = asyncio.run(scenario())
+
+    assert started_at == NOW
+    warnings = _clock_warnings(caplog)
+    assert len(warnings) == 1 and "90 seconds ahead" in warnings[0].getMessage()
+
+
+def test_a_computer_clock_that_steps_back_while_waiting_is_not_read_as_negative_time(
+    tmp_path: Path,
+) -> None:
+    """The clock read 11:01:40 when start() began and 11:01:30 when the
+    answer came (Windows corrected it meanwhile). No time can have passed
+    backwards: Telegram's 11:00:00 is taken as it is."""
+    readings = iter([NOW + timedelta(seconds=100)])
+
+    def clock() -> datetime:
+        return next(readings, NOW + timedelta(seconds=90))
+
+    client = FakeTelegramClient(server_time=NOW)
+
+    async def scenario():
+        listener = Listener(
+            client=client, channels=(CHANNEL,), accounts=ACCOUNTS,
+            writer=db.Writer(tmp_path / "store.db"), db_path=tmp_path / "store.db", now=clock,
+        )
+        await listener.start()
+        try:
+            return listener.started_at
+        finally:
+            await listener.aclose()
+
+    assert asyncio.run(scenario()) == NOW
+
+
+def test_an_answer_without_a_usable_time_means_this_computers_clock(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = FakeTelegramClient(server_time=NOW.replace(tzinfo=None))
+    local = NOW + timedelta(minutes=5)
+    with caplog.at_level(logging.WARNING):
+        started_at, _ = _start_and_report(tmp_path / "store.db", client, local)
+
+    assert started_at == local
+    warnings = _clock_warnings(caplog)
+    assert len(warnings) == 1 and "this computer's clock" in warnings[0].getMessage()

@@ -679,8 +679,9 @@ def test_first_run_on_an_empty_channel_does_not_reseed_past_the_first_message(
     tmp_path: Path,
 ) -> None:
     """An empty channel seeds nothing (there is no newest message), so the
-    pointer stays 0. The next history read must then read from 0 -- not
-    seed again, which would jump past a first post the stream dropped."""
+    pointer stays 0. The next history read seeds again -- from the same
+    stored cutoff, the start (ledger 142) -- so it cannot jump past a first
+    post the stream dropped: that post is dated after the start."""
     db_path = tmp_path / "store.db"
 
     async def scenario() -> tuple[int, int]:
@@ -688,7 +689,9 @@ def test_first_run_on_an_empty_channel_does_not_reseed_past_the_first_message(
         async with _started(db_path, client) as listener:
             pointer_after_start = listener.read_last_processed_message_id(CHANNEL_ID)
             with client.blackout():
-                await client.emit(CHANNEL_ID, _chatter_message(1))
+                await client.emit(
+                    CHANNEL_ID, _dated(1, NOW + timedelta(seconds=30))
+                )
             await listener.read_history(CHANNEL, source="poll", limit=100, rpc_timeout=RPC_TIMEOUT)
             return pointer_after_start, listener.read_last_processed_message_id(CHANNEL_ID)
 
@@ -1451,6 +1454,7 @@ def test_poll_hook_starts_only_after_backfill_and_handler_registration(
 
     assert seen_by_poll["calls"] == [
         "connect",
+        "GetStateRequest",  # Telegram's clock (ledger 143)
         "get_dialogs",
         "get_messages",
         "add_event_handler",  # NewMessage

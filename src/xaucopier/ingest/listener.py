@@ -27,23 +27,35 @@ never makes an RPC on the update path.
    used to hang for ever (ledger 145). Past the deadline it raises
    `ListenerStartupError` with a plain "Could not reach Telegram within
    60 seconds", and `watch` exits 4.
+   Then **Telegram's clock**: one `updates.GetStateRequest()`, bounded
+   (`TELEGRAM_CLOCK_TIMEOUT_SECONDS`, 10 s). The start time the first-run
+   seed keeps everything after is min(this computer's clock, Telegram's)
+   at the moment `start()` began, in whole seconds (ledger 143): a
+   computer clock running fast used to push that start -- and with it a
+   late seed's anchor -- past posts the update stream dropped. A
+   difference over a minute is a plain WARNING, never a refusal; no
+   answer means this computer's clock, with a WARNING.
 2. **`await client.get_dialogs()`**, within the same deadline. This
    primes the per-channel `pts`
    state Telethon's update engine needs. It is not cosmetic -- skipping
    it degrades update delivery -- and it must happen before handlers
    exist, so the first update the engine dispatches is already against
    primed state.
+   Then one writer job: each enabled channel that needs a seed gets its
+   **seed cutoff stored** -- this start, unless an earlier attempt's is
+   already there (`store/channel_state.py`; F01).
 3. **Backfill** each enabled channel from
    `channel_state.last_processed_message_id`, so a restart does not lose
-   whatever was posted while the process was down. A pointer of 0 means
-   this channel has never been read: rather than ingest the channel's
+   whatever was posted while the process was down. A channel never read
+   (pointer 0 and no seeded marker), or one switched back on (a cutoff
+   set on it), is *seeded* first: rather than ingest the channel's
    *oldest* messages (which is what `get_messages(min_id=0,
    reverse=True)` returns -- possibly years-old signals, each queuing
-   ENTRY outbox rows), the first run seeds the pointer at the newest
-   message dated before the listener started (less a 60 s clock-skew
-   margin) and ingests only what came after it -- see
-   `Listener._seed_pointer` for why the cutoff is the *start* time and
-   not the moment the seed happens to succeed. Every history RPC here
+   ENTRY outbox rows), its pointer is set at the newest message dated
+   before its **stored** seed cutoff (less a 60 s clock-skew margin) and
+   only what came after it is ingested -- see `Listener._seed_pointer`
+   for why the cutoff is the first attempt's start and not the moment
+   the seed happens to succeed. Every history RPC here
    is bounded (`rpc_timeout`), so a hung read cannot hold `start()`
    before handlers exist. Backfill runs
    *before* handlers are registered, so a message can never be ingested
@@ -124,11 +136,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 
-from telethon import events
+from telethon import events, functions
 
 from xaucopier.config.accounts import AccountCfg
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.store import alerts, db, edits_repo, heartbeats, messages_repo, metrics
+from xaucopier.store import (
+    alerts,
+    channel_state,
+    db,
+    edits_repo,
+    heartbeats,
+    messages_repo,
+    metrics,
+)
 from xaucopier.store.edits_repo import DeletionResult, EditResult
 from xaucopier.store.messages_repo import IngestResult
 
@@ -143,10 +163,18 @@ DEFAULT_BACKFILL_LIMIT = 500
 #: Hard bound on every history `get_messages()` RPC `read_history()`
 #: makes -- backfill's, and the poll's by default.
 DEFAULT_RPC_TIMEOUT = 20.0
-#: How far before the listener's start a first-run seed still ingests
-#: from. Absorbs skew between this machine's clock (the start time) and
-#: Telegram's (message dates); see `Listener._seed_pointer`.
+#: How far before a channel's stored seed cutoff its first read still
+#: ingests from. Absorbs what skew is left between the start time and
+#: Telegram's message dates; see `Listener._seed_pointer`.
 FIRST_RUN_SEED_MARGIN = timedelta(seconds=60)
+#: How long `start()` waits for Telegram's clock (`updates.GetState`)
+#: before it uses this computer's own (ledger 143).
+TELEGRAM_CLOCK_TIMEOUT_SECONDS = 10.0
+#: A difference between this computer's clock and Telegram's above this
+#: is logged as a WARNING (never a refusal).
+CLOCK_DIFFERENCE_WARNING = timedelta(seconds=60)
+#: A stored seed cutoff older than this, when used, is named in a WARNING.
+OLD_SEED_CUTOFF_WARNING = timedelta(minutes=10)
 DEFAULT_WRITER_STOP_TIMEOUT = 15.0
 #: How long `start()` waits for the writer thread to have connected.
 #: Connecting and migrating a local SQLite file takes milliseconds; 30 s
@@ -399,9 +427,13 @@ class Listener:
         self._now = now if now is not None else _utcnow
         self._backfill_limit = backfill_limit
         self._backfill_rpc_timeout = backfill_rpc_timeout
-        # When start() began, from the injected clock. The first-run seed
-        # keeps everything posted after it (less FIRST_RUN_SEED_MARGIN).
+        # When start() began: min(the injected clock, Telegram's), whole
+        # seconds. The seed cutoff start() stores for a channel that needs
+        # one; see `started_at`.
         self._started_at: datetime | None = None
+        # Channels already reported as having no messages at all, so the
+        # report is logged once, not every round.
+        self._reported_empty: set[int] = set()
         self._writer_stop_timeout = writer_stop_timeout
         self._writer_ready_timeout = writer_ready_timeout
         # The start-up deadline for connect() and get_dialogs(); None means
@@ -415,11 +447,9 @@ class Listener:
             maxlen=MAX_RECORDED_HANDLER_ERRORS
         )
         self._handler_error_count = 0
-        # Channels whose pointer this process has established -- read as
-        # non-zero, or seeded (even to 0, for an empty channel). Only a
-        # channel *not* in here may be seeded: re-seeding an empty
-        # channel on the next read would jump past its first post.
-        self._pointer_seeded: set[int] = set()
+        # (No in-memory "seeded" set: whether a channel still needs its
+        # seed is the store's `channel_state`, read at every history read,
+        # so a seed re-runs until it succeeds -- ledger 142.)
         # Failed history-read attempts per (channel_id, message_id); see
         # ingest_history(). Cleared on success or skip.
         self._history_attempts: dict[tuple[int, int], int] = {}
@@ -438,6 +468,15 @@ class Listener:
     @property
     def enabled_channels(self) -> tuple[ChannelCfg, ...]:
         return tuple(self._channels_by_id.values())
+
+    @property
+    def started_at(self) -> datetime | None:
+        """When this `watch` started, as `start()` decided it: the earlier
+        of this computer's clock and Telegram's at the moment `start()`
+        began, UTC, whole seconds. None before `start()`. A post dated
+        after it (less `FIRST_RUN_SEED_MARGIN`) was made while this
+        process ran."""
+        return self._started_at
 
     @property
     def reader(self) -> Connection:
@@ -801,14 +840,18 @@ class Listener:
         pointer stops at the last id read and the next call continues
         from there.
 
-        A pointer of 0 on a channel this process has not yet seeded
-        means the channel has never been read. Reading from 0 would
-        return its *oldest* messages, so this call first seeds the
-        pointer just below everything posted since the listener started
-        (`_seed_pointer`) and then reads on from there as usual. If that
-        seed fails at startup, the next call -- the poll's -- seeds
-        instead, from the same start time, and never reads from 0 unless
-        the channel verifiably has nothing older.
+        A channel that needs a seed (`channel_state.ChannelState.
+        needs_seed`: never read, or switched back on) is seeded first:
+        reading a never-read channel from 0 would return its *oldest*
+        messages, so this call sets the pointer just below everything
+        posted since its **stored** seed cutoff (`_seed_pointer`) and then
+        reads on from there as usual. Whether a seed is needed is read
+        from the store every time, never remembered: a seed that fails --
+        at startup, in the poll, in an earlier process -- is simply run
+        again by the next call, from the same stored cutoff, until it
+        succeeds (ledger 142). It never reads from 0 unless the channel
+        verifiably has nothing older, and a channel with no messages at
+        all is not read -- nor marked seeded -- until its first post.
 
         `rpc_timeout` is required: it bounds every `get_messages()` RPC
         this call makes (`asyncio.wait_for`; `TimeoutError` propagates),
@@ -843,10 +886,13 @@ class Listener:
             raise ValueError(f"rpc_timeout must be a positive number, got {rpc_timeout!r}")
         channel_id = channel_cfg.channel_id
         async with self.history_lock(channel_id):
-            pointer = self.read_last_processed_message_id(channel_id)
-            if pointer == 0 and channel_id not in self._pointer_seeded:
-                pointer = await self._seed_pointer(channel_cfg, rpc_timeout=rpc_timeout)
-            self._pointer_seeded.add(channel_id)
+            state = channel_state.read(self.reader, channel_id)
+            pointer = state.pointer
+            if state.needs_seed:
+                seeded = await self._seed_pointer(channel_cfg, state, rpc_timeout=rpc_timeout)
+                if seeded is None:
+                    return ()  # no messages at all yet: seeded by a later read
+                pointer = seeded
             messages = await asyncio.wait_for(
                 self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
                 rpc_timeout,
@@ -947,79 +993,261 @@ class Listener:
 
         return await self._run_on_writer(job)
 
-    async def _seed_pointer(self, channel_cfg: ChannelCfg, *, rpc_timeout: float) -> int:
-        """First run for this channel: set the pointer just below
-        everything posted since the listener started, and return it.
+    async def _seed_pointer(
+        self,
+        channel_cfg: ChannelCfg,
+        state: channel_state.ChannelState,
+        *,
+        rpc_timeout: float,
+    ) -> int | None:
+        """Seed `channel_cfg`: set its pointer just below everything posted
+        since its stored seed cutoff, and return it -- or None if the
+        channel has no messages at all yet (nothing is marked; the next
+        read tries again).
 
-        The anchor is the newest message dated before `cutoff =
-        started_at - FIRST_RUN_SEED_MARGIN` -- one RPC,
-        `get_messages(limit=1, offset_date=cutoff)` (Telegram's
-        `getHistory` returns only messages sent before `offset_date`).
-        The pointer is set to it, and the read that follows in the same
-        `read_history()` call ingests everything after it.
+        The anchor is the newest message dated before `cutoff -
+        FIRST_RUN_SEED_MARGIN` -- one RPC, `get_messages(limit=1,
+        offset_date=...)` (Telegram's `getHistory` returns only messages
+        sent before `offset_date`). One writer job then sets the pointer
+        to it (never lower than it already is), marks the channel seeded
+        and clears the cutoff it used (`channel_state.complete_seed`); the
+        read that follows in the same `read_history()` call ingests
+        everything after it.
 
-        **Why the start time, and not "now".** Seeding at whatever is
-        newest when the seed finally succeeds is only harmless at
-        startup. If the startup seed fails (a connection blip, a long
-        flood wait, a timeout), the poll seeds later -- and "newest" by
-        then includes messages posted after the listener started, which
-        the update stream may well have dropped. Seeding above them would
-        skip them for good: never stored, never counted, with a log line
-        claiming nothing after the seed was lost (fix round 1's
-        Critical, probe 1f). With the cutoff tied to the start, a late
-        seed lands where a prompt one would have, and those messages are
-        ingested by the poll (`source="poll"`, so they count as missed).
-        At startup it finds only what was posted in the margin or during
-        startup itself -- messages the update stream could not have
-        delivered either, since handlers are not registered yet.
+        **Why the stored cutoff, and not "now" or this process's start.**
+        Seeding at whatever is newest when the seed finally succeeds is
+        only harmless at startup. If the startup seed fails (a connection
+        blip, a long flood wait, a timeout), the poll seeds later -- and
+        "newest" by then includes messages posted after `watch` started,
+        which the update stream may well have dropped (fix round 1's
+        Critical, probe 1f). The same holds across processes: a `watch`
+        whose seed failed for its whole run, restarted, used to anchor at
+        the NEW start and skip everything the first run missed or that
+        was posted while it was stopped (final review F01). So the cutoff
+        is the start of the FIRST attempt, stored before any seed request
+        (`start()`; `channel_state.claim_seed_cutoff`) and used by every
+        attempt after it. Messages at or after it are ingested by the
+        read that follows (`source="poll"`, so they count as missed, or
+        `"backfill"`). A channel switched back on (F28) carries the cutoff
+        `channels on` wrote: posts made while it was off are not read.
 
-        The margin absorbs skew between this machine's clock (the start
-        time) and Telegram's (the message dates).
+        The cutoff is in whole seconds, and so is `offset_date` (ledger
+        141): Telethon sends it as whole seconds, and a fraction here made
+        the anchor query and the guard below disagree about a message
+        dated in that last second -- the guard then refused the channel
+        for ever. The margin absorbs what skew is left between the start
+        time and Telegram's message dates (`start()` already takes the
+        earlier of this computer's clock and Telegram's).
 
-        No anchor -- the channel is empty, or everything in it is after
-        the cutoff -- leaves the pointer at 0 and the read goes from 0.
-        That is safe only if the channel really has nothing older, so it
-        is verified: the oldest message is fetched, and if *it* predates
-        the cutoff the anchor query was wrong and this raises
-        `RuntimeError` rather than ingest the channel's ancient history
-        (the reviewer's D3). The next read retries the seed.
+        No anchor -- everything in the channel is after the cutoff -- is a
+        seed at 0, and the read goes from 0. That is safe only if the
+        channel really has nothing older, so it is verified: the oldest
+        message is fetched, and if *it* predates the cutoff the anchor
+        query was wrong and this raises `RuntimeError` rather than ingest
+        the channel's ancient history (the reviewer's D3); the next read
+        retries. If the oldest query finds nothing either, the channel is
+        empty -- or Telegram answered nothing both times -- and nothing is
+        marked: a single empty answer used to mark the channel seeded at 0
+        and let the next read ingest 400-day-old history (ledger 142). The
+        cutoff stays stored, so the channel's first post is read whenever
+        it comes, even across a restart (ledger 114/144).
         """
         channel_id = channel_cfg.channel_id
         if self._started_at is None:
-            raise RuntimeError("a first-run seed needs the start time Listener.start() records")
-        cutoff = self._started_at - FIRST_RUN_SEED_MARGIN
+            raise RuntimeError("a seed needs the start time Listener.start() records")
+        cutoff, cutoff_raw = state.seed_cutoff_utc, state.seed_cutoff_raw
+        if cutoff is None:
+            # None stored yet (start()'s job could not write it) or one
+            # that cannot be read: store it now, before any seed request.
+            decision = await self._claim_seed_cutoff(channel_cfg)
+            if decision is None:  # the channel needs no seed after all
+                return channel_state.read(self.reader, channel_id).pointer
+            cutoff, cutoff_raw = decision.cutoff_utc, decision.cutoff_raw
+        offset = (cutoff - FIRST_RUN_SEED_MARGIN).replace(microsecond=0)
         before_cutoff = await asyncio.wait_for(
-            self.client.get_messages(channel_id, limit=1, offset_date=cutoff), rpc_timeout
+            self.client.get_messages(channel_id, limit=1, offset_date=offset), rpc_timeout
         )
         anchor_id = max((message.id for message in before_cutoff), default=0)
-        if anchor_id:
-
-            def seed(conn: Connection) -> None:
-                _advance_last_processed(conn, channel_id=channel_id, message_id=anchor_id)
-
-            await self._run_on_writer(seed)
-        else:
+        if not anchor_id:
             oldest = await asyncio.wait_for(
                 self.client.get_messages(channel_id, limit=1, reverse=True), rpc_timeout
             )
-            if any(message.date < cutoff for message in oldest):
+            if not oldest:
+                if channel_id not in self._reported_empty:
+                    self._reported_empty.add(channel_id)
+                    logger.info(
+                        "Channel %s (%s) has no messages yet. Its first message will be "
+                        "read when it is posted.",
+                        channel_id,
+                        channel_cfg.name,
+                    )
+                return None
+            if any(message.date < offset for message in oldest):
                 raise RuntimeError(
                     f"channel {channel_id} ({channel_cfg.name}): Telegram reported no "
-                    f"message before {cutoff.isoformat()}, yet its oldest message "
+                    f"message before {offset.isoformat()}, yet its oldest message "
                     f"({oldest[0].id}) is older; refusing to read its history from 0"
                 )
-        self._pointer_seeded.add(channel_id)
-        logger.warning(
-            "first run for channel %s (%s): pointer seeded at message_id %s, the newest "
-            "message dated before %s (listener start minus %ss). Everything after it is "
-            "ingested; nothing before it is.",
-            channel_id,
-            channel_cfg.name,
-            anchor_id,
-            cutoff.isoformat(),
-            int(FIRST_RUN_SEED_MARGIN.total_seconds()),
-        )
-        return anchor_id
+        seeded_at = self._now()
+
+        def seed(conn: Connection) -> int:
+            return channel_state.complete_seed(
+                conn,
+                channel_id=channel_id,
+                anchor_id=anchor_id,
+                cutoff_raw=cutoff_raw,
+                seeded_at_utc=seeded_at,
+            )
+
+        pointer = await self._run_on_writer(seed)
+        self._reported_empty.discard(channel_id)
+        when = offset.strftime("%Y-%m-%d %H:%M:%S")
+        if anchor_id:
+            logger.warning(
+                "Channel %s (%s): reading starts after message %s, the last one posted "
+                "before %s UTC. Everything posted after it is read; nothing before it is.",
+                channel_id,
+                channel_cfg.name,
+                anchor_id,
+                when,
+            )
+        else:
+            logger.warning(
+                "Channel %s (%s): nothing in it was posted before %s UTC, so it is read "
+                "from its first message.",
+                channel_id,
+                channel_cfg.name,
+                when,
+            )
+        return pointer
+
+    async def _claim_seed_cutoff(
+        self, channel_cfg: ChannelCfg
+    ) -> channel_state.CutoffDecision | None:
+        """Store this start as `channel_cfg`'s seed cutoff unless one is
+        already stored (`channel_state.claim_seed_cutoff`), in one writer
+        job, and report what happened. Raises whatever the job raised: a
+        seed must not run without a stored cutoff."""
+        started_at = self._started_at
+        channel_id = channel_cfg.channel_id
+
+        def claim(conn: Connection) -> channel_state.CutoffDecision | None:
+            return channel_state.claim_seed_cutoff(
+                conn, channel_id=channel_id, started_at_utc=started_at
+            )
+
+        decision = await self._run_on_writer(claim)
+        if decision is not None:
+            self._report_seed_cutoff(channel_cfg, decision)
+        return decision
+
+    async def _store_seed_cutoffs(self) -> None:
+        """Startup, before any seed request: one writer job stores this
+        start as the seed cutoff of every enabled channel that needs a seed
+        and has none yet (`channel_state.claim_seed_cutoff`: the first
+        attempt's stays). If the job fails -- another program holding the
+        database, say -- each channel's own read stores it before seeding
+        (`_seed_pointer`), so no seed ever runs without one."""
+        started_at = self._started_at
+        channels = self.enabled_channels
+
+        def claim_all(
+            conn: Connection,
+        ) -> tuple[tuple[ChannelCfg, channel_state.CutoffDecision | None], ...]:
+            return tuple(
+                (
+                    channel,
+                    channel_state.claim_seed_cutoff(
+                        conn, channel_id=channel.channel_id, started_at_utc=started_at
+                    ),
+                )
+                for channel in channels
+            )
+
+        try:
+            decisions = await self._run_on_writer(claim_all)
+        except Exception as exc:  # noqa: BLE001 -- each channel's read stores its own
+            logger.warning(
+                "Could not save where the reading of new channels starts (%s: %s). It is "
+                "saved again before each such channel is first read, and nothing is read "
+                "from it until then.",
+                type(exc).__name__,
+                exc,
+            )
+            return
+        for channel, decision in decisions:
+            if decision is not None:
+                self._report_seed_cutoff(channel, decision)
+
+    def _report_seed_cutoff(
+        self, channel_cfg: ChannelCfg, decision: channel_state.CutoffDecision
+    ) -> None:
+        """Log what `claim_seed_cutoff` did, in plain words: a cutoff an
+        earlier start stored more than `OLD_SEED_CUTOFF_WARNING` ago, or
+        one replaced, is a WARNING naming its age (ruling C1)."""
+        started_at = self._started_at
+        channel = f"Channel {channel_cfg.channel_id} ({channel_cfg.name})"
+        cutoff_text = decision.cutoff_utc.strftime("%Y-%m-%d %H:%M:%S")
+        switched_on = decision.pointer > 0
+        if decision.action == "set":
+            logger.info(
+                "%s is read for the first time: everything posted from about a minute "
+                "before %s UTC on is read.",
+                channel,
+                cutoff_text,
+            )
+            return
+        previous = decision.previous_utc
+        if decision.action == "kept":
+            age = started_at - decision.cutoff_utc if started_at is not None else timedelta(0)
+            level = logging.WARNING if age > OLD_SEED_CUTOFF_WARNING else logging.INFO
+            if switched_on:
+                logger.log(
+                    level,
+                    "%s was switched back on at %s UTC, %s ago: it is read from about a "
+                    "minute before then. Posts made while it was off are not read.",
+                    channel,
+                    cutoff_text,
+                    _describe_age(age),
+                )
+            else:
+                logger.log(
+                    level,
+                    "%s: an earlier start of watch did not finish its first read of this "
+                    "channel, which begins at about a minute before %s UTC, %s ago. It is "
+                    "read from there now, so nothing posted since then is skipped.",
+                    channel,
+                    cutoff_text,
+                    _describe_age(age),
+                )
+            return
+        # "replaced"
+        if previous is None:
+            logger.warning(
+                "%s: the saved start of its reading could not be understood, so it is "
+                "read from this start of watch (%s UTC) instead.",
+                channel,
+                cutoff_text,
+            )
+        elif previous > decision.cutoff_utc:
+            logger.warning(
+                "%s: the saved start of its reading, %s UTC, was later than this start of "
+                "watch (a clock may have run fast), so it is read from %s UTC instead.",
+                channel,
+                previous.strftime("%Y-%m-%d %H:%M:%S"),
+                cutoff_text,
+            )
+        else:
+            logger.warning(
+                "%s: its reading was due to start at %s UTC, %s ago -- too long ago for "
+                "anything posted then to be traded -- so it is read from this start of "
+                "watch (%s UTC) instead. Posts made in those %s are not read.",
+                channel,
+                previous.strftime("%Y-%m-%d %H:%M:%S"),
+                _describe_age(decision.cutoff_utc - previous),
+                cutoff_text,
+                _describe_age(decision.cutoff_utc - previous),
+            )
 
     # -- startup ------------------------------------------------------------
 
@@ -1030,11 +1258,12 @@ class Listener:
             raise RuntimeError("Listener.start() called twice")
         self._started = True
         # Before anything else, so before handlers are registered: the
-        # first-run seed keeps everything posted after this instant.
-        started_at = self._now()
-        if started_at.tzinfo is None or started_at.utcoffset() is None:
-            raise ValueError(f"the injected clock returned a naive datetime: {started_at!r}")
-        self._started_at = started_at.astimezone(UTC)
+        # first-run seed keeps everything posted after this instant (or
+        # Telegram's clock's reading of it, if earlier -- see below).
+        local_start = self._now()
+        if local_start.tzinfo is None or local_start.utcoffset() is None:
+            raise ValueError(f"the injected clock returned a naive datetime: {local_start!r}")
+        local_start = local_start.astimezone(UTC)
         self._writer_death = asyncio.get_running_loop().create_future()
 
         await self._start_writer_and_wait_for_connection()  # 0
@@ -1050,12 +1279,15 @@ class Listener:
         )
         try:
             await client_module.connect_within(self.client, timeout)  # 1
+            telegram_clock = await self._read_telegram_clock()
             await client_module.telegram_within(self.client.get_dialogs(), timeout)  # 2
         except client_module.TelegramUnreachableError as exc:
             raise ListenerStartupError(
                 f"{exc} watch stops now (exit code 4); start it again once this "
                 "computer is back online."
             ) from exc
+        self._started_at = self._decide_start(local_start, telegram_clock)
+        await self._store_seed_cutoffs()
 
         for channel in self.enabled_channels:  # 3
             await self._backfill_channel(channel)
@@ -1086,6 +1318,79 @@ class Listener:
                 f"the writer thread could not connect to {self.db_path}: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
+
+    async def _read_telegram_clock(self) -> tuple[datetime, datetime] | None:
+        """Ask Telegram for its time: one `updates.GetStateRequest()`,
+        bounded by `TELEGRAM_CLOCK_TIMEOUT_SECONDS`. Returns Telegram's
+        time (whole seconds, as it reports it) and this computer's clock
+        when the answer came -- or None, with a plain WARNING, if there
+        was no usable answer: watch then starts on this computer's clock,
+        never refuses to start. A dead session or a rejected api_id is
+        not "no answer", and is raised as itself (exit 3 or 5)."""
+        # Imported here for the same reason as in run_listener().
+        from xaucopier.ingest import client as client_module
+
+        try:
+            state = await client_module.telegram_within(
+                self.client(functions.updates.GetStateRequest()),
+                TELEGRAM_CLOCK_TIMEOUT_SECONDS,
+            )
+            telegram_now = state.date
+            if (
+                not isinstance(telegram_now, datetime)
+                or telegram_now.tzinfo is None
+                or telegram_now.utcoffset() is None
+            ):
+                raise ValueError(f"Telegram's answer carried no usable time: {telegram_now!r}")
+        except client_module.PERMANENT_TELEGRAM_ERRORS:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- no answer: this computer's clock, with a warning
+            reason = (
+                f"no answer within {TELEGRAM_CLOCK_TIMEOUT_SECONDS:g} seconds"
+                if isinstance(exc, client_module.TelegramUnreachableError)
+                else type(exc).__name__
+            )
+            logger.warning(
+                "Could not read Telegram's clock (%s), so watch goes by this computer's "
+                "clock. If this computer's clock runs fast, a message posted around this "
+                "start could be missed: in Windows Settings > Time & language > Date & "
+                "time, switch on 'Set time automatically'.",
+                reason,
+            )
+            return None
+        return telegram_now.astimezone(UTC), self._now().astimezone(UTC)
+
+    def _decide_start(
+        self, local_start: datetime, telegram_clock: tuple[datetime, datetime] | None
+    ) -> datetime:
+        """This watch's start: min(this computer's clock, Telegram's) at the
+        moment `start()` began, in whole seconds (ledger 143).
+
+        Telegram's answer came later than that moment, so its time is
+        taken back by how long this computer's clock says passed since
+        (all of it, up to the answer -- which errs early). The earlier of
+        the two is the safe one: a start too early only reads a little
+        more; a start too late -- a computer clock running fast -- made a
+        late seed skip posts the update stream dropped. A difference over
+        `CLOCK_DIFFERENCE_WARNING` is a WARNING in plain words, never a
+        refusal: Telegram is the one that dates the posts."""
+        start = local_start
+        if telegram_clock is not None:
+            telegram_now, answered_at = telegram_clock
+            elapsed = max(answered_at - local_start, timedelta(0))
+            telegram_start = telegram_now - elapsed
+            difference = local_start - telegram_start
+            if abs(difference) > CLOCK_DIFFERENCE_WARNING:
+                logger.warning(
+                    "This computer's clock is %d seconds %s Telegram's. watch goes by the "
+                    "earlier of the two, so nothing is skipped, but please fix the clock: "
+                    "in Windows Settings > Time & language > Date & time, switch on 'Set "
+                    "time automatically'.",
+                    int(abs(difference).total_seconds()),
+                    "ahead of" if difference > timedelta(0) else "behind",
+                )
+            start = min(local_start, telegram_start)
+        return start.replace(microsecond=0)
 
     async def _backfill_channel(self, channel: ChannelCfg) -> None:
         # Imported here for the same reason as in run_listener().
@@ -1373,6 +1678,15 @@ def _writer_noop(conn: Connection) -> None:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _describe_age(age: timedelta) -> str:
+    """A duration in plain words for a log line: minutes below two hours,
+    hours from there."""
+    seconds = max(int(age.total_seconds()), 0)
+    if seconds < 2 * 3600:
+        return f"{seconds // 60} minutes"
+    return f"{seconds // 3600} hours"
 
 
 async def run_listener(listener: Listener) -> int:
