@@ -410,6 +410,23 @@ def test_a_group_members_message_is_stored_as_not_a_post(conn):
         ({"fwd_from_date_utc": datetime(2026, 9, 5, 10, 30)}, "fwd_from_date_utc"),
         ({"is_post": 1}, "is_post"),
         ({"sender_kind": "bot"}, "sender_kind"),
+        # Group-1 review: only the sign was checked. A bare negated id is
+        # not the -100... form, and would never match a stored channel_id
+        # in the forward lookup (F09) -- a late relay copy would become a
+        # second ENTRY. Every channel peer id is -(10**12 + id).
+        ({"fwd_from_channel_id": -3333333333}, "fwd_from_channel_id"),
+        ({"fwd_from_channel_id": -1000000000000}, "fwd_from_channel_id"),
+        ({"fwd_from_channel_id": "-1003333333333"}, "fwd_from_channel_id"),
+        ({"fwd_from_channel_id": -1003333333333.0}, "fwd_from_channel_id"),
+        ({"fwd_from_channel_id": True}, "fwd_from_channel_id"),
+        ({"sender_id": "abc"}, "sender_id"),
+        ({"sender_id": True}, "sender_id"),
+        ({"sender_id": 42.0}, "sender_id"),
+        ({"fwd_from_post_id": "x"}, "fwd_from_post_id"),
+        ({"fwd_from_post_id": True}, "fwd_from_post_id"),
+        ({"fwd_from_post_id": 0}, "fwd_from_post_id"),
+        ({"fwd_from_date_utc": "2026-09-05T10:30:00+00:00"}, "fwd_from_date_utc"),
+        ({"sender_kind": ["user"]}, "sender_kind"),
     ],
 )
 def test_malformed_provenance_is_refused_before_anything_is_stored(conn, kwargs, match):
@@ -429,6 +446,29 @@ def test_malformed_provenance_is_refused_before_anything_is_stored(conn, kwargs,
         )
     assert _count(conn, "messages") == 0
     assert _count(conn, "signals") == 0
+
+
+def test_the_first_channel_id_in_the_minus_100_form_is_accepted(conn):
+    """The boundary of the -100... check: -(10**12 + 1) is channel 1."""
+    ingest(
+        conn,
+        channel_cfg=CHANNEL_A,
+        message_id=9406,
+        text=CHATTER_TEXT,
+        posted_at_utc=POSTED,
+        edit_date_utc=None,
+        reply_to_message_id=None,
+        source="live",
+        now_utc=NOW,
+        accounts=(),
+        sender_id=-1000000000001,
+        fwd_from_channel_id=-1000000000001,
+        fwd_from_post_id=1,
+    )
+    provenance = _provenance(conn, 9406)
+    assert provenance["fwd_from_channel_id"] == -1000000000001
+    assert provenance["fwd_from_post_id"] == 1
+    assert provenance["sender_id"] == -1000000000001
 
 
 # -- final review F39: parsed_json.source is where the message really came from

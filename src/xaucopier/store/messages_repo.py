@@ -88,8 +88,11 @@ every kind and NULL when not given: ``sender_kind`` (``'user'`` /
 ``'channel'`` / ``'chat'``), ``sender_id``, ``is_post``, and for a
 forwarded message ``fwd_from_channel_id`` (the -100... form, like
 ``channel_id``), ``fwd_from_post_id`` and ``fwd_from_date_utc`` (stored
-in UTC). They are checked before anything is written: a raw positive
-channel id, a naive date, a non-bool ``is_post`` or an unknown
+in UTC). They are checked before anything is written: a
+``fwd_from_channel_id`` not in the -100... form (every channel peer id is
+below -10**12), a ``sender_id`` or ``fwd_from_post_id`` that is not an
+integer (a bool is not one; a post id must be positive), a date that is
+not a timezone-aware datetime, a non-bool ``is_post`` or an unknown
 ``sender_kind`` is a ``ValueError``. They are written once, when the
 message is first stored; a later version of the same message does not
 change them. (``messages.relay_of_signal_id`` is ingest's own finding,
@@ -147,6 +150,15 @@ def _get_message(conn: sqlite3.Connection, *, channel_id: int, message_id: int) 
     ).fetchone()
 
 
+#: Every channel peer id is below this: -(10**12 + the channel's own id).
+_CHANNEL_PEER_ID_BASE = -(10**12)
+
+
+def _is_int(value: object) -> bool:
+    """An int that is not a bool (True is an int in Python)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _provenance_columns(
     *,
     sender_kind: str | None,
@@ -158,24 +170,35 @@ def _provenance_columns(
 ) -> dict[str, Any]:
     """The migration-4 provenance columns as stored, checked first -- see
     the module docstring. Raises ValueError, before anything is written."""
-    if sender_kind is not None and sender_kind not in _SENDER_KINDS:
+    if sender_kind is not None and not (
+        isinstance(sender_kind, str) and sender_kind in _SENDER_KINDS
+    ):
         raise ValueError(
             f"sender_kind must be one of {sorted(_SENDER_KINDS)} or None, got {sender_kind!r}"
         )
+    if sender_id is not None and not _is_int(sender_id):
+        raise ValueError(f"sender_id must be an integer or None, got {sender_id!r}")
     if is_post is not None and not isinstance(is_post, bool):
         raise ValueError(f"is_post must be True, False or None, got {is_post!r}")
-    if fwd_from_channel_id is not None and (
-        isinstance(fwd_from_channel_id, bool) or fwd_from_channel_id >= 0
+    if fwd_from_channel_id is not None and not (
+        _is_int(fwd_from_channel_id) and fwd_from_channel_id < _CHANNEL_PEER_ID_BASE
     ):
+        # Every channel's peer id is -(10**12 + its Telegram id): the
+        # -100... form of channel_id. A bare negated id would never match
+        # a stored channel_id in the forward lookup (final review F09).
         raise ValueError(
             "fwd_from_channel_id must be in the same -100... form as channel_id, "
             f"got {fwd_from_channel_id!r}"
         )
-    if fwd_from_date_utc is not None and (
-        fwd_from_date_utc.tzinfo is None or fwd_from_date_utc.utcoffset() is None
+    if fwd_from_post_id is not None and not (_is_int(fwd_from_post_id) and fwd_from_post_id > 0):
+        raise ValueError(
+            f"fwd_from_post_id must be a positive integer or None, got {fwd_from_post_id!r}"
+        )
+    if fwd_from_date_utc is not None and not (
+        isinstance(fwd_from_date_utc, datetime) and fwd_from_date_utc.utcoffset() is not None
     ):
         raise ValueError(
-            f"fwd_from_date_utc must be timezone-aware, got naive {fwd_from_date_utc!r}"
+            f"fwd_from_date_utc must be a timezone-aware datetime, got {fwd_from_date_utc!r}"
         )
     return {
         "sender_kind": sender_kind,
