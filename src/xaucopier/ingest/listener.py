@@ -137,6 +137,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from telethon import events, functions
+from telethon.tl import types as tl_types
 
 from xaucopier.config.accounts import AccountCfg
 from xaucopier.config.channels import ChannelCfg
@@ -244,6 +245,19 @@ class IncomingMessage:
     posted_at_utc: datetime
     edit_date_utc: datetime | None
     reply_to_message_id: int | None
+    #: Who posted it (final review F05): `post` is a channel's own post;
+    #: `sender_kind` "user" / "channel" / "chat" and `sender_id` (a user's
+    #: id, or a channel's or group's in its -100... / negative form) come
+    #: from `from_id`. None: not known.
+    is_post: bool | None = None
+    sender_kind: str | None = None
+    sender_id: int | None = None
+    #: Where a forward came from (F09): the channel (-100... form), its
+    #: post id there, and when it was first posted. None: not a forward,
+    #: or not from a channel. `posted_at_utc` stays this copy's own date.
+    fwd_from_channel_id: int | None = None
+    fwd_from_post_id: int | None = None
+    fwd_from_date_utc: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,9 +315,73 @@ def _to_utc(value: datetime, *, field: str) -> datetime:
     return value.astimezone(UTC)
 
 
+#: Every channel's marked id is -(this + its bare Telegram id): the -100...
+#: form channels.toml and `event.chat_id` use (Telethon's `get_peer_id`).
+_CHANNEL_MARK = 10**12
+#: The largest bare channel or chat id Telethon marks as such.
+_MAX_BARE_ID = 9_999_999_999
+
+
+def _positive_int(value: Any) -> int | None:
+    """`value` if it is a positive int (never a bool), else None."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _marked_channel_id(peer: Any) -> int | None:
+    """A `PeerChannel`'s id in the -100... form, or None."""
+    bare = _positive_int(getattr(peer, "channel_id", None))
+    if bare is None or bare > _MAX_BARE_ID:
+        return None
+    return -(_CHANNEL_MARK + bare)
+
+
+def _sender_of(peer: Any) -> tuple[str | None, int | None]:
+    """`message.from_id` as (kind, id): a user's own id, a channel's in the
+    -100... form, a basic group's negated -- as Telethon marks them. None
+    for anything else (an anonymous channel post has no `from_id`)."""
+    if isinstance(peer, tl_types.PeerUser):
+        user_id = _positive_int(peer.user_id)
+        return ("user", user_id) if user_id is not None else (None, None)
+    if isinstance(peer, tl_types.PeerChannel):
+        marked = _marked_channel_id(peer)
+        return ("channel", marked) if marked is not None else (None, None)
+    if isinstance(peer, tl_types.PeerChat):
+        chat_id = _positive_int(peer.chat_id)
+        if chat_id is None or chat_id > _MAX_BARE_ID:
+            return None, None
+        return "chat", -chat_id
+    return None, None
+
+
+def _forward_of(header: Any) -> tuple[int | None, int | None, datetime | None]:
+    """`message.fwd_from` as (channel in the -100... form, its post id
+    there, the original's date in UTC). Each part that is missing or
+    cannot be read is None."""
+    if not isinstance(header, tl_types.MessageFwdHeader):
+        return None, None, None
+    from_id = getattr(header, "from_id", None)
+    channel_id = (
+        _marked_channel_id(from_id) if isinstance(from_id, tl_types.PeerChannel) else None
+    )
+    post_id = _positive_int(getattr(header, "channel_post", None))
+    date = getattr(header, "date", None)
+    if isinstance(date, datetime) and date.tzinfo is not None and date.utcoffset() is not None:
+        date_utc: datetime | None = date.astimezone(UTC)
+    else:
+        date_utc = None
+    return channel_id, post_id, date_utc
+
+
 def normalise_message(message: Any, *, channel_id: int) -> IncomingMessage:
     """Flatten a Telethon `Message` (or the fake's stand-in). Pure
-    attribute reads -- no RPC, no awaits, no clock."""
+    attribute reads -- no RPC, no awaits, no clock.
+
+    Who posted it (`post`, `from_id`) and where a forward came from
+    (`fwd_from`) are read too, for the relay and group checks built on
+    them (final review F05, F09). A part that is missing or cannot be read
+    is None: that metadata must never keep a message from being stored."""
     text = getattr(message, "message", None)
     if text is None:
         text = getattr(message, "raw_text", None)
@@ -314,6 +392,10 @@ def normalise_message(message: Any, *, channel_id: int) -> IncomingMessage:
 
     edit_date = getattr(message, "edit_date", None)
 
+    post = getattr(message, "post", None)
+    sender_kind, sender_id = _sender_of(getattr(message, "from_id", None))
+    fwd_channel_id, fwd_post_id, fwd_date = _forward_of(getattr(message, "fwd_from", None))
+
     return IncomingMessage(
         channel_id=channel_id,
         message_id=message.id,
@@ -321,6 +403,12 @@ def normalise_message(message: Any, *, channel_id: int) -> IncomingMessage:
         posted_at_utc=_to_utc(message.date, field="date"),
         edit_date_utc=_to_utc(edit_date, field="edit_date") if edit_date is not None else None,
         reply_to_message_id=reply_to,
+        is_post=post if isinstance(post, bool) else None,
+        sender_kind=sender_kind,
+        sender_id=sender_id,
+        fwd_from_channel_id=fwd_channel_id,
+        fwd_from_post_id=fwd_post_id,
+        fwd_from_date_utc=fwd_date,
     )
 
 
@@ -568,6 +656,12 @@ class Listener:
                 source=source,
                 now_utc=now_utc,
                 accounts=accounts,
+                is_post=incoming.is_post,
+                sender_kind=incoming.sender_kind,
+                sender_id=incoming.sender_id,
+                fwd_from_channel_id=incoming.fwd_from_channel_id,
+                fwd_from_post_id=incoming.fwd_from_post_id,
+                fwd_from_date_utc=incoming.fwd_from_date_utc,
             )
             if advances_pointer:
                 _advance_last_processed(
