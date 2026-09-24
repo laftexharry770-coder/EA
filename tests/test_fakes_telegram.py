@@ -768,3 +768,109 @@ def test_emit_edit_and_delete_refuse_what_telegram_could_not_produce() -> None:
         assert unchanged == _msg(1)
 
     asyncio.run(scenario())
+
+
+# -- final review fix wave: start-up and provenance --------------------------------
+
+
+def test_offset_date_is_sent_in_whole_seconds_as_telethon_sends_it() -> None:
+    """Ledger 141 (MF1): Telethon serialises offset_date with
+    int(total_seconds()), dropping the fraction. A message dated at the
+    whole second below a fractional cutoff is therefore NOT "before" it
+    on the wire -- the fake must agree, or a fractional-cutoff bug passes
+    its tests."""
+    from datetime import timedelta
+
+    from telethon.tl.tlobject import _datetime_to_timestamp
+
+    whole = POSTED
+    fractional = POSTED + timedelta(milliseconds=500)
+    assert _datetime_to_timestamp(fractional) == _datetime_to_timestamp(whole)
+
+    async def scenario():
+        client = FakeTelegramClient(
+            history={CHANNEL: [FakeMessage(id=1, message="hi", date=whole)]}
+        )
+        return (
+            await client.get_messages(CHANNEL, limit=1, offset_date=fractional),
+            client.get_messages_calls[-1].offset_date,
+        )
+
+    found, recorded = asyncio.run(scenario())
+    assert found == []
+    assert recorded == fractional, "the call is recorded as it was passed"
+
+
+def test_get_state_reports_the_scripted_server_time() -> None:
+    from datetime import timedelta
+
+    from telethon import functions
+
+    server = POSTED + timedelta(seconds=7, microseconds=900)
+
+    async def scenario():
+        client = FakeTelegramClient(server_time=server)
+        state = await client(functions.updates.GetStateRequest())
+        return state, client.calls
+
+    state, calls = asyncio.run(scenario())
+    assert state.date == POSTED + timedelta(seconds=7)  # whole seconds, as Telegram's
+    assert calls == ["GetStateRequest"]
+
+
+def test_get_state_without_a_scripted_time_answers_with_the_real_clock() -> None:
+    from telethon import functions
+
+    before = datetime.now(UTC).replace(microsecond=0)
+
+    async def scenario():
+        return await FakeTelegramClient()(functions.updates.GetStateRequest())
+
+    state = asyncio.run(scenario())
+    assert before <= state.date <= datetime.now(UTC)
+
+
+def test_get_state_can_fail_and_other_raw_requests_are_refused() -> None:
+    from telethon import functions
+
+    async def scenario():
+        failing = FakeTelegramClient(get_state_failure=ConnectionError("no answer"))
+        with pytest.raises(ConnectionError):
+            await failing(functions.updates.GetStateRequest())
+        with pytest.raises(NotImplementedError, match="GetDifferenceRequest"):
+            await FakeTelegramClient()(
+                functions.updates.GetDifferenceRequest(pts=1, date=POSTED, qts=0)
+            )
+        hanging = FakeTelegramClient(get_state_failure="hang")
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(hanging(functions.updates.GetStateRequest()), 0.05)
+
+    asyncio.run(scenario())
+
+
+def test_get_dialogs_returns_the_scripted_chats() -> None:
+    from types import SimpleNamespace
+
+    chats = [SimpleNamespace(entity="a"), SimpleNamespace(entity="b")]
+
+    async def scenario():
+        return await FakeTelegramClient(dialogs=chats).get_dialogs()
+
+    assert list(asyncio.run(scenario())) == chats
+
+
+def test_a_fake_message_carries_telethons_provenance_fields() -> None:
+    from telethon.tl import types
+
+    header = types.MessageFwdHeader(
+        date=POSTED, from_id=types.PeerChannel(5555555555), channel_post=77
+    )
+    message = FakeMessage(
+        id=1, message="hi", date=POSTED, post=True,
+        from_id=types.PeerUser(42), fwd_from=header,
+    )
+    assert (message.post, message.from_id, message.fwd_from) == (
+        True, types.PeerUser(42), header,
+    )
+    bare = FakeMessage(id=2, message="hi", date=POSTED)
+    assert (bare.post, bare.from_id, bare.fwd_from) == (None, None, None)

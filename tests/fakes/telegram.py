@@ -67,6 +67,15 @@ stream dropped. Handlers are matched to events by the builder's *exact*
 type, as Telethon does (see `_filter_matches`): `MessageEdited`
 subclasses `NewMessage`, so an `isinstance` match would hand every new
 message to an edit handler too.
+
+**Start-up and provenance (final review fix wave).** `await client(
+GetStateRequest())` answers with `server_time` (Telegram's clock, which
+`watch` compares with this computer's), or raises `get_state_failure`;
+every other raw request is refused. `get_dialogs()` returns `dialogs`
+(the account's chats, whose entities say channel or group).
+`get_messages(offset_date=...)` drops the fraction of a second, as
+Telethon does when it sends it. A `FakeMessage` can carry `post`,
+`from_id` and `fwd_from`, as Telethon's `Message` does.
 """
 from __future__ import annotations
 
@@ -75,10 +84,10 @@ import contextlib
 import dataclasses
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Callable, Literal
 
-from telethon import events, utils
+from telethon import events, functions, types, utils
 
 DeliveryRoute = Literal["event", "history"]
 
@@ -108,6 +117,14 @@ class FakeMessage:
     date: datetime
     edit_date: datetime | None = None
     reply_to_msg_id: int | None = None
+    #: Who posted it and where a forward came from (final review F05/F09),
+    #: as Telethon's `Message` carries them: `post` (a channel's own post),
+    #: `from_id` (a `types.PeerUser`/`PeerChannel`/`PeerChat`, or None for
+    #: an anonymous channel post) and `fwd_from` (a `types.MessageFwdHeader`
+    #: with `from_id`, `channel_post` and `date`). None: not modelled.
+    post: bool | None = None
+    from_id: Any = None
+    fwd_from: Any = None
 
     def __post_init__(self) -> None:
         for name in ("date", "edit_date"):
@@ -248,6 +265,17 @@ class FakeTelegramClient:
     deliveries: list[Delivery] = field(default_factory=list)
     handler_exceptions: list[BaseException] = field(default_factory=list)
     get_dialogs_call_count: int = 0
+    #: What `get_dialogs()` returns: the account's chats, each with an
+    #: `.entity` (a `types.Channel` with `broadcast`/`megagroup`, or a
+    #: `types.Chat`) as Telethon's `Dialog` has.
+    dialogs: list[Any] = field(default_factory=list)
+    #: Telegram's clock, as `updates.GetStateRequest` reports it in
+    #: `State.date` (whole seconds). None: the real UTC clock, as a real
+    #: server's would be.
+    server_time: datetime | None = None
+    #: Raised by `GetStateRequest` instead of answering (the string
+    #: "hang" never answers, until cancelled).
+    get_state_failure: BaseException | str | None = None
 
     _connected: bool = False
     _blackout: bool = False
@@ -278,7 +306,28 @@ class FakeTelegramClient:
         else."""
         self.calls.append("get_dialogs")
         self.get_dialogs_call_count += 1
-        return ()
+        return tuple(self.dialogs)
+
+    async def __call__(self, request: Any, *args: Any, **kwargs: Any) -> Any:
+        """`await client(request)` -- a raw request, as on Telethon. Only
+        `updates.GetStateRequest` is modelled (the start-up read of
+        Telegram's clock); anything else is refused rather than answered
+        with something production never would. Logged to `calls`."""
+        if not isinstance(request, functions.updates.GetStateRequest):
+            raise NotImplementedError(
+                f"FakeTelegramClient does not answer {type(request).__name__}; "
+                "add it to the fake before relying on it"
+            )
+        self.calls.append("GetStateRequest")
+        failure = self.get_state_failure
+        if failure == "hang":
+            await asyncio.Event().wait()
+        if isinstance(failure, BaseException):
+            raise failure
+        date = self.server_time if self.server_time is not None else datetime.now(UTC)
+        return types.updates.State(
+            pts=1, qts=0, date=date.replace(microsecond=0), seq=1, unread_count=0
+        )
 
     def add_event_handler(
         self, callback: Callable[[Any], Any], event: Any = None
@@ -320,7 +369,8 @@ class FakeTelegramClient:
         `offset_date` (not reversed) returns only messages dated strictly
         before it, newest first -- Telegram's `messages.getHistory`
         "only return messages sent before the specified date", which is
-        what Telethon sends for a non-reversed `offset_date`. Reversed, or
+        what Telethon sends for a non-reversed `offset_date` -- in whole
+        seconds, the fraction dropped, as Telethon serialises it. Reversed, or
         combined with `min_id`/`max_id`, its semantics are not modelled
         here, so the fake refuses them.
 
@@ -443,12 +493,18 @@ class FakeTelegramClient:
         )
 
         channel_id = self._channel_id_of(entity)
+        # Telethon sends offset_date as whole seconds: tlobject.py's
+        # _datetime_to_timestamp is int(total_seconds()), i.e. it drops the
+        # fraction. So does the fake -- a cutoff with a fraction would
+        # otherwise behave here as it never can in production (ledger 141).
+        # The call is recorded as it was passed.
+        sent_offset = None if offset_date is None else offset_date.replace(microsecond=0)
         messages = [
             message
             for message in self.history.get(channel_id, [])
             if message.id > min_id
             and (max_id == 0 or message.id < max_id)
-            and (offset_date is None or message.date < offset_date)
+            and (sent_offset is None or message.date < sent_offset)
         ]
         messages.sort(key=lambda m: m.id, reverse=not reverse)
         if limit is not None:
