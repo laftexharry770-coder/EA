@@ -13,10 +13,29 @@ mode in two of three candidate architectures.
 So :func:`claim` matches ``state='QUEUED' OR (state='CLAIMED' AND
 claimed_at_utc < now - lease)``: a dead claimant's row becomes claimable
 again once its lease has expired. Every such reclaim is itself recorded
-as a metric (``outbox_lease_reclaimed``, via :func:`sweep_expired`)
-because a reclaim means a worker died mid-claim -- that is an operational
-fact someone should see, not just a queue mechanic that quietly heals
-itself.
+as a metric (``outbox_lease_reclaimed``) because a reclaim means a worker
+died mid-claim -- that is an operational fact someone should see, not
+just a queue mechanic that quietly heals itself. Both doors count it, in
+the same transaction as the reclaim: :func:`sweep_expired` for each row
+it re-queues, and :func:`claim` when the row it takes was CLAIMED, not
+QUEUED (final review F13: claim() used to reclaim silently). A row the
+sweep already re-queued is QUEUED again, so it is not counted twice.
+
+**The lease clock is UTC, always.** ``claimed_at_utc`` is compared as an
+ISO string, which only orders correctly when every value has the same
+offset. :func:`claim` and :func:`sweep_expired` therefore refuse a naive
+``now_utc`` and convert an aware one to UTC before building any string
+(final review F14: a claim written at UTC-5 looked 5 hours old and was
+reclaimed seconds later -- two workers holding one ENTRY -- and one
+written at UTC+3 kept a dead worker's row for 3 hours).
+
+**A result is only accepted from the claim it answers.** :func:`mark`
+takes the fence :func:`claim` returned -- ``claimed_by_pid`` and
+``attempts`` -- and matches both in its ``WHERE`` (final review F12).
+A worker slower than the lease, whose row another worker has since
+reclaimed (attempts moved on, even under the same pid), gets
+:class:`StaleClaimError` and changes nothing; the live owner's mark
+lands.
 
 **Why BEGIN IMMEDIATE, not a bare UPDATE ... RETURNING.** A single UPDATE
 statement is already atomic with respect to *what it writes*, but Python's
@@ -123,7 +142,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
 
 from xaucopier.store import metrics
@@ -150,6 +169,22 @@ _DEAD_ENTRY = (
     "kind = 'ENTRY' AND signal_id IN ("
     "SELECT signal_id FROM signals WHERE state != 'NEW' OR withdrawn_at_utc IS NOT NULL)"
 )
+
+
+class StaleClaimError(ValueError):
+    """:func:`mark` was given a claim that no longer holds the row: the
+    lease was reclaimed by another worker (or by the same pid again --
+    ``attempts`` moved on), the sweep re-queued it, it is already DONE or
+    SKIPPED, or it does not exist. Nothing was changed. A ValueError, as
+    mark()'s refusal always was."""
+
+
+def _utc(now_utc: datetime, *, caller: str) -> datetime:
+    """`now_utc` in UTC; a naive datetime is refused (see the module
+    docstring: the lease clock is compared as ISO strings)."""
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise ValueError(f"{caller}() needs a timezone-aware now_utc, got naive {now_utc!r}")
+    return now_utc.astimezone(UTC)
 
 
 class _AccountCfgLike(Protocol):
@@ -263,7 +298,16 @@ def claim(
     `attempts`. Returns None if nothing is claimable right now.
 
     `now_utc` is always a parameter, never read from the wall clock --
-    it is what makes the lease-expiry rule testable at all.
+    it is what makes the lease-expiry rule testable at all. It must be
+    timezone-aware (ValueError otherwise) and is converted to UTC before
+    anything is compared or stored.
+
+    Keep the returned row: its `claimed_by_pid` and `attempts` are the
+    fence `mark()` requires.
+
+    Taking a row that was CLAIMED (an expired lease: its worker died)
+    rather than QUEUED bumps `outbox_lease_reclaimed` in the same
+    transaction.
 
     An ENTRY row whose signal is no longer tradeable (INVALID, VOIDED,
     withdrawn) is never returned: in the same transaction, every such
@@ -277,6 +321,7 @@ def claim(
     Raises RuntimeError if `conn` already has a transaction pending --
     see `_require_no_pending_transaction` and the module docstring.
     """
+    now_utc = _utc(now_utc, caller="claim")
     _require_no_pending_transaction(conn, caller="claim")
 
     cutoff_iso = (now_utc - timedelta(seconds=lease_seconds)).isoformat()
@@ -302,23 +347,38 @@ def claim(
                     name=DEAD_ENTRY_SKIPPED_METRIC,
                     value=dead,
                 )
-            row = conn.execute(
-                "UPDATE outbox SET "
-                "  state = 'CLAIMED', "
-                "  claimed_by_pid = ?, "
-                "  claimed_at_utc = ?, "
-                "  attempts = attempts + 1 "
-                "WHERE outbox_id = ("
-                "  SELECT outbox_id FROM outbox "
-                "  WHERE account_id = ? "
-                "    AND (state = 'QUEUED' "
-                "         OR (state = 'CLAIMED' AND claimed_at_utc < ?)) "
-                "  ORDER BY outbox_id ASC "
-                "  LIMIT 1"
-                ") "
-                "RETURNING *",
-                (pid, now_iso, account_id, cutoff_iso),
+            # Pick first, under the write lock BEGIN IMMEDIATE holds, so
+            # the state the row had -- QUEUED, or CLAIMED with an expired
+            # lease -- is known (RETURNING only gives the new values).
+            candidate = conn.execute(
+                "SELECT outbox_id, state FROM outbox "
+                "WHERE account_id = ? "
+                "  AND (state = 'QUEUED' OR (state = 'CLAIMED' AND claimed_at_utc < ?)) "
+                "ORDER BY outbox_id ASC "
+                "LIMIT 1",
+                (account_id, cutoff_iso),
             ).fetchone()
+            row = None
+            if candidate is not None:
+                row = conn.execute(
+                    "UPDATE outbox SET "
+                    "  state = 'CLAIMED', "
+                    "  claimed_by_pid = ?, "
+                    "  claimed_at_utc = ?, "
+                    "  attempts = attempts + 1 "
+                    "WHERE outbox_id = ? "
+                    "RETURNING *",
+                    (pid, now_iso, candidate[0]),
+                ).fetchone()
+                if candidate[1] == "CLAIMED":
+                    # A worker died holding this row (F13). Through the
+                    # module, like sweep_expired(), so a test can prove the
+                    # pair is atomic.
+                    metrics.bump(
+                        conn,
+                        day_key=metrics.day_key_for(now_utc),
+                        name=LEASE_RECLAIMED_METRIC,
+                    )
         except BaseException:
             conn.execute("ROLLBACK")
             raise
@@ -335,27 +395,48 @@ def mark(
     *,
     outbox_id: int,
     state: Literal["DONE", "SKIPPED"],
+    claimed_by_pid: int,
+    attempts: int,
     reason: str | None = None,
 ) -> None:
     """Transition a CLAIMED row to a terminal state (DONE or SKIPPED),
-    recording `reason`. Raises if the row is not currently CLAIMED --
-    marking a row a worker never actually held would silently paper over
-    a lease that had already expired out from under it (reclaimed by
-    someone else, or by sweep_expired()), which is exactly the kind of
-    silent double-write the lease exists to prevent.
+    recording `reason` -- but only for the claim that holds it now.
+
+    `claimed_by_pid` and `attempts` are the fence: pass them exactly as
+    `claim()` returned them. Both are matched in the UPDATE itself, so a
+    worker whose lease expired and was reclaimed by someone else (or by
+    the same pid again: `attempts` moved on) cannot record its late
+    result over the live owner's, and a row the sweep re-queued, a row
+    already DONE/SKIPPED, or no row at all is refused too. Any refusal
+    raises `StaleClaimError` (a ValueError) naming who holds the row
+    now, and changes nothing (final review F12).
 
     Does not commit or roll back -- same contract as fan_out().
     """
     cursor = conn.execute(
-        "UPDATE outbox SET state = ?, reason = ? WHERE outbox_id = ? AND state = 'CLAIMED'",
-        (state, reason, outbox_id),
+        "UPDATE outbox SET state = ?, reason = ? "
+        "WHERE outbox_id = ? AND state = 'CLAIMED' AND claimed_by_pid = ? AND attempts = ?",
+        (state, reason, outbox_id, claimed_by_pid, attempts),
     )
-    if cursor.rowcount == 0:
-        raise ValueError(
-            f"outbox_id={outbox_id} is not CLAIMED; refusing to mark it {state!r} "
-            "(it may not exist, already be terminal, or have had its lease "
-            "reclaimed by someone else)"
+    if cursor.rowcount == 1:
+        return
+    current = conn.execute(
+        "SELECT state, claimed_by_pid, attempts FROM outbox WHERE outbox_id = ?",
+        (outbox_id,),
+    ).fetchone()
+    yours = f"your claim (pid {claimed_by_pid}, attempt {attempts})"
+    if current is None:
+        now = "the row does not exist"
+    elif current[0] == "CLAIMED":
+        now = (
+            f"it is now claimed by pid {current[1]} (attempt {current[2]}): the lease "
+            "expired and was reclaimed"
         )
+    else:
+        now = f"it is now {current[0]}"
+    raise StaleClaimError(
+        f"refusing to mark outbox_id={outbox_id} {state!r} for {yours}: {now}"
+    )
 
 
 def sweep_expired(
@@ -378,9 +459,13 @@ def sweep_expired(
     VOIDED, withdrawn) is SKIPPED instead of re-queued, and counted in
     `outbox_dead_entry_skipped`, not in the return value.
 
+    `now_utc` must be timezone-aware (ValueError otherwise) and is
+    converted to UTC before anything is compared.
+
     Raises RuntimeError if `conn` already has a transaction pending --
     see `_require_no_pending_transaction` and the module docstring.
     """
+    now_utc = _utc(now_utc, caller="sweep_expired")
     _require_no_pending_transaction(conn, caller="sweep_expired")
 
     cutoff_iso = (now_utc - timedelta(seconds=lease_seconds)).isoformat()

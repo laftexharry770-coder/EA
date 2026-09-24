@@ -16,7 +16,7 @@ import json
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -492,9 +492,13 @@ def test_sweep_expired_accumulates_metric_across_calls(conn):
 
 
 def test_mark_transitions_claimed_to_done_and_records_reason(conn):
-    outbox_id = _insert_outbox_row(conn, account_id="acct-1", state="CLAIMED")
+    outbox_id = _insert_outbox_row(
+        conn, account_id="acct-1", state="CLAIMED", claimed_by_pid=4, attempts=1
+    )
 
-    outbox.mark(conn, outbox_id=outbox_id, state="DONE", reason="filled")
+    outbox.mark(
+        conn, outbox_id=outbox_id, state="DONE", reason="filled", claimed_by_pid=4, attempts=1
+    )
 
     row = conn.execute(
         "SELECT state, reason FROM outbox WHERE outbox_id = ?", (outbox_id,)
@@ -506,8 +510,8 @@ def test_mark_transitions_claimed_to_done_and_records_reason(conn):
 def test_mark_raises_when_row_is_not_claimed(conn):
     outbox_id = _insert_outbox_row(conn, account_id="acct-1", state="QUEUED")
 
-    with pytest.raises(Exception):
-        outbox.mark(conn, outbox_id=outbox_id, state="DONE")
+    with pytest.raises(outbox.StaleClaimError):
+        outbox.mark(conn, outbox_id=outbox_id, state="DONE", claimed_by_pid=1, attempts=0)
 
     row = conn.execute(
         "SELECT state FROM outbox WHERE outbox_id = ?", (outbox_id,)
@@ -882,3 +886,237 @@ def test_claim_refuses_an_expired_claim_of_a_dead_signal_even_without_a_sweep(co
 
     assert outbox.claim(conn, account_id="acct-1", pid=2, now_utc=NOW + timedelta(days=1)) is None
     assert _entry_states(conn, signal_id)[0] == ("acct-1", "SKIPPED", 1)
+
+
+# -- final review F12: mark() is fenced by the claim it answers ---------------
+
+
+def _claimed_by(conn, outbox_id: int) -> tuple:
+    return tuple(
+        conn.execute(
+            "SELECT state, reason, claimed_by_pid, attempts FROM outbox WHERE outbox_id = ?",
+            (outbox_id,),
+        ).fetchone()
+    )
+
+
+def test_a_stale_claimants_mark_is_refused_and_the_live_owners_succeeds(conn):
+    """pid 1 claims, is slower than the lease, and pid 2 reclaims the row
+    (attempts 2). pid 1's late mark used to be ACCEPTED -- the row said
+    DONE by pid 1 with claimed_by_pid 2 -- and pid 2, the worker really
+    executing, then got the error."""
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    first = outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW)
+    second = outbox.claim(
+        conn, account_id="acct-1", pid=2, now_utc=NOW + timedelta(seconds=90, microseconds=1)
+    )
+    assert (first.outbox_id, second.outbox_id) == (outbox_id, outbox_id)
+    assert (second.claimed_by_pid, second.attempts) == (2, 2)
+
+    with pytest.raises(outbox.StaleClaimError, match="pid 2") as caught:
+        outbox.mark(
+            conn,
+            outbox_id=outbox_id,
+            state="DONE",
+            reason="pid 1 done (late)",
+            claimed_by_pid=first.claimed_by_pid,
+            attempts=first.attempts,
+        )
+    assert isinstance(caught.value, ValueError)
+    assert _claimed_by(conn, outbox_id) == ("CLAIMED", None, 2, 2)
+
+    outbox.mark(
+        conn,
+        outbox_id=outbox_id,
+        state="DONE",
+        reason="pid 2 done",
+        claimed_by_pid=second.claimed_by_pid,
+        attempts=second.attempts,
+    )
+    assert _claimed_by(conn, outbox_id) == ("DONE", "pid 2 done", 2, 2)
+
+
+def test_the_same_pid_reclaiming_is_still_told_apart_by_attempts(conn):
+    """A restarted worker can get the same pid; the attempt number is
+    what tells its new claim from the dead one's."""
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    old = outbox.claim(conn, account_id="acct-1", pid=7, now_utc=NOW)
+    new = outbox.claim(conn, account_id="acct-1", pid=7, now_utc=NOW + timedelta(seconds=91))
+    assert (old.attempts, new.attempts) == (1, 2)
+
+    with pytest.raises(outbox.StaleClaimError):
+        outbox.mark(conn, outbox_id=outbox_id, state="SKIPPED", reason="old",
+                    claimed_by_pid=7, attempts=1)
+    assert _claimed_by(conn, outbox_id) == ("CLAIMED", None, 7, 2)
+    outbox.mark(conn, outbox_id=outbox_id, state="SKIPPED", reason="new",
+                claimed_by_pid=7, attempts=2)
+    assert _claimed_by(conn, outbox_id)[:2] == ("SKIPPED", "new")
+
+
+def test_a_mark_after_the_sweep_requeued_the_row_is_refused(conn):
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    claimed = outbox.claim(conn, account_id="acct-1", pid=3, now_utc=NOW)
+    assert outbox.sweep_expired(conn, now_utc=NOW + timedelta(seconds=91)) == 1
+
+    with pytest.raises(outbox.StaleClaimError, match="QUEUED"):
+        outbox.mark(conn, outbox_id=outbox_id, state="DONE",
+                    claimed_by_pid=claimed.claimed_by_pid, attempts=claimed.attempts)
+    assert _claimed_by(conn, outbox_id) == ("QUEUED", None, None, 1)
+
+
+def test_mark_cannot_be_called_without_the_fence(conn):
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1", state="CLAIMED",
+                                   claimed_by_pid=1, attempts=1)
+    with pytest.raises(TypeError):
+        outbox.mark(conn, outbox_id=outbox_id, state="DONE")  # type: ignore[call-arg]
+    assert _claimed_by(conn, outbox_id) == ("CLAIMED", None, 1, 1)
+
+
+def test_mark_of_a_row_that_does_not_exist_is_refused(conn):
+    with pytest.raises(outbox.StaleClaimError, match="does not exist"):
+        outbox.mark(conn, outbox_id=12345, state="DONE", claimed_by_pid=1, attempts=1)
+
+
+# -- final review F13: claim()'s own reclaim is counted ------------------------
+
+
+def _reclaimed_metric(conn) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT day_key, value FROM metrics WHERE name = ?",
+            (outbox.LEASE_RECLAIMED_METRIC,),
+        )
+    ]
+
+
+def test_claim_taking_an_expired_claim_counts_a_lease_reclaim(conn):
+    """A reclaim means a worker died holding the row. claim() took such
+    rows itself without counting them, so `status` showed 0 while dead
+    workers healed silently."""
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    assert outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW) is not None
+    assert _reclaimed_metric(conn) == []  # a QUEUED row is not a reclaim
+
+    later = NOW + timedelta(days=1, seconds=1)  # expired, and on the next UTC day
+    again = outbox.claim(conn, account_id="acct-1", pid=2, now_utc=later)
+
+    assert (again.outbox_id, again.claimed_by_pid, again.attempts) == (outbox_id, 2, 2)
+    assert _reclaimed_metric(conn) == [(later.date().isoformat(), 1)]
+
+
+def test_a_row_the_sweep_already_requeued_is_not_counted_twice(conn):
+    _insert_outbox_row(conn, account_id="acct-1")
+    outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW)
+    later = NOW + timedelta(seconds=91)
+    assert outbox.sweep_expired(conn, now_utc=later) == 1
+    assert outbox.claim(conn, account_id="acct-1", pid=2, now_utc=later) is not None
+    assert _reclaimed_metric(conn) == [(later.date().isoformat(), 1)]
+
+
+def test_an_expired_claim_of_a_dead_signal_skipped_by_claim_is_not_a_reclaim(conn):
+    """Mirrors sweep_expired(): a dead ENTRY is counted as skipped, not as
+    reclaimed -- nobody takes it."""
+    signal_id = _signal_with_entries(conn)
+    assert outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW) is not None
+    conn.execute("UPDATE signals SET state = 'INVALID' WHERE signal_id = ?", (signal_id,))
+    conn.commit()
+    assert outbox.claim(conn, account_id="acct-1", pid=2, now_utc=NOW + timedelta(days=1)) is None
+    assert _reclaimed_metric(conn) == []
+    assert _dead_metric(conn) == 1
+
+
+def test_claims_reclaim_count_is_atomic_with_the_claim(conn, monkeypatch):
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW)
+    real_bump = metrics.bump
+
+    def bump(conn_, *, day_key, name, value=1):
+        if name == outbox.LEASE_RECLAIMED_METRIC:
+            raise RuntimeError("simulated crash writing the reclaim count")
+        real_bump(conn_, day_key=day_key, name=name, value=value)
+
+    monkeypatch.setattr(metrics, "bump", bump)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        outbox.claim(conn, account_id="acct-1", pid=2, now_utc=NOW + timedelta(seconds=91))
+    assert _claimed_by(conn, outbox_id) == ("CLAIMED", None, 1, 1)  # the claim rolled back
+    assert not conn.in_transaction
+
+
+# -- final review F14: the lease clock is always UTC ---------------------------
+
+_UTC_MINUS_5 = timezone(timedelta(hours=-5))
+_UTC_PLUS_3 = timezone(timedelta(hours=3))
+
+
+def test_a_claim_made_with_a_non_utc_clock_is_not_reclaimed_five_seconds_later(conn):
+    """claimed_at_utc was compared as an ISO string across offsets: a
+    claim at T0 written '...05:00:00-05:00' looked older than a UTC
+    cutoff, so a fresh lease was taken by a second worker."""
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    first = outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW.astimezone(_UTC_MINUS_5))
+    stored = conn.execute(
+        "SELECT claimed_at_utc FROM outbox WHERE outbox_id = ?", (outbox_id,)
+    ).fetchone()[0]
+    assert stored == NOW.isoformat()  # '2026-09-05T11:00:00+00:00'
+    assert first.claimed_at_utc == NOW and first.claimed_at_utc.utcoffset() == timedelta(0)
+
+    assert outbox.claim(conn, account_id="acct-1", pid=2, now_utc=NOW + timedelta(seconds=5)) is None
+    assert outbox.sweep_expired(conn, now_utc=NOW + timedelta(seconds=5)) == 0
+    assert _claimed_by(conn, outbox_id) == ("CLAIMED", None, 1, 1)
+
+
+def test_a_non_utc_sweep_clock_does_not_reset_a_fresh_lease(conn):
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW)
+    assert outbox.sweep_expired(
+        conn, now_utc=(NOW + timedelta(seconds=5)).astimezone(_UTC_PLUS_3)
+    ) == 0
+    assert _claimed_by(conn, outbox_id) == ("CLAIMED", None, 1, 1)
+
+
+def test_a_dead_workers_claim_made_east_of_utc_expires_on_time(conn):
+    """The opposite direction (verifier's F4c): a claim written at UTC+3
+    looked *newer* than it was, so a dead worker's ENTRY stayed stuck for
+    three hours."""
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    outbox.claim(conn, account_id="acct-1", pid=1, now_utc=NOW.astimezone(_UTC_PLUS_3))
+    later = NOW + timedelta(seconds=150)
+    again = outbox.claim(conn, account_id="acct-1", pid=2, now_utc=later)
+    assert again is not None and again.outbox_id == outbox_id
+
+
+@pytest.mark.parametrize("call", ["claim", "sweep_expired"])
+def test_a_naive_clock_is_refused_before_anything_changes(conn, call):
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    naive = datetime(2026, 9, 5, 11, 0)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        if call == "claim":
+            outbox.claim(conn, account_id="acct-1", pid=1, now_utc=naive)
+        else:
+            outbox.sweep_expired(conn, now_utc=naive)
+    assert _claimed_by(conn, outbox_id) == ("QUEUED", None, None, 0)
+    assert not conn.in_transaction
+
+
+def test_a_worker_cannot_mark_a_row_another_worker_holds(conn):
+    """Same attempt number, different worker: the pid half of the fence."""
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    held = outbox.claim(conn, account_id="acct-1", pid=2, now_utc=NOW)
+    with pytest.raises(outbox.StaleClaimError, match="claimed by pid 2"):
+        outbox.mark(conn, outbox_id=outbox_id, state="DONE", claimed_by_pid=1,
+                    attempts=held.attempts)
+    assert _claimed_by(conn, outbox_id) == ("CLAIMED", None, 2, 1)
+
+
+def test_a_result_is_recorded_once(conn):
+    """A second mark with the very same fence finds the row DONE: a
+    terminal state is never overwritten."""
+    outbox_id = _insert_outbox_row(conn, account_id="acct-1")
+    held = outbox.claim(conn, account_id="acct-1", pid=5, now_utc=NOW)
+    outbox.mark(conn, outbox_id=outbox_id, state="DONE", reason="filled",
+                claimed_by_pid=5, attempts=held.attempts)
+    with pytest.raises(outbox.StaleClaimError, match="now DONE"):
+        outbox.mark(conn, outbox_id=outbox_id, state="SKIPPED", reason="again",
+                    claimed_by_pid=5, attempts=held.attempts)
+    assert _claimed_by(conn, outbox_id) == ("DONE", "filled", 5, 1)
