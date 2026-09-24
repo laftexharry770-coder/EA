@@ -71,6 +71,7 @@ import logging
 import queue
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, NoReturn, TypeVar
@@ -277,6 +278,26 @@ class Writer:
         # sentinel -- orphaning that job behind a queue nothing will ever
         # drain again, and its future never resolves.
         self._lifecycle_lock = threading.Lock()
+        # time.monotonic() when the thread last started or finished a job
+        # (None before the first); see `last_progress`.
+        self._last_progress: float | None = None
+        # Whether the "another program holds the database" warning is out:
+        # set by a job failing on the lock, cleared by a write succeeding.
+        self._lock_reported = False
+
+    @property
+    def last_progress(self) -> float | None:
+        """`time.monotonic()` when the writer thread last started or
+        finished a job, or None if it has run none yet.
+
+        This, not one queued job finishing, is how to tell a busy writer
+        from a hung one (group-1 review leftover G1L-1): while another
+        program holds the write lock, every job waits out the busy timeout
+        and fails, one after another, and a probe queued behind them can
+        miss any fixed deadline -- yet the thread is healthy and makes
+        progress every busy timeout. A writer stuck inside one job makes
+        none."""
+        return self._last_progress
 
     def start(self) -> None:
         if self._thread is not None:
@@ -362,12 +383,37 @@ class Writer:
                 if job is None:
                     break
                 fn, in_flight, read_only = job
+                self._last_progress = time.monotonic()
                 self._run_job(conn, fn, in_flight, read_only=read_only)
+                self._last_progress = time.monotonic()
+                self._report_lock(in_flight, read_only=read_only)
                 in_flight = None
         except BaseException as exc:  # noqa: BLE001 -- same: never orphan a future
             self._die(exc, in_flight=in_flight)
         finally:
             conn.close()
+
+    def _report_lock(self, future: concurrent.futures.Future, *, read_only: bool) -> None:
+        """Say plainly, once per stretch, that another program is holding
+        the database: each job failing on its lock is otherwise only an
+        error line about one message. A write that succeeds ends the
+        stretch (a read-only job does not: it never needed the lock)."""
+        if future.cancelled():
+            return
+        error = future.exception()
+        if error is not None and is_lock_error(error):
+            if not self._lock_reported:
+                self._lock_reported = True
+                logger.warning(
+                    "Another program is holding the database %s, so nothing can be "
+                    "saved right now (it may be a database viewer, or a second copy "
+                    "of xaucopier). Nothing is lost: what arrives meanwhile is saved "
+                    "once it lets go. If this keeps happening, close that program.",
+                    self._path,
+                )
+        elif error is None and not read_only and self._lock_reported:
+            self._lock_reported = False
+            logger.info("The database %s is free again; saving has resumed.", self._path)
 
     def _die(
         self, exc: BaseException, *, in_flight: concurrent.futures.Future | None

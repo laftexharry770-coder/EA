@@ -860,6 +860,13 @@ class Listener:
         past the busy timeout must not fail it and stop `watch`."""
         await self._run_on_writer(_writer_noop, read_only=True)
 
+    def writer_progressed_since(self, moment: float) -> bool:
+        """Whether the writer thread started or finished a job at or after
+        `moment` (a `time.monotonic()` reading) -- the poll's test of a
+        busy writer versus a hung one (see `db.Writer.last_progress`)."""
+        progress = getattr(self.writer, "last_progress", None)
+        return progress is not None and progress >= moment
+
     async def record_metric(self, name: str, value: int = 1) -> None:
         """`metrics(today, name) += value`, on the writer thread, where
         today is the UTC day of this listener's injected clock. Through

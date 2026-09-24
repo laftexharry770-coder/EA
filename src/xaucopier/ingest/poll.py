@@ -13,7 +13,11 @@ Every `interval` (5 s) the poll runs one *round*:
    writer thread). A dead writer is otherwise noticed only by the next
    write, and a quiet channel makes none; the probe surfaces a death
    within one interval, through the listener's own writer door, so it
-   stops the listener with exit 4 like any other `WriterDeadError`.
+   stops the listener with exit 4 like any other `WriterDeadError`. A
+   probe still queued at its deadline is not proof of a hung writer: if
+   the writer started or finished any job meanwhile it is busy, not
+   hung (another program holding the database's write lock makes every
+   queued job wait out the busy timeout), and the round carries on.
 2. **Read each enabled channel's history, one channel after another** --
    `Listener.read_history(channel, source="poll", limit=..., rpc_timeout=
    ...)`. That call is the only thing that moves the per-channel pointer:
@@ -102,9 +106,10 @@ listener) at once:
   again. The listener re-raises it as itself, so the process exits 3 or
   5 ("do not restart"), not 4. (`FrozenMethodInvalidError` is a
   `FloodError`; it is matched here first, never deferred as a flood.)
-- `WriterUnresponsiveError`: the writer did not run the probe within
-  `writer_probe_timeout` -- a hung writer thread, which stores nothing
-  and would hang the next ingest forever.
+- `WriterUnresponsiveError`: the writer neither ran the probe nor
+  started or finished any other job within `writer_probe_timeout` -- a
+  hung writer thread, which stores nothing and would hang the next
+  ingest forever.
 
 **One history read per channel at a time.** Channels are read one after
 another within a round, and rounds never overlap, so the poll never runs
@@ -153,7 +158,8 @@ DEFAULT_POLL_LIMIT = 100
 #: imported from the listener above: backfill uses the same bound.
 #: Hard bound on the per-round writer probe. Generous: the probe queues
 #: behind whatever the writer is doing, and each job may legitimately wait
-#: out a 10 s `busy_timeout`. Only a hung writer takes a full minute.
+#: out a 10 s `busy_timeout`. Past it, the writer still counts as alive if
+#: it started or finished any job meanwhile; only a hung writer does not.
 DEFAULT_WRITER_PROBE_TIMEOUT = 60.0
 
 #: `messages.source` for everything the poll ingests.
@@ -171,6 +177,14 @@ class WriterUnresponsiveError(RuntimeError):
     `writer_probe_timeout`. It is alive but not serving jobs, so nothing
     is being stored; the poll stops, and with it the listener, for the
     supervisor to restart."""
+
+
+def _retrieve_outcome(task: asyncio.Future[object]) -> None:
+    """Mark a probe's outcome as seen, so a probe left to finish in the
+    queue never logs "exception was never retrieved". A writer death it
+    meets has already been reported through the listener's writer door."""
+    if not task.cancelled():
+        task.exception()
 
 
 def count_missed(results: tuple[HistoryIngest, ...]) -> int:
@@ -272,12 +286,31 @@ class HistoryPoll:
             logger.exception("could not record the poll round for `status`; carrying on")
 
     async def _probe_writer(self, listener: Listener) -> None:
+        """Step 1. The writer is alive if it runs the probe within
+        `writer_probe_timeout` -- or, failing that, if it started or
+        finished *some* job in that time (`Listener.writer_progressed_
+        since`): a probe queued behind jobs that each wait out another
+        program's write lock can miss any fixed deadline while the writer
+        is perfectly healthy (group-1 review leftover G1L-1). The probe is
+        then left to finish in the queue. Only a writer that made no
+        progress at all is `WriterUnresponsiveError`."""
+        queued_at = time.monotonic()
+        probe = asyncio.ensure_future(listener.probe_writer())
+        probe.add_done_callback(_retrieve_outcome)
         try:
-            await asyncio.wait_for(listener.probe_writer(), timeout=self.writer_probe_timeout)
+            await asyncio.wait_for(asyncio.shield(probe), timeout=self.writer_probe_timeout)
         except TimeoutError as exc:
+            if listener.writer_progressed_since(queued_at):
+                logger.warning(
+                    "the database is slow to answer (still busy after %gs); carrying on",
+                    self.writer_probe_timeout,
+                )
+                return
+            probe.cancel()
             raise WriterUnresponsiveError(
-                f"the writer thread did not run a no-op within {self.writer_probe_timeout:g}s; "
-                "it is not storing anything, so the poll is stopping the listener"
+                f"the writer thread did not run a no-op within {self.writer_probe_timeout:g}s "
+                "and finished no other job in that time; it is not storing anything, so "
+                "the poll is stopping the listener"
             ) from exc
 
     async def _poll_channel(

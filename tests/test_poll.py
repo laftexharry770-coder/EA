@@ -1096,3 +1096,87 @@ def test_another_programs_lock_across_three_rounds_never_skips_the_message(
     assert _rows(db_path, "SELECT COUNT(*) FROM outbox")[0][0] == len(ACCOUNTS)
     assert [e.message_id for e in errors] == [10, 10, 10]
     assert all("locked" in e.error for e in errors)
+
+
+# -- group-1 review leftover G1L-1: the writer is alive while it makes progress ------
+
+
+def test_a_long_lock_with_jobs_queued_does_not_make_a_healthy_writer_look_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """G1L-1. Another program holds the write lock for several busy
+    timeouts while messages keep arriving: each queued ingest waits out the
+    timeout and fails, one after another, and the round's writer probe
+    waits in the queue behind them past its deadline. The writer is
+    healthy -- it finishes a job every busy timeout -- so the poll must
+    carry on (before, it raised WriterUnresponsiveError and watch stopped
+    with exit 4), say plainly that another program holds the database, and
+    store everything once the lock is released."""
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 100)
+    db_path = tmp_path / "store.db"
+    _seed_pointer(db_path, A, 9)
+    time = SteppedTime()
+    arriving = list(range(10, 20))  # 10 queued jobs x 100 ms, against a 0.4 s deadline
+
+    async def one_round(listener: Listener) -> None:
+        time.wake()
+        await _until_asleep(listener, time, timeout=10.0)
+
+    async def scenario():
+        client = FakeTelegramClient()
+        async with _polling(db_path, client, time, writer_probe_timeout=0.4) as listener:
+            with _write_lock_held_by_another_program(db_path):
+                live = [asyncio.create_task(client.emit(A, _chatter(i))) for i in arriving]
+                await asyncio.sleep(0.05)  # every handler's job is queued now
+                await one_round(listener)
+                await one_round(listener)
+                stopped_while_locked = listener.poll_task.done()
+                await asyncio.gather(*live)
+            await one_round(listener)
+            return stopped_while_locked, listener.poll_task.done()
+
+    with caplog.at_level("INFO", logger="xaucopier.store.db"):
+        stopped_while_locked, stopped_after = asyncio.run(scenario())
+
+    assert not stopped_while_locked, "a writer failing jobs on a lock was taken for dead"
+    assert not stopped_after
+    assert _stored_ids(db_path) == arriving
+    assert _pointer(db_path) == arriving[-1]
+    held = [r for r in caplog.records if "another program" in r.getMessage().lower()]
+    assert len(held) == 1 and held[0].levelname == "WARNING", [r.getMessage() for r in held]
+    freed = [r for r in caplog.records if "free again" in r.getMessage()]
+    assert len(freed) == 1
+
+
+def test_a_writer_stuck_in_one_job_is_still_found_unresponsive(tmp_path: Path) -> None:
+    """The other side of G1L-1: progress means a job *started or finished*
+    since the probe was queued. A writer stuck inside one job makes none,
+    and the poll still stops it."""
+    import threading
+
+    db_path = tmp_path / "store.db"
+    _seed_pointer(db_path, A, 9)
+    time = SteppedTime()
+    release = threading.Event()
+
+    async def scenario():
+        client = FakeTelegramClient()
+        listener = _build(db_path, client, time, writer_probe_timeout=0.3)
+        task = asyncio.create_task(run_listener(listener))
+        await _wait_for(lambda: "run_until_disconnected" in client.calls)
+        await _until_asleep(listener, time)
+        stuck = listener.writer.submit(lambda conn: release.wait(10))
+        await asyncio.sleep(0.05)  # the stuck job has started
+        time.wake()
+        try:
+            await _wait_for(lambda: listener.poll_task.done(), timeout=3.0)
+        finally:
+            release.set()  # let the stuck job end, so the writer can stop
+        await asyncio.wrap_future(stuck)
+        exit_code = await asyncio.wait_for(task, timeout=5.0)
+        return exit_code, listener.poll_task
+
+    exit_code, poll_task = asyncio.run(scenario())
+
+    assert exit_code == EXIT_LISTENER_STOPPED
+    assert isinstance(poll_task.exception(), WriterUnresponsiveError)
