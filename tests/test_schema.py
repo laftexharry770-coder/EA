@@ -395,17 +395,16 @@ def _dump(conn):
             "ORDER BY followup_id"
         ).fetchall(),
         "outbox": conn.execute("SELECT * FROM outbox ORDER BY outbox_id").fetchall(),
-        "channel_state": conn.execute("SELECT * FROM channel_state").fetchall(),
+        "channel_state": conn.execute(
+            "SELECT channel_id, last_processed_message_id, consecutive_parse_failures "
+            "FROM channel_state ORDER BY channel_id"
+        ).fetchall(),
         "metrics": conn.execute("SELECT * FROM metrics").fetchall(),
     }
 
 
 def _columns(conn, table):
     return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
-
-
-def test_current_version_is_three():
-    assert CURRENT_VERSION == 3
 
 
 def test_upgrading_a_version_1_database_to_2_preserves_every_row(tmp_path):
@@ -564,7 +563,7 @@ def test_upgrading_a_version_2_database_to_3_preserves_every_row(tmp_path):
     migrate(conn)
 
     (version,) = conn.execute("PRAGMA user_version").fetchone()
-    assert version == 3
+    assert version == CURRENT_VERSION
     assert _dump(conn) == before
     assert conn.execute("SELECT * FROM alerts").fetchall() == alerts_before
     assert conn.execute("SELECT COUNT(*) FROM heartbeats").fetchone() == (0,)
@@ -596,7 +595,7 @@ def test_migration_3_rolls_back_whole_on_a_failure(tmp_path, monkeypatch):
 
     migrate(conn)
     (version,) = conn.execute("PRAGMA user_version").fetchone()
-    assert version == 3
+    assert version == CURRENT_VERSION
     conn.close()
 
 
@@ -782,3 +781,195 @@ def test_an_up_to_date_or_newer_file_is_decided_without_the_write_lock(tmp_path,
         conn.close()
         holder.execute("ROLLBACK")
         holder.close()
+
+
+# -- migration 4 (Plan 2 final review fix wave) ---------------------------------
+
+#: Every column migration 4 adds, by table. All NULL-able, no default.
+_V4_COLUMNS = {
+    "channel_state": ("seed_cutoff_utc", "seeded_at_utc"),
+    "messages": (
+        "relay_of_signal_id",
+        "sender_kind",
+        "sender_id",
+        "is_post",
+        "fwd_from_channel_id",
+        "fwd_from_post_id",
+        "fwd_from_date_utc",
+    ),
+}
+
+
+def _v3_database(db_path):
+    """A database exactly as migration 3 left it (migration 4 withheld),
+    holding a row in every table: a channel whose pointer was seeded, a
+    channel with only a parse-failure counter (pointer 0, never seeded),
+    an alert and a heartbeat."""
+    import xaucopier.store.migrations as migrations_module
+
+    conn = _v2_database(db_path)
+    conn.isolation_level = None
+    conn.execute("BEGIN")
+    for statement in migrations_module._migration_3_statements():
+        conn.execute(statement)
+    conn.execute("PRAGMA user_version = 3")
+    conn.execute("COMMIT")
+    conn.isolation_level = ""
+    conn.execute(
+        "INSERT INTO channel_state (channel_id, last_processed_message_id, "
+        "consecutive_parse_failures) VALUES (2, 0, 1)"
+    )
+    conn.execute(
+        "INSERT INTO heartbeats (name, at_utc, detail) "
+        "VALUES ('watch_started', '2026-09-10T00:00:00+00:00', NULL)"
+    )
+    conn.commit()
+    return conn
+
+
+def _schema_shape(conn):
+    """Everything about the schema a program could notice: every table's
+    and index's DDL as SQLite stored it, and every column's full
+    definition (type, NOT NULL, default, key position, hidden)."""
+    master = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    tables = [row[1] for row in master if row[0] == "table"]
+    columns = {t: conn.execute(f"PRAGMA table_xinfo({t})").fetchall() for t in tables}
+    indexes = {
+        t: [
+            (idx[1], idx[2], conn.execute(f"PRAGMA index_xinfo({idx[1]})").fetchall())
+            for idx in conn.execute(f"PRAGMA index_list({t})").fetchall()
+        ]
+        for t in tables
+    }
+    return master, columns, indexes
+
+
+def test_current_version_is_four():
+    assert CURRENT_VERSION == 4
+
+
+def test_upgrading_a_version_3_database_to_4_preserves_every_row(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    conn = _v3_database(tmp_path / "store.db")
+    before = _dump(conn)
+    alerts_before = conn.execute("SELECT * FROM alerts").fetchall()
+    heartbeats_before = conn.execute("SELECT * FROM heartbeats").fetchall()
+    for table, added in _V4_COLUMNS.items():
+        assert not set(added) & set(_columns(conn, table))
+
+    started = datetime.now(UTC).replace(microsecond=0)
+    migrate(conn)
+    finished = datetime.now(UTC)
+
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == CURRENT_VERSION == 4
+    assert _dump(conn) == before
+    assert conn.execute("SELECT * FROM alerts").fetchall() == alerts_before
+    assert conn.execute("SELECT * FROM heartbeats").fetchall() == heartbeats_before
+    for table, added in _V4_COLUMNS.items():
+        assert set(added) <= set(_columns(conn, table))
+    # Every new messages column starts NULL on existing rows.
+    new_message_columns = ", ".join(_V4_COLUMNS["messages"])
+    assert conn.execute(f"SELECT {new_message_columns} FROM messages").fetchall() == [
+        (None,) * len(_V4_COLUMNS["messages"])
+    ] * 2
+    # A channel whose pointer is above 0 was seeded by an earlier run:
+    # it is marked seeded as of the migration. A pointer-0 row (only the
+    # parse-failure counter) was never seeded and stays unmarked. No
+    # channel is waiting for a re-seed.
+    rows = dict(
+        conn.execute("SELECT channel_id, seeded_at_utc FROM channel_state").fetchall()
+    )
+    assert rows[2] is None
+    seeded_at = datetime.fromisoformat(rows[1])
+    assert seeded_at.utcoffset() == timedelta(0)
+    assert seeded_at.microsecond == 0
+    assert started - timedelta(seconds=1) <= seeded_at <= finished
+    assert rows[1].endswith("+00:00")
+    assert conn.execute("SELECT seed_cutoff_utc FROM channel_state").fetchall() == [
+        (None,),
+        (None,),
+    ]
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert tables == EXPECTED_TABLES
+    conn.close()
+
+
+def test_migration_4_rolls_back_whole_on_a_failure(tmp_path, monkeypatch):
+    """Injected after the last ALTER and the backfill: were migration 4
+    not one transaction with the user_version write, the file would be
+    left at version 3 with columns a rerun cannot add again."""
+    import xaucopier.store.migrations as migrations_module
+
+    conn = _v3_database(tmp_path / "store.db")
+    before = _dump(conn)
+    shape_before = _schema_shape(conn)
+    real = migrations_module._migration_4_statements
+    monkeypatch.setattr(
+        migrations_module,
+        "_migration_4_statements",
+        lambda: (*real(), "CREATE TABLE this is not valid sql"),
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        migrations_module.migrate(conn)
+    monkeypatch.undo()
+
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 3
+    assert _schema_shape(conn) == shape_before
+    assert _dump(conn) == before
+
+    migrate(conn)
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 4
+    conn.close()
+
+
+@pytest.mark.parametrize("start", [1, 2, 3])
+def test_a_fresh_schema_equals_an_upgraded_one(tmp_path, start):
+    """A new install and an upgraded install must end with the identical
+    schema -- same DDL text, same columns in the same order, same
+    indexes -- whichever version the upgrade started from."""
+    fresh = _connect(tmp_path)
+    builders = {1: _v1_database, 2: _v2_database, 3: _v3_database}
+    upgraded = builders[start](tmp_path / f"v{start}.db")
+    migrate(upgraded)
+    assert _schema_shape(upgraded) == _schema_shape(fresh)
+    fresh.close()
+    upgraded.close()
+
+
+def test_messages_forward_lookup_has_its_index(tmp_path):
+    conn = _connect(tmp_path)
+    indexes = {row[1]: row for row in conn.execute("PRAGMA index_list(messages)")}
+    assert "idx_messages_fwd_from" in indexes
+    columns = [row[2] for row in conn.execute("PRAGMA index_info(idx_messages_fwd_from)")]
+    assert columns == ["fwd_from_channel_id", "fwd_from_post_id"]
+    plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT channel_id, message_id FROM messages "
+            "WHERE fwd_from_channel_id = ? AND fwd_from_post_id = ?",
+            (-1001, 5),
+        )
+    )
+    assert "idx_messages_fwd_from" in plan
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "bad"),
+    [("sender_kind", "bot"), ("sender_kind", "User"), ("is_post", 2), ("is_post", -1)],
+)
+def test_sender_columns_accept_only_their_values(tmp_path, column, bad):
+    conn = _connect(tmp_path)
+    _insert_message(conn, message_id=100)
+    for good in {"sender_kind": ("user", "channel", "chat", None), "is_post": (0, 1, None)}[column]:
+        conn.execute(f"UPDATE messages SET {column} = ?", (good,))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(f"UPDATE messages SET {column} = ?", (bad,))
+    conn.close()

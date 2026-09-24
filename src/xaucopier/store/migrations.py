@@ -134,6 +134,37 @@ at the end of every round, and ``watch`` stamps its own start and stop
 "stopped" and "stopped because the Telegram session was logged out".
 ``store/heartbeats.py`` is its one writer. Nothing else changes.
 
+**Migration 4 (Plan 2 final review fix wave).** Only new NULL-able
+columns and one index, all in :data:`_MIGRATION_4`; every existing row
+keeps every value it had.
+
+- ``channel_state.seed_cutoff_utc``: when set, the channel must be
+  (re)seeded at the newest message dated before this cutoff minus the
+  60 s margin -- the first run's cutoff, persisted, so a restart before
+  the first seed succeeds cannot re-anchor at the new process's start and
+  skip what the first run missed (F01). Cleared in the same transaction
+  that writes the seeded pointer.
+- ``channel_state.seeded_at_utc``: an explicit "this channel has been
+  seeded" marker. Pointer 0 with ``seeded_at_utc`` NULL means *never
+  seeded* -- ``signals_repo`` creates such rows for the parse-failure
+  counter -- while pointer 0 with a marker is an empty channel that was
+  seeded at 0. Existing rows whose pointer is above 0 were seeded by an
+  earlier run, so the migration marks them seeded as of the migration
+  (ISO UTC, whole seconds).
+- ``messages.relay_of_signal_id``: the signal a message was classified
+  as a relay duplicate of, at ingest (F02).
+- ``messages.sender_kind`` (``'user'`` / ``'channel'`` / ``'chat'``),
+  ``sender_id`` and ``is_post`` (0/1): who posted a message, so a group
+  member's chatter can be told from the channel's own posts (F05).
+- ``messages.fwd_from_channel_id`` (in the same -100... form as
+  ``channel_id``), ``fwd_from_post_id``, ``fwd_from_date_utc``: where a
+  forwarded message came from, so a relay of an already-stored post is
+  recognised exactly, however late it arrives (F09), with the index
+  ``idx_messages_fwd_from`` for that lookup.
+
+``sender_kind`` and ``is_post`` carry CHECK constraints; NULL (not
+known, or stored before migration 4) always passes.
+
 **Two programs opening one file at once (final review F19).** ``watch``
 and, from Plan 3, the execution worker may both open the file for the
 first time after an upgrade. ``migrate()`` used to read ``user_version``
@@ -160,7 +191,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-CURRENT_VERSION = 3
+CURRENT_VERSION = 4
 
 
 class SchemaVersionError(sqlite3.DatabaseError):
@@ -248,6 +279,28 @@ _MIGRATION_3: tuple[str, ...] = (
     )""",
 )
 
+#: Migration 4 -- seed state, sender and forward provenance, relay link;
+#: see the module docstring. The ALTERs rely on `user_version` gating and
+#: the one transaction, like migration 2's.
+_MIGRATION_4: tuple[str, ...] = (
+    "ALTER TABLE channel_state ADD COLUMN seed_cutoff_utc TEXT",
+    "ALTER TABLE channel_state ADD COLUMN seeded_at_utc TEXT",
+    "ALTER TABLE messages ADD COLUMN relay_of_signal_id INTEGER",
+    "ALTER TABLE messages ADD COLUMN sender_kind TEXT "
+    "CHECK (sender_kind IN ('user', 'channel', 'chat'))",
+    "ALTER TABLE messages ADD COLUMN sender_id INTEGER",
+    "ALTER TABLE messages ADD COLUMN is_post INTEGER CHECK (is_post IN (0, 1))",
+    "ALTER TABLE messages ADD COLUMN fwd_from_channel_id INTEGER",
+    "ALTER TABLE messages ADD COLUMN fwd_from_post_id INTEGER",
+    "ALTER TABLE messages ADD COLUMN fwd_from_date_utc TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_messages_fwd_from "
+    "ON messages(fwd_from_channel_id, fwd_from_post_id)",
+    # A pointer above 0 was written by a seed (or by ingest after one):
+    # that channel has been seeded. Pointer-0 rows stay unmarked.
+    "UPDATE channel_state SET seeded_at_utc = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now') "
+    "WHERE last_processed_message_id > 0 AND seeded_at_utc IS NULL",
+)
+
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 
@@ -284,6 +337,12 @@ def _migration_3_statements() -> tuple[str, ...]:
     """Migration 3's statements; a function for the same reason as
     `_migration_2_statements`."""
     return _MIGRATION_3
+
+
+def _migration_4_statements() -> tuple[str, ...]:
+    """Migration 4's statements; a function for the same reason as
+    `_migration_2_statements`."""
+    return _MIGRATION_4
 
 
 def migrate(conn: sqlite3.Connection) -> None:
@@ -333,8 +392,13 @@ def migrate(conn: sqlite3.Connection) -> None:
                     conn.execute(statement)
                 current = 3
 
+            if current == 3:
+                for statement in _migration_4_statements():
+                    conn.execute(statement)
+                current = 4
+
             # Future migrations:
-            # `if current == 3: for stmt in ...: conn.execute(stmt); current = 4`
+            # `if current == 4: for stmt in ...: conn.execute(stmt); current = 5`
 
             if current != CURRENT_VERSION:
                 raise RuntimeError(

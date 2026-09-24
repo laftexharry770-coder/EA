@@ -81,18 +81,34 @@ to a zero-row fan-out, whichever one produced it -- and a `fanout_count`
 that doesn't match the number of enabled accounts passed (0 when some
 were expected, or any other mismatch) raises instead of silently
 under- or over-fanning-out.
+
+**Who posted it, and where a forward came from (migration 4).** ingest()
+takes six optional keyword arguments, all stored on the message's row for
+every kind and NULL when not given: ``sender_kind`` (``'user'`` /
+``'channel'`` / ``'chat'``), ``sender_id``, ``is_post``, and for a
+forwarded message ``fwd_from_channel_id`` (the -100... form, like
+``channel_id``), ``fwd_from_post_id`` and ``fwd_from_date_utc`` (stored
+in UTC). They are checked before anything is written: a raw positive
+channel id, a naive date, a non-bool ``is_post`` or an unknown
+``sender_kind`` is a ``ValueError``. They are written once, when the
+message is first stored; a later version of the same message does not
+change them. (``messages.relay_of_signal_id`` is ingest's own finding,
+not an argument.)
 """
 from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Literal, Protocol
+from datetime import UTC, datetime
+from typing import Any, Literal, Protocol
 
 from xaucopier.parsing.router import RouteResult, route
 from xaucopier.store import edits_repo, outbox, signals_repo
 
 IngestOutcome = Literal["new", "duplicate", "edited", "relay_duplicate"]
+SenderKind = Literal["user", "channel", "chat"]
+
+_SENDER_KINDS = frozenset({"user", "channel", "chat"})
 
 
 class _ChannelCfgLike(Protocol):
@@ -131,6 +147,48 @@ def _get_message(conn: sqlite3.Connection, *, channel_id: int, message_id: int) 
     ).fetchone()
 
 
+def _provenance_columns(
+    *,
+    sender_kind: str | None,
+    sender_id: int | None,
+    is_post: bool | None,
+    fwd_from_channel_id: int | None,
+    fwd_from_post_id: int | None,
+    fwd_from_date_utc: datetime | None,
+) -> dict[str, Any]:
+    """The migration-4 provenance columns as stored, checked first -- see
+    the module docstring. Raises ValueError, before anything is written."""
+    if sender_kind is not None and sender_kind not in _SENDER_KINDS:
+        raise ValueError(
+            f"sender_kind must be one of {sorted(_SENDER_KINDS)} or None, got {sender_kind!r}"
+        )
+    if is_post is not None and not isinstance(is_post, bool):
+        raise ValueError(f"is_post must be True, False or None, got {is_post!r}")
+    if fwd_from_channel_id is not None and (
+        isinstance(fwd_from_channel_id, bool) or fwd_from_channel_id >= 0
+    ):
+        raise ValueError(
+            "fwd_from_channel_id must be in the same -100... form as channel_id, "
+            f"got {fwd_from_channel_id!r}"
+        )
+    if fwd_from_date_utc is not None and (
+        fwd_from_date_utc.tzinfo is None or fwd_from_date_utc.utcoffset() is None
+    ):
+        raise ValueError(
+            f"fwd_from_date_utc must be timezone-aware, got naive {fwd_from_date_utc!r}"
+        )
+    return {
+        "sender_kind": sender_kind,
+        "sender_id": sender_id,
+        "is_post": is_post,  # sqlite3 stores True/False as 1/0
+        "fwd_from_channel_id": fwd_from_channel_id,
+        "fwd_from_post_id": fwd_from_post_id,
+        "fwd_from_date_utc": (
+            None if fwd_from_date_utc is None else fwd_from_date_utc.astimezone(UTC).isoformat()
+        ),
+    }
+
+
 def _insert_message(
     conn: sqlite3.Connection,
     *,
@@ -143,12 +201,14 @@ def _insert_message(
     received_at_utc: datetime,
     posted_at_utc: datetime,
     source: str,
+    provenance: dict[str, Any],
 ) -> None:
+    extra_columns = "".join(f", {name}" for name in provenance)
     conn.execute(
         "INSERT INTO messages "
         "(channel_id, message_id, kind, content_hash, raw_text, edit_date_utc, "
-        " received_at_utc, posted_at_utc, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        f" received_at_utc, posted_at_utc, source{extra_columns}) "
+        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{', ?' * len(provenance)})",
         (
             channel_id,
             message_id,
@@ -159,6 +219,7 @@ def _insert_message(
             received_at_utc.isoformat(),
             posted_at_utc.isoformat(),
             source,
+            *provenance.values(),
         ),
     )
 
@@ -176,8 +237,22 @@ def ingest(
     now_utc: datetime,
     accounts: tuple[_AccountCfgLike, ...],
     relay_window_seconds: int = 900,
+    sender_kind: SenderKind | None = None,
+    sender_id: int | None = None,
+    is_post: bool | None = None,
+    fwd_from_channel_id: int | None = None,
+    fwd_from_post_id: int | None = None,
+    fwd_from_date_utc: datetime | None = None,
 ) -> IngestResult:
     channel_id = channel_cfg.channel_id
+    provenance = _provenance_columns(
+        sender_kind=sender_kind,
+        sender_id=sender_id,
+        is_post=is_post,
+        fwd_from_channel_id=fwd_from_channel_id,
+        fwd_from_post_id=fwd_from_post_id,
+        fwd_from_date_utc=fwd_from_date_utc,
+    )
 
     route_result = route(
         text,
@@ -204,6 +279,7 @@ def ingest(
             now_utc=now_utc,
             accounts=accounts,
             relay_window_seconds=relay_window_seconds,
+            provenance=provenance,
         )
 
     edit = edits_repo.reconcile(
@@ -242,6 +318,7 @@ def _ingest_new(
     now_utc: datetime,
     accounts: tuple[_AccountCfgLike, ...],
     relay_window_seconds: int,
+    provenance: dict[str, Any],
 ) -> IngestResult:
     kind = route_result.kind
 
@@ -258,6 +335,7 @@ def _ingest_new(
         received_at_utc=now_utc,
         posted_at_utc=posted_at_utc,
         source=source,
+        provenance=provenance,
     )
 
     if kind == "parse_failed":

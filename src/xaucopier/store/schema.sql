@@ -1,11 +1,15 @@
 -- Migration 1: the original schema. Later migrations change it in
--- migrations.py (migration 2: the alerts table, messages deletion marks,
--- followups.edit_seq) -- read both for the current shape.
+-- migrations.py (2: the alerts table, messages deletion marks,
+-- followups.edit_seq, signals withdrawal and first trade hash; 3: the
+-- heartbeats table; 4: channel_state seed cutoff and seeded marker,
+-- messages sender, forward and relay columns) -- read both for the
+-- current shape.
 CREATE TABLE IF NOT EXISTS messages (
   channel_id      INTEGER NOT NULL,
   message_id      INTEGER NOT NULL,
   kind            TEXT    NOT NULL,   -- signal | followup | skip | parse_failed
-  content_hash    TEXT,               -- trade identity; NULL for non-signals
+  content_hash    TEXT,               -- signal: its trade identity; any other kind:
+                                      -- a hash of the normalised text (never NULL)
   raw_text        TEXT    NOT NULL,   -- verbatim, always, even for rejects
   edit_date_utc   TEXT,
   received_at_utc TEXT    NOT NULL,

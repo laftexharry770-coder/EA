@@ -300,3 +300,132 @@ def test_received_at_utc_is_the_passed_now_not_wall_clock(conn):
         (CHANNEL_A.channel_id, 9301),
     ).fetchone()
     assert row["received_at_utc"] == fixed_now.isoformat()
+
+
+# -- migration 4: who posted a message, and where a forward came from ---------
+#
+# ingest() stores them for every kind of message, as optional keyword
+# arguments that default to NULL (the listener fills them from Telegram;
+# a message stored before migration 4 has none).
+
+_PROVENANCE_COLUMNS = (
+    "sender_kind",
+    "sender_id",
+    "is_post",
+    "fwd_from_channel_id",
+    "fwd_from_post_id",
+    "fwd_from_date_utc",
+    "relay_of_signal_id",
+)
+
+
+def _provenance(conn, message_id: int, channel_id: int = CHANNEL_A.channel_id):
+    row = conn.execute(
+        f"SELECT {', '.join(_PROVENANCE_COLUMNS)} FROM messages "
+        "WHERE channel_id = ? AND message_id = ?",
+        (channel_id, message_id),
+    ).fetchone()
+    return dict(zip(_PROVENANCE_COLUMNS, tuple(row)))
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [(SIGNAL_TEXT, "signal"), (CHATTER_TEXT, "skip"), (BROKEN_TEXT, "parse_failed"),
+     ("close all", "followup")],
+    ids=["signal", "skip", "parse_failed", "followup"],
+)
+def test_provenance_columns_default_to_null(conn, text, kind):
+    result = _ingest(conn, message_id=9401, text=text)
+    assert (result.outcome, result.kind) == ("new", kind)
+    assert _provenance(conn, 9401) == dict.fromkeys(_PROVENANCE_COLUMNS)
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [(SIGNAL_TEXT, "signal"), (CHATTER_TEXT, "skip"), (BROKEN_TEXT, "parse_failed"),
+     ("close all", "followup")],
+    ids=["signal", "skip", "parse_failed", "followup"],
+)
+def test_ingest_stores_sender_and_forward_provenance(conn, text, kind):
+    from datetime import timezone
+
+    forwarded_at = datetime(2026, 9, 5, 13, 30, 15, tzinfo=timezone(timedelta(hours=3)))
+    result = ingest(
+        conn,
+        channel_cfg=CHANNEL_A,
+        message_id=9402,
+        text=text,
+        posted_at_utc=POSTED,
+        edit_date_utc=None,
+        reply_to_message_id=None,
+        source="live",
+        now_utc=NOW,
+        accounts=(),
+        sender_kind="channel",
+        sender_id=CHANNEL_A.channel_id,
+        is_post=True,
+        fwd_from_channel_id=-1003333333333,
+        fwd_from_post_id=77,
+        fwd_from_date_utc=forwarded_at,
+    )
+    assert (result.outcome, result.kind) == ("new", kind)
+    assert _provenance(conn, 9402) == {
+        "sender_kind": "channel",
+        "sender_id": CHANNEL_A.channel_id,
+        "is_post": 1,
+        "fwd_from_channel_id": -1003333333333,
+        "fwd_from_post_id": 77,
+        # Stored in UTC, like every other timestamp in the store.
+        "fwd_from_date_utc": "2026-09-05T10:30:15+00:00",
+        "relay_of_signal_id": None,
+    }
+
+
+def test_a_group_members_message_is_stored_as_not_a_post(conn):
+    _ingest(conn, message_id=9403, text=CHATTER_TEXT)
+    ingest(
+        conn,
+        channel_cfg=CHANNEL_A,
+        message_id=9404,
+        text=CHATTER_TEXT,
+        posted_at_utc=POSTED,
+        edit_date_utc=None,
+        reply_to_message_id=None,
+        source="poll",
+        now_utc=NOW,
+        accounts=(),
+        sender_kind="user",
+        sender_id=424242,
+        is_post=False,
+    )
+    assert _provenance(conn, 9404)["is_post"] == 0
+    assert _provenance(conn, 9404)["sender_kind"] == "user"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        # The raw positive Telegram id of a channel is not the stored form.
+        ({"fwd_from_channel_id": 3333333333}, "fwd_from_channel_id"),
+        ({"fwd_from_date_utc": datetime(2026, 9, 5, 10, 30)}, "fwd_from_date_utc"),
+        ({"is_post": 1}, "is_post"),
+        ({"sender_kind": "bot"}, "sender_kind"),
+    ],
+)
+def test_malformed_provenance_is_refused_before_anything_is_stored(conn, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        ingest(
+            conn,
+            channel_cfg=CHANNEL_A,
+            message_id=9405,
+            text=SIGNAL_TEXT,
+            posted_at_utc=POSTED,
+            edit_date_utc=None,
+            reply_to_message_id=None,
+            source="live",
+            now_utc=NOW,
+            accounts=(),
+            **kwargs,
+        )
+    assert _count(conn, "messages") == 0
+    assert _count(conn, "signals") == 0
