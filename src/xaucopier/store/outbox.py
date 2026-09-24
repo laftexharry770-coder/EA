@@ -115,28 +115,24 @@ executed.)
 own connection, never the Writer's.** ``store/db.py``'s ``Writer`` exists
 for exactly one reason: to keep SQLite's synchronous ``commit()`` off the
 asyncio event loop in the *listener*, by handing every write to one
-dedicated thread whose ``fn`` never manages its own transaction (a normal
-return commits, an exception rolls back -- see ``Writer.submit``'s
-docstring). :func:`claim` and :func:`sweep_expired` are the opposite
-shape on purpose: they manage their *own* ``BEGIN IMMEDIATE`` transaction
-internally, because that is what makes the claim atomic (see "Why BEGIN
-IMMEDIATE" above) -- a self-managed transaction is precisely what
-``Writer`` detects and rejects as misuse. Submitting either function
-through a real ``Writer`` (``writer.submit(lambda c: outbox.claim(c,
-...))``) does not fail cleanly: the future resolves with
-``WriterMisuseError``, but by the time ``Writer`` notices, ``claim()``
-has already called ``COMMIT`` itself and the row is durably ``CLAIMED``
-on disk -- a worker that took the ``WriterMisuseError`` at face value
-("no work happened") would be wrong, and that claimed row would sit
-invisible until the next ``sweep_expired()`` lease sweep. This is
-deliberate and pinned by test, not an oversight to be "fixed" by removing
-:func:`claim`'s internal transaction (which would break the atomic-claim
-guarantee the whole lease design rests on): Plan 3's execution worker is
-a separate blocking process with its own ``db.connect(role="writer")``
-connection and has no need of ``Writer`` at all -- ``Writer`` belongs to
-the listener alone. See ``test_claim_through_writer_raises_writer_misuse_error_but_lands_durably``
-(pins the rejected pattern) and ``test_claim_on_its_own_connection_succeeds``
-(pins the correct one) in tests/test_outbox.py.
+dedicated thread whose job runs inside a transaction the Writer opens
+(``BEGIN IMMEDIATE``) and closes itself -- see ``Writer.submit``'s
+docstring. :func:`claim` and :func:`sweep_expired` are the opposite shape
+on purpose: they manage their *own* ``BEGIN IMMEDIATE`` transaction,
+because that is what makes the claim atomic (see "Why BEGIN IMMEDIATE"
+above). Routed through a Writer they now fail at once, on an empty queue
+as on a full one, before anything is written: the Writer's transaction is
+already open, so their no-pending-transaction precondition raises
+``RuntimeError`` ("not Writer work"), and the stand-in connection a Writer
+job gets would refuse their ``isolation_level`` switch anyway
+(``WriterMisuseError``). Until final review F20 the Writer only noticed
+*after* ``claim()`` had committed its own claim -- the future said
+``WriterMisuseError`` while the row sat durably ``CLAIMED`` -- and on an
+empty queue it looked healthy. Plan 3's execution worker is a separate
+blocking process with its own ``db.connect(role="writer")`` connection and
+has no need of ``Writer`` at all -- ``Writer`` belongs to the listener
+alone. See ``test_claim_through_writer_fails_before_anything_lands`` and
+``test_claim_on_its_own_connection_succeeds`` in tests/test_outbox.py.
 """
 from __future__ import annotations
 
@@ -246,7 +242,8 @@ def _require_no_pending_transaction(conn: sqlite3.Connection, *, caller: str) ->
             "that via conn.isolation_level = None on a connection with "
             "uncommitted work would silently commit that work first "
             "rather than raise. Commit or roll back whatever is pending "
-            f"before calling {caller}()."
+            f"before calling {caller}(). (A Writer job always has one open: "
+            f"{caller}() is not Writer work -- call it on its own connection.)"
         )
 
 

@@ -717,20 +717,17 @@ def test_ingest_new_signal_raises_if_fan_out_count_mismatches_enabled_count(conn
 # -- claim() is not Writer work: pin the rejected pattern and the correct one --
 
 
-def test_claim_through_writer_raises_writer_misuse_error_but_lands_durably(tmp_path: Path):
-    """Task 6 review round 2, finding 3 (controller ruling): claim() and
-    sweep_expired() manage their own BEGIN IMMEDIATE transaction --
-    that's what makes the claim atomic -- so they are deliberately not
-    Writer work. Submitting claim() through a real Writer does not fail
-    cleanly: claim() calls COMMIT itself, so by the time Writer's own
-    self-managed-fn misuse detector notices (total_changes moved while
-    in_transaction is False) and resolves the future with
-    WriterMisuseError, the claim has already landed durably on disk. A
-    worker that took the WriterMisuseError at face value ("no work
-    happened") would be wrong -- the row is CLAIMED and invisible to
-    everyone until the next lease sweep. This pins that failure mode as
-    known-and-rejected, not an untested surprise: Plan 3 must never
-    route claim()/sweep_expired() through a Writer.
+def test_claim_through_writer_fails_before_anything_lands(tmp_path: Path):
+    """Task 6 review round 2, finding 3 (controller ruling), updated by
+    final review F20: claim() and sweep_expired() manage their own BEGIN
+    IMMEDIATE transaction -- that's what makes the claim atomic -- so they
+    are not Writer work. Routed through a Writer, claim() used to COMMIT
+    itself before the Writer noticed: the future said WriterMisuseError
+    while the row sat durably CLAIMED. Every Writer job now already runs
+    inside the Writer's own transaction, so claim()'s no-pending-
+    transaction precondition refuses at once: the future fails, and the
+    row is untouched. Plan 3 must still never route them through a
+    Writer; now it cannot by accident.
     """
     db_path = tmp_path / "store.db"
     setup_conn = db.connect(db_path, role="writer")
@@ -744,7 +741,7 @@ def test_claim_through_writer_raises_writer_misuse_error_but_lands_durably(tmp_p
         future = writer.submit(
             lambda c: outbox.claim(c, account_id="acct-1", pid=1, now_utc=NOW)
         )
-        with pytest.raises(db.WriterMisuseError):
+        with pytest.raises(RuntimeError, match="not Writer work"):
             await asyncio.wrap_future(future)
 
     try:
@@ -752,17 +749,13 @@ def test_claim_through_writer_raises_writer_misuse_error_but_lands_durably(tmp_p
     finally:
         writer.stop(timeout=5.0)
 
-    # The claim landed durably anyway -- exactly the hazard this test
-    # pins down.
     reader = db.connect(db_path, role="reader")
     try:
         row = reader.execute(
             "SELECT state, attempts, claimed_by_pid FROM outbox WHERE outbox_id = ?",
             (outbox_id,),
         ).fetchone()
-        assert row["state"] == "CLAIMED"
-        assert row["attempts"] == 1
-        assert row["claimed_by_pid"] == 1
+        assert tuple(row) == ("QUEUED", 0, None)
     finally:
         reader.close()
 

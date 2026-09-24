@@ -346,12 +346,11 @@ def test_submit_racing_stop_never_hangs(tmp_path: Path):
 
 
 def test_fn_that_commits_then_raises_is_flagged_as_misuse(tmp_path: Path):
-    """Reproduces the reviewer's finding: a `fn` that calls `commit()`
-    itself and then raises used to have the exception surface normally
-    while the row it wrote stayed durably committed -- `_rollback_quietly`
-    has nothing left to undo by that point, so the caller is misled into
-    thinking the write never happened. The Writer must instead detect
-    that `fn` managed its own transaction and say so explicitly.
+    """Reproduces the Task 4 reviewer's finding: a `fn` that calls
+    `commit()` itself and then raises used to have the exception surface
+    normally while the row it wrote stayed durably committed. Since final
+    review F20 the commit() is refused before it runs, so the caller is
+    told WriterMisuseError *and* nothing the job wrote was kept.
     """
     db_path = tmp_path / "store.db"
     writer = Writer(db_path)
@@ -374,13 +373,10 @@ def test_fn_that_commits_then_raises_is_flagged_as_misuse(tmp_path: Path):
 
     reader = connect(db_path, role="reader")
     try:
-        # fn committed for real before raising -- the Writer's job is to
-        # make the caller distrust its own result, not to un-commit a
-        # write it never controlled in the first place.
         row = reader.execute(
             "SELECT last_processed_message_id FROM channel_state WHERE channel_id = 4"
         ).fetchone()
-        assert row is not None
+        assert row is None
     finally:
         reader.close()
 
@@ -566,3 +562,386 @@ def test_schema_version_error_is_a_database_error():
     for an sqlite3.Error (watch's startup stamp) reports this too, instead
     of a traceback."""
     assert issubclass(store_db.SchemaVersionError, sqlite3.DatabaseError)
+
+
+# -- final review F20 / F21 / F31: the Writer owns the whole job ---------------
+#
+# Every job runs inside BEGIN IMMEDIATE, issued before fn: its reads and
+# writes happen under the write lock (F21). fn gets a thin stand-in for
+# the connection that refuses, before anything runs, every way of ending
+# or reshaping that transaction (F20). A rollback SQLite makes itself --
+# a full disk, INSERT OR ROLLBACK, RAISE(ROLLBACK) -- is reported as the
+# real sqlite3 error, not as fn's misuse (F31).
+
+
+def _run_jobs(db_path: Path, *jobs):
+    """Run `jobs` in order on a fresh Writer; return each outcome: the
+    result, or the exception instance."""
+    writer = Writer(db_path)
+    writer.start()
+    outcomes = []
+    try:
+        for job in jobs:
+            future = writer.submit(job)
+            error = future.exception(timeout=10.0)
+            outcomes.append(error if error is not None else future.result())
+    finally:
+        writer.stop(timeout=5.0)
+    return outcomes
+
+
+def _channel_ids(db_path: Path) -> list[int]:
+    reader = connect(db_path, role="reader")
+    try:
+        return [
+            row[0]
+            for row in reader.execute("SELECT channel_id FROM channel_state ORDER BY 1")
+        ]
+    finally:
+        reader.close()
+
+
+def test_every_job_runs_inside_the_writers_write_transaction(tmp_path: Path):
+    """F21: the job's first statement already runs in the transaction --
+    before, a read before the first write ran outside it."""
+    (seen,) = _run_jobs(tmp_path / "store.db", lambda conn: conn.in_transaction)
+    assert seen is True
+
+
+def test_a_jobs_reads_are_protected_by_the_write_lock(tmp_path: Path):
+    """F21's scenario: a job reads, another connection tries to change
+    what it read, then the job decides. The other connection must wait
+    for the job (here: give up after 0.2 s) instead of committing in
+    between."""
+    db_path = tmp_path / "store.db"
+    connect(db_path, role="writer").close()
+    job_has_read = threading.Event()
+    other_done = threading.Event()
+    other_outcome: list[object] = []
+
+    def other_writer():
+        assert job_has_read.wait(timeout=5.0)
+        other = sqlite3.connect(db_path, timeout=0.2)
+        try:
+            other.execute(
+                "INSERT INTO channel_state (channel_id, last_processed_message_id) VALUES (8, 8)"
+            )
+            other.commit()
+            other_outcome.append("committed")
+        except sqlite3.OperationalError as exc:
+            other_outcome.append(str(exc))
+        finally:
+            other.close()
+            other_done.set()
+
+    def job(conn: sqlite3.Connection) -> int:
+        (count,) = conn.execute("SELECT COUNT(*) FROM channel_state").fetchone()
+        job_has_read.set()
+        assert other_done.wait(timeout=5.0)
+        (count_again,) = conn.execute("SELECT COUNT(*) FROM channel_state").fetchone()
+        assert count_again == count
+        _insert_channel_state(conn, channel_id=7, last_id=count)
+        return count
+
+    thread = threading.Thread(target=other_writer)
+    thread.start()
+    (result,) = _run_jobs(db_path, job)
+    thread.join(timeout=5.0)
+
+    assert result == 0
+    assert other_outcome == ["database is locked"]
+    assert _channel_ids(db_path) == [7]
+
+
+def _write_then(action):
+    """A job that writes channel 1, then does `action(conn)`, then writes
+    channel 2."""
+
+    def job(conn: sqlite3.Connection) -> str:
+        _insert_channel_state(conn, channel_id=1, last_id=1)
+        action(conn)
+        _insert_channel_state(conn, channel_id=2, last_id=2)
+        return "returned"
+
+    return job
+
+
+def _set(name, value):
+    return lambda conn: setattr(conn, name, value)
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        lambda conn: conn.commit(),
+        lambda conn: conn.rollback(),
+        _set("isolation_level", None),
+        _set("isolation_level", "IMMEDIATE"),
+        _set("autocommit", True),
+        _set("row_factory", None),
+        lambda conn: conn.execute("COMMIT"),
+        lambda conn: conn.execute("  commit transaction"),
+        lambda conn: conn.execute("END"),
+        lambda conn: conn.execute("-- done\nCOMMIT"),
+        lambda conn: conn.execute("/* done */ COMMIT"),
+        lambda conn: conn.execute("; COMMIT"),
+        lambda conn: conn.execute("ROLLBACK"),
+        lambda conn: conn.execute("BEGIN"),
+        lambda conn: conn.execute("SAVEPOINT s"),
+        lambda conn: conn.execute("RELEASE s"),
+        lambda conn: conn.executemany("COMMIT", []),
+        lambda conn: conn.executescript("SELECT 1;"),
+        lambda conn: conn.cursor(),
+        lambda conn: conn.close(),
+    ],
+    ids=[
+        "commit()", "rollback()", "isolation_level=None", "isolation_level=IMMEDIATE",
+        "autocommit=True", "row_factory", "COMMIT", "commit-transaction", "END",
+        "comment-COMMIT", "block-comment-COMMIT", "semicolon-COMMIT", "ROLLBACK", "BEGIN", "SAVEPOINT",
+        "RELEASE", "executemany-COMMIT", "executescript", "cursor()", "close()",
+    ],
+)
+def test_a_job_that_tries_to_manage_the_transaction_is_refused_and_writes_nothing(
+    tmp_path: Path, action
+):
+    """F20. Before: only a *trailing* commit was noticed, and a job that
+    wrote, committed and wrote again resolved normally with its first
+    write already durable. Now every such call raises WriterMisuseError
+    before it runs, the whole job is rolled back, and the future says so
+    -- whatever fn did with the exception."""
+    db_path = tmp_path / "store.db"
+    raising, swallowing, after = _run_jobs(
+        db_path,
+        _write_then(action),
+        _write_then(lambda conn: _swallow(action, conn)),
+        lambda conn: _insert_channel_state(conn, channel_id=3, last_id=3),
+    )
+    assert isinstance(raising, WriterMisuseError), raising
+    assert isinstance(swallowing, WriterMisuseError), swallowing
+    assert "Nothing this job wrote was kept" in str(raising)
+    assert after is None  # the thread survives, the next job commits
+    assert _channel_ids(db_path) == [3]
+
+
+def _swallow(action, conn):
+    try:
+        action(conn)
+    except WriterMisuseError:
+        pass
+
+
+def test_ordinary_statements_still_run(tmp_path: Path):
+    """The refusal is about transaction control, not keywords inside
+    ordinary statements."""
+
+    def job(conn: sqlite3.Connection) -> list:
+        conn.execute("CREATE TABLE notes (body TEXT)")
+        conn.executemany("INSERT INTO notes VALUES (?)", [("COMMIT",), ("end",)])
+        conn.execute("-- a comment\nINSERT INTO notes VALUES ('ROLLBACK')")
+        return [row[0] for row in conn.execute("SELECT body FROM notes ORDER BY rowid")]
+
+    (result,) = _run_jobs(tmp_path / "store.db", job)
+    assert result == ["COMMIT", "end", "ROLLBACK"]
+
+
+def _full_disk_job(conn: sqlite3.Connection) -> None:
+    """A nearly full disk: the file may grow by 3 pages, and one message
+    needs many more."""
+    (pages,) = conn.execute("PRAGMA page_count").fetchone()
+    conn.execute(f"PRAGMA max_page_count = {pages + 3}")
+    _insert_channel_state(conn, channel_id=1, last_id=1)
+    conn.execute(
+        "INSERT INTO messages (channel_id, message_id, kind, content_hash, raw_text, "
+        "received_at_utc, posted_at_utc, source) VALUES (1, 1, 'skip', 'h', ?, 't', 't', 'live')",
+        ("x" * 200_000,),
+    )
+
+
+def _or_rollback_job(conn: sqlite3.Connection) -> None:
+    _insert_channel_state(conn, channel_id=1, last_id=1)
+    conn.execute("INSERT OR ROLLBACK INTO channel_state (channel_id) VALUES (1)")
+
+
+def _swallowing_or_rollback_job(conn: sqlite3.Connection) -> str:
+    """Catches SQLite's rollback and carries on writing: the later write
+    must not be committed as if it were the whole job."""
+    _insert_channel_state(conn, channel_id=1, last_id=1)
+    try:
+        conn.execute("INSERT OR ROLLBACK INTO channel_state (channel_id) VALUES (1)")
+    except sqlite3.IntegrityError:
+        pass
+    _insert_channel_state(conn, channel_id=2, last_id=2)
+    return "carried on"
+
+
+def _trigger_rollback_job(conn: sqlite3.Connection) -> None:
+    _insert_channel_state(conn, channel_id=1, last_id=1)
+    conn.execute("INSERT INTO heartbeats (name, at_utc) VALUES ('forbidden', 'x')")
+
+
+@pytest.mark.parametrize(
+    ("job", "error_type", "text"),
+    [
+        (_full_disk_job, sqlite3.OperationalError, "full"),
+        (_or_rollback_job, sqlite3.IntegrityError, "UNIQUE"),
+        (_swallowing_or_rollback_job, sqlite3.IntegrityError, "UNIQUE"),
+        (_trigger_rollback_job, sqlite3.IntegrityError, "no forbidden heartbeat"),
+    ],
+    ids=["disk-full", "insert-or-rollback", "or-rollback-swallowed", "raise-rollback"],
+)
+def test_a_rollback_sqlite_made_itself_is_reported_as_the_real_error(
+    tmp_path: Path, job, error_type, text
+):
+    """F31. Before: WriterMisuseError('fn called commit()/rollback()
+    itself'), blaming a code bug that does not exist, for a full disk."""
+    db_path = tmp_path / "store.db"
+    conn = connect(db_path, role="writer")
+    conn.execute(
+        "CREATE TRIGGER no_forbidden BEFORE INSERT ON heartbeats "
+        "WHEN NEW.name = 'forbidden' BEGIN SELECT RAISE(ROLLBACK, 'no forbidden heartbeat'); END"
+    )
+    conn.commit()
+    conn.close()
+
+    def after_job(conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA max_page_count = 1073741823")  # undo the full-disk cap
+        _insert_channel_state(conn, channel_id=3, last_id=3)
+
+    outcome, after = _run_jobs(db_path, job, after_job)
+
+    assert type(outcome) is error_type, repr(outcome)
+    assert text in str(outcome)
+    assert after is None
+    assert _channel_ids(db_path) == [3]  # nothing of the failed job was kept
+
+
+def test_claim_and_sweep_through_the_writer_fail_even_on_an_empty_queue(tmp_path: Path):
+    """F20's other half (Plan 3 obligation 15's trap): claim() and
+    sweep_expired() drive their own transaction, so routed through the
+    Writer they used to 'work' on an empty queue and only misbehave once
+    there was a row. Now they fail every time, before anything runs."""
+    from datetime import UTC, datetime
+
+    from xaucopier.store import outbox
+
+    now = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
+    claimed, swept = _run_jobs(
+        tmp_path / "store.db",
+        lambda conn: outbox.claim(conn, account_id="acct-1", pid=1, now_utc=now),
+        lambda conn: outbox.sweep_expired(conn, now_utc=now),
+    )
+    for outcome in (claimed, swept):
+        assert isinstance(outcome, RuntimeError), repr(outcome)
+        assert "not Writer work" in str(outcome)
+
+
+def test_a_rollback_sqlite_made_through_a_cursor_is_still_the_real_error(tmp_path: Path):
+    """The same F31 rule when the failing statement ran on a cursor fn
+    got back from execute() -- not through the stand-in itself."""
+
+    def job(conn: sqlite3.Connection) -> None:
+        _insert_channel_state(conn, channel_id=1, last_id=1)
+        cursor = conn.execute("SELECT 1")
+        cursor.execute("INSERT OR ROLLBACK INTO channel_state (channel_id) VALUES (1)")
+
+    db_path = tmp_path / "store.db"
+    (outcome,) = _run_jobs(db_path, job)
+    assert type(outcome) is sqlite3.IntegrityError, repr(outcome)
+    assert _channel_ids(db_path) == []
+
+
+def test_a_transaction_ended_by_an_unguarded_path_is_still_misuse(tmp_path: Path):
+    """The backstop: a cursor's own execute("COMMIT") is not refused in
+    advance, but a job that leaves the Writer's transaction closed fails
+    with WriterMisuseError -- which says its earlier writes may be kept."""
+
+    def job(conn: sqlite3.Connection) -> str:
+        _insert_channel_state(conn, channel_id=1, last_id=1)
+        conn.execute("SELECT 1").execute("COMMIT")
+        return "looked fine"
+
+    (outcome,) = _run_jobs(tmp_path / "store.db", job)
+    assert isinstance(outcome, WriterMisuseError), repr(outcome)
+    assert "may already be committed" in str(outcome)
+
+
+def _misuse_swallowed(conn: sqlite3.Connection) -> None:
+    _insert_channel_state(conn, channel_id=1, last_id=1)
+    try:
+        conn.commit()
+    except WriterMisuseError:
+        pass
+
+
+def _plain_failure(conn: sqlite3.Connection) -> None:
+    _insert_channel_state(conn, channel_id=1, last_id=1)
+    raise ValueError("the job gave up")
+
+
+@pytest.mark.parametrize(
+    "job",
+    [_swallowing_or_rollback_job, _misuse_swallowed, _plain_failure],
+    ids=["sqlite-rollback-swallowed", "misuse-swallowed", "plain-failure"],
+)
+def test_a_failed_job_does_not_keep_the_write_lock(tmp_path: Path, job):
+    """A failed job is rolled back at once, so it does not hold the write
+    lock until the next job comes along (`ack`, or Plan 3's worker, would
+    wait for it)."""
+    db_path = tmp_path / "store.db"
+    writer = Writer(db_path)
+    writer.start()
+    try:
+        assert writer.submit(job).exception(timeout=10.0) is not None
+        other = sqlite3.connect(db_path, timeout=0.2)
+        try:
+            _insert_channel_state(other, channel_id=9, last_id=9)
+            other.commit()
+        finally:
+            other.close()
+    finally:
+        writer.stop(timeout=5.0)
+    assert _channel_ids(db_path) == [9]
+
+
+def test_a_job_never_starts_inside_a_transaction_a_failed_job_left_open(
+    tmp_path: Path, monkeypatch
+):
+    """If an earlier job's rollback itself failed, the next job must not
+    inherit its writes -- nor fail because a transaction is already open."""
+    monkeypatch.setattr(Writer, "_rollback_quietly", staticmethod(lambda conn: None))
+    db_path = tmp_path / "store.db"
+    failed, good = _run_jobs(
+        db_path,
+        _plain_failure,
+        lambda conn: _insert_channel_state(conn, channel_id=2, last_id=2),
+    )
+    assert isinstance(failed, ValueError)
+    assert good is None
+    assert _channel_ids(db_path) == [2]
+
+
+def test_a_busy_database_fails_the_job_not_the_writer(tmp_path: Path, monkeypatch):
+    """BEGIN IMMEDIATE waits for another program's write lock; if that
+    outlasts the busy timeout, only this job fails ("database is locked")
+    -- fn never ran -- and the next job runs normally."""
+    monkeypatch.setattr(store_db, "_BUSY_TIMEOUT_MS", 100)
+    db_path = tmp_path / "store.db"
+    connect(db_path, role="writer").close()
+    holder = sqlite3.connect(db_path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    ran: list[str] = []
+    writer = Writer(db_path)
+    writer.start()
+    try:
+        error = writer.submit(lambda conn: ran.append("first")).exception(timeout=10.0)
+        holder.execute("ROLLBACK")
+        after = writer.submit(
+            lambda conn: _insert_channel_state(conn, channel_id=6, last_id=6)
+        ).exception(timeout=10.0)
+    finally:
+        holder.close()
+        writer.stop(timeout=5.0)
+    assert isinstance(error, sqlite3.OperationalError) and "locked" in str(error)
+    assert ran == []
+    assert after is None
+    assert _channel_ids(db_path) == [6]

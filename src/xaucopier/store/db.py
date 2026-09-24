@@ -16,12 +16,22 @@ Design decisions (the brief specifies the interface, not the body):
   cannot usefully be shared by more than one writer thread anyway
   (SQLite serialises writers at the file level regardless), so a pool
   would add complexity for zero throughput gain.
-- Each submitted ``fn`` runs inside its own transaction: a normal return
-  commits it, any exception rolls it back. ``fn`` must never call
-  ``commit()``/``rollback()`` itself -- see ``Writer.submit``'s
-  docstring and ``WriterMisuseError``. ``submit()`` is therefore "one
-  job, one all-or-nothing write", which is the unit the listener
-  actually wants.
+- Each submitted ``fn`` runs inside its own transaction, opened with
+  ``BEGIN IMMEDIATE`` *before* ``fn`` runs: a normal return commits it,
+  any exception rolls it back. Every statement ``fn`` runs, reads
+  included, is therefore under the write lock, so no other program can
+  change what ``fn`` read before ``fn`` decides and writes (final review
+  F21). ``submit()`` is "one job, one all-or-nothing write", which is the
+  unit the listener actually wants.
+- ``fn`` never gets the connection itself, only a thin stand-in for it
+  (``_JobConnection``) that refuses, *before anything runs*, every way of
+  ending or reshaping that transaction: ``commit()``, ``rollback()``,
+  ``close()``, ``cursor()``, ``executescript()`` (which commits first),
+  assigning ``isolation_level``, ``autocommit`` or any other attribute,
+  and ``execute()``/``executemany()`` of ``BEGIN``, ``COMMIT``, ``END``,
+  ``ROLLBACK``, ``SAVEPOINT`` or ``RELEASE``. Each raises
+  ``WriterMisuseError``, and the job is rolled back and fails with it even
+  if ``fn`` caught it (final review F20). See ``WriterMisuseError``.
 - ``stop()`` pushes a sentinel onto the queue rather than signalling the
   thread out-of-band. Because ``queue.Queue`` is FIFO, the sentinel is
   only ever processed after every job submitted before ``stop()`` was
@@ -52,7 +62,7 @@ import sqlite3
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import Literal, NoReturn, TypeVar
 
 from xaucopier.store.migrations import (
     CURRENT_VERSION,
@@ -154,20 +164,29 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
 
 
 class WriterMisuseError(RuntimeError):
-    """Raised (via the future, not as a live exception) when a submitted
-    `fn` calls `commit()` or `rollback()` on the connection itself,
-    instead of letting the `Writer` own the transaction boundary for the
-    whole job.
+    """A submitted `fn` tried to manage the transaction the `Writer` owns
+    for the whole job.
 
-    Detected by comparing `conn.total_changes` and `conn.in_transaction`
-    from just before `fn` runs to just after: if `fn` made at least one
-    write (`total_changes` moved) but left no open transaction behind,
-    the only way that can happen is `fn` called `commit()` or
-    `rollback()` on its own -- the Writer never calls either until after
-    this check. Whatever `fn` already did to the database at that point
-    is final; there is nothing left to roll back, and the caller must
-    not be left trusting `fn`'s own result or exception as the whole
-    story.
+    Raised *inside* `fn`, before the call does anything, by the stand-in
+    connection `fn` is given: `commit()`, `rollback()`, `close()`,
+    `cursor()`, `executescript()`, assigning `isolation_level`,
+    `autocommit` or any other attribute, or `execute()`/`executemany()`
+    of a transaction-control statement (BEGIN, COMMIT, END, ROLLBACK,
+    SAVEPOINT, RELEASE -- leading comments and case do not hide one).
+    The job is then rolled back and its future fails with this error,
+    even if `fn` caught it and carried on: nothing the job wrote is kept.
+
+    One backstop remains for a path the stand-in does not guard (a
+    cursor's own `execute("COMMIT")`, or reaching the real connection
+    through `cursor.connection`): if the Writer's transaction is found
+    closed after `fn` returns, and SQLite did not close it itself, the
+    future fails with this error too -- and in that case what `fn` wrote
+    before closing it may already be committed.
+
+    Not raised for a rollback SQLite makes on its own (a full disk,
+    `INSERT OR ROLLBACK`, a trigger's `RAISE(ROLLBACK)`): that job's future
+    fails with the real `sqlite3` error, and nothing of the job is kept
+    (final review F31).
     """
 
 
@@ -247,12 +266,19 @@ class Writer:
         value (or its exception). The listener awaits this with
         `await asyncio.wrap_future(writer.submit(fn))`.
 
-        `fn` MUST NOT call `commit()` or `rollback()` on the connection
-        it is given -- the Writer owns the transaction boundary for the
-        whole job: a normal return commits, an exception rolls back. A
-        self-managed `fn` is detected and resolves the future with
-        `WriterMisuseError` instead of `fn`'s own result/exception (see
-        that class's docstring for why).
+        `fn` runs inside a transaction the Writer opens with BEGIN
+        IMMEDIATE before calling it, so all of `fn` -- reads included --
+        runs under the write lock. A normal return commits; an exception
+        rolls back and fails the future with that exception. `fn` is
+        given a stand-in for the connection that only runs statements:
+        any attempt to commit, roll back or otherwise end or reshape the
+        transaction raises `WriterMisuseError` before it runs, and the
+        whole job is rolled back and fails with it (see that class). A
+        rollback SQLite makes itself (a full disk, `INSERT OR ROLLBACK`,
+        `RAISE(ROLLBACK)`) fails the future with the real `sqlite3`
+        error, with nothing of the job kept. If the write lock cannot be
+        had within the busy timeout, the future fails with SQLite's
+        "database is locked" and `fn` never runs.
 
         If the returned future is cancelled before the writer thread
         reaches it, `fn` is never invoked -- no statement it would have
@@ -363,24 +389,54 @@ class Writer:
             # against conn -- nothing to roll back, just move on.
             return
 
-        before_changes = conn.total_changes
+        try:
+            if conn.in_transaction:
+                # Only if an earlier job's commit and rollback both
+                # failed: never start a job inside someone else's work.
+                conn.rollback()
+            # Before fn, so fn's reads are under the write lock too (F21).
+            conn.execute("BEGIN IMMEDIATE")
+        except Exception as exc:  # noqa: BLE001 -- e.g. "database is locked"
+            Writer._rollback_quietly(conn)
+            future.set_exception(exc)
+            return
+
+        job_conn = _JobConnection(conn)
         fn_exc: Exception | None = None
         result: object = None
         try:
-            result = fn(conn)
+            result = fn(job_conn)  # type: ignore[arg-type] -- a stand-in, see _JobConnection
         except Exception as exc:  # noqa: BLE001 -- must reach the future, never kill the thread
             fn_exc = exc
 
-        if conn.total_changes != before_changes and not conn.in_transaction:
-            # fn wrote something (total_changes moved) yet left no open
-            # transaction behind, even though the Writer has not called
-            # commit()/rollback() yet at this point. The only way that
-            # combination happens is fn called one of them itself.
+        sqlite_rollback = job_conn.sqlite_rollback
+        if sqlite_rollback is None and isinstance(fn_exc, sqlite3.Error) and not conn.in_transaction:
+            sqlite_rollback = fn_exc
+        if sqlite_rollback is not None:
+            # SQLite ended the transaction itself (F31): nothing of the
+            # job before that point was kept, and anything fn wrote after
+            # it (a new implicit transaction) is rolled back here, so the
+            # job stays all-or-nothing. Report the real error.
+            Writer._rollback_quietly(conn)
+            future.set_exception(sqlite_rollback)
+            return
+
+        if job_conn.misuse is not None:
+            # fn tried to manage the transaction; the stand-in refused
+            # before anything ran, whatever fn then did with the error.
+            Writer._rollback_quietly(conn)
+            future.set_exception(job_conn.misuse)
+            return
+
+        if not conn.in_transaction:
+            # The Writer's transaction is gone, SQLite did not end it,
+            # and no guarded call did: fn reached the connection another
+            # way (a cursor's own execute("COMMIT"), cursor.connection).
             misuse = WriterMisuseError(
-                "fn called commit()/rollback() itself; the Writer owns "
-                "the transaction for the whole submitted job -- fn must "
-                "only execute statements and let the Writer commit or "
-                "roll back."
+                "fn ended the Writer's transaction by a path the Writer does not "
+                "guard (a cursor's own execute('COMMIT'), or cursor.connection); "
+                "what fn wrote before that may already be committed. fn must only "
+                "execute statements and let the Writer commit or roll back."
             )
             if fn_exc is not None:
                 misuse.__cause__ = fn_exc
@@ -407,3 +463,108 @@ class Writer:
             conn.rollback()
         except sqlite3.Error:
             pass
+
+
+#: Statements that begin, end or nest a transaction -- the Writer's job.
+_TRANSACTION_CONTROL = frozenset({"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"})
+
+
+def _leading_keyword(sql: str) -> str:
+    """The first word of `sql`, upper-cased, after any whitespace, `;`,
+    `-- line` and `/* block */` comments -- enough to see a
+    transaction-control statement however it is dressed."""
+    i, n = 0, len(sql)
+    while i < n:
+        if sql[i].isspace() or sql[i] == ";":
+            i += 1
+        elif sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = n if end < 0 else end + 1
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        else:
+            break
+    j = i
+    while j < n and (sql[j].isalnum() or sql[j] == "_"):
+        j += 1
+    return sql[i:j].upper()
+
+
+class _JobConnection:
+    """What a Writer job's `fn` gets instead of the connection: every
+    read and every ordinary statement passes straight through, and every
+    way of ending or reshaping the Writer's transaction raises
+    `WriterMisuseError` *before it runs* (see that class).
+
+    It also notes, for `Writer._run_job`, the first misuse (so a job that
+    catches the error still fails) and the first `sqlite3` error after
+    which SQLite had ended the transaction itself (so a full disk is
+    reported as a full disk, even if `fn` caught it)."""
+
+    __slots__ = ("_conn", "misuse", "sqlite_rollback")
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "misuse", None)
+        object.__setattr__(self, "sqlite_rollback", None)
+
+    def _refuse(self, what: str) -> NoReturn:
+        error = WriterMisuseError(
+            f"fn {what}; the Writer owns the transaction for the whole submitted "
+            "job -- fn must only execute statements and let the Writer commit or "
+            "roll back. Nothing this job wrote was kept."
+        )
+        if self.misuse is None:
+            object.__setattr__(self, "misuse", error)
+        raise error
+
+    def _check(self, sql: object, method: str) -> None:
+        if isinstance(sql, str):
+            keyword = _leading_keyword(sql)
+            if keyword in _TRANSACTION_CONTROL:
+                self._refuse(f"ran {keyword} through {method}()")
+
+    def _run(self, method: Callable[..., T], *args: object, **kwargs: object) -> T:
+        was_in_transaction = self._conn.in_transaction
+        try:
+            return method(*args, **kwargs)
+        except sqlite3.Error as exc:
+            if (
+                was_in_transaction
+                and not self._conn.in_transaction
+                and self.sqlite_rollback is None
+            ):
+                object.__setattr__(self, "sqlite_rollback", exc)
+            raise
+
+    def execute(self, sql: str, *args: object, **kwargs: object) -> sqlite3.Cursor:
+        self._check(sql, "execute")
+        return self._run(self._conn.execute, sql, *args, **kwargs)
+
+    def executemany(self, sql: str, *args: object, **kwargs: object) -> sqlite3.Cursor:
+        self._check(sql, "executemany")
+        return self._run(self._conn.executemany, sql, *args, **kwargs)
+
+    def executescript(self, *args: object, **kwargs: object) -> NoReturn:
+        self._refuse("called executescript(), which commits the open transaction first")
+
+    def commit(self) -> NoReturn:
+        self._refuse("called commit()")
+
+    def rollback(self) -> NoReturn:
+        self._refuse("called rollback()")
+
+    def close(self) -> NoReturn:
+        self._refuse("called close() on the Writer's connection")
+
+    def cursor(self, *args: object, **kwargs: object) -> NoReturn:
+        self._refuse("asked for cursor() (use execute(), which returns one)")
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name: str, value: object) -> NoReturn:
+        if name in ("isolation_level", "autocommit"):
+            self._refuse(f"set {name}, which can commit or end the open transaction")
+        self._refuse(f"set {name} on the Writer's connection, which every job shares")
