@@ -7,10 +7,10 @@
 // Strategy)", rule for rule:
 //
 //  Chart  : 1 minute. Williams Fractals with Periods = 2 (TradingView's
-//           algorithm), colours flipped so the arrow UNDER a candle is GREEN
-//           and the arrow OVER a candle is RED. Three moving averages on the
-//           close, lengths 20 / 50 / 100 ("Three Moving Averages" by
-//           AdventTrading, which plots EMAs).
+//           algorithm), colours flipped so the triangle UNDER a candle is
+//           GREEN and the triangle OVER a candle is RED. Three moving averages
+//           on the close, lengths 20 / 50 / 100 ("Three Moving Averages" by
+//           AdventTrading, which plots EMAs), coloured green, yellow and red.
 //
 //  Long   : only when the 20 EMA is above the 50 EMA and the 50 EMA is above
 //           the 100 EMA. If they are crossing each other, no trade.
@@ -29,8 +29,13 @@
 //
 //  Manage : trust the strategy and stay in the trade: stop and target only.
 //
-//  Costs  : the one-minute chart gives a lot of signals, so fees must be low.
-//           Entries are skipped while the spread is wider than InpMaxSpread.
+//  Costs  : the one-minute chart gives a lot of signals, so use a broker with
+//           very low fees. (InpMaxSpread can skip wide-spread entries; it is
+//           not in the video, so it is off by default.)
+//
+// The stop sits on the first price past the EMA, where the video drags it.
+// Sell stops trigger on the Ask, so the spread is added to them: the chart
+// (Bid) price then has to trade right above the EMA to stop the trade out.
 //
 // How the arrow is traded: a Williams fractal only exists once the n candles
 // after it have closed. The EA reads closed candles only, so when the green
@@ -66,8 +71,8 @@ input bool            InpTradeLongs     = true;       // Take buy trades
 input bool            InpTradeShorts    = true;       // Take sell trades
 
 input group "Stop loss"
-input double          InpStopBuffer     = 0.30;       // Distance past the EMA for the stop, in price (0.30 = 30 cents)
-input bool            InpSpreadOnSellSL = true;       // Add the spread to sell stops (they trigger on the Ask)
+input double          InpStopBuffer     = 0.0;        // Extra distance past the EMA for the stop, in price (video: 0, right at the line)
+input bool            InpSpreadOnSellSL = true;       // Measure sell stops on the chart price like the video (adds the spread)
 
 input group "Position size"
 input ENUM_LOT_MODE   InpLotMode        = LOT_MODE_RISK_PERCENT; // Sizing mode
@@ -80,27 +85,33 @@ input bool            InpMinLotFallback = false;      // Trade the minimum lot w
 
 input group "Execution and costs"
 input ulong           InpMagic          = 20260924;   // Magic number
-input double          InpMaxSpread      = 0.50;       // Widest spread allowed at entry, in price (0 = no limit)
 input double          InpSlippage       = 0.30;       // Maximum slippage, in price (0.30 = 30 cents)
 input bool            InpOnePosition    = true;       // One trade at a time: stay in it until stop or target
-input bool            InpRetryInBar     = true;       // If the spread blocks the entry, keep trying until the candle closes
+input bool            InpRetryInBar     = true;       // If the entry is blocked, keep trying until the candle closes
 
 input group "Optional filters (not in the video, off by default)"
+input double          InpMaxSpread      = 0.0;        // Widest spread allowed at entry, in price (0 = off)
 input double          InpMinStopDist    = 0.0;        // Skip if entry-to-stop is smaller than this, in price (0 = off)
 input double          InpMaxStopDist    = 0.0;        // Skip if entry-to-stop is larger than this, in price (0 = off)
 input bool            InpUseHours       = false;      // Only open trades between the hours below
 input int             InpStartHour      = 1;          // First trading hour, server time (0-23)
 input int             InpEndHour        = 22;         // Last trading hour, server time (0-23)
 
-input group "Chart"
-input bool            InpShowEMAs       = true;       // Add the three EMAs to the chart
-input bool            InpDrawArrows     = true;       // Draw the green / red fractal arrows
+input group "Chart (as in the video)"
+input bool            InpShowEMAs       = true;       // Draw the EMAs: 20 green, 50 yellow, 100 red
+input bool            InpDrawArrows     = true;       // Draw the fractals: green under the candle, red over it
 input bool            InpShowPanel      = true;       // Show the status panel
+input int             InpLineBars       = 600;        // Candles of EMA line kept on the chart
 input int             InpMaxArrows      = 500;        // Most arrows kept on the chart
 
 #define EA_NAME      "XAUUSD Fractal EMA Scalper"
 #define WARMUP_BARS  600      // closed candles replayed at start-up to rebuild the setup state
 #define MAX_SENDS    5        // order sends tried per signal before giving up
+
+//--- the colours picked in the video (TradingView palette)
+const color CLR_GREEN  = C'76,175,80';    // 20 EMA and the green fractal
+const color CLR_YELLOW = C'255,235,59';   // 50 EMA
+const color CLR_RED    = C'244,67,54';    // 100 EMA and the red fractal
 
 //--- setup state for one side (long or short)
 struct SideState
@@ -140,6 +151,8 @@ bool            g_draw       = true;    // false in optimisation / non-visual te
 string          g_prefix     = "";
 string          g_arrows[];             // ring of arrow object names
 int             g_arrowNext  = 0;
+string          g_lines[];              // ring of EMA line segment names
+int             g_lineNext   = 0;
 string          g_lastAction = "";
 datetime        g_panelTime  = 0;
 
@@ -147,7 +160,6 @@ datetime        g_panelTime  = 0;
 //| Small helpers                                                    |
 //+------------------------------------------------------------------+
 int IMin(const int a, const int b) { return (a < b) ? a : b; }
-int IMax(const int a, const int b) { return (a > b) ? a : b; }
 
 double TickSize()
   {
@@ -254,42 +266,68 @@ bool IsRedFractal(const MqlRates &r[], const int c, const int n)
 //+------------------------------------------------------------------+
 //| Chart drawing                                                    |
 //+------------------------------------------------------------------+
+//--- keep a fixed number of objects: the newest name takes the oldest slot
+void Remember(string &ring[], int &next, const string name)
+  {
+   const int size = ArraySize(ring);
+   if(size <= 0)
+      return;
+   const int slot = next % size;
+   if(ring[slot] != "")
+      ObjectDelete(0, ring[slot]);
+   ring[slot] = name;
+   next       = (slot + 1) % size;
+  }
+
 void DrawArrow(const bool green, const datetime t, const double price)
   {
-   const int size = ArraySize(g_arrows);
-   if(!g_draw || !InpDrawArrows || size <= 0)
+   if(!g_draw || !InpDrawArrows || ArraySize(g_arrows) <= 0)
       return;
    const string name = g_prefix + (green ? "G" : "R") + IntegerToString((long)t);
    if(ObjectFind(0, name) >= 0)
       return;
    if(!ObjectCreate(0, name, OBJ_ARROW, 0, t, price))
       return;
-   //--- as in the video: green triangle-down under the candle, red triangle-up over it
-   ObjectSetInteger(0, name, OBJPROP_ARROWCODE, green ? 234 : 233);
-   ObjectSetInteger(0, name, OBJPROP_COLOR, green ? clrLimeGreen : clrRed);
+   //--- as in the video: green triangle pointing down under the candle,
+   //--- red triangle pointing up over it (Wingdings 218 / 217)
+   ObjectSetInteger(0, name, OBJPROP_ARROWCODE, green ? 218 : 217);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, green ? CLR_GREEN : CLR_RED);
    ObjectSetInteger(0, name, OBJPROP_ANCHOR, green ? ANCHOR_TOP : ANCHOR_BOTTOM);
    ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
    ObjectSetInteger(0, name, OBJPROP_BACK, false);
-   //--- keep a fixed number of arrows: reuse the oldest slot
-   const int slot = g_arrowNext % size;
-   if(g_arrows[slot] != "")
-      ObjectDelete(0, g_arrows[slot]);
-   g_arrows[slot] = name;
-   g_arrowNext    = (slot + 1) % size;
+   Remember(g_arrows, g_arrowNext, name);
   }
 
-//--- put an EMA on the chart once (iMA's short name is "MA(<length>)")
-void AddEmaToChart(const int handle, const int length)
+//--- one candle of an EMA line, from the previous candle to this one
+void DrawEmaSegment(const string tag, const datetime t1, const double p1, const datetime t2, const double p2,
+                    const color clr)
   {
-   const string wanted = "MA(" + IntegerToString(length) + ")";
-   const int    total  = ChartIndicatorsTotal(0, 0);
-   for(int i = 0; i < total; i++)
-      if(ChartIndicatorName(0, 0, i) == wanted)
-         return;
-   if(!ChartIndicatorAdd(0, 0, handle))
-      Print(EA_NAME, ": could not add ", wanted, " to the chart, error ", IntegerToString(GetLastError()));
+   const string name = g_prefix + "E" + tag + IntegerToString((long)t2);
+   if(ObjectFind(0, name) >= 0)
+      return;
+   if(!ObjectCreate(0, name, OBJ_TREND, 0, t1, p1, t2, p2))
+      return;
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, name, OBJPROP_RAY_LEFT, false);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name, OBJPROP_BACK, true);
+   Remember(g_lines, g_lineNext, name);
+  }
+
+//--- the three EMAs in the video's colours: 20 green, 50 yellow, 100 red
+void DrawEmas(const int s, const MqlRates &r[], const double &emaF[], const double &emaM[], const double &emaS[])
+  {
+   if(!g_draw || !InpShowEMAs || ArraySize(g_lines) <= 0)
+      return;
+   DrawEmaSegment("F", r[s + 1].time, emaF[s + 1], r[s].time, emaF[s], CLR_GREEN);
+   DrawEmaSegment("M", r[s + 1].time, emaM[s + 1], r[s].time, emaM[s], CLR_YELLOW);
+   DrawEmaSegment("S", r[s + 1].time, emaS[s + 1], r[s].time, emaS[s], CLR_RED);
   }
 
 void UpdatePanel(const bool force)
@@ -322,7 +360,8 @@ void UpdatePanel(const bool force)
    text += "Short: over " + f + " EMA " + YesNo(g_short.pullback) + " | crossed " + m + " EMA " + YesNo(g_short.deep)
            + " | skip next red " + YesNo(g_short.skipNext) + "\n";
    text += "Spread " + Px(spread) + (InpMaxSpread > 0.0 ? " (max " + Px(InpMaxSpread) + ")" : "")
-           + "   stop buffer " + Px(InpStopBuffer) + "   target " + DoubleToString(InpRewardRisk, 2) + "R\n";
+           + "   stop " + (InpStopBuffer > 0.0 ? Px(InpStopBuffer) + " past the EMA" : "right past the EMA")
+           + "   target " + DoubleToString(InpRewardRisk, 2) + "R\n";
    text += "Last: " + g_lastAction;
    Comment(text);
   }
@@ -446,6 +485,7 @@ void ProcessClosedBar(const int s, const MqlRates &r[], const double &emaF[], co
       g_bullStack = bull;
       g_bearStack = bear;
      }
+   DrawEmas(s, r, emaF, emaM, emaS);
 
    //--- the arrow confirmed by this candle sits n candles back
    const int c = s + n;
@@ -708,13 +748,14 @@ void TryEntry(const datetime barTime)
       return;
      }
 
-   //--- stop right below / above the EMA, target 1.5 x the risk
+   //--- stop on the first price right below / above the EMA, target 1.5 x the risk
    const double entry = isBuy ? tick.ask : tick.bid;
+   const double half  = TickSize() * 0.5;      // keeps the stop strictly past the EMA
    double sl = 0.0;
    if(isBuy)
-      sl = PriceDown(g_signal.stopEma - InpStopBuffer);
+      sl = PriceDown(g_signal.stopEma - InpStopBuffer - half);
    else
-      sl = PriceUp(g_signal.stopEma + InpStopBuffer + (InpSpreadOnSellSL ? spread : 0.0));
+      sl = PriceUp(g_signal.stopEma + InpStopBuffer + (InpSpreadOnSellSL ? spread : 0.0) + half);
    const double risk = isBuy ? entry - sl : sl - entry;
    if(risk <= 0.0)
      {
@@ -821,6 +862,11 @@ int OnInit()
       Print(EA_NAME, ": trading hours must be between 0 and 23");
       return INIT_PARAMETERS_INCORRECT;
      }
+   if(InpMinStopDist < 0.0 || InpMaxStopDist < 0.0 || InpSlippage < 0.0 || InpLineBars < 0 || InpMaxArrows < 0)
+     {
+      Print(EA_NAME, ": distances, slippage and chart history cannot be negative");
+      return INIT_PARAMETERS_INCORRECT;
+     }
 
    g_tf = (InpTimeframe == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpTimeframe;
 
@@ -830,6 +876,9 @@ int OnInit()
       Print(EA_NAME, ": warning - built for XAUUSD but attached to ", _Symbol,
             ". The stop buffer and spread limit are in price units, check them for this symbol.");
 
+   //--- the Strategy Tester would plot the EMAs in its default colour on top of
+   //--- the green / yellow / red lines the EA draws, so keep them hidden
+   TesterHideIndicators(true);
    g_hFast = iMA(_Symbol, g_tf, InpEmaFast, 0, MODE_EMA, PRICE_CLOSE);
    g_hMid  = iMA(_Symbol, g_tf, InpEmaMid, 0, MODE_EMA, PRICE_CLOSE);
    g_hSlow = iMA(_Symbol, g_tf, InpEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
@@ -848,18 +897,14 @@ int OnInit()
    g_draw   = !(MQLInfoInteger(MQL_OPTIMIZATION) != 0
                 || (MQLInfoInteger(MQL_TESTER) != 0 && MQLInfoInteger(MQL_VISUAL_MODE) == 0));
    g_prefix = "FES_" + IntegerToString((long)InpMagic) + "_";
-   ArrayResize(g_arrows, (g_draw && InpDrawArrows) ? IMax(InpMaxArrows, 0) : 0);
+   ArrayResize(g_arrows, (g_draw && InpDrawArrows) ? InpMaxArrows : 0);
    for(int i = 0; i < ArraySize(g_arrows); i++)
       g_arrows[i] = "";
    g_arrowNext = 0;
-
-   //--- the Strategy Tester shows the EA's indicators by itself
-   if(g_draw && InpShowEMAs && MQLInfoInteger(MQL_TESTER) == 0 && g_tf == (ENUM_TIMEFRAMES)_Period)
-     {
-      AddEmaToChart(g_hFast, InpEmaFast);
-      AddEmaToChart(g_hMid, InpEmaMid);
-      AddEmaToChart(g_hSlow, InpEmaSlow);
-     }
+   ArrayResize(g_lines, (g_draw && InpShowEMAs) ? 3 * InpLineBars : 0);
+   for(int i = 0; i < ArraySize(g_lines); i++)
+      g_lines[i] = "";
+   g_lineNext = 0;
 
    ResetSide(g_long);
    ResetSide(g_short);
