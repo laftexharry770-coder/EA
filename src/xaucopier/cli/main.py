@@ -7,7 +7,8 @@ The commands, in the order the user runs them (docs/RUNBOOK.md):
 - `resolve-channels` (`cli/resolve.py`) -- look up each placeholder
   channel's numeric id once and write it into `config/channels.toml`.
 - `channels` (`cli/channels.py`) -- list the channels signals are taken
-  from; switch one on or off (`channels on N` / `channels off N`).
+  from; switch one on or off (`channels on N` / `channels off N`), or add
+  a new one (`channels add`).
 - `watch` (`cli/watch.py`) -- the deliverable: record every signal,
   place no order. Nothing reachable from here imports `MetaTrader5`.
 - `status` (`cli/status.py`) -- a read-only report on what `watch` has
@@ -414,14 +415,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     channels = subparsers.add_parser(
         "channels",
-        help="Choose the channels signals come from: list them, or switch one on or off.",
+        help="Choose the channels signals come from: list, add, or switch one on or off.",
         description=(
             "With nothing after it, lists every channel in channels.toml: its "
             "number, name, ON or OFF, whether its id has been looked up, its parser, "
             "its newest recorded message and how many signals it produced (this only "
             "reads). `channels on NUMBER` / `channels off NUMBER` switch that channel "
             "on or off; NUMBER is the one the list shows. None of these contact "
-            "Telegram. watch reads the list when it starts."
+            "Telegram. `channels add` adds a new channel: it looks the channel up on "
+            "Telegram once (paste its link, or pick it from the channels you have "
+            "joined), so watch must be stopped first. watch reads the list when it "
+            "starts."
         ),
         epilog=exit_codes.help_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -429,9 +433,10 @@ def build_parser() -> argparse.ArgumentParser:
     channels.add_argument(
         "action",
         nargs="?",
-        choices=("on", "off"),
+        choices=("add", "on", "off"),
         default=None,
-        help="on / off: switch channel NUMBER on or off. Leave out to list the channels.",
+        help="add: add a new channel. on / off: switch channel NUMBER on or off. "
+        "Leave out to list the channels.",
     )
     channels.add_argument(
         "number",
@@ -442,7 +447,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_config_dir(channels)
     _add_db(channels)
-    channels.set_defaults(func=cmd_channels, link=None, yes=False)
+    _add_secrets(channels)
+    channels.add_argument(
+        "--link",
+        default=None,
+        help="For add: the channel's t.me link or @username, instead of being asked.",
+    )
+    channels.add_argument(
+        "--yes",
+        action="store_true",
+        help="For add: add what was found without asking for confirmation.",
+    )
+    channels.set_defaults(func=cmd_channels)
 
     watch = subparsers.add_parser(
         "watch",

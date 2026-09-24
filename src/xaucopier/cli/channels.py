@@ -11,6 +11,15 @@
   looked up (`channel_id = 0`) and one whose parser xaucopier does not
   have; `off` of the last channel still on is allowed, with a warning that
   `watch` will then refuse to start.
+- `channels add` adds a NEW channel: the only command here that contacts
+  Telegram, once, to look the channel up -- by the same paste-a-link or
+  pick-from-the-channels-you-joined flow `resolve-channels` uses. It takes
+  the session mutex first, exactly as `resolve-channels` does, so it
+  refuses to run while `watch` holds the session. The new block gets the
+  channel's numeric id and title, `parser = "mmh"`, the next free number
+  (one more than the highest ordinal -- never derived from how many
+  channels there are) and `enabled = true`. A channel already in the file
+  is never added twice.
 
 **Every write goes through `resolve.write_config_atomically()`**, the one
 writer `resolve-channels` also uses: the edited text is written to a
@@ -33,6 +42,7 @@ without taking it, so asking never stops a `watch` from starting.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sqlite3
 import sys
 import tomllib
@@ -42,11 +52,26 @@ from pathlib import Path
 from typing import Any
 
 from xaucopier.cli import exit_codes, paths
-from xaucopier.cli.resolve import PLACEHOLDER_ID, save_switch
+from xaucopier.cli.resolve import (
+    PLACEHOLDER_ID,
+    ResolveError,
+    _ask,
+    _choose,
+    report_not_logged_in,
+    report_permanent_error,
+    save_added,
+    save_switch,
+)
 from xaucopier.cli.status import ago, when
-from xaucopier.cli.watch import SetupError, load_channels_config
+from xaucopier.cli.watch import SetupError, load_channels_config, load_session
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.ingest.client import session_in_use
+from xaucopier.ingest.client import (
+    PERMANENT_TELEGRAM_ERRORS,
+    AlreadyRunningError,
+    acquire_single_instance_lock,
+    build_client,
+    session_in_use,
+)
 from xaucopier.parsing.registry import parser_for
 from xaucopier.store import db, report
 
@@ -377,6 +402,160 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
     return exit_codes.EXIT_OK
 
 
+#: What `channels add` says when `watch` (or another command) holds the session.
+ADD_WHILE_WATCH_RUNS = (
+    "watch is running (or another xaucopier command is using the Telegram login). "
+    "Only one program may use the Telegram session at a time, so a channel cannot "
+    "be added while it runs. Nothing was changed.\n"
+    "Stop watch first -- click in its window, press Ctrl+C and answer Y -- then run "
+    f"`{_CMD} channels add` again, and start `{_CMD} watch` again afterwards."
+)
+
+
+def _next_number(channels: tuple[ChannelCfg, ...]) -> int:
+    """The number (ordinal) a new channel gets: one more than the highest in
+    use -- never how many channels there are, which could hand out a
+    number another channel already has."""
+    return max((channel.ordinal for channel in channels), default=0) + 1
+
+
+async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
+    """Look the channel up on Telegram, then -- offline -- check it and
+    append it. The Telegram connection is closed before the file is read."""
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            return report_not_logged_in()
+        try:
+            resolved = await _choose(client, "the channel to add", args.link, again="channels add")
+        except ResolveError as exc:
+            complain(f"Could not find the channel: {exc}. Nothing was added.")
+            return exit_codes.EXIT_FAILED
+    except PERMANENT_TELEGRAM_ERRORS as exc:
+        return report_permanent_error(exc)
+    except (ConnectionError, TimeoutError, OSError) as exc:
+        complain(
+            f"Could not reach Telegram ({type(exc).__name__}). Check the internet "
+            f"connection, then run `{_CMD} channels add` again. Nothing was added."
+        )
+        return exit_codes.EXIT_FAILED
+    finally:
+        await client.disconnect()
+    if resolved is None:
+        say("Cancelled. Nothing was added.")
+        return exit_codes.EXIT_FAILED
+    title = _printable(resolved.title)
+    say(f"Found: {title} -- numeric id {resolved.channel_id}")
+
+    # Read the file now, not before the lookup: the user may have taken a
+    # while to choose. The writer also refuses if it changes after this.
+    try:
+        original = path.read_bytes().decode("utf-8")
+        channels = load_channels_config(args.config_dir)
+    except SetupError as exc:
+        return _config_problem(exc)
+    except (OSError, UnicodeDecodeError) as exc:
+        return _config_problem(SetupError(f"{path} could not be read: {exc}"))
+
+    existing = next(
+        (channel for channel in by_number(channels) if channel.channel_id == resolved.channel_id),
+        None,
+    )
+    if existing is not None:
+        state = "ON" if existing.enabled else "OFF"
+        complain(
+            f"{title} is already in channels.toml as channel {existing.ordinal} "
+            f"({_printable(existing.name)}), and it is {state}. Nothing was added."
+        )
+        if not existing.enabled:
+            complain(f"To switch it on: `{_CMD} channels on {existing.ordinal}`")
+        return exit_codes.EXIT_FAILED
+    waiting = next(
+        (
+            channel
+            for channel in by_number(channels)
+            if channel.channel_id == PLACEHOLDER_ID
+            and channel.name.strip().casefold() == resolved.title.strip().casefold()
+        ),
+        None,
+    )
+    if waiting is not None:
+        complain(
+            f"{title} is already in channels.toml as channel {waiting.ordinal}, waiting "
+            f"for its id. Nothing was added: run `{_CMD} resolve-channels` to look up "
+            "its id and switch it on."
+        )
+        return exit_codes.EXIT_FAILED
+
+    number = _next_number(channels)
+    say("", f"PLEASE NOTE: {FORMAT_CAVEAT}", "")
+    if not args.yes:
+        answer = await _ask(
+            f"Add {title} as channel {number} and switch it on? Type yes to confirm: "
+        )
+        if answer.lower() not in ("y", "yes"):
+            say("Not added. Nothing was changed.")
+            return exit_codes.EXIT_FAILED
+    try:
+        save_added(
+            path,
+            original=original,
+            resolved=resolved,
+            ordinal=number,
+            today=_utcnow().date().isoformat(),
+        )
+    except Exception as exc:  # noqa: BLE001 -- the writer leaves the file untouched on any failure
+        complain(
+            f"Could not save to {path}: {exc}",
+            "The file was not changed: nothing was added.",
+        )
+        return exit_codes.EXIT_CONFIG_ERROR
+    say(
+        f"Added: {title} is now channel {number}, switched ON (parser mmh).",
+        f"It takes effect the next time you run `{_CMD} watch`. See every channel with "
+        f"`{_CMD} channels`; switch this one off with `{_CMD} channels off {number}`.",
+    )
+    return exit_codes.EXIT_OK
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    """`channels add`: the one `channels` command that contacts Telegram."""
+    path: Path = args.config_dir / paths.CHANNELS_FILE
+    try:
+        load_channels_config(args.config_dir)  # usable, before anything connects
+    except SetupError as exc:
+        return _config_problem(exc)
+    try:
+        blob = load_session(args.secrets)
+    except SetupError as exc:
+        complain(f"channels add cannot start: {exc}", "Nothing was changed.")
+        return exit_codes.EXIT_CONFIG_ERROR
+    try:
+        lock = acquire_single_instance_lock()
+    except AlreadyRunningError:
+        complain(ADD_WHILE_WATCH_RUNS)
+        return exit_codes.EXIT_ALREADY_RUNNING
+    try:
+        client = build_client(blob)
+        return asyncio.run(_add(args, client, path))
+    except KeyboardInterrupt:
+        complain(
+            "",
+            "Cancelled (Ctrl+C). Nothing was added unless it said Added above; check with "
+            f"`{_CMD} channels`.",
+        )
+        return exit_codes.EXIT_INTERRUPTED
+    except EOFError:
+        complain(
+            "No answer could be read: the input was closed. Run "
+            f"`{_CMD} channels add` in an ordinary PowerShell window and type the answers "
+            "there. Nothing was added."
+        )
+        return exit_codes.EXIT_FAILED
+    finally:
+        lock.release()
+
+
 _ON_OFF_USAGE = (
     "Say which channel, by the number `{cmd} channels` shows: "
     "`{cmd} channels on NUMBER` or `{cmd} channels off NUMBER`."
@@ -399,6 +578,8 @@ def cmd_channels(args: argparse.Namespace) -> int:
             f"`{_CMD} channels off {args.number}`."
         )
         return exit_codes.EXIT_USAGE
+    if args.action == "add":
+        return cmd_add(args)
     if args.link is not None or args.yes:
         complain(f"--link and --yes only go with `{_CMD} channels add`.")
         return exit_codes.EXIT_USAGE

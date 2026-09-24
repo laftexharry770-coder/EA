@@ -59,7 +59,6 @@ from xaucopier.config.channels import ChannelCfg, load_channels
 from xaucopier.ingest.client import (
     API_CREDENTIAL_ERRORS,
     PERMANENT_TELEGRAM_ERRORS,
-    TERMINAL_AUTH_ERRORS,
     AlreadyRunningError,
     acquire_single_instance_lock,
     build_client,
@@ -200,6 +199,51 @@ def set_id_then_enable(text: str, *, index: int, channel_id: int, title: str, to
     return new_text
 
 
+#: The parser a channel added by `channels add` is given: the only one built.
+NEW_CHANNEL_PARSER = "mmh"
+
+
+def _toml_string(value: str) -> str:
+    """`value` as a TOML basic string: quotes, backslashes and control
+    characters escaped; everything else (an emoji in a channel title)
+    written as it is."""
+    out = []
+    for ch in value:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def append_channel(text: str, *, channel_id: int, name: str, ordinal: int, today: str) -> str:
+    """`text` with a new `[[channels]]` block added at the end (for
+    `channels add`): `channel_id`, `name`, `parser = "mmh"`, `ordinal` and
+    `enabled = true`. Every byte of `text` is kept; the block uses the
+    file's own line ending. Checked against the loader's rule."""
+    if channel_id == PLACEHOLDER_ID:
+        raise ResolveError("refusing to write channel_id = 0")
+    ending = "\r\n" if "\r\n" in text else "\n"
+    lead = text if not text or text.endswith("\n") else text + ending
+    block = (
+        "",
+        f"# {_safe_comment(name)} -- added by channels add on {today}",
+        "[[channels]]",
+        f"channel_id = {channel_id}",
+        f"name       = {_toml_string(name)}",
+        f'parser     = "{NEW_CHANNEL_PARSER}"      # reads only the MARKET MASTERY HUB layout',
+        f"ordinal    = {ordinal}",
+        "enabled    = true",
+    )
+    new_text = lead + ending.join(block) + ending
+    _check_no_enabled_placeholder(new_text)
+    return new_text
+
+
 def set_enabled(text: str, *, index: int, enabled: bool, comment: str) -> str:
     """`text` with the `index`-th channel's `enabled = ...` line set to
     `enabled` (for `channels on` / `channels off`), its trailing comment
@@ -325,6 +369,47 @@ def save_switch(
     )
 
 
+def save_added(path: Path, *, original: str, resolved: Resolved, ordinal: int, today: str) -> None:
+    """Add `resolved` to `path` (whose text was `original`) as channel
+    number `ordinal`, switched on, through `write_config_atomically`. The
+    new channel must load as the last one, and as the only one with its id."""
+    new_text = append_channel(
+        original,
+        channel_id=resolved.channel_id,
+        name=resolved.title,
+        ordinal=ordinal,
+        today=today,
+    )
+    entry = {
+        "channel_id": resolved.channel_id,
+        "name": resolved.title,
+        "parser": NEW_CHANNEL_PARSER,
+        "ordinal": ordinal,
+        "enabled": True,
+    }
+
+    def expect(data: dict[str, Any]) -> None:
+        data.setdefault("channels", []).append(dict(entry))
+
+    def confirm(loaded: tuple[ChannelCfg, ...]) -> bool:
+        last = loaded[-1] if loaded else None
+        return (
+            last is not None
+            and (last.channel_id, last.ordinal, last.parser, last.enabled)
+            == (resolved.channel_id, ordinal, NEW_CHANNEL_PARSER, True)
+            and sum(1 for channel in loaded if channel.channel_id == resolved.channel_id) == 1
+        )
+
+    write_config_atomically(
+        path,
+        original=original,
+        new_text=new_text,
+        expect=expect,
+        confirm=confirm,
+        change="the one new channel",
+    )
+
+
 # -- Telegram ---------------------------------------------------------------------
 
 
@@ -349,14 +434,15 @@ def normalise_link(text: str) -> str:
     return text
 
 
-async def resolve_link(client: Any, text: str) -> Resolved:
+async def resolve_link(client: Any, text: str, *, again: str = "resolve-channels") -> Resolved:
     """A t.me link, an invite link (t.me/+..., t.me/joinchat/...) or an
-    @username -> the channel. One `get_entity` call."""
+    @username -> the channel. One `get_entity` call. `again` is the
+    command the user is told to run again."""
     link = normalise_link(text)
     if _PRIVATE_POST_LINK.search(link):
         raise ResolveError(
             "that is a link to a post in a private channel, which cannot be looked up "
-            f"by link; run `{paths.USER_COMMAND} resolve-channels` again and just press "
+            f"by link; run `{paths.USER_COMMAND} {again}` again and just press "
             "Enter to choose the channel from the list"
         )
     if link.lstrip("+-").isdigit():
@@ -389,25 +475,61 @@ async def _ask(prompt: str) -> str:
     return (await asyncio.to_thread(input, prompt)).strip()
 
 
-async def _choose(client: Any, cfg: ChannelCfg, link: str | None) -> Resolved | None:
+async def _choose(
+    client: Any, wanted: str, link: str | None, *, again: str = "resolve-channels"
+) -> Resolved | None:
+    """The channel the user means: from `link`, else from what they paste,
+    else picked from the channels the account has joined. None if they
+    cancel. `wanted` names it in the prompt; `again` is the command."""
     answer = link if link is not None else await _ask(
         "Paste the channel's t.me link or @username -- or just press Enter to choose it "
         "from the channels you have joined (do that for a private channel): "
     )
     if answer:
-        return await resolve_link(client, answer)
+        return await resolve_link(client, answer, again=again)
     channels = await joined_channels(client)
     if not channels:
         raise ResolveError("this Telegram account has not joined any channel")
     print("The channels this account has joined:")
     for number, channel in enumerate(channels, start=1):
         print(f"  {number:>3}. {channel.title}")
-    choice = await _ask(f"Type the number of {cfg.name!r}, or press Enter to cancel: ")
+    choice = await _ask(f"Type the number of {wanted}, or press Enter to cancel: ")
     if not choice:
         return None
     if not choice.isdigit() or not 1 <= int(choice) <= len(channels):
         raise ResolveError(f"{choice!r} is not one of the numbers listed")
     return channels[int(choice) - 1]
+
+
+def report_not_logged_in() -> int:
+    """Say the session is not logged in; the exit code for it (3)."""
+    print(
+        "This Telegram session is not logged in (it may have been logged out). "
+        f"Run `{paths.USER_COMMAND} setup-login` again.",
+        file=sys.stderr,
+    )
+    return exit_codes.EXIT_TERMINAL_AUTH
+
+
+def report_permanent_error(exc: BaseException) -> int:
+    """One plain sentence for a Telegram error no retry can fix, and its
+    exit code: 5 for a rejected api_id/api_hash, 3 for a dead session or
+    account. Shared by `resolve-channels` and `channels add`."""
+    if isinstance(exc, API_CREDENTIAL_ERRORS):
+        print(
+            f"Telegram rejects this program's api_id/api_hash ({type(exc).__name__}). "
+            "Get a NEW pair at https://my.telegram.org, then run "
+            "`.\\xaucopier setup-login` again.",
+            file=sys.stderr,
+        )
+        return exit_codes.EXIT_CONFIG_ERROR
+    print(
+        f"Telegram refuses this login ({type(exc).__name__}): it was logged out, "
+        "used from two places at once, or the account is banned. Run "
+        "`.\\xaucopier setup-login` again.",
+        file=sys.stderr,
+    )
+    return exit_codes.EXIT_TERMINAL_AUTH
 
 
 async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[ChannelCfg, ...]) -> int:
@@ -420,17 +542,12 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
     await client.connect()
     try:
         if not await client.is_user_authorized():
-            print(
-                "This Telegram session is not logged in (it may have been logged out). "
-                f"Run `{paths.USER_COMMAND} setup-login` again.",
-                file=sys.stderr,
-            )
-            return exit_codes.EXIT_TERMINAL_AUTH
+            return report_not_logged_in()
         saved = 0
         for index, cfg in pending:
             print(f"\nChannel {cfg.name!r} does not have its numeric id yet.")
             try:
-                resolved = await _choose(client, cfg, args.link)
+                resolved = await _choose(client, repr(cfg.name), args.link)
             except ResolveError as exc:
                 print(f"Could not resolve {cfg.name!r}: {exc}. Nothing was changed.", file=sys.stderr)
                 return exit_codes.EXIT_FAILED
@@ -472,22 +589,8 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
                 return exit_codes.EXIT_CONFIG_ERROR
             saved += 1
             print(f"Saved: {cfg.name!r} is now channel {resolved.channel_id}, switched on.")
-    except TERMINAL_AUTH_ERRORS as exc:
-        print(
-            f"Telegram refuses this login ({type(exc).__name__}): it was logged out, "
-            "used from two places at once, or the account is banned. Run "
-            "`.\\xaucopier setup-login` again.",
-            file=sys.stderr,
-        )
-        return exit_codes.EXIT_TERMINAL_AUTH
-    except API_CREDENTIAL_ERRORS as exc:
-        print(
-            f"Telegram rejects this program's api_id/api_hash ({type(exc).__name__}). "
-            "Get a NEW pair at https://my.telegram.org, then run "
-            "`.\\xaucopier setup-login` again.",
-            file=sys.stderr,
-        )
-        return exit_codes.EXIT_CONFIG_ERROR
+    except PERMANENT_TELEGRAM_ERRORS as exc:
+        return report_permanent_error(exc)
     finally:
         await client.disconnect()
 

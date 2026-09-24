@@ -21,19 +21,26 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from telethon import errors
+from telethon.tl import types
 
 import xaucopier.cli.channels as channels_module
 import xaucopier.cli.main as cli_main
 import xaucopier.cli.resolve as resolve_module
+from fakes.telegram import FakeTelegramClient
 from xaucopier.cli import exit_codes
+from xaucopier.cli.watch import load_session as real_load_session
 from xaucopier.config.accounts import load_accounts
 from xaucopier.config.channels import ChannelCfg, load_channels
+from xaucopier.ingest.client import AlreadyRunningError
+from xaucopier.ingest.secrets import SecretsBlob
 from xaucopier.store import db, messages_repo
 
 REPO = Path(__file__).resolve().parents[1]
@@ -138,6 +145,7 @@ class Rig:
             *extra,
             "--config-dir", str(self.config_dir),
             "--db", str(self.db_path),
+            "--secrets", str(self.config_dir.parent / "no-session.dpapi"),
         ]
 
     def files(self) -> list[str]:
@@ -540,3 +548,329 @@ def test_a_layout_it_cannot_edit_safely_is_refused_not_guessed(
     assert cli_main.main(rig.argv("on", "2")) == exit_codes.EXIT_CONFIG_ERROR
     assert rig.channels_path.read_bytes() == before
     assert _no_temp_files(rig)
+
+
+# -- add --------------------------------------------------------------------------------------
+
+SILVER = types.Channel(
+    id=4444444444,
+    title='Silver "Signals" \\ \U0001F680',
+    photo=types.ChatPhotoEmpty(),
+    date=None,
+    broadcast=True,
+)
+SILVER_ID = -1004444444444
+GOLD_ENTITY = types.Channel(id=2222222222, title="Gold Room", photo=types.ChatPhotoEmpty(), date=None)
+QUIET_ENTITY = types.Channel(id=3333333333, title="Quiet Signals", photo=types.ChatPhotoEmpty(), date=None)
+MMH_ENTITY = types.Channel(
+    id=1234567890, title="MARKET MASTERY HUB / COMMUNITY", photo=types.ChatPhotoEmpty(), date=None
+)
+A_USER = types.User(id=42, first_name="Not A Channel")
+
+
+@dataclass
+class AddClient(FakeTelegramClient):
+    entities: dict[str, Any] = field(default_factory=dict)
+    dialogs: tuple[Any, ...] = ()
+    authorized: bool = True
+    asked: list[Any] = field(default_factory=list)
+
+    async def is_user_authorized(self) -> bool:
+        return self.authorized
+
+    async def get_entity(self, entity: Any) -> Any:
+        self.calls.append("get_entity")
+        self.asked.append(entity)
+        if entity in self.entities:
+            return self.entities[entity]
+        raise ValueError(f'Cannot find any entity corresponding to "{entity}"')
+
+    async def get_dialogs(self, *args: Any, **kwargs: Any) -> list[Any]:
+        self.calls.append("get_dialogs")
+        return list(self.dialogs)
+
+
+class Lock:
+    def __init__(self) -> None:
+        self.acquired = self.released = 0
+
+    def __call__(self) -> "Lock":
+        self.acquired += 1
+        return self
+
+    def release(self) -> None:
+        self.released += 1
+
+
+@dataclass
+class AddRig:
+    rig: Rig
+    client: AddClient
+    lock: Lock
+    answers: list[str]
+
+    def argv(self, *extra: str) -> list[str]:
+        return self.rig.argv("add", *extra)
+
+
+@pytest.fixture
+def add_rig(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> AddRig:
+    client = AddClient(
+        entities={
+            "https://t.me/silver": SILVER,
+            "https://t.me/goldroom": GOLD_ENTITY,
+            "https://t.me/quiet": QUIET_ENTITY,
+            "https://t.me/mmhcommunity": MMH_ENTITY,
+            "@someuser": A_USER,
+        },
+        dialogs=(SimpleNamespace(entity=A_USER), SimpleNamespace(entity=GOLD_ENTITY),
+                 SimpleNamespace(entity=SILVER)),
+    )
+    lock = Lock()
+    answers: list[str] = []
+    monkeypatch.setattr(
+        channels_module, "load_session",
+        lambda path: SecretsBlob(api_id=1, api_hash="0" * 32, session_string="NOT_REAL"),
+    )
+    monkeypatch.setattr(channels_module, "build_client", lambda blob: client)
+    monkeypatch.setattr(channels_module, "acquire_single_instance_lock", lock)
+    monkeypatch.setattr("builtins.input", lambda prompt="": answers.pop(0))
+    return AddRig(rig=rig, client=client, lock=lock, answers=answers)
+
+
+def test_add_appends_the_channel_as_the_next_number_keeping_every_byte(
+    add_rig: AddRig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = add_rig.rig.channels_path
+    before = path.read_bytes()
+    old = load_channels(path)
+
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes")) == exit_codes.EXIT_OK
+
+    after = path.read_bytes()
+    assert after.startswith(before)  # every byte of the old file kept, comments included
+    added = after[len(before):].decode("utf-8")
+    assert added.startswith("\n# Silver") and added.count("[[channels]]") == 1
+    loaded = load_channels(path)
+    assert loaded[:-1] == old  # every other channel exactly as it was
+    # One more than the highest number in use (1, 7, 3 -> 8) -- NOT how
+    # many channels there are (3 -> 4).
+    assert loaded[-1] == ChannelCfg(
+        channel_id=SILVER_ID, name=SILVER.title, parser="mmh", ordinal=8, enabled=True
+    )
+    assert _no_temp_files(add_rig.rig)
+    assert add_rig.client.asked == ["https://t.me/silver"]
+    assert add_rig.client.calls[0] == "connect" and add_rig.client.calls[-1] == "disconnect"
+    assert add_rig.lock.acquired == add_rig.lock.released == 1
+    out = capsys.readouterr().out
+    assert "The only parser built so far, mmh, understands only the MARKET MASTERY HUB" in out
+    assert "nothing will be traded from it until a parser is built" in out
+    assert "5-10 of its real messages" in out
+    assert "is now channel 8, switched ON" in out
+    assert "`.\\xaucopier channels off 8`" in out
+
+
+def test_add_by_picking_from_the_joined_channels(add_rig: AddRig) -> None:
+    add_rig.answers.extend(["", "2", "yes"])  # Enter; "2" = Silver (the user is not listed); confirm
+
+    assert cli_main.main(add_rig.argv()) == exit_codes.EXIT_OK
+
+    assert load_channels(add_rig.rig.channels_path)[-1].channel_id == SILVER_ID
+    assert "get_entity" not in add_rig.client.calls
+    assert add_rig.answers == []
+
+
+def test_add_keeps_crlf_line_endings_and_a_missing_final_newline(add_rig: AddRig) -> None:
+    path = add_rig.rig.channels_path
+    path.write_bytes(SEEDED_TOML.rstrip("\n").replace("\n", "\r\n").encode("utf-8"))
+    before = path.read_bytes()
+    assert not before.endswith(b"\n")
+
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes")) == 0
+
+    after = path.read_bytes()
+    assert after.startswith(before + b"\r\n")
+    assert after.count(b"\n") == after.count(b"\r\n")
+    assert load_channels(path)[-1].ordinal == 8
+
+
+def test_add_to_a_file_with_no_channel_gives_number_1(add_rig: AddRig) -> None:
+    path = add_rig.rig.channels_path
+    path.write_bytes(b"# no channels yet\n")
+
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes")) == 0
+
+    (only,) = load_channels(path)
+    assert (only.channel_id, only.ordinal, only.enabled) == (SILVER_ID, 1, True)
+    assert path.read_bytes().startswith(b"# no channels yet\n")
+
+
+@pytest.mark.parametrize(
+    ("link", "number", "state"),
+    [("https://t.me/goldroom", 7, "ON"), ("https://t.me/quiet", 3, "OFF")],
+)
+def test_add_refuses_a_channel_already_in_the_file(
+    add_rig: AddRig, capsys: pytest.CaptureFixture[str], link: str, number: int, state: str
+) -> None:
+    before = add_rig.rig.channels_path.read_bytes()
+
+    assert cli_main.main(add_rig.argv("--link", link, "--yes")) == exit_codes.EXIT_FAILED
+
+    assert add_rig.rig.channels_path.read_bytes() == before
+    assert _no_temp_files(add_rig.rig)
+    err = capsys.readouterr().err
+    assert f"already in channels.toml as channel {number}" in err
+    assert f"and it is {state}. Nothing was added." in err
+    assert ("`.\\xaucopier channels on 3`" in err) is (state == "OFF")
+
+
+def test_add_sends_the_channel_waiting_for_its_id_to_resolve_channels(
+    add_rig: AddRig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = add_rig.rig.channels_path.read_bytes()
+
+    code = cli_main.main(add_rig.argv("--link", "https://t.me/mmhcommunity", "--yes"))
+
+    assert code == exit_codes.EXIT_FAILED
+    assert add_rig.rig.channels_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert "as channel 1, waiting for its id" in err and "`.\\xaucopier resolve-channels`" in err
+
+
+def test_add_while_watch_holds_the_session_says_so_and_does_nothing(
+    add_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def held() -> None:
+        raise AlreadyRunningError("held")
+
+    monkeypatch.setattr(channels_module, "acquire_single_instance_lock", held)
+    before = add_rig.rig.channels_path.read_bytes()
+    add_rig.answers.extend(["https://t.me/silver", "yes"])
+
+    code = cli_main.main(add_rig.argv())
+
+    assert code == exit_codes.EXIT_ALREADY_RUNNING
+    assert add_rig.client.calls == []  # never connected
+    assert add_rig.answers == ["https://t.me/silver", "yes"]  # never asked anything
+    assert add_rig.rig.channels_path.read_bytes() == before
+    assert _no_temp_files(add_rig.rig)
+    err = capsys.readouterr().err
+    assert "watch is running" in err and "Only one program may use the Telegram session" in err
+    assert "Stop watch first" in err and "`.\\xaucopier channels add` again" in err
+    assert "Traceback" not in err
+
+
+@pytest.mark.parametrize("where", ["get_entity", "get_dialogs"])
+@pytest.mark.parametrize(
+    ("error", "code", "words"),
+    [
+        (errors.ApiIdInvalidError(request=None), 5, "https://my.telegram.org"),
+        (errors.ApiIdPublishedFloodError(request=None), 5, "https://my.telegram.org"),
+        (errors.SessionRevokedError(request=None), 3, "`.\\xaucopier setup-login`"),
+        (errors.UserDeactivatedBanError(request=None), 3, "`.\\xaucopier setup-login`"),
+        (errors.AuthKeyDuplicatedError(request=None), 3, "`.\\xaucopier setup-login`"),
+    ],
+    ids=["api_id invalid", "api_id published", "session revoked", "account banned", "key duplicated"],
+)
+def test_add_stops_on_a_permanent_telegram_error_with_its_exit_code(
+    add_rig: AddRig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    where: str,
+    error: Exception,
+    code: int,
+    words: str,
+) -> None:
+    async def refused(*args: Any, **kwargs: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(add_rig.client, where, refused)
+    before = add_rig.rig.channels_path.read_bytes()
+    argv = add_rig.argv("--link", "https://t.me/silver") if where == "get_entity" else add_rig.argv()
+    add_rig.answers.append("")  # get_dialogs: Enter, to pick from the list
+
+    assert cli_main.main(argv) == code
+
+    assert add_rig.rig.channels_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert words in err and "Traceback" not in err
+    assert len([line for line in err.splitlines() if line.strip()]) == 1  # one plain sentence
+    assert "disconnect" in add_rig.client.calls
+    assert add_rig.lock.released == 1
+
+
+def test_add_with_a_logged_out_session_exits_3(add_rig: AddRig) -> None:
+    add_rig.client.authorized = False
+    before = add_rig.rig.channels_path.read_bytes()
+
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes")) == 3
+    assert add_rig.rig.channels_path.read_bytes() == before
+
+
+def test_add_without_a_session_file_exits_5_before_taking_the_lock(
+    add_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(channels_module, "load_session", real_load_session)
+
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/silver")) == 5
+    assert add_rig.lock.acquired == 0 and add_rig.client.calls == []
+    assert "channels add cannot start" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("answers", "link", "message"),
+    [
+        (["https://t.me/silver", "no"], None, "Not added"),
+        ([], "https://t.me/nosuchchannel", "Could not find the channel"),
+        ([], "@someuser", "is not a channel"),
+        (["", ""], None, "Cancelled"),
+    ],
+    ids=["declined", "not found", "a user, not a channel", "cancelled at the list"],
+)
+def test_add_that_goes_no_further_changes_nothing(
+    add_rig: AddRig,
+    capsys: pytest.CaptureFixture[str],
+    answers: list[str],
+    link: str | None,
+    message: str,
+) -> None:
+    add_rig.answers.extend(answers)
+    before = add_rig.rig.channels_path.read_bytes()
+    extra = ("--link", link) if link is not None else ()
+
+    assert cli_main.main(add_rig.argv(*extra)) == exit_codes.EXIT_FAILED
+
+    assert add_rig.rig.channels_path.read_bytes() == before
+    captured = capsys.readouterr()
+    assert message in captured.out + captured.err
+
+
+def test_add_takes_no_number(add_rig: AddRig, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli_main.main(add_rig.argv("3")) == exit_codes.EXIT_USAGE
+    assert add_rig.lock.acquired == 0 and add_rig.client.calls == []
+
+
+@pytest.mark.parametrize("where", WRITE_STEPS)
+def test_a_failure_at_any_step_of_an_add_leaves_the_file_exactly_as_it_was(
+    add_rig: AddRig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    where: str,
+) -> None:
+    rig = add_rig.rig
+    _inject(where, monkeypatch, rig)
+    before = rig.channels_path.read_bytes()
+
+    code = cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes"))
+
+    assert code == exit_codes.EXIT_CONFIG_ERROR
+    if where == "changed meanwhile":
+        assert rig.channels_path.read_bytes() == before + b"# edited by hand\n"
+    else:
+        assert rig.channels_path.read_bytes() == before
+    assert _no_temp_files(rig)
+    err = capsys.readouterr().err
+    assert "The file was not changed: nothing was added." in err
+    if where == "compare":
+        assert "differs from the original" in err
+    assert add_rig.lock.released == 1
