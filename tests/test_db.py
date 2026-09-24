@@ -845,15 +845,33 @@ def test_claim_and_sweep_through_the_writer_fail_even_on_an_empty_queue(tmp_path
         assert "not Writer work" in str(outcome)
 
 
-def test_a_rollback_sqlite_made_through_a_cursor_is_still_the_real_error(tmp_path: Path):
-    """The same F31 rule when the failing statement ran on a cursor fn
-    got back from execute() -- not through the stand-in itself."""
+def _or_rollback_through_the_cursor(conn: sqlite3.Connection) -> None:
+    _insert_channel_state(conn, channel_id=1, last_id=1)
+    cursor = conn.execute("SELECT 1")
+    cursor.execute("INSERT OR ROLLBACK INTO channel_state (channel_id) VALUES (1)")
 
-    def job(conn: sqlite3.Connection) -> None:
-        _insert_channel_state(conn, channel_id=1, last_id=1)
-        cursor = conn.execute("SELECT 1")
+
+def _or_rollback_through_the_cursor_swallowed(conn: sqlite3.Connection) -> str:
+    """Catches SQLite's rollback on the cursor and carries on writing."""
+    _insert_channel_state(conn, channel_id=1, last_id=1)
+    cursor = conn.execute("SELECT 1")
+    try:
         cursor.execute("INSERT OR ROLLBACK INTO channel_state (channel_id) VALUES (1)")
+    except sqlite3.IntegrityError:
+        pass
+    _insert_channel_state(conn, channel_id=2, last_id=2)
+    return "carried on"
 
+
+@pytest.mark.parametrize(
+    "job",
+    [_or_rollback_through_the_cursor, _or_rollback_through_the_cursor_swallowed],
+    ids=["raised", "swallowed"],
+)
+def test_a_rollback_sqlite_made_through_a_cursor_is_still_the_real_error(tmp_path: Path, job):
+    """The same F31 rule when the failing statement ran on a cursor fn
+    got back from execute() -- not through the stand-in itself -- even if
+    fn caught the error and wrote on."""
     db_path = tmp_path / "store.db"
     (outcome,) = _run_jobs(db_path, job)
     assert type(outcome) is sqlite3.IntegrityError, repr(outcome)
@@ -1200,10 +1218,22 @@ def test_a_read_only_job_that_writes_behind_the_stand_ins_back_is_rolled_back(
         _insert_channel_state(conn._conn, channel_id=7, last_id=7)
         return "only read, honest"
 
-    (outcome,) = _read_only(db_path, sneaky)
+    writer = Writer(db_path)
+    writer.start()
+    try:
+        outcome = writer.submit(sneaky, read_only=True).exception(timeout=10.0)
+        # Rolled back at once: the write lock it took is free again.
+        other = sqlite3.connect(db_path, timeout=0.2)
+        try:
+            _insert_channel_state(other, channel_id=9, last_id=9)
+            other.commit()
+        finally:
+            other.close()
+    finally:
+        writer.stop(timeout=5.0)
     assert isinstance(outcome, WriterMisuseError), repr(outcome)
     assert "read-only" in str(outcome) and "rolled back" in str(outcome)
-    assert _channel_ids(db_path) == []
+    assert _channel_ids(db_path) == [9]
 
 
 def test_a_read_only_job_never_runs_inside_a_transaction_a_failed_job_left_open(

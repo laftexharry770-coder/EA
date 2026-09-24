@@ -1017,3 +1017,28 @@ def test_migration_4_corrects_parsed_json_source_of_recovered_signals(tmp_path):
     for message_id, parsed_json in untouched.items():
         assert after[message_id] == parsed_json
     conn.close()
+
+
+def test_migration_4_leaves_a_signal_without_its_message_alone(tmp_path):
+    """The backfill's EXISTS guard (an equivalent mutant in the group-1
+    review while foreign keys hold). A signals row whose message row is
+    missing -- possible only in a file some connection wrote with foreign
+    keys off -- keeps its parsed_json byte for byte, instead of having its
+    source set to null."""
+    import json
+
+    conn = _v3_database(tmp_path / "store.db")
+    conn.execute("PRAGMA foreign_keys = OFF")
+    original = json.dumps({"side": "BUY", "source": "live"})
+    conn.execute(
+        "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, state, "
+        "version) VALUES (1, 400, ?, 'hash400', 'NEW', 1)",
+        (original,),
+    )
+    conn.commit()
+
+    migrate(conn)
+
+    (after,) = conn.execute("SELECT parsed_json FROM signals WHERE message_id = 400").fetchone()
+    assert after == original
+    conn.close()
