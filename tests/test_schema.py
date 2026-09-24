@@ -608,3 +608,177 @@ def test_heartbeats_are_one_row_per_name(tmp_path):
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("INSERT INTO heartbeats (name, at_utc) VALUES ('b', NULL)")
     conn.close()
+
+
+# -- final review F19: two processes upgrading one file at once ----------------
+
+
+def test_two_connections_upgrading_one_file_at_once_both_succeed(tmp_path):
+    """F19. B read `user_version` before A committed its upgrade, then
+    re-ran migration 2's ALTERs after A's commit: "duplicate column name".
+    migrate() now takes the write lock (BEGIN IMMEDIATE) *before* it
+    decides what to run, and re-reads the version inside that
+    transaction, so B waits for A and then finds nothing left to do."""
+    import threading
+    import time
+
+    import xaucopier.store.migrations as migrations_module
+
+    db_path = tmp_path / "store.db"
+    _v1_database(db_path).close()
+
+    a_holds_the_lock = threading.Event()
+    real = migrations_module._migration_2_statements
+
+    def slowed():
+        statements = real()
+        first_alter = next(i for i, s in enumerate(statements) if s.startswith("ALTER"))
+        # After A's first ALTER, A holds the write lock; `slow()` then
+        # signals the test and keeps the transaction open for a while.
+        return (*statements[: first_alter + 1], "SELECT slow()", *statements[first_alter + 1 :])
+
+    def a_slow():
+        a_holds_the_lock.set()
+        time.sleep(1.0)
+        return 0
+
+    conn_a = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+    conn_b = sqlite3.connect(db_path, timeout=10)
+    conn_a.create_function("slow", 0, a_slow)
+    conn_b.create_function("slow", 0, lambda: 0)
+    outcome: dict[str, object] = {}
+
+    def upgrade_a():
+        try:
+            migrations_module.migrate(conn_a)
+            outcome["a"] = "ok"
+        except Exception as exc:  # noqa: BLE001 -- reported by the assert below
+            outcome["a"] = exc
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(migrations_module, "_migration_2_statements", slowed)
+        thread = threading.Thread(target=upgrade_a)
+        thread.start()
+        assert a_holds_the_lock.wait(timeout=5)
+        try:
+            migrations_module.migrate(conn_b)  # starts while A is mid-upgrade
+            outcome["b"] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            outcome["b"] = exc
+        thread.join(timeout=10)
+
+    assert outcome == {"a": "ok", "b": "ok"}
+    for conn in (conn_a, conn_b):
+        (version,) = conn.execute("PRAGMA user_version").fetchone()
+        assert version == CURRENT_VERSION
+    assert "edit_seq" in _columns(conn_b, "followups")
+    conn_a.close()
+    conn_b.close()
+
+
+# -- final review F22: a database from a newer version is refused --------------
+
+
+def test_migrate_refuses_a_database_from_a_newer_version(tmp_path):
+    from xaucopier.store.migrations import SchemaVersionError
+
+    db_path = tmp_path / "store.db"
+    conn = _connect(tmp_path)
+    conn.execute(f"PRAGMA user_version = {CURRENT_VERSION + 1}")
+    conn.commit()
+    conn.close()
+
+    conn = sqlite3.connect(db_path)
+    with pytest.raises(SchemaVersionError) as caught:
+        migrate(conn)
+    assert caught.value.found == CURRENT_VERSION + 1
+    assert caught.value.expected == CURRENT_VERSION
+    assert caught.value.newer is True
+    assert f"reads version {CURRENT_VERSION}" in str(caught.value)
+    assert "newer version of xaucopier" in str(caught.value)
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == CURRENT_VERSION + 1  # left exactly as it was
+    assert not conn.in_transaction
+    conn.close()
+
+
+def test_migrate_refuses_a_newer_version_written_while_it_waited(tmp_path):
+    """The version is checked again inside migrate()'s own transaction:
+    a newer program may upgrade the file between migrate()'s first look
+    (which saw version 1) and the write lock."""
+    import threading
+    import time
+
+    import xaucopier.store.migrations as migrations_module
+
+    db_path = tmp_path / "store.db"
+    _v1_database(db_path).close()
+    newer = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
+    newer_holds_the_lock = threading.Event()
+
+    def newer_program_upgrades():
+        newer.execute("BEGIN IMMEDIATE")
+        newer.execute(f"PRAGMA user_version = {CURRENT_VERSION + 1}")
+        newer_holds_the_lock.set()
+        time.sleep(1.0)
+        newer.execute("COMMIT")
+
+    thread = threading.Thread(target=newer_program_upgrades)
+    thread.start()
+    assert newer_holds_the_lock.wait(timeout=5)
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        with pytest.raises(migrations_module.SchemaVersionError):
+            migrations_module.migrate(conn)
+        thread.join(timeout=10)
+        (version,) = conn.execute("PRAGMA user_version").fetchone()
+        assert version == CURRENT_VERSION + 1
+        assert "edit_seq" not in _columns(conn, "followups")  # nothing of ours ran
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+        newer.close()
+
+
+def test_a_missing_migration_step_is_an_error_not_a_version_stamp(tmp_path, monkeypatch):
+    """Bumping CURRENT_VERSION without adding its step used to stamp the
+    new version over a schema that never got the change."""
+    import xaucopier.store.migrations as migrations_module
+
+    monkeypatch.setattr(migrations_module, "CURRENT_VERSION", CURRENT_VERSION + 1)
+    conn = sqlite3.connect(tmp_path / "store.db")
+    with pytest.raises(RuntimeError, match="a migration step is missing"):
+        migrations_module.migrate(conn)
+    (version,) = conn.execute("PRAGMA user_version").fetchone()
+    assert version == 0
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone() == (0,)
+    conn.close()
+
+
+@pytest.mark.parametrize("newer", [False, True])
+def test_an_up_to_date_or_newer_file_is_decided_without_the_write_lock(tmp_path, newer):
+    """Every normal start finds the file already current: that must not
+    wait for the write lock (a reader connecting while `watch` writes
+    would stall), and a file from a newer version is refused at once."""
+    import xaucopier.store.migrations as migrations_module
+
+    db_path = tmp_path / "store.db"
+    _connect(tmp_path).close()
+    if newer:
+        raw = sqlite3.connect(db_path)
+        raw.execute(f"PRAGMA user_version = {CURRENT_VERSION + 1}")
+        raw.commit()
+        raw.close()
+    holder = sqlite3.connect(db_path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")  # another program is writing
+    conn = sqlite3.connect(db_path, timeout=0.1)
+    try:
+        if newer:
+            with pytest.raises(migrations_module.SchemaVersionError):
+                migrations_module.migrate(conn)
+        else:
+            migrations_module.migrate(conn)  # no "database is locked"
+    finally:
+        conn.close()
+        holder.execute("ROLLBACK")
+        holder.close()

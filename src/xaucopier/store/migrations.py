@@ -133,6 +133,27 @@ at the end of every round, and ``watch`` stamps its own start and stop
 (with the exit code), which is how ``status`` tells "running" from
 "stopped" and "stopped because the Telegram session was logged out".
 ``store/heartbeats.py`` is its one writer. Nothing else changes.
+
+**Two programs opening one file at once (final review F19).** ``watch``
+and, from Plan 3, the execution worker may both open the file for the
+first time after an upgrade. ``migrate()`` used to read ``user_version``
+*before* its (deferred) ``BEGIN``: the second program read the old
+version while the first was mid-upgrade, waited for the first's lock,
+then re-ran the ``ALTER TABLE``s -- "duplicate column name". Now the
+transaction is ``BEGIN IMMEDIATE`` (the write lock is taken before
+anything is decided) and ``user_version`` is read again *inside* it: the
+second program waits for the first, then finds nothing left to do. The
+first read, outside the transaction, is only a shortcut so an up-to-date
+file (every normal start) never takes the write lock at all.
+
+**A file from a newer version is refused (final review F22).** A
+``user_version`` above :data:`CURRENT_VERSION` means a later build of
+xaucopier wrote this file -- the user rolled back. This build does not
+know that schema, so writing into it could corrupt what the newer build
+relies on. ``migrate()`` raises :class:`SchemaVersionError` (checked
+both before and inside the transaction) and changes nothing; since
+``store.db.connect()`` runs ``migrate()`` for every role, every
+connection refuses such a file, as ``connect_readonly()`` already did.
 """
 from __future__ import annotations
 
@@ -140,6 +161,40 @@ import sqlite3
 from pathlib import Path
 
 CURRENT_VERSION = 3
+
+
+class SchemaVersionError(sqlite3.DatabaseError):
+    """The database file's schema is not one this code can use: older
+    than :data:`CURRENT_VERSION` where the caller may not migrate
+    (``store.db.connect_readonly``), or newer, written by a later
+    build of xaucopier (every caller -- see the module docstring).
+
+    A ``sqlite3.DatabaseError`` so a caller that already reports "the
+    database cannot be used" for any ``sqlite3.Error`` reports this too.
+    ``found`` / ``expected`` are the two versions; ``newer`` says which
+    way round, because the fix differs: an older file is brought up to
+    date by one run of ``watch``, a newer one needs the newer build.
+    """
+
+    def __init__(self, message: str, *, found: int, expected: int) -> None:
+        super().__init__(message)
+        self.found = found
+        self.expected = expected
+
+    @property
+    def newer(self) -> bool:
+        return self.found > self.expected
+
+
+def newer_version_error(found: int, *, where: str = "this database") -> SchemaVersionError:
+    """The error for a file written by a later build (F22)."""
+    return SchemaVersionError(
+        f"{where} was written by a newer version of xaucopier (schema version "
+        f"{found}); this version of xaucopier reads version {CURRENT_VERSION} "
+        "and will not change it",
+        found=found,
+        expected=CURRENT_VERSION,
+    )
 
 #: Migration 2 -- see the module docstring. Plain statements, run in
 #: order inside `migrate()`'s transaction. `CREATE ... IF NOT EXISTS`
@@ -239,17 +294,30 @@ def migrate(conn: sqlite3.Connection) -> None:
     power loss) never leaves the database in a half-migrated state --
     see the module docstring for why `executescript()` cannot offer
     that guarantee and what replaces it here.
+
+    Safe against a second program upgrading the same file at the same
+    moment: the version is re-read under the write lock (F19). Raises
+    `SchemaVersionError`, changing nothing, for a file from a newer
+    version of xaucopier (F22).
     """
     (current,) = conn.execute("PRAGMA user_version").fetchone()
-
-    if current >= CURRENT_VERSION:
-        return
+    if current > CURRENT_VERSION:
+        raise newer_version_error(current)
+    if current == CURRENT_VERSION:
+        return  # the normal start: no write lock taken at all
 
     previous_isolation_level = conn.isolation_level
     conn.isolation_level = None  # autocommit; we drive BEGIN/COMMIT ourselves
     try:
-        conn.execute("BEGIN")
+        # IMMEDIATE: take the write lock *before* deciding what to run,
+        # then decide from the version as it is now -- another program
+        # may have upgraded the file while this one waited (F19).
+        conn.execute("BEGIN IMMEDIATE")
         try:
+            (current,) = conn.execute("PRAGMA user_version").fetchone()
+            if current > CURRENT_VERSION:
+                raise newer_version_error(current)
+
             if current == 0:
                 for statement in _schema_statements():
                     conn.execute(statement)
@@ -268,6 +336,11 @@ def migrate(conn: sqlite3.Connection) -> None:
             # Future migrations:
             # `if current == 3: for stmt in ...: conn.execute(stmt); current = 4`
 
+            if current != CURRENT_VERSION:
+                raise RuntimeError(
+                    f"migrate() stopped at schema version {current}, not "
+                    f"{CURRENT_VERSION}: a migration step is missing"
+                )
             conn.execute(f"PRAGMA user_version = {CURRENT_VERSION}")
         except BaseException:
             conn.execute("ROLLBACK")

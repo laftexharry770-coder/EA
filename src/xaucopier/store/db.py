@@ -54,7 +54,21 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, TypeVar
 
-from xaucopier.store.migrations import CURRENT_VERSION, migrate
+from xaucopier.store.migrations import (
+    CURRENT_VERSION,
+    SchemaVersionError,
+    migrate,
+    newer_version_error,
+)
+
+__all__ = [
+    "SchemaVersionError",
+    "Writer",
+    "WriterDeadError",
+    "WriterMisuseError",
+    "connect",
+    "connect_readonly",
+]
 
 Role = Literal["writer", "reader"]
 
@@ -78,22 +92,23 @@ def connect(path: Path, *, role: Role) -> sqlite3.Connection:
     a read-only connection has nothing to lose from that anyway).
 
     Runs `migrations.migrate()` before returning, so a brand new file is
-    immediately usable regardless of which role opens it first.
+    immediately usable regardless of which role opens it first. A file
+    written by a newer version of xaucopier is refused for every role
+    with `SchemaVersionError` (final review F22), and the connection is
+    closed before the error leaves.
     """
     conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-    conn.execute(f"PRAGMA synchronous = {'FULL' if role == 'writer' else 'NORMAL'}")
-    migrate(conn)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        conn.execute(f"PRAGMA synchronous = {'FULL' if role == 'writer' else 'NORMAL'}")
+        migrate(conn)
+    except BaseException:
+        conn.close()
+        raise
     return conn
-
-
-class SchemaVersionError(RuntimeError):
-    """`connect_readonly()` found a database whose schema is not the one
-    this code reads. It never migrates (that would be a write), so the
-    caller must say what to do instead: run `watch` once to upgrade it."""
 
 
 def connect_readonly(path: Path) -> sqlite3.Connection:
@@ -111,8 +126,9 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
     data, and the main file is never touched.
 
     Raises `FileNotFoundError` for a missing file (it is never created)
-    and `SchemaVersionError` for a schema other than `CURRENT_VERSION`
-    (it is never migrated).
+    and `SchemaVersionError` for a schema other than `CURRENT_VERSION`:
+    an older one is never migrated here (that would be a write), and a
+    newer one (`.newer`) is from a later build of xaucopier.
     """
     if not path.is_file():
         raise FileNotFoundError(f"no database at {path}")
@@ -122,10 +138,14 @@ def connect_readonly(path: Path) -> sqlite3.Connection:
         conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA query_only = ON")
         (version,) = conn.execute("PRAGMA user_version").fetchone()
+        if version > CURRENT_VERSION:
+            raise newer_version_error(version, where=f"the database at {path}")
         if version != CURRENT_VERSION:
             raise SchemaVersionError(
                 f"the database at {path} is at schema version {version}; this "
-                f"version of xaucopier reads version {CURRENT_VERSION}"
+                f"version of xaucopier reads version {CURRENT_VERSION}",
+                found=version,
+                expected=CURRENT_VERSION,
             )
     except BaseException:
         conn.close()

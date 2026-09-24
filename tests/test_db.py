@@ -505,3 +505,64 @@ def test_writer_killed_mid_job_fails_the_in_flight_and_every_queued_job(tmp_path
     assert isinstance(killed_error.__cause__, SystemExit)
     assert isinstance(queued_error, store_db.WriterDeadError)
     assert isinstance(queued_error.__cause__, SystemExit)
+
+
+# -- final review F22: every role refuses a database from a newer version -----
+
+
+def _newer_database(db_path: Path) -> None:
+    conn = connect(db_path, role="writer")
+    conn.execute(f"PRAGMA user_version = {CURRENT_VERSION + 1}")
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("role", ["writer", "reader"])
+def test_connect_refuses_a_database_from_a_newer_version(tmp_path: Path, role: str):
+    """Rolling back from a later build must not let this one write into a
+    schema it does not understand. Before F22, connect() accepted the file
+    and left user_version as it was; only connect_readonly refused."""
+    db_path = tmp_path / "store.db"
+    _newer_database(db_path)
+
+    with pytest.raises(store_db.SchemaVersionError, match=f"reads version {CURRENT_VERSION}"):
+        connect(db_path, role=role)
+
+    # The refused connection was closed, not leaked: on Windows an open
+    # SQLite connection keeps the file from being deleted.
+    raw = sqlite3.connect(db_path)
+    (version,) = raw.execute("PRAGMA user_version").fetchone()
+    raw.close()
+    assert version == CURRENT_VERSION + 1
+    for suffix in ("", "-wal", "-shm"):
+        (tmp_path / f"store.db{suffix}").unlink(missing_ok=True)
+    assert not db_path.exists()
+
+
+def test_connect_readonly_refuses_a_database_from_a_newer_version(tmp_path: Path):
+    db_path = tmp_path / "store.db"
+    _newer_database(db_path)
+    with pytest.raises(store_db.SchemaVersionError) as caught:
+        store_db.connect_readonly(db_path)
+    assert caught.value.newer is True
+    assert "newer version of xaucopier" in str(caught.value)
+
+
+def test_a_writer_on_a_newer_database_dies_and_fails_its_jobs(tmp_path: Path):
+    db_path = tmp_path / "store.db"
+    _newer_database(db_path)
+    writer = Writer(db_path)
+    writer.start()
+    try:
+        error = writer.submit(lambda conn: None).exception(timeout=5.0)
+    finally:
+        writer.stop(timeout=5.0)
+    assert isinstance(error, store_db.WriterDeadError)
+    assert isinstance(error.__cause__, store_db.SchemaVersionError)
+
+
+def test_schema_version_error_is_a_database_error():
+    """So every caller that already reports "the database cannot be used"
+    for an sqlite3.Error (watch's startup stamp) reports this too, instead
+    of a traceback."""
+    assert issubclass(store_db.SchemaVersionError, sqlite3.DatabaseError)
