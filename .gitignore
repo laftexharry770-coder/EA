@@ -1,0 +1,3 @@
+# Compiled MetaTrader programs: rebuilt from the .mq5 / .mq4 sources
+*.ex5
+*.ex4
