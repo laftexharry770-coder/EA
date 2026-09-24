@@ -5,15 +5,18 @@ Two families (ingest/client.py):
 
 - `TERMINAL_AUTH_ERRORS` -> exit 3: every 401 (`UnauthorizedError` --
   logged out, revoked, expired, deactivated, banned, ...),
-  `AuthKeyDuplicatedError` and `FrozenMethodInvalidError`. Fix: log in
-  again (`setup-login`).
+  `AuthKeyDuplicatedError`, `FrozenMethodInvalidError`, and Telethon's
+  transport-level `AuthKeyNotFound` (-404: Telegram no longer knows this
+  session's key -- not an RPC error, and it takes no `request`). Fix: log
+  in again (`setup-login`).
 - `API_CREDENTIAL_ERRORS` -> exit 5: the api_id/api_hash is rejected.
   Fix: a new pair from my.telegram.org -- logging in again with the same
   pair cannot help, so this is a setup problem, not a dead session.
 
 Each class is driven through the real path -- `cli_main.main(["watch"])`
 -> `Listener` -> `HistoryPoll` -> the store -- at each place Telegram can
-say it: at startup (priming `get_dialogs`, or the first backfill read),
+say it: at startup (`connect`, priming `get_dialogs`, or the first
+backfill read),
 from the update loop (`run_until_disconnected()` raising, as Telethon's
 does on a 401), and mid-run in the poll after a good round. For each: the
 exit code, the stop stamp `status` reads, the CRITICAL alert naming the
@@ -68,12 +71,21 @@ PERMANENT: tuple[tuple[type[Exception], int], ...] = (
     (errors.AuthKeyPermEmptyError, 3),
     (errors.SessionPasswordNeededError, 3),
     (errors.FrozenMethodInvalidError, 3),
+    (errors.common.AuthKeyNotFound, 3),  # transport -404 (final review F06)
     (errors.ApiIdInvalidError, 5),
     (errors.ApiIdPublishedFloodError, 5),
     (errors.ConnectionApiIdInvalidError, 5),
 )
 #: Where Telegram can say it.
-WHERE = ("get_dialogs", "backfill", "update loop", "poll")
+WHERE = ("connect", "get_dialogs", "backfill", "update loop", "poll")
+
+
+def _make(error_class: type[Exception]) -> Exception:
+    """One instance of `error_class`. Every RPC error takes `request`;
+    Telethon's transport-level `AuthKeyNotFound` takes nothing."""
+    if error_class is errors.common.AuthKeyNotFound:
+        return error_class()
+    return error_class(request=None)
 #: Look alike, but a retry can succeed: never a reason to stop.
 HARMLESS: tuple[type[Exception], ...] = (
     errors.FilerefUpgradeNeededError,  # a 406 (AuthKeyError), not AuthKeyDuplicated
@@ -100,6 +112,11 @@ class TroubleClient(ScriptedWatchClient):
     failed_reads: int = 0
     #: Set if `watch` was still running WATCHDOG_SECONDS after the error.
     still_running_after_error: bool = False
+
+    async def connect(self) -> None:
+        if self.where == "connect":
+            raise self.error
+        await super().connect()
 
     async def get_dialogs(self, *args: Any, **kwargs: Any) -> Any:
         if self.where == "get_dialogs":
@@ -152,7 +169,7 @@ def test_a_permanent_telegram_error_stops_watch_with_its_code_wherever_it_is_met
     expected: int,
     where: str,
 ) -> None:
-    client = TroubleClient(error=error_class(request=None), where=where, db_path=rig.db_path)
+    client = TroubleClient(error=_make(error_class), where=where, db_path=rig.db_path)
     _use_client(rig, monkeypatch, client)
 
     exit_code = cli_main.main(rig.argv())
@@ -195,7 +212,7 @@ def test_a_harmless_lookalike_error_mid_run_does_not_stop_watch(
 def test_every_error_in_the_table_is_permanent_with_its_code(
     error_class: type[Exception], expected: int
 ) -> None:
-    exc = error_class(request=None)
+    exc = _make(error_class)
     assert classify_auth_error(exc) == "terminal"
     assert isinstance(exc, PERMANENT_TELEGRAM_ERRORS)
     assert exit_code_for(exc) == expected

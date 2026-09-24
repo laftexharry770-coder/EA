@@ -21,9 +21,14 @@ Two hazards this module exists to prevent:
      rule Telethon 1.44's own update loop stops on
      (telethon/client/updates.py:328, :373) -- plus
      `AuthKeyDuplicatedError` (406: the key was used from two places at
-     once) and `FrozenMethodInvalidError` (420: a frozen account). *Not*
-     the `AuthKeyError` base class: that is every 406, including harmless
-     ones such as `FilerefUpgradeNeededError`.
+     once), `FrozenMethodInvalidError` (420: a frozen account) and
+     Telethon's transport-level `AuthKeyNotFound` (-404: Telegram no
+     longer knows this session's key; not an RPC error, so it takes no
+     `request` -- final review F06). *Not* the `AuthKeyError` base class:
+     that is every 406, including harmless ones such as
+     `FilerefUpgradeNeededError`. Telethon says a -404 can occasionally
+     be temporary; then it costs one manual restart, and the poll's first
+     good read clears the `TELEGRAM_SESSION_DEAD` alert on its own.
    - `API_CREDENTIAL_ERRORS` -> `EXIT_CONFIG_ERROR` (5): Telegram rejects
      this program's api_id/api_hash (invalid, or published somewhere --
      the tutorial-id ban). Logging in again with the same pair cannot fix
@@ -52,11 +57,12 @@ from xaucopier.ingest.secrets import SecretsBlob
 _MUTEX_NAME = r"Global\xaucopier_listener"
 
 #: The session or the account is dead and no retry can revive it (see
-#: the module docstring for why these three and not `AuthKeyError`).
+#: the module docstring for why these and not `AuthKeyError`).
 TERMINAL_AUTH_ERRORS: tuple[type[Exception], ...] = (
     errors.UnauthorizedError,  # every 401
     errors.AuthKeyDuplicatedError,  # 406 -- not the AuthKeyError base
     errors.FrozenMethodInvalidError,  # 420, a frozen account
+    errors.common.AuthKeyNotFound,  # transport -404: the key is gone (F06)
 )
 
 #: Telegram rejects this program's api_id/api_hash: a new pair is needed.
