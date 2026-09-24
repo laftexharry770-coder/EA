@@ -863,10 +863,33 @@ def _or_rollback_through_the_cursor_swallowed(conn: sqlite3.Connection) -> str:
     return "carried on"
 
 
+def _or_rollback_through_executemany_swallowed(on_cursor: bool):
+    """The same through executemany(), on the stand-in or on a cursor."""
+
+    def job(conn: sqlite3.Connection) -> str:
+        _insert_channel_state(conn, channel_id=1, last_id=1)
+        target = conn.execute("SELECT 1") if on_cursor else conn
+        try:
+            target.executemany(
+                "INSERT OR ROLLBACK INTO channel_state (channel_id) VALUES (?)", [(1,)]
+            )
+        except sqlite3.IntegrityError:
+            pass
+        _insert_channel_state(conn, channel_id=2, last_id=2)
+        return "carried on"
+
+    return job
+
+
 @pytest.mark.parametrize(
     "job",
-    [_or_rollback_through_the_cursor, _or_rollback_through_the_cursor_swallowed],
-    ids=["raised", "swallowed"],
+    [
+        _or_rollback_through_the_cursor,
+        _or_rollback_through_the_cursor_swallowed,
+        _or_rollback_through_executemany_swallowed(on_cursor=False),
+        _or_rollback_through_executemany_swallowed(on_cursor=True),
+    ],
+    ids=["raised", "swallowed", "executemany-swallowed", "cursor-executemany-swallowed"],
 )
 def test_a_rollback_sqlite_made_through_a_cursor_is_still_the_real_error(tmp_path: Path, job):
     """The same F31 rule when the failing statement ran on a cursor fn
