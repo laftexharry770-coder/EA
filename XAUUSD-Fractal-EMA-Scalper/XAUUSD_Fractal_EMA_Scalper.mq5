@@ -39,6 +39,11 @@
 // Sell stops trigger on the Ask, so the spread is added to them: the chart
 // (Bid) price then has to trade right above the EMA to stop the trade out.
 //
+// On the chart the fractals are drawn as in the screen recording: the video's
+// green arrow (under the candle, the buy signal) is a cyan triangle pointing
+// up, and the red arrow (over the candle, the sell signal) is a red triangle
+// pointing down. Only the look changed; the signals are the same.
+//
 // How the arrow is traded: a Williams fractal only exists once the n candles
 // after it have closed. The EA reads closed candles only, so when the green
 // (or red) arrow appears on the chart it buys (or sells) at market on the
@@ -47,7 +52,7 @@
 #property copyright   "Sentinal"
 #property version     "1.00"
 #property description "XAUUSD 1-minute scalper: Williams Fractals (2) + EMA 20/50/100 pullbacks."
-#property description "Buy the green fractal after a pullback under the 20 EMA in a 20>50>100 stack,"
+#property description "Buy the cyan fractal after a pullback under the 20 EMA in a 20>50>100 stack,"
 #property description "sell the red fractal after a pullback over the 20 EMA in a 100>50>20 stack."
 #property description "Stop beyond the 50 EMA (100 EMA if the 50 was crossed), target 1.5 x risk."
 
@@ -102,7 +107,7 @@ input int             InpEndHour        = 22;         // Last trading hour, serv
 
 input group "Chart (as in the video)"
 input bool            InpShowEMAs       = true;       // Draw the EMAs: 20 green, 50 yellow, 100 red
-input bool            InpDrawArrows     = true;       // Draw the fractals: green under the candle, red over it
+input bool            InpDrawArrows     = true;       // Draw the fractals: cyan triangle up under the candle, red triangle down over it
 input bool            InpShowPanel      = true;       // Show the status panel
 input int             InpLineBars       = 600;        // Candles of EMA line kept on the chart
 input int             InpMaxArrows      = 500;        // Most arrows kept on the chart
@@ -113,9 +118,12 @@ input int             InpMaxArrows      = 500;        // Most arrows kept on the
 #define MAX_POSITIONS 100     // most positions one entry may open
 
 //--- the colours picked in the video (TradingView palette)
-const color CLR_GREEN  = C'76,175,80';    // 20 EMA and the green fractal
+const color CLR_GREEN  = C'76,175,80';    // 20 EMA
 const color CLR_YELLOW = C'255,235,59';   // 50 EMA
-const color CLR_RED    = C'244,67,54';    // 100 EMA and the red fractal
+const color CLR_RED    = C'244,67,54';    // 100 EMA
+//--- fractal colours from the screen recording (TradingView palette)
+const color CLR_FRACTAL_UNDER = C'0,188,212';  // cyan triangle under the candle (buy side)
+const color CLR_FRACTAL_OVER  = C'242,54,69';  // red triangle over the candle (sell side)
 
 //--- setup state for one side (long or short)
 struct SideState
@@ -291,21 +299,22 @@ void Remember(string &ring[], int &next, const string name)
    next       = (slot + 1) % size;
   }
 
-void DrawArrow(const bool green, const datetime t, const double price)
+void DrawArrow(const bool under, const datetime t, const double price)
   {
    if(!g_draw || !InpDrawArrows || ArraySize(g_arrows) <= 0)
       return;
-   const string name = g_prefix + (green ? "G" : "R") + IntegerToString((long)t);
+   const string name = g_prefix + (under ? "G" : "R") + IntegerToString((long)t);
    if(ObjectFind(0, name) >= 0)
       return;
-   if(!ObjectCreate(0, name, OBJ_ARROW, 0, t, price))
+   if(!ObjectCreate(0, name, OBJ_TEXT, 0, t, price))
       return;
-   //--- as in the video: green triangle pointing down under the candle,
-   //--- red triangle pointing up over it (Wingdings 218 / 217)
-   ObjectSetInteger(0, name, OBJPROP_ARROWCODE, green ? 218 : 217);
-   ObjectSetInteger(0, name, OBJPROP_COLOR, green ? CLR_GREEN : CLR_RED);
-   ObjectSetInteger(0, name, OBJPROP_ANCHOR, green ? ANCHOR_TOP : ANCHOR_BOTTOM);
-   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   //--- as in the screen recording: a solid cyan triangle pointing up under the
+   //--- candle, a solid red triangle pointing down over it (Unicode U+25B2 / U+25BC)
+   ObjectSetString(0, name, OBJPROP_TEXT, ShortToString((ushort)(under ? 0x25B2 : 0x25BC)));
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 11);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, under ? CLR_FRACTAL_UNDER : CLR_FRACTAL_OVER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, under ? ANCHOR_UPPER : ANCHOR_LOWER);
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
    ObjectSetInteger(0, name, OBJPROP_BACK, false);
@@ -368,7 +377,7 @@ void UpdatePanel(const bool force)
    string text = EA_NAME + "   " + _Symbol + " " + TfName(g_tf) + "   magic " + IntegerToString((long)InpMagic) + "\n";
    text += "EMAs " + f + "/" + m + "/" + s + ": " + stack + "\n";
    text += "Long : under " + f + " EMA " + YesNo(g_long.pullback) + " | crossed " + m + " EMA " + YesNo(g_long.deep)
-           + " | skip next green " + YesNo(g_long.skipNext) + "\n";
+           + " | skip next cyan " + YesNo(g_long.skipNext) + "\n";
    text += "Short: over " + f + " EMA " + YesNo(g_short.pullback) + " | crossed " + m + " EMA " + YesNo(g_short.deep)
            + " | skip next red " + YesNo(g_short.skipNext) + "\n";
    text += "Spread " + Px(spread) + (InpMaxSpread > 0.0 ? " (max " + Px(InpMaxSpread) + ")" : "")
@@ -393,7 +402,7 @@ void QueueSignal(const int dir, const bool deep, const double stopEma, const dat
    g_signal.arrowTime = arrowTime;
    g_signal.validBar  = entryBar;
    Note(StringFormat("%s arrow at %s -> %s, stop %s the %d EMA (%s)",
-                     dir > 0 ? "green" : "red",
+                     dir > 0 ? "cyan" : "red",
                      TimeToString(arrowTime, TIME_DATE | TIME_MINUTES),
                      dir > 0 ? "BUY" : "SELL",
                      dir > 0 ? "below" : "above",
@@ -409,7 +418,7 @@ void OnGreenArrow(const bool bull, const double emaMid, const double emaSlow,
      {
       //--- "if the price ever closes below the 100 day, just disregard the next green arrow"
       if(live && bull && g_long.pullback)
-         Note("green arrow at " + TimeToString(arrowTime, TIME_MINUTES) + " disregarded: price closed below the "
+         Note("cyan arrow at " + TimeToString(arrowTime, TIME_MINUTES) + " disregarded: price closed below the "
               + IntegerToString(InpEmaSlow) + " EMA");
       g_long.skipNext = false;
       g_long.pullback = false;
