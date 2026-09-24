@@ -119,8 +119,24 @@ def acquire_single_instance_lock() -> SingleInstanceLock:
     Raises `AlreadyRunningError` if another handle to it is already open
     anywhere on the system (including this process). Must be called
     before `build_client()` opens the session.
+
+    A mutex that exists but that this process may not open (access
+    denied) is held too -- typically by a `watch` started in an
+    administrator window, which a normal window cannot open. That is
+    `AlreadyRunningError` as well, saying so, never a raw
+    `pywintypes.error` (final review F36; `session_in_use()` already
+    reads the same case as "in use").
     """
-    handle = win32event.CreateMutex(None, False, _MUTEX_NAME)
+    try:
+        handle = win32event.CreateMutex(None, False, _MUTEX_NAME)
+    except pywintypes.error as exc:
+        if exc.winerror != winerror.ERROR_ACCESS_DENIED:
+            raise
+        raise AlreadyRunningError(
+            "xaucopier is already running on this computer, probably in a window "
+            "opened as administrator (this window is not allowed to see it). Find "
+            "that window and stop it there (Ctrl+C, then Y) before starting again."
+        ) from exc
     already_exists = win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS
     if already_exists:
         win32api.CloseHandle(handle)

@@ -119,3 +119,43 @@ def test_flood_wait_is_retryable_not_terminal() -> None:
 
 def test_exit_terminal_auth_is_3() -> None:
     assert EXIT_TERMINAL_AUTH == 3
+
+
+# ---------------------------------------------------------------------
+# Final review F36: a mutex this process may not open is still "running"
+# ---------------------------------------------------------------------
+
+def test_a_mutex_that_cannot_be_opened_means_already_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `watch` started in an administrator window leaves a mutex a
+    normal window may not open: CreateMutex fails with access denied.
+    That is "already running" (exit 6), with a hint -- not a traceback."""
+    import pywintypes
+    import winerror
+
+    import xaucopier.ingest.client as client_module
+
+    def denied(*args: object) -> object:
+        raise pywintypes.error(winerror.ERROR_ACCESS_DENIED, "CreateMutex", "Access is denied.")
+
+    monkeypatch.setattr(client_module.win32event, "CreateMutex", denied)
+    with pytest.raises(AlreadyRunningError, match="administrator") as caught:
+        acquire_single_instance_lock()
+    assert isinstance(caught.value.__cause__, pywintypes.error)
+
+
+def test_any_other_mutex_failure_is_not_mistaken_for_already_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pywintypes
+    import winerror
+
+    import xaucopier.ingest.client as client_module
+
+    def broken(*args: object) -> object:
+        raise pywintypes.error(winerror.ERROR_INVALID_HANDLE, "CreateMutex", "The handle is invalid.")
+
+    monkeypatch.setattr(client_module.win32event, "CreateMutex", broken)
+    with pytest.raises(pywintypes.error):
+        acquire_single_instance_lock()
