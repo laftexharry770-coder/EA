@@ -571,6 +571,7 @@ def _reverse_window_deletion(ctx: _Ctx, existing: sqlite3.Row) -> int:
             "when it was withdrawn stay skipped, and claim() will not hand out its "
             "remaining ones. Trade status: "
             f"{trade_status(ctx.conn, signal_id=row['signal_id'])}"
+            f"{_promoted_in_place_of(ctx.conn, row['signal_id'])}"
         )
     elif ctx.followup_id is not None:
         consequence = f"follow-up {ctx.followup_id}'s queued instructions stay skipped"
@@ -583,6 +584,25 @@ def _reverse_window_deletion(ctx: _Ctx, existing: sqlite3.Row) -> int:
         "because the window re-read stopped returning it, but it exists after all. "
         f"The mark is cleared; what the deletion did is NOT undone: {consequence}. "
         "Review by hand.",
+    )
+
+
+def _promoted_in_place_of(conn: sqlite3.Connection, signal_id: int) -> str:
+    """For an alert about withdrawn signal `signal_id`: the repost promoted
+    in its place (`signals.promoted_from_signal_id`), if any -- the same
+    call, which trading `signal_id` by hand as well would open twice."""
+    row = conn.execute(
+        "SELECT signal_id, channel_id, message_id, state FROM signals "
+        "WHERE promoted_from_signal_id = ? ORDER BY signal_id LIMIT 1",
+        (signal_id,),
+    ).fetchone()
+    if row is None:
+        return ""
+    return (
+        f". The same call posted again, message {row['message_id']} on channel "
+        f"{row['channel_id']}, was made signal {row['signal_id']} in its place (it is "
+        f"{row['state']}, trade status {trade_status(conn, signal_id=row['signal_id'])}): "
+        f"trading signal {signal_id} by hand as well would open the trade twice"
     )
 
 
@@ -885,7 +905,8 @@ def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> tuple[int, int] | None
     channel's parser, given its `signals` row and its ENTRY rows (in this
     same writer job), unlinked, and announced with a WARNING naming both
     messages. The channel's other standing copies now repeat the promoted
-    signal, and follow-ups that replied to the repost now target it.
+    signal, and follow-ups that replied to the repost, or to one of those
+    copies, now target it.
 
     A copy on any other channel is never promoted -- in particular not a
     repeat on the signal's own channel when another channel withdrew the
@@ -954,6 +975,22 @@ def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> tuple[int, int] | None
                 ctx.channel_id,
                 repost["message_id"],
                 relay_repo.RELAY_REPLY_PATH,
+            ),
+        )
+        # ... and those that replied to one of the channel's other copies,
+        # which now repeat the promoted signal.
+        conn.execute(
+            "UPDATE followups SET target_signal_id = ? "
+            "WHERE channel_id = ? AND resolution_path = ? AND target_signal_id = ? "
+            "  AND reply_to_message_id IN (SELECT message_id FROM messages "
+            "    WHERE channel_id = ? AND relay_of_signal_id = ?)",
+            (
+                new_id,
+                ctx.channel_id,
+                relay_repo.RELAY_REPLY_PATH,
+                old_id,
+                ctx.channel_id,
+                new_id,
             ),
         )
         alert = ctx.alert(

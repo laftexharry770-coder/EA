@@ -2042,3 +2042,49 @@ def test_a_message_that_holds_a_signal_is_never_matched_against_it(conn):
         fwd_from_channel_id=VIP.channel_id, fwd_from_post_id=4001, **ask,
     )
     assert match is not None and match.signal_id != own.signal_id
+
+
+def test_a_promotion_re_points_follow_ups_that_replied_to_any_repost_it_takes_over(conn):
+    """The call posted three times, "close half" replying to the third
+    post; the first is deleted, the second promoted, the third now repeats
+    the second's signal -- and so does the follow-up that replied to it."""
+    holder = _ingest(conn, VIP, 4001)
+    _ingest(conn, VIP, 4002, posted=POSTED + timedelta(minutes=1))
+    _ingest(conn, VIP, 4003, posted=POSTED + timedelta(minutes=2))
+    _ingest(conn, VIP, 4004, CLOSE_HALF, posted=POSTED + timedelta(minutes=3), reply_to=4003)
+    assert [row[5:] for row in _followups(conn)] == [(holder.signal_id, "relay-reply")]
+    result = edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4001, now_utc=POSTED, accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    promoted = result.promoted_signal_id
+    assert _signals(conn)[1] == (promoted, VIP.channel_id, 4002, "NEW")
+    assert _link(conn, VIP, 4003) == promoted
+    assert [row[5:] for row in _followups(conn)] == [(promoted, "relay-reply")]
+
+
+def test_a_window_deletion_reversed_after_a_promotion_names_the_promoted_repost(tmp_path):
+    """The window inferred the VIP's call deleted, voided it and promoted
+    its repost; then the call reads back. The alert must say the repost
+    now carries the call, or the user trades it twice by hand."""
+    db_path = tmp_path / "store.db"
+    client = ScriptedClient()
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        await _round(listener, time)
+        # Only the VIP's window is read by id (the relay has no posts): two
+        # misses of the VIP's call in a row, then it is back.
+        client.ids_answers = [_without(CALL)] * 2
+        for _ in range(3):
+            await _round(listener, time)
+
+    _run(db_path, body, client=client)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "VOIDED", 1), (2, V, REPOST, "NEW", 0)]
+    assert ("CRITICAL", edits_repo.DELETION_REVERSED) in _codes(state)
+    detail = _alert_detail(db_path, edits_repo.DELETION_REVERSED)
+    assert f"message {REPOST}" in detail and "signal 2" in detail
+    assert "twice" in detail
