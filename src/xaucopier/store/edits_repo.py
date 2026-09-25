@@ -76,6 +76,16 @@ on the signal's *own* channel -- a double post -- that is deleted, or
 edited into something that is no signal, only warns
 (`SIGNAL_REPEAT_REMOVED`): the call still stands in the other post.
 
+**A copy's edit never puts back a level the poster moved since.** A
+copy is often a hand copy that mirrors some edits and not others. Its
+edit is applied like the signal's own -- but when the copy's version
+still shows a level (SL, a TP, the ladder's length) that its edit did
+not change and the signal has since moved, applying it would silently
+put the old level back on a live position. Then nothing is applied and
+a WARNING `SIGNAL_COPY_OUT_OF_DATE` names what the copy changed and what
+it still shows; if what it changed is on the signal already (a mirrored
+edit), nothing is said.
+
 **The same change on every post of a relayed call is applied once.** A
 relay that mirrors edits and deletions delivers each change twice. For a
 signal that has copies (or a change through one), a version that would
@@ -185,6 +195,9 @@ SIGNAL_REPEAT_REMOVED = "SIGNAL_REPEAT_REMOVED"
 #: same call posted again on that channel still stands: the repost is now
 #: the signal, queued for trading (final review F04).
 SIGNAL_REPOST_PROMOTED = "SIGNAL_REPOST_PROMOTED"
+#: WARNING: a relay copy's edit was not applied: its version still shows a
+#: level the signal has moved since (review round 1, minor 4).
+SIGNAL_COPY_OUT_OF_DATE = "SIGNAL_COPY_OUT_OF_DATE"
 #: WARNING: an executed signal's TP ladder changed length; legs cannot follow.
 TP_LADDER_CHANGED_AFTER_ENTRY = "TP_LADDER_CHANGED_AFTER_ENTRY"
 #: WARNING: a follow-up already dispatched to a worker was edited.
@@ -551,7 +564,9 @@ def _reconcile_version(
         return ctx.result("cosmetic", new_kind, "cosmetic edit; parse unchanged")
 
     if stored_kind == "signal":
-        return _edit_of_signal(ctx, route_result)
+        return _edit_of_signal(
+            dataclasses.replace(ctx, previous_text=existing["raw_text"]), route_result
+        )
     if stored_kind == "followup":
         return _edit_of_followup(ctx, route_result, new_hash)
     return _edit_of_other(ctx, stored_kind, route_result)
@@ -726,6 +741,10 @@ def _signal_to_signal(
         # The signal already says this: the same correction reaching another
         # copy of the call (the edited message's own hash did change).
         return ctx.result("cosmetic", "signal", "levels unchanged")
+    if ctx.via_copy is not None:
+        out_of_date = _copy_out_of_date(ctx, row, old, new)
+        if out_of_date is not None:
+            return out_of_date
 
     signal_id = row["signal_id"]
     if ctx.via_copy is not None:
@@ -773,6 +792,82 @@ def _signal_to_signal(
     )
     return ctx.result(
         "reparsed", "signal", change, amendments=tuple(amendments), alert_ids=tuple(raised)
+    )
+
+
+def _copy_out_of_date(
+    ctx: _Ctx, row: sqlite3.Row, old: dict, new: Signal
+) -> EditResult | None:
+    """A copy's edit (`new`) of signal `row` (stored parse `old`): None
+    when it may be applied like the signal's own. Otherwise its version
+    still shows a level its edit did not change but the signal has moved
+    since -- see the module docstring -- and nothing is applied: an INFO
+    line when what the copy changed is on the signal already, else a
+    WARNING naming both."""
+    if ctx.previous_text is None:
+        return None
+    before = route(
+        ctx.previous_text,
+        channel_cfg=ctx.channel_cfg,
+        message_id=ctx.message_id,
+        posted_at_utc=new.posted_at_utc,
+    )
+    if before.kind != "signal":
+        return None
+    prev = before.signal
+    old_tps = tuple(old["tps"])
+    changed: list[str] = []  # what the copy's edit changed
+    pending: list[str] = []  # ... and is not on the signal yet
+    stale: list[str] = []  # what it did not change, which the signal has moved since
+    if not _same(prev.sl, new.sl):
+        changed.append(f"SL {prev.sl:g} -> {new.sl:g}")
+        if not _same(new.sl, old["sl"]):
+            pending.append("SL")
+    elif not _same(new.sl, old["sl"]):
+        stale.append(f"SL {new.sl:g} (signal {row['signal_id']} has {old['sl']:g})")
+    for index in range(min(len(prev.tps), len(new.tps))):
+        label = f"TP{index + 1}"
+        on_signal = old_tps[index] if index < len(old_tps) else None
+        if not _same(prev.tps[index], new.tps[index]):
+            changed.append(f"{label} {prev.tps[index]:g} -> {new.tps[index]:g}")
+            if on_signal is None or not _same(new.tps[index], on_signal):
+                pending.append(label)
+        elif on_signal is not None and not _same(new.tps[index], on_signal):
+            stale.append(
+                f"{label} {new.tps[index]:g} (signal {row['signal_id']} has {on_signal:g})"
+            )
+    if len(prev.tps) != len(new.tps):
+        changed.append(f"its take-profit count {len(prev.tps)} -> {len(new.tps)}")
+        if len(new.tps) != len(old_tps):
+            pending.append("the take-profit count")
+    elif len(new.tps) != len(old_tps):
+        stale.append(
+            f"{len(new.tps)} take-profits (signal {row['signal_id']} has {len(old_tps)})"
+        )
+    if not stale:
+        return None
+    if not pending:
+        logger.info(
+            "edit of channel %s message %s, a copy of signal %s (%s): the signal carries "
+            "that already; nothing more is done",
+            ctx.channel_id,
+            ctx.message_id,
+            row["signal_id"],
+            ", ".join(changed),
+        )
+        return ctx.result("recorded", "signal", f"signal {row['signal_id']} carries it already")
+    alert = ctx.alert(
+        "WARNING",
+        SIGNAL_COPY_OUT_OF_DATE,
+        f"its edit changed {', '.join(changed)}, but it still shows {', '.join(stale)}: "
+        f"the poster has moved that since, and this copy never followed. Signal "
+        f"{row['signal_id']} was NOT changed and nothing was queued -- applying this "
+        "version would put the old level back. If the poster meant the new level, "
+        "review it by hand.",
+        signal_id=row["signal_id"],
+    )
+    return ctx.result(
+        "recorded", "signal", "a copy's out-of-date version; not applied", alert_ids=(alert,)
     )
 
 
@@ -1506,6 +1601,8 @@ class _Ctx:
     relay_of_followup_id: int | None = None
     #: A deletion's: the channel's other ids the same report deleted.
     also_deleted: frozenset[int] = frozenset()
+    #: An edit of a stored signal message: the text it replaces.
+    previous_text: str | None = None
 
     @property
     def channel_id(self) -> int:

@@ -1916,7 +1916,9 @@ def test_the_same_instruction_said_twice_on_one_channel_is_two_instructions(
     to the call, or to the poster's own repost of it."""
     holder = _ingest(conn, VIP, 4001)
     _ingest(conn, VIP, 4012, posted=POSTED + timedelta(minutes=1))  # a repeat: a copy of 4001
-    first = _ingest(conn, VIP, 4002, CLOSE_HALF, posted=POSTED + timedelta(minutes=5), reply_to=4001)
+    first = _ingest(
+        conn, VIP, 4002, CLOSE_HALF, posted=POSTED + timedelta(minutes=5), reply_to=4001
+    )
     again = _ingest(
         conn, VIP, 4003, CLOSE_HALF, posted=POSTED + timedelta(minutes=12),
         reply_to=second_reply_to,
@@ -2093,7 +2095,9 @@ def test_a_window_deletion_reversed_after_a_promotion_names_the_promoted_repost(
 # -- F04: the call and its repost deleted together -----------------------------------
 
 
-@pytest.mark.parametrize("ids", [(CALL, REPOST), (REPOST, CALL)], ids=["call-first", "repost-first"])
+@pytest.mark.parametrize(
+    "ids", [(CALL, REPOST), (REPOST, CALL)], ids=["call-first", "repost-first"]
+)
 @pytest.mark.parametrize("found_by", ["event", "window"])
 def test_a_call_deleted_with_its_repost_in_one_go_is_voided_once(tmp_path, ids, found_by):
     """One deletion naming both posts (or one window read missing both):
@@ -2123,3 +2127,87 @@ def test_a_call_deleted_with_its_repost_in_one_go_is_voided_once(tmp_path, ids, 
     if found_by == "window":
         expected.append(("CRITICAL", edits_repo.WINDOW_VOIDED_SIGNALS))
     assert _codes(state) == expected
+
+
+# -- F02: a copy's edit never reverts what the poster moved since -----------------------
+
+TP1_EDIT = SIGNAL_TEXT.replace("4490", "4491")  # TP1 4490 -> 4491, the stop left at 4470
+assert SIGNAL_TEXT.count("4490") == 1
+
+
+def _copied_and_executed(conn) -> int:
+    """The VIP's call (signal 1, acct-1's entry DONE) and the relay's hand
+    copy of it 30 s later."""
+    holder = _ingest(conn, VIP, 4001)
+    _ingest(conn, RELAY, 7001, posted=POSTED + timedelta(seconds=30))
+    conn.execute("UPDATE outbox SET state = 'DONE' WHERE kind = 'ENTRY' AND account_id = 'acct-1'")
+    conn.commit()
+    return holder.signal_id
+
+
+def _edit(conn, channel: ChannelCfg, message_id: int, text: str, edit_date: datetime):
+    return edits_repo.apply_edit(
+        conn, channel_cfg=channel, message_id=message_id, text=text, posted_at_utc=POSTED,
+        edit_date_utc=edit_date, reply_to_message_id=None, now_utc=edit_date,
+        accounts=ACCOUNTS, detected_by="event",
+    )
+
+
+def _levels(conn) -> tuple:
+    (row,) = _q(
+        conn,
+        "SELECT version, json_extract(parsed_json, '$.sl'), json_extract(parsed_json, '$.tps') "
+        "FROM signals",
+    )
+    return row[0], row[1], json.loads(row[2])
+
+
+def _amendments(conn) -> list[tuple]:
+    return _q(
+        conn,
+        "SELECT op, json_extract(parsed_json, '$.price_hint') FROM followups "
+        "WHERE edit_seq > 0 ORDER BY followup_id",
+    )
+
+
+def test_a_copys_edit_never_puts_back_a_stop_the_poster_moved(conn):
+    """The VIP moved the stop (amended); the relay never mirrored that and
+    later edits only its TP1. Its whole version would put the old stop
+    back on a live position: nothing is applied, a WARNING says why."""
+    signal_id = _copied_and_executed(conn)
+    assert _edit(conn, VIP, 4001, SL_EDIT, EDIT_1).outcome == "reparsed"
+    result = _edit(conn, RELAY, 7001, TP1_EDIT, EDIT_2)
+
+    assert result.outcome == "recorded"
+    assert _levels(conn) == (2, 4460.0, [4490.0, 4495.0, 4500.0, 4505.0])
+    assert _amendments(conn) == [("amend_sl", 4460.0)]
+    assert _alerts(conn) == [
+        ("WARNING", edits_repo.SIGNAL_COPY_OUT_OF_DATE, RELAY.channel_id, 7001, signal_id)
+    ]
+    (detail,) = _q(conn, "SELECT detail FROM alerts")[0]
+    assert "TP1 4490 -> 4491" in detail and "SL 4470" in detail and "4460" in detail
+
+
+def test_a_copy_mirroring_an_edit_the_poster_made_changes_nothing_more(conn):
+    """The VIP moved its stop, then its TP1; the relay mirrors only the
+    TP1 edit. The signal carries it already: nothing to do, nothing said."""
+    _copied_and_executed(conn)
+    _edit(conn, VIP, 4001, SL_EDIT, EDIT_1)
+    _edit(conn, VIP, 4001, SL_EDIT.replace("4490", "4491"), EDIT_2)
+    before = (_levels(conn), _amendments(conn))
+    result = _edit(conn, RELAY, 7001, TP1_EDIT, EDIT_2 + timedelta(minutes=1))
+
+    assert result.outcome == "recorded"
+    assert (_levels(conn), _amendments(conn)) == before
+    assert _alerts(conn) == []
+
+
+def test_a_copys_edit_of_the_level_it_changes_still_wins(conn):
+    """Control: the copy's own change is applied as the holder's would be,
+    latest first -- only levels it did not touch are protected."""
+    _copied_and_executed(conn)
+    _edit(conn, VIP, 4001, SL_EDIT, EDIT_1)  # SL 4460
+    result = _edit(conn, RELAY, 7001, SIGNAL_TEXT.replace("4470", "4465"), EDIT_2)
+    assert result.outcome == "reparsed"
+    assert _levels(conn)[:2] == (3, 4465.0)
+    assert _amendments(conn) == [("amend_sl", 4460.0), ("amend_sl", 4465.0)]
