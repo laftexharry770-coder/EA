@@ -2016,3 +2016,29 @@ def test_a_forward_of_a_withdrawn_post_repeats_the_live_repost_of_the_call(
     assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", repost.signal_id)
     assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL not in [code for _, code, *_ in _alerts(conn)]
     assert _queued_entries(conn) == [(repost.signal_id, "acct-1"), (repost.signal_id, "acct-2")]
+
+
+def test_a_message_that_holds_a_signal_is_never_matched_against_it(conn):
+    """For an edit path asking about a message that already has its own
+    signals row: find_signal_relay never answers with that signal, by the
+    trade nor as the live repost of a withdrawn post it forwards."""
+    _ingest(conn, VIP, 4001)
+    (trade_hash,) = _q(conn, "SELECT trade_hash FROM signals")[0]
+    ask = dict(trade_hash=trade_hash, relay_window_seconds=900)
+    assert relay_repo.find_signal_relay(
+        conn, channel_id=VIP.channel_id, message_id=4001, posted_at_utc=POSTED,
+        fwd_from_channel_id=None, fwd_from_post_id=None, **ask,
+    ) is None
+
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4001, now_utc=POSTED, accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    later = POSTED + timedelta(hours=2)
+    own = _ingest(conn, RELAY, 7001, posted=later)  # its own signal: outside the window
+    assert own.outcome == "new"
+    match = relay_repo.find_signal_relay(
+        conn, channel_id=RELAY.channel_id, message_id=7001, posted_at_utc=later,
+        fwd_from_channel_id=VIP.channel_id, fwd_from_post_id=4001, **ask,
+    )
+    assert match is not None and match.signal_id != own.signal_id
