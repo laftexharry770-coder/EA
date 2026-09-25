@@ -740,16 +740,19 @@ class Listener:
         """Record that `message_id` is gone from its channel --
         `edits_repo.apply_deletion()`, on the writer thread. Idempotent:
         the second report of the same deletion finds it marked. Never
-        closes anything, never touches the pointer."""
+        closes anything, never touches the pointer. (A withdrawn call's
+        standing repost may be promoted in the same job, which is why the
+        accounts go along.)"""
         now_utc = self._now()
-        channel_id = channel_cfg.channel_id
+        accounts = self.accounts
 
         def job(conn: Connection) -> DeletionResult:
             return edits_repo.apply_deletion(
                 conn,
-                channel_id=channel_id,
+                channel_cfg=channel_cfg,
                 message_id=message_id,
                 now_utc=now_utc,
+                accounts=accounts,
                 detected_by=detected_by,
             )
 

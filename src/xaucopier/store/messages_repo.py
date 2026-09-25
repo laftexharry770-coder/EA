@@ -318,7 +318,7 @@ def ingest(
     edit = edits_repo.reconcile(
         conn,
         existing=existing,
-        channel_id=channel_id,
+        channel_cfg=channel_cfg,
         message_id=message_id,
         text=text,
         route_result=route_result,

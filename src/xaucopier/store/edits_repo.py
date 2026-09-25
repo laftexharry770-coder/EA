@@ -60,6 +60,20 @@ worker died holding it), and entries not yet taken (`QUEUED`) are
 skipped. A deleted follow-up's queued rows are skipped. Everything else
 is only marked. A signal edited into chatter is withdrawn the same way.
 
+**A withdrawn call posted again** (final review F04). When an unexecuted
+signal is withdrawn through its own message -- VOIDED by a deletion or an
+edit into chatter, or INVALID by an edit -- and the same call, posted
+again on that channel, still stands as a stored copy of it (not deleted,
+still read as a signal; `relay_repo.standing_copies_on`), the earliest
+such repost is promoted in the same writer job: re-read with the
+channel's parser, given its `signals` row and its ENTRY rows, unlinked,
+and announced with a WARNING `SIGNAL_REPOST_PROMOTED` naming both
+messages. The channel's other standing copies then repeat the promoted
+signal. An executed signal is never replaced (trading its repost would
+open the trade twice), and a copy on another channel is never promoted.
+(A repost posted *after* the withdrawal is not a copy at all: see
+`relay_repo`.)
+
 **A deletion inferred from absence can be reversed.** The window re-read
 (`ingest/edits.py`) infers a deletion when a message stops coming back --
 guarded there by a circuit breaker and a second read, but still an
@@ -97,7 +111,7 @@ from typing import Literal, Protocol
 from xaucopier.domain.signal import FollowUp, FollowUpOp, Signal
 from xaucopier.parsing.normalize import normalize
 from xaucopier.parsing.router import RouteResult, route
-from xaucopier.store import alerts, metrics, outbox, signals_repo
+from xaucopier.store import alerts, metrics, outbox, relay_repo, signals_repo
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +134,10 @@ EDIT_CREATED_SIGNAL = "EDIT_CREATED_SIGNAL"
 EDIT_CREATED_FOLLOWUP = "EDIT_CREATED_FOLLOWUP"
 #: WARNING: a material edit of a signal that is already INVALID or VOIDED.
 EDIT_OF_CLOSED_SIGNAL = "EDIT_OF_CLOSED_SIGNAL"
+#: WARNING: an unexecuted signal was withdrawn by its own poster, and the
+#: same call posted again on that channel still stands: the repost is now
+#: the signal, queued for trading (final review F04).
+SIGNAL_REPOST_PROMOTED = "SIGNAL_REPOST_PROMOTED"
 #: WARNING: an executed signal's TP ladder changed length; legs cannot follow.
 TP_LADDER_CHANGED_AFTER_ENTRY = "TP_LADDER_CHANGED_AFTER_ENTRY"
 #: WARNING: a follow-up already dispatched to a worker was edited.
@@ -223,6 +241,8 @@ class EditResult:
     skipped: int = 0
     #: This version proved a window-inferred deletion wrong, and cleared it.
     reversed_deletion: bool = False
+    #: The withdrawn signal's standing repost this change promoted, if any.
+    promoted_signal_id: int | None = None
 
     @property
     def changed(self) -> bool:
@@ -239,6 +259,8 @@ class DeletionResult:
     #: QUEUED outbox rows this deletion skipped.
     skipped: int
     alert_ids: tuple[int, ...]
+    #: The withdrawn signal's standing repost this deletion promoted, if any.
+    promoted_signal_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,7 +368,7 @@ def apply_edit(
     return reconcile(
         conn,
         existing=existing,
-        channel_id=channel_id,
+        channel_cfg=channel_cfg,
         message_id=message_id,
         text=text,
         route_result=route_result,
@@ -362,7 +384,7 @@ def reconcile(
     conn: sqlite3.Connection,
     *,
     existing: sqlite3.Row,
-    channel_id: int,
+    channel_cfg: _ChannelCfgLike,
     message_id: int,
     text: str,
     route_result: RouteResult,
@@ -375,13 +397,14 @@ def reconcile(
     """Decide what a version of an already-stored message means, and do
     it. `existing` is its `messages` row. See the module docstring for
     the whole policy; `messages_repo.ingest()` and `apply_edit()` both
-    end here."""
+    end here. `channel_cfg` is the message's channel (its parser re-reads
+    a withdrawn call's standing repost, which may be promoted)."""
     _check_detector(detected_by)
     stored_kind = existing["kind"]
-    stored_hash = existing["content_hash"]
+    channel_id = channel_cfg.channel_id
     ctx = _Ctx(
         conn=conn,
-        channel_id=channel_id,
+        channel_cfg=channel_cfg,
         message_id=message_id,
         now_utc=now_utc,
         edit_date_utc=edit_date_utc,
@@ -703,7 +726,14 @@ def _invalidate(
         f"{'y' if skipped == 1 else 'ies'} skipped. {_live_clause(status)}",
         signal_id=signal_id,
     )
-    return ctx.result("invalidated", new_kind, reason, alert_ids=(alert,))
+    promoted = _promote_repost(ctx, row) if status == "pending" else None
+    return ctx.result(
+        "invalidated",
+        new_kind,
+        reason,
+        alert_ids=(alert, *_alerts_of(promoted)),
+        promoted_signal_id=_signal_of(promoted),
+    )
 
 
 def _withdraw_signal(
@@ -736,7 +766,15 @@ def _withdraw_signal(
             f"executed; {entries}.",
             signal_id=signal_id,
         )
-        return ctx.result("voided", new_kind, via, alert_ids=(alert,), skipped=skipped)
+        promoted = _promote_repost(ctx, row)
+        return ctx.result(
+            "voided",
+            new_kind,
+            via,
+            alert_ids=(alert, *_alerts_of(promoted)),
+            skipped=skipped,
+            promoted_signal_id=_signal_of(promoted),
+        )
     alert = ctx.alert(
         "CRITICAL",
         live_code,
@@ -746,6 +784,106 @@ def _withdraw_signal(
         signal_id=signal_id,
     )
     return ctx.result("flagged", new_kind, via, alert_ids=(alert,), skipped=skipped)
+
+
+def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> tuple[int, int] | None:
+    """The poster withdrew `withdrawn` (deleted it, edited it into
+    something else, or broke it) before anything was executed. If the
+    same call, posted again on the same channel, still stands -- a stored
+    copy of this signal there, not deleted, still read as a signal -- the
+    earliest such repost becomes the signal: re-read with the channel's
+    parser, given its `signals` row and its ENTRY rows (in this same
+    writer job), unlinked, and announced with a WARNING naming both
+    messages. The channel's other standing copies now repeat the promoted
+    signal, and follow-ups that replied to the repost now target it.
+
+    Only a withdrawal through the signal's own message promotes: a copy
+    on another channel is never promoted, and a withdrawal that reached
+    the signal through a copy (another channel withdrew the call) leaves
+    it withdrawn. Returns (new signal id, alert id) or None."""
+    if ctx.via_copy is not None:
+        return None
+    conn = ctx.conn
+    old_id = withdrawn["signal_id"]
+    for repost in relay_repo.standing_copies_on(conn, signal_id=old_id, channel_id=ctx.channel_id):
+        posted_at = datetime.fromisoformat(repost["posted_at_utc"])
+        routed = route(
+            repost["raw_text"],
+            channel_cfg=ctx.channel_cfg,
+            message_id=repost["message_id"],
+            posted_at_utc=posted_at,
+        )
+        if routed.kind != "signal":
+            logger.warning(
+                "channel %s message %s, a repost of withdrawn signal %s, no longer reads as a "
+                "signal (%s); not promoted",
+                ctx.channel_id,
+                repost["message_id"],
+                old_id,
+                routed.detail,
+            )
+            continue
+        new_id = signals_repo.insert_signal(
+            conn, channel_id=ctx.channel_id, message_id=repost["message_id"], signal=routed.signal
+        )
+        queued = outbox.fan_out_checked(
+            conn,
+            kind="ENTRY",
+            signal_id=new_id,
+            followup_id=None,
+            accounts=ctx.accounts,
+            now_utc=ctx.now_utc,
+        )
+        conn.execute(
+            "UPDATE messages SET relay_of_signal_id = NULL WHERE channel_id = ? AND message_id = ?",
+            (ctx.channel_id, repost["message_id"]),
+        )
+        conn.execute(
+            "UPDATE messages SET relay_of_signal_id = ? "
+            "WHERE relay_of_signal_id = ? AND channel_id = ? AND deleted_at_utc IS NULL",
+            (new_id, old_id, ctx.channel_id),
+        )
+        conn.execute(
+            "UPDATE followups SET target_signal_id = ?, resolution_path = ? "
+            "WHERE channel_id = ? AND reply_to_message_id = ? AND resolution_path = ?",
+            (
+                new_id,
+                relay_repo.REPLY_PATH,
+                ctx.channel_id,
+                repost["message_id"],
+                relay_repo.RELAY_REPLY_PATH,
+            ),
+        )
+        alert = ctx.alert(
+            "WARNING",
+            SIGNAL_REPOST_PROMOTED,
+            f"signal {old_id} (message {ctx.message_id}) was withdrawn before anything was "
+            f"executed, but the same call posted again as message {repost['message_id']} on "
+            f"this channel still stands: it is now signal {new_id}, and {queued} trade "
+            f"entr{'y is' if queued == 1 else 'ies are'} queued for it. If the poster meant to "
+            "cancel the call altogether, check the channel.",
+            signal_id=new_id,
+            message_id=repost["message_id"],
+        )
+        logger.warning(
+            "channel %s: repost %s promoted to signal %s after signal %s (message %s) was "
+            "withdrawn",
+            ctx.channel_id,
+            repost["message_id"],
+            new_id,
+            old_id,
+            ctx.message_id,
+        )
+        return new_id, alert
+    return None
+
+
+def _alerts_of(promoted: tuple[int, int] | None) -> tuple[int, ...]:
+    return () if promoted is None else (promoted[1],)
+
+
+def _signal_of(promoted: tuple[int, int] | None) -> int | None:
+    return None if promoted is None else promoted[0]
 
 
 def _edit_of_followup(ctx: _Ctx, route_result: RouteResult) -> EditResult:
@@ -851,16 +989,23 @@ def _created_alert(ctx: _Ctx, route_result: RouteResult) -> int:
 def apply_deletion(
     conn: sqlite3.Connection,
     *,
-    channel_id: int,
+    channel_cfg: _ChannelCfgLike,
     message_id: int,
     now_utc: datetime,
+    accounts: tuple[_AccountCfgLike, ...],
     detected_by: str,
 ) -> DeletionResult:
     """A message is gone from its channel (the event said so, or the
     window re-read found `None` where it used to be). Marks it deleted --
     exactly once: a second report finds the mark -- and applies the
-    deletion policy in the module docstring. Never closes anything."""
+    deletion policy in the module docstring. Never closes anything.
+
+    `channel_cfg` and `accounts` are what promoting a withdrawn call's
+    standing repost needs (its parser; its ENTRY fan-out): required, like
+    `ingest()`'s `accounts`, so a caller cannot silently promote a repost
+    to no account."""
     _check_detector(detected_by)
+    channel_id = channel_cfg.channel_id
     existing = _get_message(conn, channel_id=channel_id, message_id=message_id)
     if existing is None:
         return DeletionResult("unknown", message_id, None, None, None, 0, ())
@@ -890,11 +1035,11 @@ def apply_deletion(
         )
     ctx = _Ctx(
         conn=conn,
-        channel_id=channel_id,
+        channel_cfg=channel_cfg,
         message_id=message_id,
         now_utc=now_utc,
         edit_date_utc=None,
-        accounts=(),
+        accounts=accounts,
         detected_by=detected_by,
         signal_id=signal_id,
         followup_id=followup_id,
@@ -928,6 +1073,7 @@ def apply_deletion(
                 followup_id,
                 result.skipped,
                 result.alert_ids,
+                result.promoted_signal_id,
             )
     elif kind == "followup" and followup_id is not None:
         partial = _withdraw_followup(
@@ -961,7 +1107,8 @@ class _Ctx:
     """Everything one call's helpers share."""
 
     conn: sqlite3.Connection
-    channel_id: int
+    #: The changed message's channel.
+    channel_cfg: _ChannelCfgLike
     message_id: int
     now_utc: datetime
     edit_date_utc: datetime | None
@@ -969,19 +1116,33 @@ class _Ctx:
     detected_by: str
     signal_id: int | None
     followup_id: int | None
+    #: Set when the change reaches a signal through one of its relay copies
+    #: (this message): what every alert then says first, naming both.
+    via_copy: str | None = None
+
+    @property
+    def channel_id(self) -> int:
+        return self.channel_cfg.channel_id
 
     def alert(
-        self, level: alerts.AlertLevel, code: str, detail: str, *, signal_id: int | None = None
+        self,
+        level: alerts.AlertLevel,
+        code: str,
+        detail: str,
+        *,
+        signal_id: int | None = None,
+        message_id: int | None = None,
     ) -> int:
+        prefix = "" if self.via_copy is None else f"{self.via_copy}: "
         return alerts.record(
             self.conn,
             now_utc=self.now_utc,
             level=level,
             code=code,
             channel_id=self.channel_id,
-            message_id=self.message_id,
+            message_id=message_id if message_id is not None else self.message_id,
             signal_id=signal_id if signal_id is not None else self.signal_id,
-            detail=f"{detail} [found by {self.detected_by}]",
+            detail=f"{prefix}{detail} [found by {self.detected_by}]",
         )
 
     def result(
@@ -993,6 +1154,7 @@ class _Ctx:
         amendments: tuple[int, ...] = (),
         alert_ids: tuple[int, ...] = (),
         skipped: int = 0,
+        promoted_signal_id: int | None = None,
     ) -> EditResult:
         return EditResult(
             outcome=outcome,
@@ -1003,6 +1165,7 @@ class _Ctx:
             alert_ids=alert_ids,
             detail=detail,
             skipped=skipped,
+            promoted_signal_id=promoted_signal_id,
         )
 
 

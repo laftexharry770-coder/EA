@@ -111,7 +111,12 @@ def seeded(tmp_path: Path) -> Seeded:
 
         # Signal 2 (message 11): deleted before any trade -> VOIDED, WARNING.
         edits_repo.apply_deletion(
-            conn, channel_id=A, message_id=11, now_utc=NOW, detected_by="event"
+            conn,
+            channel_cfg=CHANNEL_A,
+            message_id=11,
+            now_utc=NOW,
+            accounts=ACCOUNTS,
+            detected_by="event",
         )
         # Signal 3 (message 12): re-aimed BUY -> SELL by an edit the event
         # stream dropped -> INVALID, CRITICAL, edit_missed_by_eventstream.
@@ -131,7 +136,12 @@ def seeded(tmp_path: Path) -> Seeded:
         # leave it), then deleted -> stays NEW, flagged, CRITICAL.
         conn.execute("UPDATE outbox SET state = 'DONE' WHERE kind = 'ENTRY' AND signal_id = 4")
         edits_repo.apply_deletion(
-            conn, channel_id=A, message_id=13, now_utc=NOW, detected_by="window"
+            conn,
+            channel_cfg=CHANNEL_A,
+            message_id=13,
+            now_utc=NOW,
+            accounts=ACCOUNTS,
+            detected_by="window",
         )
         # An acknowledged alert must not be shown.
         acked = alerts.record(conn, now_utc=NOW, level="CRITICAL", code="OLD_NEWS", detail="done")

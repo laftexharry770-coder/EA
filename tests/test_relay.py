@@ -344,3 +344,541 @@ def test_a_copy_only_a_history_read_found_counts_as_missed_by_the_update_stream(
     )
     assert split_new(results, live_from=POSTED - timedelta(minutes=1)) == ([1, 2], [])
     assert split_new(results, live_from=POSTED + timedelta(minutes=1)) == ([], [1, 2])
+
+
+# == the arrival paths: the real listener and poll, the fake Telegram ===========
+
+import asyncio  # noqa: E402 -- the path tests' own imports
+
+from fakes.telegram import FakeMessage, FakeTelegramClient  # noqa: E402
+from test_edits import ACCOUNTS as LIVE_ACCOUNTS  # noqa: E402
+from test_edits import CHATTER_TEXT as EDIT_CHATTER  # noqa: E402
+from test_edits import (  # noqa: E402
+    DIRECTION_EDIT,
+    EDIT_1,
+    EDIT_2,
+    NOW,
+    SL_EDIT,
+    UNPARSEABLE_EDIT,
+    SteppedTime,
+    _round,
+    _until_asleep,
+)
+from xaucopier.ingest.listener import Listener  # noqa: E402
+from xaucopier.ingest.poll import HistoryPoll  # noqa: E402
+from xaucopier.store import edits_repo  # noqa: E402
+
+V = VIP.channel_id
+R = RELAY.channel_id
+#: The VIP's call, three chatter messages after it (a window re-read
+#: needs company to believe an absence), then room for a repost.
+CALL = 4001
+VIP_CHATTER = (4002, 4003, 4004)
+REPOST = 4012
+REPOST_2 = 4013
+COPY = 7001  # the relay channel's copy
+N = len(LIVE_ACCOUNTS)
+
+
+def _post(
+    message_id: int,
+    text: str = SIGNAL_TEXT,
+    *,
+    after: timedelta = timedelta(0),
+    reply_to: int | None = None,
+) -> FakeMessage:
+    return FakeMessage(id=message_id, message=text, date=POSTED + after, reply_to_msg_id=reply_to)
+
+
+def _db_rows(db_path: Path, sql: str, params: tuple = ()) -> list[tuple]:
+    conn = db.connect(db_path, role="reader")
+    try:
+        return [tuple(row) for row in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def _db_write(db_path: Path, sql: str, params: tuple = ()) -> None:
+    conn = db.connect(db_path, role="writer")
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _run(db_path: Path, body, *, channels=(VIP, RELAY), client=None):
+    """Pointers just below each channel's first test id; start the real
+    listener and poll; run `body(client, listener, time)`; no handler may
+    fail."""
+    for channel_id, pointer in ((V, CALL - 1), (R, COPY - 1)):
+        _db_write(
+            db_path,
+            "INSERT INTO channel_state (channel_id, last_processed_message_id) VALUES (?, ?)",
+            (channel_id, pointer),
+        )
+    time = SteppedTime()
+    client = client if client is not None else FakeTelegramClient()
+
+    async def scenario():
+        listener = Listener(
+            client=client,
+            channels=channels,
+            accounts=LIVE_ACCOUNTS,
+            writer=db.Writer(db_path),
+            db_path=db_path,
+            now=lambda: NOW,
+            poll_hook=HistoryPoll(sleep=time.sleep, clock=time.clock),
+        )
+        await listener.start()
+        try:
+            await _until_asleep(listener, time)
+            result = await body(client, listener, time)
+            assert listener.handler_error_count == 0, listener.handler_errors
+            return result
+        finally:
+            await listener.aclose()
+
+    return asyncio.run(scenario())
+
+
+def _state(db_path: Path) -> dict:
+    """What the path tests assert on: signals, QUEUED entries per signal,
+    alerts, and every copy's link."""
+    return {
+        "signals": _db_rows(
+            db_path,
+            "SELECT signal_id, channel_id, message_id, state, withdrawn_at_utc IS NOT NULL "
+            "FROM signals ORDER BY signal_id",
+        ),
+        "queued": _db_rows(
+            db_path,
+            "SELECT signal_id, COUNT(*) FROM outbox WHERE kind = 'ENTRY' AND state = 'QUEUED' "
+            "GROUP BY signal_id ORDER BY signal_id",
+        ),
+        "alerts": _db_rows(
+            db_path,
+            "SELECT level, code, channel_id, message_id, signal_id FROM alerts ORDER BY alert_id",
+        ),
+        "links": _db_rows(
+            db_path,
+            "SELECT channel_id, message_id, relay_of_signal_id FROM messages "
+            "WHERE relay_of_signal_id IS NOT NULL ORDER BY channel_id, message_id",
+        ),
+    }
+
+
+def _codes(state: dict) -> list[tuple[str, str]]:
+    return [(level, code) for level, code, *_ in state["alerts"]]
+
+
+def _alert_detail(db_path: Path, code: str) -> str:
+    (row,) = _db_rows(db_path, "SELECT detail FROM alerts WHERE code = ?", (code,))
+    return row[0]
+
+
+def _mark_executed(db_path: Path, signal_id: int = 1) -> None:
+    """Plan 3's worker, simulated: acct-1's ENTRY of `signal_id` is DONE."""
+    _db_write(
+        db_path,
+        "UPDATE outbox SET state = 'DONE' WHERE kind = 'ENTRY' AND account_id = 'acct-1' "
+        "AND signal_id = ?",
+        (signal_id,),
+    )
+
+
+async def _vip_call_stored(client, listener, time) -> None:
+    """The VIP's call and three chatter posts, all stored and passed by
+    the pointer (a window of four)."""
+    assert await client.emit(V, _post(CALL))
+    for message_id in VIP_CHATTER:
+        assert await client.emit(V, _post(message_id, CHATTER_TEXT))
+    await _round(listener, time)
+
+
+VOIDED_BY_DELETION = ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION, V, CALL, 1)
+
+
+# -- F04: a withdrawn call posted again -------------------------------------------
+
+
+def test_delete_then_repost_on_the_same_channel_is_a_new_signal(tmp_path):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit_delete(V, CALL)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        await _round(listener, time)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "VOIDED", 1), (2, V, REPOST, "NEW", 0)]
+    assert state["queued"] == [(2, N)]
+    assert state["alerts"] == [VOIDED_BY_DELETION]
+    assert state["links"] == []
+
+
+@pytest.mark.parametrize("how", ["unparseable", "chatter"])
+def test_a_call_edited_away_then_posted_again_is_a_new_signal(tmp_path, how):
+    """The original is INVALID (edited into something unparseable, which
+    keeps its trade hash) or VOIDED (edited into chatter); the clean
+    repost six minutes later trades."""
+    db_path = tmp_path / "store.db"
+    edit = UNPARSEABLE_EDIT if how == "unparseable" else EDIT_CHATTER
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit_edit(V, CALL, edit, edit_date=EDIT_1)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=6)))
+        await _round(listener, time)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [
+        (1, V, CALL, "INVALID" if how == "unparseable" else "VOIDED", int(how == "chatter")),
+        (2, V, REPOST, "NEW", 0),
+    ]
+    assert state["queued"] == [(2, N)]
+
+
+def test_delete_then_repost_outside_the_window_is_a_new_signal(tmp_path):
+    """Control: 16 minutes later, as before the fix."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit_delete(V, CALL)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=16)))
+        await _round(listener, time)
+
+    _run(db_path, body)
+    assert _state(db_path)["queued"] == [(2, N)]
+
+
+def test_an_executed_call_deleted_and_posted_again_is_not_traded_twice(tmp_path):
+    """Control: the original was executed before it was deleted. The
+    repost is still the same call -- trading it would open the trade
+    twice -- and no copy alert fires."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        _mark_executed(db_path)
+        assert await client.emit_delete(V, CALL)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        await _round(listener, time)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "NEW", 1)]
+    assert state["queued"] == []
+    assert state["alerts"] == [("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED, V, CALL, 1)]
+    assert state["links"] == [(V, REPOST, 1)]
+
+
+@pytest.mark.parametrize("found_by", ["event", "window"])
+def test_repost_then_delete_promotes_the_standing_repost(tmp_path, found_by):
+    """The poster posts the call again (a copy while the original stands),
+    then deletes the original, which nobody had taken yet: the repost
+    becomes the signal, in the same writer job as the deletion."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        await _round(listener, time)
+        assert _state(db_path)["links"] == [(V, REPOST, 1)]
+        if found_by == "event":
+            assert await client.emit_delete(V, CALL)
+        else:
+            with client.blackout():
+                assert not await client.emit_delete(V, CALL)
+            for _ in range(3):
+                await _round(listener, time)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "VOIDED", 1), (2, V, REPOST, "NEW", 0)]
+    assert state["queued"] == [(2, N)]
+    assert state["links"] == []  # the promoted repost is no copy any more
+    assert ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION) in _codes(state)
+    assert ("WARNING", edits_repo.SIGNAL_REPOST_PROMOTED, V, REPOST, 2) in state["alerts"]
+    if found_by == "window":
+        assert ("CRITICAL", edits_repo.WINDOW_VOIDED_SIGNALS) in _codes(state)
+    detail = _alert_detail(db_path, edits_repo.SIGNAL_REPOST_PROMOTED)
+    assert f"message {REPOST}" in detail and f"message {CALL}" in detail
+
+
+@pytest.mark.parametrize("edit", ["reaim", "unparseable", "chatter"])
+def test_a_standing_repost_is_promoted_when_the_original_is_edited_away(tmp_path, edit):
+    db_path = tmp_path / "store.db"
+    text = {"reaim": DIRECTION_EDIT, "unparseable": UNPARSEABLE_EDIT, "chatter": EDIT_CHATTER}[edit]
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        assert await client.emit_edit(V, CALL, text, edit_date=EDIT_1)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"][1] == (2, V, REPOST, "NEW", 0)
+    assert state["queued"] == [(2, N)]
+    assert ("WARNING", edits_repo.SIGNAL_REPOST_PROMOTED, V, REPOST, 2) in state["alerts"]
+
+
+def test_an_executed_original_is_never_replaced_by_its_repost(tmp_path):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        _mark_executed(db_path)
+        assert await client.emit_delete(V, CALL)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "NEW", 1)]
+    assert state["queued"] == []
+    assert state["links"] == [(V, REPOST, 1)]
+
+
+def test_the_earliest_standing_repost_is_promoted_and_the_rest_follow_it(tmp_path):
+    """Posted three times: deleting the first promotes the second, and the
+    third becomes a copy of the second -- so deleting the second in turn
+    promotes the third."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        assert await client.emit(V, _post(REPOST_2, after=timedelta(minutes=3)))
+        assert await client.emit_delete(V, CALL)
+        after_first = _state(db_path)
+        assert await client.emit_delete(V, REPOST)
+        return after_first
+
+    after_first = _run(db_path, body)
+
+    assert after_first["links"] == [(V, REPOST_2, 2)]
+    state = _state(db_path)
+    assert state["signals"] == [
+        (1, V, CALL, "VOIDED", 1),
+        (2, V, REPOST, "VOIDED", 1),
+        (3, V, REPOST_2, "NEW", 0),
+    ]
+    assert state["queued"] == [(3, N)]
+    assert state["links"] == []
+
+
+def test_a_repost_stored_before_the_original_is_promoted_too(tmp_path):
+    """The original's update was dropped, so the repost was stored first
+    and holds the signal; the original, recovered by the poll, became its
+    copy. Deleting the repost leaves the original standing: it is promoted
+    (both are the poster's own posts of the same call)."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        with client.blackout():
+            await client.emit(V, _post(CALL))
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        await _round(listener, time)
+        assert _state(db_path)["links"] == [(V, CALL, 1)]
+        assert await client.emit_delete(V, REPOST)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, REPOST, "VOIDED", 1), (2, V, CALL, "NEW", 0)]
+    assert state["queued"] == [(2, N)]
+
+
+def test_a_deleted_repost_is_not_promoted(tmp_path):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        assert await client.emit_delete(V, REPOST)
+        assert await client.emit_delete(V, CALL)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "VOIDED", 1)]
+    assert state["queued"] == []
+
+
+def test_a_copy_on_another_channel_is_never_promoted(tmp_path):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(R, _post(COPY, after=timedelta(minutes=1)))
+        assert await client.emit_delete(V, CALL)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "VOIDED", 1)]
+    assert state["queued"] == []
+    assert state["links"] == [(R, COPY, 1)]
+
+
+def test_a_withdrawn_call_copied_from_another_channel_is_held_back_loudly(tmp_path):
+    """The VIP deleted the call before anyone took it; the relay's copy
+    arrives a minute later. Not traded -- one source withdrew it -- but a
+    CRITICAL alert names both messages."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit_delete(V, CALL)
+        assert await client.emit(R, _post(COPY, after=timedelta(minutes=1)))
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "VOIDED", 1)]
+    assert state["queued"] == []
+    assert state["links"] == [(R, COPY, 1)]
+    assert state["alerts"] == [
+        VOIDED_BY_DELETION,
+        ("CRITICAL", relay_repo.COPY_OF_WITHDRAWN_SIGNAL, R, COPY, 1),
+    ]
+    detail = _alert_detail(db_path, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert f"message {COPY} on channel {R}" in detail
+    assert f"message {CALL} on channel {V}" in detail
+
+
+def test_a_live_repost_is_preferred_to_the_withdrawn_original(tmp_path):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit_delete(V, CALL)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        assert await client.emit(R, _post(COPY, after=timedelta(minutes=3)))
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["links"] == [(R, COPY, 2)]
+    assert _codes(state) == [("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)]
+
+
+def test_a_forward_of_a_withdrawn_call_is_held_back_loudly_however_late(conn):
+    first = _ingest(conn, VIP, 4001)
+    conn.execute(
+        "UPDATE signals SET state = 'VOIDED', withdrawn_at_utc = ? WHERE signal_id = ?",
+        (POSTED.isoformat(), first.signal_id),
+    )
+    conn.execute("UPDATE outbox SET state = 'SKIPPED'")
+    forward = _ingest(
+        conn, RELAY, 7001, posted=POSTED + timedelta(hours=2), fwd=(VIP.channel_id, 4001)
+    )
+    assert forward.outcome == "relay_duplicate"
+    assert _alerts(conn) == [
+        ("CRITICAL", relay_repo.COPY_OF_WITHDRAWN_SIGNAL, RELAY.channel_id, 7001, first.signal_id)
+    ]
+    assert _queued_entries(conn) == []
+
+
+@pytest.mark.parametrize(
+    ("state", "withdrawn", "executed", "outcome"),
+    [
+        ("VOIDED", True, False, "new"),
+        ("INVALID", False, False, "new"),
+        ("NEW", True, False, "new"),  # withdrawn, state kept NEW (was in flight, then released)
+        ("NEW", True, True, "relay_duplicate"),  # withdrawn while live
+        ("INVALID", False, True, "relay_duplicate"),  # re-aimed after it was executed
+        ("NEW", False, False, "relay_duplicate"),  # a live call
+    ],
+)
+def test_which_signals_a_repost_on_the_same_channel_repeats(
+    conn, state, withdrawn, executed, outcome
+):
+    first = _ingest(conn, VIP, 4001)
+    conn.execute(
+        "UPDATE signals SET state = ?, withdrawn_at_utc = ? WHERE signal_id = ?",
+        (state, POSTED.isoformat() if withdrawn else None, first.signal_id),
+    )
+    if executed:
+        conn.execute("UPDATE outbox SET state = 'DONE' WHERE account_id = 'acct-1'")
+    conn.commit()
+    repost = _ingest(conn, VIP, 4012, posted=POSTED + timedelta(minutes=2))
+    assert repost.outcome == outcome
+    assert _alerts(conn) == []
+
+
+def test_a_promotion_is_part_of_the_deletion_that_caused_it(conn, monkeypatch):
+    """One writer job: a crash while the repost's entries are fanned out
+    rolls the deletion back too, so it is retried whole -- never a VOIDED
+    original with an unpromoted repost."""
+    from xaucopier.store import outbox
+
+    holder = _ingest(conn, VIP, 4001)
+    _ingest(conn, VIP, 4012, posted=POSTED + timedelta(minutes=2))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash while the repost is fanned out")
+
+    monkeypatch.setattr(outbox, "fan_out", boom)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=4001, now_utc=POSTED, accounts=ACCOUNTS,
+            detected_by="event",
+        )
+    conn.rollback()  # as the Writer does for a job that raised
+    assert _signals(conn) == [(holder.signal_id, VIP.channel_id, 4001, "NEW")]
+    assert _q(conn, "SELECT deleted_at_utc FROM messages WHERE message_id = 4001") == [(None,)]
+
+    monkeypatch.undo()
+    result = edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4001, now_utc=POSTED, accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    assert (result.outcome, result.promoted_signal_id) == ("voided", 2)
+    assert _signals(conn)[1] == (2, VIP.channel_id, 4012, "NEW")
+
+
+def test_an_executed_original_edited_away_leaves_its_repost_a_copy(tmp_path):
+    """Invalidation promotes only while nothing was executed."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        _mark_executed(db_path)
+        assert await client.emit_edit(V, CALL, DIRECTION_EDIT, edit_date=EDIT_1)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "INVALID", 0)]
+    assert state["links"] == [(V, REPOST, 1)]
+    assert _codes(state) == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT)]
+
+
+def test_a_repost_that_no_longer_reads_as_a_signal_is_passed_over(conn, caplog):
+    """A stored repost whose text no longer parses (the channel's parser
+    changed since) is not promoted; the next standing one is."""
+    holder = _ingest(conn, VIP, 4001)
+    _ingest(conn, VIP, 4012, posted=POSTED + timedelta(minutes=2))
+    _ingest(conn, VIP, 4013, posted=POSTED + timedelta(minutes=3))
+    conn.execute("UPDATE messages SET raw_text = ? WHERE message_id = 4012", (CHATTER_TEXT,))
+    with caplog.at_level(logging.WARNING, logger="xaucopier.store.edits_repo"):
+        result = edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=4001, now_utc=POSTED, accounts=ACCOUNTS,
+            detected_by="event",
+        )
+    assert result.promoted_signal_id == holder.signal_id + 1
+    assert _signals(conn)[1] == (holder.signal_id + 1, VIP.channel_id, 4013, "NEW")
+    assert any("4012" in r.getMessage() and "not promoted" in r.getMessage()
+               for r in caplog.records)
