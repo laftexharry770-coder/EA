@@ -332,6 +332,39 @@ def test_a_cutoff_with_a_fraction_of_a_second_cannot_block_a_channel_for_ever(
     assert _rows(db_path, "SELECT message_id FROM signals") == [(2,)]
 
 
+def test_a_stored_cutoff_carrying_a_fraction_is_still_asked_in_whole_seconds(
+    tmp_path: Path,
+) -> None:
+    """Every cutoff this program writes is in whole seconds, but one already
+    in the store with a fraction (written by hand, or by an earlier build)
+    must not bring MF1 back: the anchor query and the empty-anchor guard
+    both use the same whole-second instant, so the message posted exactly
+    then is read, not refused for ever."""
+    db_path = tmp_path / "store.db"
+    conn = db.connect(db_path, role="writer")
+    conn.execute(
+        "INSERT INTO channel_state (channel_id, seed_cutoff_utc) VALUES (?, ?)",
+        (A, (NOW - timedelta(minutes=5, milliseconds=-500)).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    offset = NOW - timedelta(minutes=5) - FIRST_RUN_SEED_MARGIN
+    history = [FakeMessage(id=1, message=CHATTER_TEXT, date=offset)]
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history})
+        async with _watching(db_path, client, {"now": NOW}) as (listener, time):
+            await _run_rounds(listener, time, rounds=2)
+            return _anchor_queries(client), listener.handler_error_count
+
+    anchors, errors_seen = asyncio.run(scenario())
+
+    assert anchors[0] == offset and all(a.microsecond == 0 for a in anchors)
+    assert errors_seen == 0
+    assert [m for m, _ in _stored(db_path)] == [1]
+    assert _seed_row(db_path)[:2] == (1, True)
+
+
 # -- ledger 142 (MF2): one empty answer cannot mark a channel seeded ------------------------
 
 

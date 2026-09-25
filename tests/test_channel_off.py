@@ -190,6 +190,29 @@ def test_follow_ups_are_not_touched(tmp_path: Path) -> None:
     assert _channel_off_alerts(db_path) == []
 
 
+def test_a_follow_up_row_that_names_its_signal_is_not_touched_either(tmp_path: Path) -> None:
+    """Follow-up rows are queued without a signal today, but one that names
+    the signal it acts on (as a follow-up resolved to its target may) is
+    still a follow-up: only ENTRY rows are cancelled."""
+    db_path = tmp_path / "store.db"
+    signal_id = _store_signal(db_path, B_OFF, 201)
+    conn = db.connect(db_path, role="writer")
+    try:
+        conn.execute(
+            "INSERT INTO outbox (account_id, kind, signal_id, followup_id, state) "
+            "VALUES ('acct-a', 'FOLLOWUP', ?, NULL, 'QUEUED')",
+            (signal_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _start_once(db_path, (A, B_OFF))
+
+    assert _rows(db_path, "SELECT state FROM outbox WHERE kind = 'FOLLOWUP'") == [("QUEUED",)]
+    assert {state for _, _, state, _ in _entries(db_path)} == {"SKIPPED"}
+
+
 def test_the_alert_names_each_channel(tmp_path: Path) -> None:
     db_path = tmp_path / "store.db"
     _store_signal(db_path, B_OFF, 201)
