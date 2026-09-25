@@ -45,7 +45,12 @@ on the same channel excepted (F04). A match makes this one a
 "relay_duplicate": the messages row is still inserted (every message is
 a fixture; Plan 3's replay needs it), with `relay_of_signal_id` naming
 the signal it repeats (F02: an edit or deletion of the copy reaches that
-signal), logged and counted -- but no signals row is. `UNIQUE(channel_id,
+signal), logged and counted -- but no signals row is. A *follow-up*
+records the signal it replies to (`followups.target_signal_id`, path
+`'reply'`, or `'relay-reply'` through a copy) and is itself a
+"relay_duplicate" -- stored, linked by `relay_of_followup_id`, logged and
+counted, but no followups row and no outbox row -- when it repeats a
+stored follow-up (F08). `UNIQUE(channel_id,
 message_id)` cannot express "the other channel relayed the same call":
 the user's own channel is itself a relay of a VIP channel, so the
 identical trade legitimately shows up twice. See `relay_repo` for the
@@ -151,6 +156,9 @@ class IngestResult:
     #: For a "relay_duplicate" signal message: the signal it repeats
     #: (also stored as `messages.relay_of_signal_id`). None otherwise.
     relay_of_signal_id: int | None = None
+    #: For a "relay_duplicate" follow-up: the follow-up it repeats (also
+    #: stored as `messages.relay_of_followup_id`). None otherwise.
+    relay_of_followup_id: int | None = None
 
 
 def _get_message(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> sqlite3.Row | None:
@@ -387,8 +395,45 @@ def _ingest_new(
         )
 
     if kind == "followup":
+        followup = route_result.followup
+        # The signal it is about, when it replies to one we have: the
+        # replied-to message's own, or the one that message is a copy of
+        # (final review F08). Plan 3 resolves by this, not by the reply.
+        target = relay_repo.resolve_reply_target(
+            conn, channel_id=channel_id, reply_to_message_id=followup.reply_to_message_id
+        )
+        target_signal_id, resolution_path = target if target is not None else (None, None)
+        relay = relay_repo.find_followup_relay(
+            conn,
+            channel_id=channel_id,
+            message_id=message_id,
+            op=followup.op.value,
+            content_hash=new_hash,
+            target_signal_id=target_signal_id,
+            posted_at_utc=posted_at_utc,
+            relay_window_seconds=relay_window_seconds,
+            fwd_from_channel_id=provenance["fwd_from_channel_id"],
+            fwd_from_post_id=provenance["fwd_from_post_id"],
+        )
+        if relay is not None:
+            relay_repo.record_followup_copy(
+                conn, channel_id=channel_id, message_id=message_id, match=relay, now_utc=now_utc
+            )
+            return IngestResult(
+                outcome="relay_duplicate",
+                signal_id=None,
+                followup_id=None,
+                kind=kind,
+                detail=route_result.detail,
+                relay_of_followup_id=relay.followup_id,
+            )
         followup_id = signals_repo.insert_followup(
-            conn, channel_id=channel_id, message_id=message_id, followup=route_result.followup
+            conn,
+            channel_id=channel_id,
+            message_id=message_id,
+            followup=followup,
+            target_signal_id=target_signal_id,
+            resolution_path=resolution_path,
         )
         # Same transaction as the followup insert above -- see the module
         # docstring and tests/test_outbox.py's atomicity tests.

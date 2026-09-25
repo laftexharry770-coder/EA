@@ -185,17 +185,31 @@ def get_signal_id(conn: sqlite3.Connection, *, channel_id: int, message_id: int)
 
 
 def insert_followup(
-    conn: sqlite3.Connection, *, channel_id: int, message_id: int, followup: FollowUp
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    message_id: int,
+    followup: FollowUp,
+    target_signal_id: int | None = None,
+    resolution_path: str | None = None,
 ) -> int:
+    """A message's own follow-up (`edit_seq` 0). `target_signal_id` /
+    `resolution_path` are the signal it replies to, when ingest could
+    resolve it (`relay_repo.resolve_reply_target`: `'reply'` or
+    `'relay-reply'`); NULL when it replies to nothing stored."""
+    if (target_signal_id is None) != (resolution_path is None):
+        raise ValueError("target_signal_id and resolution_path go together")
     cursor = conn.execute(
         "INSERT INTO followups (channel_id, message_id, op, parsed_json, reply_to_message_id, "
-        "edit_seq) VALUES (?, ?, ?, ?, ?, 0)",
+        "target_signal_id, resolution_path, edit_seq) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
         (
             channel_id,
             message_id,
             followup.op.value,
             followup_to_json(followup),
             followup.reply_to_message_id,
+            target_signal_id,
+            resolution_path,
         ),
     )
     return cursor.lastrowid

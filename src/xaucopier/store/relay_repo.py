@@ -306,7 +306,7 @@ def find_followup_relay(
         "       m.deleted_at_utc, m.kind "
         "FROM followups f "
         "JOIN messages m ON m.channel_id = f.channel_id AND m.message_id = f.message_id "
-        "WHERE f.edit_seq = 0 AND f.target_signal_id = ? AND f.op = ? AND m.content_hash = ? "
+        "WHERE f.edit_seq = 0 AND f.target_signal_id IS ? AND f.op = ? AND m.content_hash = ? "
         "ORDER BY f.followup_id",
         (target_signal_id, op, content_hash),
     ).fetchall()

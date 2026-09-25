@@ -42,6 +42,10 @@ which now follows the latest classification -- and then:
 - **Follow-up -> follow-up** -- updated in place (a worker reads it when it
   claims); WARNING if it had already been dispatched.
 - **Follow-up -> anything else** -- withdrawn: its queued rows are skipped.
+- **A relay copy of a follow-up** (no followups row of its own; see
+  `relay_repo`) edited or deleted -- a WARNING naming both posts; the
+  follow-up acted on is the other post's and is not changed by guess.
+  Nothing is said when that post already reads the same, or was withdrawn.
 - **Anything -> signal or follow-up, from something else** -- recorded and
   alerted (WARNING), never traded. An edit never fans out an ENTRY, nor
   an instruction: one that creates a trade is too easy to trigger by
@@ -173,6 +177,9 @@ FOLLOWUP_EDITED_AFTER_DISPATCH = "FOLLOWUP_EDITED_AFTER_DISPATCH"
 FOLLOWUP_RETRACTED_BY_EDIT = "FOLLOWUP_RETRACTED_BY_EDIT"
 #: WARNING: a follow-up message was deleted.
 FOLLOWUP_DELETED = "FOLLOWUP_DELETED"
+#: WARNING: a relay copy of a follow-up was edited or deleted; the
+#: follow-up acted on is the other post's, and it was not changed (F08).
+FOLLOWUP_COPY_CHANGED = "FOLLOWUP_COPY_CHANGED"
 #: CRITICAL: a message the window re-read had inferred deleted is back.
 DELETION_REVERSED = "DELETION_REVERSED"
 #: CRITICAL: a window re-read's answer looks wrong (too many ids missing);
@@ -442,6 +449,7 @@ def reconcile(
             conn, channel_id=channel_id, message_id=message_id
         ),
         relay_of_signal_id=existing["relay_of_signal_id"],
+        relay_of_followup_id=existing["relay_of_followup_id"],
     )
 
     reversal: tuple[int, ...] = ()
@@ -529,7 +537,7 @@ def _reconcile_version(
     if stored_kind == "signal":
         return _edit_of_signal(ctx, route_result)
     if stored_kind == "followup":
-        return _edit_of_followup(ctx, route_result)
+        return _edit_of_followup(ctx, route_result, new_hash)
     return _edit_of_other(ctx, stored_kind, route_result)
 
 
@@ -1026,10 +1034,17 @@ def _signal_of(promoted: tuple[int, int] | None) -> int | None:
     return None if promoted is None else promoted[0]
 
 
-def _edit_of_followup(ctx: _Ctx, route_result: RouteResult) -> EditResult:
+def _edit_of_followup(ctx: _Ctx, route_result: RouteResult, new_hash: str) -> EditResult:
     new_kind = route_result.kind
     followup_id = ctx.followup_id
     if followup_id is None:
+        if ctx.relay_of_followup_id is not None:
+            raised = _followup_copy_changed(
+                ctx, how=f"edited to {_describe(route_result)}", new_hash=new_hash
+            )
+            return ctx.result(
+                "recorded", new_kind, "a copy of a follow-up edited", alert_ids=raised
+            )
         return ctx.result("recorded", new_kind, "no follow-up on file for this message")
     counts = outbox.state_counts(ctx.conn, kind="FOLLOWUP", followup_id=followup_id)
     dispatched = counts.get("CLAIMED", 0) + counts.get("DONE", 0)
@@ -1071,6 +1086,49 @@ def _edit_of_followup(ctx: _Ctx, route_result: RouteResult) -> EditResult:
         alert_ids=(*partial.alert_ids, created),
         skipped=partial.skipped,
     )
+
+
+def _followup_copy_changed(ctx: _Ctx, *, how: str, new_hash: str | None) -> tuple[int, ...]:
+    """A relay copy of a follow-up (`ctx.relay_of_followup_id`) was edited
+    or deleted. The follow-up acted on is the other post's, and it is not
+    changed by guess: a WARNING names both, unless the change is already
+    there -- the follow-up's own message reads the same, or was withdrawn
+    (the same change reaching both posts)."""
+    row = ctx.conn.execute(
+        "SELECT f.followup_id, f.channel_id, f.message_id, m.content_hash, m.kind, "
+        "       m.deleted_at_utc "
+        "FROM followups f "
+        "JOIN messages m ON m.channel_id = f.channel_id AND m.message_id = f.message_id "
+        "WHERE f.followup_id = ?",
+        (ctx.relay_of_followup_id,),
+    ).fetchone()
+    if row is None:
+        return ()
+    if row["content_hash"] == new_hash or row["deleted_at_utc"] is not None or (
+        row["kind"] != "followup"
+    ):
+        logger.info(
+            "channel %s message %s, a copy of follow-up %s, was %s; the follow-up's own "
+            "message already says so",
+            ctx.channel_id,
+            ctx.message_id,
+            row["followup_id"],
+            how,
+        )
+        return ()
+    counts = outbox.state_counts(ctx.conn, kind="FOLLOWUP", followup_id=row["followup_id"])
+    taken = counts.get("CLAIMED", 0) + counts.get("DONE", 0)
+    alert = ctx.alert(
+        "WARNING",
+        FOLLOWUP_COPY_CHANGED,
+        f"message {ctx.message_id} on channel {ctx.channel_id}, a copy of follow-up "
+        f"{row['followup_id']} (message {row['message_id']} on channel {row['channel_id']}), "
+        f"was {how}. Follow-up {row['followup_id']} is the one acted on, and it was NOT "
+        f"changed: {counts.get('QUEUED', 0)} instruction(s) still queued, {taken} already "
+        "taken by a worker. If the poster changed or withdrew the instruction, review it by "
+        "hand.",
+    )
+    return (alert,)
 
 
 def _withdraw_followup(ctx: _Ctx, followup_id: int, *, code: str, via: str) -> _Partial:
@@ -1196,6 +1254,7 @@ def apply_deletion(
         signal_id=signal_id,
         followup_id=followup_id,
         relay_of_signal_id=existing["relay_of_signal_id"],
+        relay_of_followup_id=existing["relay_of_followup_id"],
     )
 
     # Decided on the signals row, not on `kind`: a signal an earlier edit
@@ -1251,6 +1310,11 @@ def apply_deletion(
         holder = _holder_of_copy(ctx)
         if holder is not None:
             return _deletion_of_copy(ctx, holder, kind)
+        if ctx.relay_of_followup_id is not None:
+            raised = _followup_copy_changed(
+                ctx, how=f"deleted, found by {detected_by}", new_hash=None
+            )
+            return DeletionResult("deleted", message_id, kind, None, None, 0, raised)
 
     logger.info(
         "channel %s message %s (%s) deleted, found by %s; marked",
@@ -1341,6 +1405,8 @@ class _Ctx:
     via_copy: str | None = None
     #: The changed message's own `messages.relay_of_signal_id`.
     relay_of_signal_id: int | None = None
+    #: ... and `messages.relay_of_followup_id`.
+    relay_of_followup_id: int | None = None
 
     @property
     def channel_id(self) -> int:

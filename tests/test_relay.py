@@ -1405,3 +1405,283 @@ def test_a_call_nobody_copied_keeps_its_own_policy_for_a_deletion_after_a_retrac
         ("CRITICAL", edits_repo.LIVE_SIGNAL_RETRACTED_BY_EDIT),
         ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED),
     ]
+
+
+# -- F08: follow-ups ---------------------------------------------------------------
+
+CLOSE_HALF = "Close half now"
+SL_TO_BE = "Move SL to BE"
+
+
+def _followups(conn) -> list[tuple]:
+    return _q(
+        conn,
+        "SELECT followup_id, channel_id, message_id, op, reply_to_message_id, "
+        "target_signal_id, resolution_path FROM followups ORDER BY followup_id",
+    )
+
+
+def _followup_link(conn, channel: ChannelCfg, message_id: int) -> int | None:
+    (row,) = _q(
+        conn,
+        "SELECT relay_of_followup_id FROM messages WHERE channel_id = ? AND message_id = ?",
+        channel.channel_id,
+        message_id,
+    )
+    return row[0]
+
+
+def _claims(conn) -> list[tuple]:
+    from xaucopier.store import outbox
+
+    claimed = []
+    while (row := outbox.claim(
+        conn, account_id="acct-1", pid=1, now_utc=POSTED + timedelta(hours=1)
+    )) is not None:
+        claimed.append((row.kind, row.signal_id, row.followup_id))
+    return claimed
+
+
+@pytest.mark.parametrize("text", [CLOSE_HALF, SL_TO_BE])
+def test_a_follow_up_repeated_on_the_relay_is_dispatched_once(conn, text):
+    """F2a: the VIP's call and the relay's copy 60 s later; the VIP's
+    follow-up replies to its call, the relay's to its copy. One signal,
+    one follow-up targeting it, the copy stored and linked."""
+    holder = _ingest(conn, VIP, 4001)
+    _ingest(conn, RELAY, 5001, posted=POSTED + timedelta(seconds=60))
+    first = _ingest(conn, VIP, 4002, text, posted=POSTED + timedelta(minutes=5), reply_to=4001)
+    copy = _ingest(
+        conn, RELAY, 5002, text, posted=POSTED + timedelta(minutes=5, seconds=40), reply_to=5001
+    )
+
+    assert (first.outcome, first.kind) == ("new", "followup")
+    assert (copy.outcome, copy.kind, copy.followup_id) == ("relay_duplicate", "followup", None)
+    assert copy.relay_of_followup_id == first.followup_id
+    op = "close_half" if text == CLOSE_HALF else "sl_to_be"
+    assert _followups(conn) == [
+        (first.followup_id, VIP.channel_id, 4002, op, 4001, holder.signal_id, "reply")
+    ]
+    assert _followup_link(conn, RELAY, 5002) == first.followup_id
+    assert _claims(conn) == [
+        ("ENTRY", holder.signal_id, None),
+        ("FOLLOWUP", None, first.followup_id),
+    ]
+
+
+def test_a_follow_up_replying_to_a_copy_targets_the_signal_the_copy_repeats(conn):
+    """F2b: the relay's copy was stored first and holds the signal; the
+    VIP's call is its copy, and the VIP's follow-up replies to it."""
+    holder = _ingest(conn, RELAY, 5001, posted=POSTED + timedelta(seconds=60))
+    _ingest(conn, VIP, 4001, source="poll")
+    followup = _ingest(
+        conn, VIP, 4002, CLOSE_HALF, posted=POSTED + timedelta(minutes=5), reply_to=4001
+    )
+    assert followup.outcome == "new"
+    assert _followups(conn) == [
+        (followup.followup_id, VIP.channel_id, 4002, "close_half", 4001, holder.signal_id,
+         "relay-reply")
+    ]
+
+
+def test_a_follow_up_replying_to_nothing_stored_has_no_target(conn):
+    followup = _ingest(conn, VIP, 4002, CLOSE_HALF, reply_to=3999)
+    assert _followups(conn)[0][5:] == (None, None)
+    assert followup.outcome == "new"
+
+
+def test_follow_ups_replying_to_nothing_are_never_matched_by_their_text(conn):
+    """Two channels each saying "close half": two instructions."""
+    _ingest(conn, VIP, 4001)
+    _ingest(conn, RELAY, 5001, posted=POSTED + timedelta(seconds=60))
+    first = _ingest(conn, VIP, 4002, CLOSE_HALF, posted=POSTED + timedelta(minutes=5))
+    second = _ingest(conn, RELAY, 5002, CLOSE_HALF, posted=POSTED + timedelta(minutes=5))
+    assert (first.outcome, second.outcome) == ("new", "new")
+    assert len(_followups(conn)) == 2
+
+
+def test_a_forwarded_follow_up_is_a_copy_however_late(conn):
+    """A forward keeps no reply link, so it is matched by the post."""
+    _ingest(conn, VIP, 4001)
+    first = _ingest(conn, VIP, 4002, CLOSE_HALF, posted=POSTED + timedelta(minutes=5), reply_to=4001)
+    copy = _ingest(
+        conn, RELAY, 5002, CLOSE_HALF, posted=POSTED + timedelta(hours=2),
+        fwd=(VIP.channel_id, 4002),
+    )
+    assert copy.outcome == "relay_duplicate"
+    assert copy.relay_of_followup_id == first.followup_id
+
+
+@pytest.mark.parametrize(
+    ("text", "gap", "outcome"),
+    [
+        (CLOSE_HALF, 900, "relay_duplicate"),
+        (CLOSE_HALF, 901, "new"),  # outside the window
+        (SL_TO_BE, 60, "new"),  # another instruction
+        ("close half now", 60, "new"),  # the same instruction in other words
+    ],
+)
+def test_which_follow_ups_on_the_same_signal_are_copies(conn, text, gap, outcome):
+    _ingest(conn, VIP, 4001)
+    _ingest(conn, RELAY, 5001, posted=POSTED + timedelta(seconds=60))
+    at = POSTED + timedelta(minutes=5)
+    _ingest(conn, VIP, 4002, CLOSE_HALF, posted=at, reply_to=4001)
+    copy = _ingest(conn, RELAY, 5002, text, posted=at + timedelta(seconds=gap), reply_to=5001)
+    assert copy.outcome == outcome
+
+
+def test_a_follow_up_withdrawn_and_said_again_on_its_channel_is_new(conn):
+    _ingest(conn, VIP, 4001)
+    at = POSTED + timedelta(minutes=5)
+    _ingest(conn, VIP, 4002, CLOSE_HALF, posted=at, reply_to=4001)
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4002, now_utc=at, accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    again = _ingest(conn, VIP, 4003, CLOSE_HALF, posted=at + timedelta(minutes=1), reply_to=4001)
+    assert again.outcome == "new"
+
+
+def test_a_follow_up_copy_is_logged_with_both_messages_and_counted(conn, caplog):
+    _ingest(conn, VIP, 4001)
+    _ingest(conn, RELAY, 5001, posted=POSTED + timedelta(seconds=60))
+    at = POSTED + timedelta(minutes=5)
+    _ingest(conn, VIP, 4002, CLOSE_HALF, posted=at, reply_to=4001)
+    with caplog.at_level(logging.INFO, logger="xaucopier.store.relay_repo"):
+        _ingest(conn, RELAY, 5002, CLOSE_HALF, posted=at, reply_to=5001)
+    assert _metric(conn, relay_repo.RELAY_DUPLICATE_FOLLOWUPS_METRIC) == 1
+    assert _metric(conn, relay_repo.RELAY_DUPLICATES_METRIC) == 1  # the signal's copy
+    (line,) = [r.getMessage() for r in caplog.records]
+    assert f"channel {RELAY.channel_id} message 5002" in line
+    assert f"channel {VIP.channel_id} message 4002" in line
+
+
+def test_a_promoted_repost_takes_over_the_follow_ups_that_replied_to_it(conn):
+    holder = _ingest(conn, VIP, 4001)
+    _ingest(conn, VIP, 4012, posted=POSTED + timedelta(minutes=2))
+    _ingest(conn, VIP, 4013, CLOSE_HALF, posted=POSTED + timedelta(minutes=3), reply_to=4012)
+    _ingest(conn, VIP, 4014, SL_TO_BE, posted=POSTED + timedelta(minutes=4), reply_to=4001)
+    assert [row[5:] for row in _followups(conn)] == [
+        (holder.signal_id, "relay-reply"),
+        (holder.signal_id, "reply"),
+    ]
+    result = edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4001, now_utc=POSTED, accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    assert [row[5:] for row in _followups(conn)] == [
+        (result.promoted_signal_id, "reply"),
+        (holder.signal_id, "reply"),  # it replied to the deleted post
+    ]
+
+
+def test_a_relayed_follow_up_is_dispatched_once_through_the_listener(tmp_path):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        assert await client.emit(V, _post(CALL))
+        assert await client.emit(R, _post(COPY, after=timedelta(seconds=60)))
+        assert await client.emit(V, _post(CALL + 1, CLOSE_HALF, after=timedelta(minutes=5),
+                                          reply_to=CALL))
+        with client.blackout():  # the relay's copy is found by the poll
+            await client.emit(R, _post(COPY + 1, CLOSE_HALF, after=timedelta(minutes=5),
+                                       reply_to=COPY))
+        await _round(listener, time)
+
+    _run(db_path, body)
+
+    assert _db_rows(db_path, "SELECT channel_id, message_id, target_signal_id FROM followups") == [
+        (V, CALL + 1, 1)
+    ]
+    assert _db_rows(db_path, "SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP'") == [(N,)]
+    assert _db_rows(
+        db_path,
+        "SELECT relay_of_followup_id FROM messages WHERE channel_id = ? AND message_id = ?",
+        (R, COPY + 1),
+    ) == [(1,)]
+
+
+# -- F08: a follow-up copy edited or deleted -------------------------------------------
+
+
+@pytest.mark.parametrize("change", ["edited", "deleted"])
+def test_a_follow_up_copy_changed_is_a_warning_naming_both(conn, change):
+    """The follow-up acted on is the other post's; a change of its copy is
+    never applied silently, and never applied by guess either."""
+    _ingest(conn, VIP, 4001)
+    _ingest(conn, RELAY, 5001, posted=POSTED + timedelta(seconds=60))
+    at = POSTED + timedelta(minutes=5)
+    first = _ingest(conn, VIP, 4002, CLOSE_HALF, posted=at, reply_to=4001)
+    _ingest(conn, RELAY, 5002, CLOSE_HALF, posted=at, reply_to=5001)
+    if change == "edited":
+        edits_repo.apply_edit(
+            conn, channel_cfg=RELAY, message_id=5002, text="Close all now", posted_at_utc=at,
+            edit_date_utc=at + timedelta(minutes=1), reply_to_message_id=5001, now_utc=at,
+            accounts=ACCOUNTS, detected_by="event",
+        )
+    else:
+        edits_repo.apply_deletion(
+            conn, channel_cfg=RELAY, message_id=5002, now_utc=at, accounts=ACCOUNTS,
+            detected_by="event",
+        )
+    assert _alerts(conn) == [
+        ("WARNING", edits_repo.FOLLOWUP_COPY_CHANGED, RELAY.channel_id, 5002, None)
+    ]
+    (detail,) = _q(conn, "SELECT detail FROM alerts")[0]
+    assert f"follow-up {first.followup_id}" in detail and "message 4002" in detail
+    assert _followups(conn)[0][3] == "close_half"  # unchanged
+    queued = _q(conn, "SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP' AND state = 'QUEUED'")
+    assert queued == [(len(ACCOUNTS),)]
+
+
+@pytest.mark.parametrize("change", ["edited", "deleted"])
+def test_a_follow_up_change_mirrored_on_its_copy_is_said_once(conn, change):
+    _ingest(conn, VIP, 4001)
+    _ingest(conn, RELAY, 5001, posted=POSTED + timedelta(seconds=60))
+    at = POSTED + timedelta(minutes=5)
+    _ingest(conn, VIP, 4002, CLOSE_HALF, posted=at, reply_to=4001)
+    _ingest(conn, RELAY, 5002, CLOSE_HALF, posted=at, reply_to=5001)
+    for channel, message_id, reply_to, index in ((VIP, 4002, 4001, 0), (RELAY, 5002, 5001, 1)):
+        if change == "edited":
+            edits_repo.apply_edit(
+                conn, channel_cfg=channel, message_id=message_id, text="Close all now",
+                posted_at_utc=at, edit_date_utc=at + timedelta(minutes=1, seconds=index),
+                reply_to_message_id=reply_to, now_utc=at, accounts=ACCOUNTS,
+                detected_by="event",
+            )
+        else:
+            edits_repo.apply_deletion(
+                conn, channel_cfg=channel, message_id=message_id, now_utc=at,
+                accounts=ACCOUNTS, detected_by="event",
+            )
+    codes = [code for _, code, *_ in _alerts(conn)]
+    assert edits_repo.FOLLOWUP_COPY_CHANGED not in codes
+    assert len(codes) == (0 if change == "edited" else 1)  # edited: updated in place, silently
+
+
+def test_a_forward_of_a_follow_up_copy_repeats_the_follow_up_it_copied(conn):
+    _ingest(conn, VIP, 4001)
+    _ingest(conn, RELAY, 5001, posted=POSTED + timedelta(seconds=60))
+    at = POSTED + timedelta(minutes=5)
+    first = _ingest(conn, VIP, 4002, CLOSE_HALF, posted=at, reply_to=4001)
+    _ingest(conn, RELAY, 5002, CLOSE_HALF, posted=at, reply_to=5001)
+    forward = _ingest(
+        conn, OTHER, 8002, CLOSE_HALF, posted=at + timedelta(hours=2),
+        fwd=(RELAY.channel_id, 5002),
+    )
+    assert forward.outcome == "relay_duplicate"
+    assert forward.relay_of_followup_id == first.followup_id
+
+
+def test_a_follow_ups_target_and_its_path_go_together(conn):
+    from xaucopier.domain.signal import FollowUp, FollowUpOp
+    from xaucopier.store import signals_repo
+
+    followup = FollowUp(
+        channel_id=VIP.channel_id, message_id=1, op=FollowUpOp.CLOSE_ALL, posted_at_utc=POSTED
+    )
+    for target, path in ((1, None), (None, "reply")):
+        with pytest.raises(ValueError, match="go together"):
+            signals_repo.insert_followup(
+                conn, channel_id=VIP.channel_id, message_id=1, followup=followup,
+                target_signal_id=target, resolution_path=path,
+            )

@@ -316,6 +316,7 @@ _PROVENANCE_COLUMNS = (
     "fwd_from_post_id",
     "fwd_from_date_utc",
     "relay_of_signal_id",
+    "relay_of_followup_id",
 )
 
 
@@ -378,6 +379,7 @@ def test_ingest_stores_sender_and_forward_provenance(conn, text, kind):
         # Stored in UTC, like every other timestamp in the store.
         "fwd_from_date_utc": "2026-09-05T10:30:15+00:00",
         "relay_of_signal_id": None,
+        "relay_of_followup_id": None,
     }
 
 
