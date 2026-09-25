@@ -11,6 +11,10 @@
   in whole seconds: a fast local clock can no longer make a late seed skip
   posts. A difference over 60 s is a plain WARNING, never a refusal; no
   answer means this computer's clock, with a WARNING.
+- **What each source is (final review F05).** From the start-up chat list,
+  watch names each switched-on source as a channel, a group or unknown. A
+  group -- where anyone can post, and every post is read as an instruction
+  -- or a source it cannot tell is a plain WARNING; never a refusal.
 
 Real listener, real store, fake Telegram only.
 """
@@ -21,9 +25,12 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from telethon import utils as tl_utils
+from telethon.tl import types as tl_types
 
 from fakes.telegram import FakeMessage, FakeTelegramClient
 from test_listener import (
@@ -31,10 +38,12 @@ from test_listener import (
     CHANNEL,
     CHANNEL_ID,
     CHATTER_TEXT,
+    DISABLED_CHANNEL,
     NOW,
     _build_listener,
     _rows,
 )
+from xaucopier.config.channels import ChannelCfg
 from xaucopier.ingest import client as client_module
 from xaucopier.ingest import listener as listener_module
 from xaucopier.ingest.listener import (
@@ -380,3 +389,179 @@ def test_an_answer_without_a_usable_time_means_this_computers_clock(
     assert started_at == local
     warnings = _clock_warnings(caplog)
     assert len(warnings) == 1 and "this computer's clock" in warnings[0].getMessage()
+
+
+# -- F05: what each source is -------------------------------------------------------------
+#
+# A supergroup passes every check `channels add` / `resolve-channels` make, and
+# nothing filters who posted: once one is switched on, any member's "close all
+# now" is read as an instruction. watch cannot refuse it (the user may mean it),
+# but at every start it says, for each switched-on source, what Telegram says it
+# is -- and, for a group, in plain words what that means.
+
+GROUP_WARNING = "anyone in it can post; their messages are read as instructions"
+
+
+def _channel_entity(peer_id: int, **flags: Any) -> tl_types.Channel:
+    bare_id, _ = tl_utils.resolve_id(peer_id)
+    return tl_types.Channel(
+        id=bare_id, title="Gold Signals VIP", photo=tl_types.ChatPhotoEmpty(), date=NOW,
+        access_hash=1, **flags,
+    )
+
+
+def _dialog(entity: Any) -> SimpleNamespace:
+    """What Telethon's `Dialog` carries that watch reads: the entity."""
+    return SimpleNamespace(entity=entity)
+
+
+def _start_and_read_kinds(
+    db_path: Path, client: FakeTelegramClient, channels=(CHANNEL,)
+) -> tuple[dict[int, str], list[str]]:
+    async def scenario():
+        listener = _build_listener(db_path, client, channels=channels)
+        await listener.start()
+        try:
+            return dict(listener.source_kinds), list(client.calls)
+        finally:
+            await listener.aclose()
+
+    return asyncio.run(scenario())
+
+
+def _listener_records(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == listener_module.__name__ and r.levelno == level
+    ]
+
+
+def test_a_group_switched_on_is_named_at_start_with_a_plain_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The finding's scenario: the switched-on source is the channel's
+    discussion supergroup, titled like the channel. watch still starts --
+    the user may mean it -- but says once, in plain words, what it is."""
+    client = FakeTelegramClient(
+        dialogs=[_dialog(_channel_entity(CHANNEL_ID, megagroup=True))]
+    )
+    with caplog.at_level(logging.INFO):
+        kinds, calls = _start_and_read_kinds(tmp_path / "store.db", client)
+
+    assert kinds == {CHANNEL_ID: "group"}
+    assert "add_event_handler" in calls, "a group is named, never refused"
+    warnings = [m for m in _listener_records(caplog, logging.WARNING) if GROUP_WARNING in m]
+    assert len(warnings) == 1, caplog.text
+    text = warnings[0]
+    assert "Channel A" in text and str(CHANNEL_ID) in text
+    assert "is a group, not a channel" in text
+    assert "channels off 1" in text
+    _assert_plain(text)
+
+
+def test_a_broadcast_channel_is_named_without_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = FakeTelegramClient(
+        dialogs=[_dialog(_channel_entity(CHANNEL_ID, broadcast=True))]
+    )
+    with caplog.at_level(logging.INFO):
+        kinds, _ = _start_and_read_kinds(tmp_path / "store.db", client)
+
+    assert kinds == {CHANNEL_ID: "channel"}
+    infos = [m for m in _listener_records(caplog, logging.INFO) if "Channel A" in m]
+    assert any("is a channel" in m for m in infos), caplog.text
+    assert not [m for m in _listener_records(caplog, logging.WARNING) if "Channel A" in m]
+
+
+def test_a_source_missing_from_the_accounts_chats_is_unknown_and_said_so(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Not in the chat list: this account has not joined it (or has left),
+    so watch cannot tell a channel from a group -- and its posts are not
+    pushed to watch as they arrive."""
+    other = _channel_entity(-1004444444444, broadcast=True)
+    client = FakeTelegramClient(dialogs=[_dialog(other)])
+    with caplog.at_level(logging.INFO):
+        kinds, calls = _start_and_read_kinds(tmp_path / "store.db", client)
+
+    assert kinds == {CHANNEL_ID: "unknown"}
+    assert "add_event_handler" in calls
+    warnings = [m for m in _listener_records(caplog, logging.WARNING) if "Channel A" in m]
+    assert len(warnings) == 1, caplog.text
+    assert "cannot tell whether it is a channel or a group" in warnings[0]
+    assert "list of chats" in warnings[0]
+    _assert_plain(warnings[0])
+
+
+def test_a_source_telegram_lists_as_neither_is_unknown(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    person = tl_types.User(id=777, first_name="Bot")
+    channel = ChannelCfg(channel_id=777, name="Channel A", parser="mmh", ordinal=1, enabled=True)
+    client = FakeTelegramClient(dialogs=[_dialog(person)])
+    with caplog.at_level(logging.INFO):
+        kinds, _ = _start_and_read_kinds(tmp_path / "store.db", client, channels=(channel,))
+
+    assert kinds == {777: "unknown"}
+    warnings = [m for m in _listener_records(caplog, logging.WARNING) if "Channel A" in m]
+    assert len(warnings) == 1 and "neither a channel nor a group" in warnings[0], caplog.text
+    _assert_plain(warnings[0])
+
+
+def test_only_switched_on_sources_are_named(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = FakeTelegramClient(
+        dialogs=[
+            _dialog(_channel_entity(CHANNEL_ID, broadcast=True)),
+            _dialog(_channel_entity(DISABLED_CHANNEL.channel_id, megagroup=True)),
+        ]
+    )
+    with caplog.at_level(logging.INFO):
+        kinds, _ = _start_and_read_kinds(
+            tmp_path / "store.db", client, channels=(CHANNEL, DISABLED_CHANNEL)
+        )
+
+    assert kinds == {CHANNEL_ID: "channel"}
+    assert DISABLED_CHANNEL.name not in caplog.text
+
+
+def test_a_chat_list_entry_that_cannot_be_read_never_stops_watch(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Whatever else the chat list holds, naming the sources is a courtesy:
+    an entry with no entity, or one no id can be read from, is passed over."""
+    client = FakeTelegramClient(
+        dialogs=[
+            SimpleNamespace(),
+            _dialog(object()),
+            _dialog(None),
+            _dialog(_channel_entity(CHANNEL_ID, megagroup=True)),
+        ]
+    )
+    with caplog.at_level(logging.INFO):
+        kinds, calls = _start_and_read_kinds(tmp_path / "store.db", client)
+
+    assert kinds == {CHANNEL_ID: "group"}
+    assert "add_event_handler" in calls
+
+
+def test_the_kinds_are_read_from_the_start_up_chat_list_not_asked_for_again(
+    tmp_path: Path,
+) -> None:
+    client = FakeTelegramClient(dialogs=[_dialog(_channel_entity(CHANNEL_ID, broadcast=True))])
+    _start_and_read_kinds(tmp_path / "store.db", client)
+    assert client.get_dialogs_call_count == 1
+
+
+def test_a_chat_list_that_is_not_a_list_never_stops_watch(tmp_path: Path) -> None:
+    @dataclass
+    class NoListClient(FakeTelegramClient):
+        async def get_dialogs(self, *args: Any, **kwargs: Any) -> Any:
+            await super().get_dialogs(*args, **kwargs)
+            return None
+
+    kinds, calls = _start_and_read_kinds(tmp_path / "store.db", NoListClient())
+    assert kinds == {CHANNEL_ID: "unknown"}
+    assert "add_event_handler" in calls

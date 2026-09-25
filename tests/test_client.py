@@ -228,3 +228,47 @@ def test_the_same_deadline_bounds_any_startup_call() -> None:
     assert asyncio.run(telegram_within(quick(), 5)) == "answered"
     with pytest.raises(TelegramUnreachableError, match="within 0.05 seconds"):
         asyncio.run(telegram_within(slow(), 0.05))
+
+
+# ---------------------------------------------------------------------
+# source_kind (final review F05)
+# ---------------------------------------------------------------------
+
+def _source_kind_cases():
+    from telethon.tl import types
+
+    photo = types.ChatPhotoEmpty()
+
+    def channel(**flags):
+        return types.Channel(id=5, title="t", photo=photo, date=None, access_hash=1, **flags)
+
+    return [
+        ("broadcast channel", channel(broadcast=True), "channel"),
+        ("supergroup", channel(megagroup=True), "group"),
+        ("broadcast group (gigagroup)", channel(megagroup=True, gigagroup=True), "group"),
+        ("gigagroup flag alone", channel(gigagroup=True), "group"),
+        ("channel with neither flag", channel(), "unknown"),
+        ("basic group", types.Chat(
+            id=5, title="t", photo=photo, participants_count=3, date=None, version=1
+        ), "group"),
+        ("basic group we were removed from", types.ChatForbidden(id=5, title="t"), "group"),
+        ("channel we were banned from",
+         types.ChannelForbidden(id=5, access_hash=1, title="t", broadcast=True), "channel"),
+        ("supergroup we were banned from",
+         types.ChannelForbidden(id=5, access_hash=1, title="t", megagroup=True), "group"),
+        ("a person or a bot", types.User(id=5, first_name="x"), "unknown"),
+        ("nothing", None, "unknown"),
+        ("something else", object(), "unknown"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "entity, kind", [case[1:] for case in _source_kind_cases()],
+    ids=[case[0] for case in _source_kind_cases()],
+)
+def test_source_kind_tells_a_channel_from_a_group(entity: object, kind: str) -> None:
+    """Only a broadcast channel is one where only its admins post; a
+    supergroup or a basic group lets anyone in it post."""
+    from xaucopier.ingest.client import source_kind
+
+    assert source_kind(entity) == kind

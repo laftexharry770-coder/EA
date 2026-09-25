@@ -46,6 +46,11 @@ never makes an RPC on the update path.
    it degrades update delivery -- and it must happen before handlers
    exist, so the first update the engine dispatches is already against
    primed state.
+   From that same chat list, each switched-on source is **named** as a
+   channel, a group or unknown (`client.source_kind`; final review F05):
+   a group -- anyone in it can post, and nothing filters who posted -- is
+   a plain WARNING, and so is a source this account's chat list does not
+   hold. Never a refusal: the user may mean it.
    Then one writer job: each enabled channel that needs a seed gets its
    **seed cutoff stored** -- this start, unless an earlier attempt's is
    already there (`store/channel_state.py`; F01).
@@ -142,6 +147,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from telethon import events, functions
+from telethon import utils as tl_utils
 from telethon.tl import types as tl_types
 
 from xaucopier.config.accounts import AccountCfg
@@ -540,6 +546,8 @@ class Listener:
             channel.channel_id: channel for channel in self.channels if channel.enabled
         }
         self._reader: Connection = None
+        # What each enabled source is, from start()'s chat list (F05).
+        self._source_kinds: dict[int, str] = {}
         self._handler_errors: collections.deque[HandlerError] = collections.deque(
             maxlen=MAX_RECORDED_HANDLER_ERRORS
         )
@@ -574,6 +582,13 @@ class Listener:
         after it (less `FIRST_RUN_SEED_MARGIN`) was made while this
         process ran."""
         return self._started_at
+
+    @property
+    def source_kinds(self) -> Mapping[int, str]:
+        """What each switched-on source is, by channel id, as `start()` read
+        it from Telegram's chat list: "channel", "group" or "unknown"
+        (`client.source_kind`). Empty before `start()`."""
+        return dict(self._source_kinds)
 
     @property
     def reader(self) -> Connection:
@@ -1390,12 +1405,13 @@ class Listener:
         try:
             await client_module.connect_within(self.client, timeout)  # 1
             telegram_clock = await self._read_telegram_clock()
-            await client_module.telegram_within(self.client.get_dialogs(), timeout)  # 2
+            dialogs = await client_module.telegram_within(self.client.get_dialogs(), timeout)  # 2
         except client_module.TelegramUnreachableError as exc:
             raise ListenerStartupError(
                 f"{exc} watch stops now (exit code 4); start it again once this "
                 "computer is back online."
             ) from exc
+        self._name_sources(dialogs)
         self._started_at = self._decide_start(local_start, telegram_clock)
         await self._store_seed_cutoffs()
 
@@ -1480,6 +1496,65 @@ class Listener:
                 type(exc).__name__,
                 exc,
             )
+
+    def _name_sources(self, dialogs: Any) -> None:
+        """Say what each switched-on source is (final review F05), from the
+        chat list `start()` already has -- no further call to Telegram.
+
+        A supergroup passes every check `channels add` and
+        `resolve-channels` make, and nothing filters who posted, so once
+        one is switched on any member's "close all now" is read as an
+        instruction. watch does not refuse it -- the user may mean it --
+        but a group is a plain WARNING at every start, as is a source this
+        account's chat list does not hold (not joined, or left: watch
+        cannot tell what it is, and its posts are not sent to watch as
+        they arrive). A chat-list entry that cannot be read is passed
+        over: naming the sources must never stop watch."""
+        # Imported here for the same reason as in run_listener().
+        from xaucopier.ingest.client import source_kind
+
+        listed: dict[int, Any] = {}
+        for dialog in dialogs or ():
+            entity = getattr(dialog, "entity", None)
+            try:
+                peer_id = tl_utils.get_peer_id(entity)
+            except (TypeError, ValueError):
+                continue
+            listed.setdefault(peer_id, entity)
+
+        for channel in self.enabled_channels:
+            where = f"'{channel.name}' (number {channel.ordinal}, id {channel.channel_id})"
+            if channel.channel_id not in listed:
+                kind = "unknown"
+                logger.warning(
+                    "%s is not in this Telegram account's list of chats, so watch cannot "
+                    "tell whether it is a channel or a group, and its new posts are only "
+                    "found by watch's check every few seconds, not as they arrive. Join it "
+                    "in Telegram with this account, or check its id in "
+                    "`.\\xaucopier channels`.",
+                    where,
+                )
+            else:
+                kind = source_kind(listed[channel.channel_id])
+                if kind == "channel":
+                    logger.info("%s is a channel: only its admins can post.", where)
+                elif kind == "group":
+                    logger.warning(
+                        "%s is a group, not a channel: anyone in it can post; their "
+                        "messages are read as instructions. If you meant to follow a "
+                        "channel, switch this one off with `.\\xaucopier channels off %d` "
+                        "and add the channel instead.",
+                        where,
+                        channel.ordinal,
+                    )
+                else:
+                    logger.warning(
+                        "%s is neither a channel nor a group in Telegram's list of chats, "
+                        "so watch cannot tell who can post in it. Check its id in "
+                        "`.\\xaucopier channels`.",
+                        where,
+                    )
+            self._source_kinds[channel.channel_id] = kind
 
     async def _read_telegram_clock(self) -> tuple[datetime, datetime] | None:
         """Ask Telegram for its time: one `updates.GetStateRequest()`,

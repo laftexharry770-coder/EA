@@ -51,7 +51,7 @@ import win32api
 import win32con
 import win32event
 import winerror
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, types
 from telethon.sessions import StringSession
 
 from xaucopier.ingest.secrets import SecretsBlob
@@ -127,6 +127,30 @@ async def connect_within(client: Any, seconds: float) -> None:
     for a running `watch` but leaves a start-up -- or a one-shot command
     -- hanging for ever with no network."""
     await telegram_within(client.connect(), seconds)
+
+
+#: What a source is, as `source_kind()` tells it (final review F05).
+SourceKind = Literal["channel", "group", "unknown"]
+
+
+def source_kind(entity: object) -> SourceKind:
+    """What Telegram says `entity` is: `"channel"` for a broadcast channel,
+    where only its admins can post; `"group"` for a supergroup (a
+    broadcast group included) or a basic group, where anyone in it can
+    post -- and nothing here filters who posted, so every member's
+    message is read as an instruction; `"unknown"` for anything else (a
+    person, a bot, a channel carrying neither flag, no entity at all).
+    A chat this account was removed from (`...Forbidden`) is still what
+    it was. Pure: no call to Telegram."""
+    if isinstance(entity, (types.Channel, types.ChannelForbidden)):
+        if getattr(entity, "broadcast", None):
+            return "channel"
+        if getattr(entity, "megagroup", None) or getattr(entity, "gigagroup", None):
+            return "group"
+        return "unknown"
+    if isinstance(entity, (types.Chat, types.ChatForbidden)):
+        return "group"
+    return "unknown"
 
 
 class AlreadyRunningError(Exception):
