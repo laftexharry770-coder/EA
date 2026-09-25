@@ -29,13 +29,16 @@ the caller's writer job and never commits.
 and of which nothing was executed (`signals_repo.trade_status` is
 "pending") is no longer a call anyone acts on:
 
-- a same-trade post *on that signal's own channel* is not a copy of it:
-  the poster deleted (or broke) the call and posted it again, and the new
-  post is a new signal;
-- a copy of it from another channel, or a forward of it, is still held
+- a same-trade post *on that signal's own channel, or on the channel
+  whose post withdrew it* (`signals.closed_by_channel_id`), is not a copy
+  of it: the poster deleted (or broke) the call and posted it again, and
+  the new post is a new signal. The second channel matters when a relay's
+  copy was stored first and holds the signal: the poster's own post is
+  then the copy, and deleting and reposting it must trade just the same;
+- a copy of it from any other channel, or a forward of it, is still held
   back -- one source withdrew the call -- but raises a CRITICAL alert
-  naming both messages (`COPY_OF_WITHDRAWN_SIGNAL`), because the call may
-  be meant after all;
+  naming both messages and the post that withdrew it
+  (`COPY_OF_WITHDRAWN_SIGNAL`), because the call may be meant after all;
 - a live match is always preferred to a withdrawn one.
 
 A signal that *was* executed and then withdrawn still matches: trading
@@ -103,6 +106,9 @@ class SignalMatch:
     withdrawn_unexecuted: bool
     #: Its state, for the log and the alert.
     state: str
+    #: The post (channel id, message id) that withdrew or invalidated it,
+    #: when known (`signals.closed_by_*`).
+    closed_by: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,9 +166,13 @@ def find_signal_relay(
             continue
         if not is_withdrawn_unexecuted(conn, signal):
             return _signal_match(conn, signal, via="hash")  # a live call wins
-        if signal["channel_id"] != channel_id and withdrawn_elsewhere is None:
+        if withdrawn_elsewhere is None and channel_id not in (
+            signal["channel_id"],
+            signal["closed_by_channel_id"],
+        ):
             withdrawn_elsewhere = signal
-        # Withdrawn on this channel: the poster posted the call again.
+        # Withdrawn on this channel (its own post here, or its copy here,
+        # withdrew it): the poster posted the call again.
     if withdrawn_elsewhere is not None:
         return _signal_match(conn, withdrawn_elsewhere, via="hash")
     return None
@@ -198,6 +208,11 @@ def record_signal_copy(
     )
     if not match.withdrawn_unexecuted:
         return ()
+    by = (
+        ""
+        if match.closed_by is None
+        else f" by message {match.closed_by[1]} on channel {match.closed_by[0]}"
+    )
     alert_id = alerts.record(
         conn,
         now_utc=now_utc,
@@ -209,9 +224,9 @@ def record_signal_copy(
         detail=(
             f"message {message_id} on channel {channel_id} repeats signal {match.signal_id} "
             f"(message {match.message_id} on channel {match.channel_id}), which was "
-            f"withdrawn before anything was executed (it is {match.state}). This copy was "
-            "not traded either: one source withdrew the call. If the call is still meant, "
-            "trade it by hand."
+            f"withdrawn{by} before anything was executed (it is {match.state}). This copy "
+            "was not traded either: one source withdrew the call. If the call is still "
+            "meant, trade it by hand."
         ),
     )
     return (alert_id,)
@@ -438,4 +453,7 @@ def _signal_match(conn: sqlite3.Connection, signal: sqlite3.Row, *, via: MatchVi
         withdrawn_unexecuted=is_withdrawn_unexecuted(conn, signal),
         state=signal["state"] if signal["withdrawn_at_utc"] is None
         else f"{signal['state']}, withdrawn",
+        closed_by=None
+        if signal["closed_by_channel_id"] is None
+        else (signal["closed_by_channel_id"], signal["closed_by_message_id"]),
     )

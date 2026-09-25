@@ -1690,3 +1690,202 @@ def test_a_repeat_deleted_after_its_withdrawn_signal_says_nothing_more(tmp_path)
     _run(db_path, body)
 
     assert _codes(_state(db_path)) == [("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED)]
+
+
+# -- F04 when the relay's copy holds the call ---------------------------------------
+#
+# The relay's copy was stored first (delivered first, or the VIP's update
+# was dropped), so it holds signal 1 and the VIP's own post is its copy.
+# The VIP deleting or breaking its post and posting the call again must be
+# traded exactly as when the VIP's post holds the signal: what counts is
+# the channel whose post withdrew the call, not which post was stored
+# first.
+
+
+async def _relay_holds_with_chatter(client, listener, time, db_path, *, how: str) -> None:
+    """`_relay_holds`, with the VIP's chatter stored too, so the window
+    re-read (four ids) covers the VIP's post."""
+    if how == "relay-first":
+        assert await client.emit(R, RELAY_POST)
+        assert await client.emit(V, _post(CALL))
+        for message_id in VIP_CHATTER:
+            assert await client.emit(V, _post(message_id, CHATTER_TEXT))
+    else:
+        assert how == "blackout"
+        with client.blackout():
+            await client.emit(V, _post(CALL))
+            for message_id in VIP_CHATTER:
+                await client.emit(V, _post(message_id, CHATTER_TEXT))
+        assert await client.emit(R, RELAY_POST)
+    for _ in range(2):
+        await _round(listener, time)
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "NEW", 0)], state
+    assert state["links"] == [(V, CALL, 1)]
+
+
+@pytest.mark.parametrize("found_by", ["event", "window"])
+@pytest.mark.parametrize("how", ["relay-first", "blackout"])
+def test_repost_then_delete_promotes_the_repost_when_the_relays_copy_holds_the_call(
+    tmp_path, how, found_by
+):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds_with_chatter(client, listener, time, db_path, how=how)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        await _round(listener, time)
+        assert _state(db_path)["links"] == [(V, CALL, 1), (V, REPOST, 1)]
+        if found_by == "event":
+            assert await client.emit_delete(V, CALL)
+        else:
+            with client.blackout():
+                assert not await client.emit_delete(V, CALL)
+            for _ in range(3):
+                await _round(listener, time)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "VOIDED", 1), (2, V, REPOST, "NEW", 0)]
+    assert state["queued"] == [(2, N)]
+    assert state["links"] == [(V, CALL, 1)]  # the deleted post still names what it voided
+    assert ("WARNING", edits_repo.SIGNAL_REPOST_PROMOTED, V, REPOST, 2) in state["alerts"]
+    assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL not in [code for _, code in _codes(state)]
+    assert _claim(db_path) == ("ENTRY", 2)
+    assert _db_rows(
+        db_path, "SELECT signal_id, promoted_from_signal_id FROM signals ORDER BY 1"
+    ) == [(1, None), (2, 1)]
+    assert _db_rows(
+        db_path, "SELECT closed_by_channel_id, closed_by_message_id FROM signals ORDER BY signal_id"
+    ) == [(V, CALL), (None, None)]
+
+
+_WITHDRAWING_EDITS = {
+    "chatter": (EDIT_CHATTER, "VOIDED", 1),
+    "reaim": (DIRECTION_EDIT, "INVALID", 0),
+    "unparseable": (UNPARSEABLE_EDIT, "INVALID", 0),
+}
+
+
+@pytest.mark.parametrize("change", ["deleted", *_WITHDRAWING_EDITS])
+@pytest.mark.parametrize("how", ["relay-first", "blackout"])
+def test_a_call_withdrawn_through_the_vips_copy_and_posted_again_is_a_new_signal(
+    tmp_path, how, change
+):
+    """The VIP deletes (or breaks) its post -- which reaches signal 1
+    through the VIP's copy -- and posts the call again: a new signal,
+    traded, with no "copy of a withdrawn call" alert."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds_with_chatter(client, listener, time, db_path, how=how)
+        if change == "deleted":
+            assert await client.emit_delete(V, CALL)
+        else:
+            assert await client.emit_edit(V, CALL, _WITHDRAWING_EDITS[change][0], edit_date=EDIT_1)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=6)))
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    closed, withdrawn = ("VOIDED", 1) if change == "deleted" else _WITHDRAWING_EDITS[change][1:]
+    assert state["signals"] == [(1, R, COPY, closed, withdrawn), (2, V, REPOST, "NEW", 0)]
+    assert state["queued"] == [(2, N)]
+    assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL not in [code for _, code in _codes(state)]
+    assert _claim(db_path) == ("ENTRY", 2)
+
+
+@pytest.mark.parametrize("change", list(_WITHDRAWING_EDITS))
+def test_repost_then_edit_away_promotes_the_repost_when_the_relays_copy_holds_the_call(
+    tmp_path, change
+):
+    """Promotion through the VIP's copy picks the repost, never the edited
+    post itself (a re-aimed post still reads as a signal), and leaves the
+    edited post naming the signal it closed."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds_with_chatter(client, listener, time, db_path, how="relay-first")
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        assert await client.emit_edit(V, CALL, _WITHDRAWING_EDITS[change][0], edit_date=EDIT_1)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    closed, withdrawn = _WITHDRAWING_EDITS[change][1:]
+    assert state["signals"] == [(1, R, COPY, closed, withdrawn), (2, V, REPOST, "NEW", 0)]
+    assert state["queued"] == [(2, N)]
+    assert state["links"] == [(V, CALL, 1)]
+    assert ("WARNING", edits_repo.SIGNAL_REPOST_PROMOTED, V, REPOST, 2) in state["alerts"]
+
+
+def test_the_relays_own_repost_of_a_call_the_vip_withdrew_is_new_too(tmp_path):
+    """The relay's copy holds signal 1 and the VIP deleted its post. The
+    relay posting the call again on its own channel is a new signal, as
+    for any channel reposting its own call."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds_with_chatter(client, listener, time, db_path, how="relay-first")
+        assert await client.emit_delete(V, CALL)
+        assert await client.emit(R, _post(COPY + 1, after=timedelta(minutes=3)))
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "VOIDED", 1), (2, R, COPY + 1, "NEW", 0)]
+    assert state["queued"] == [(2, N)]
+
+
+def test_a_third_channels_copy_of_a_call_the_vip_withdrew_is_held_back_loudly(tmp_path):
+    """Control: neither the channel holding the call nor the one whose post
+    withdrew it -- still held back, with the CRITICAL alert naming who
+    withdrew it."""
+    db_path = tmp_path / "store.db"
+    other = OTHER.channel_id
+
+    async def body(client, listener, time):
+        await _relay_holds_with_chatter(client, listener, time, db_path, how="relay-first")
+        assert await client.emit_delete(V, CALL)
+        assert await client.emit(other, _post(8001, after=timedelta(minutes=3)))
+
+    _run(db_path, body, channels=(VIP, RELAY, OTHER))
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "VOIDED", 1)]
+    assert state["queued"] == []
+    assert ("CRITICAL", relay_repo.COPY_OF_WITHDRAWN_SIGNAL, other, 8001, 1) in state["alerts"]
+    detail = _alert_detail(db_path, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert f"withdrawn by message {CALL} on channel {V}" in detail
+
+
+def test_a_double_post_re_aimed_promotes_nothing_while_the_call_stands_elsewhere(tmp_path):
+    """Posted three times; the second post re-aimed: the call is in doubt
+    (INVALID), and the first post still shows it -- the third is not
+    promoted over that."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(seconds=30)))
+        assert await client.emit(V, _post(REPOST_2, after=timedelta(seconds=40)))
+        assert await client.emit_edit(V, REPOST, DIRECTION_EDIT, edit_date=EDIT_1)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "INVALID", 0)]
+    assert state["queued"] == []
+    assert _codes(state) == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT)]
+
+
+def test_the_first_post_to_close_a_signal_is_the_one_recorded(conn):
+    first = _ingest(conn, VIP, 4001)
+    for channel_id, message_id in ((VIP.channel_id, 4001), (RELAY.channel_id, 7001)):
+        signals_repo.record_closed_by(
+            conn, signal_id=first.signal_id, channel_id=channel_id, message_id=message_id
+        )
+    assert _q(conn, "SELECT closed_by_channel_id, closed_by_message_id FROM signals") == [
+        (VIP.channel_id, 4001)
+    ]

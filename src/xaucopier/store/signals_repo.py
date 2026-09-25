@@ -103,20 +103,29 @@ def trade_status(conn: sqlite3.Connection, *, signal_id: int) -> TradeStatus:
 
 
 def insert_signal(
-    conn: sqlite3.Connection, *, channel_id: int, message_id: int, signal: Signal
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    message_id: int,
+    signal: Signal,
+    promoted_from_signal_id: int | None = None,
 ) -> int:
     """A new NEW signal for an already-stored message; parsed_json's
-    `source` is that message's `messages.source` (F39)."""
+    `source` is that message's `messages.source` (F39).
+    `promoted_from_signal_id` is set for a standing repost promoted to a
+    signal: the withdrawn signal it replaces (final review F04)."""
     source = _message_source(conn, channel_id=channel_id, message_id=message_id)
     cursor = conn.execute(
         "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, "
-        "first_trade_hash, state, version) VALUES (?, ?, ?, ?, ?, 'NEW', 1)",
+        "first_trade_hash, state, version, promoted_from_signal_id) "
+        "VALUES (?, ?, ?, ?, ?, 'NEW', 1, ?)",
         (
             channel_id,
             message_id,
             signal_to_json(signal, source=source),
             signal.content_hash,
             signal.content_hash,
+            promoted_from_signal_id,
         ),
     )
     return cursor.lastrowid
@@ -173,6 +182,21 @@ def mark_withdrawn(conn: sqlite3.Connection, *, signal_id: int, now_utc: datetim
     conn.execute(
         "UPDATE signals SET withdrawn_at_utc = ? WHERE signal_id = ? AND withdrawn_at_utc IS NULL",
         (now_utc.isoformat(), signal_id),
+    )
+
+
+def record_closed_by(
+    conn: sqlite3.Connection, *, signal_id: int, channel_id: int, message_id: int
+) -> None:
+    """Record the post whose deletion or edit withdrew or invalidated this
+    signal -- its own message, or a relay copy of it. Kept once set: the
+    first post to close a signal is the one that did. A withdrawn call
+    posted again on that post's channel is a new signal (final review
+    F04; see `relay_repo.find_signal_relay`)."""
+    conn.execute(
+        "UPDATE signals SET closed_by_channel_id = ?, closed_by_message_id = ? "
+        "WHERE signal_id = ? AND closed_by_channel_id IS NULL",
+        (channel_id, message_id, signal_id),
     )
 
 

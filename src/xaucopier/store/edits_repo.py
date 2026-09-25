@@ -74,8 +74,7 @@ another channel is a deletion of the signal: one source withdrew the
 call (VOIDED if nothing was executed, a CRITICAL flag if it was). A copy
 on the signal's *own* channel -- a double post -- that is deleted, or
 edited into something that is no signal, only warns
-(`SIGNAL_REPEAT_REMOVED`): the call still stands in the other post. A
-change that came through a copy never promotes a repost (below).
+(`SIGNAL_REPEAT_REMOVED`): the call still stands in the other post.
 
 **The same change on every post of a relayed call is applied once.** A
 relay that mirrors edits and deletions delivers each change twice. For a
@@ -87,19 +86,27 @@ relayed signal is only marked; an SL/TP correction the signal already
 carries changes nothing anyway. A call nobody copied keeps the policy
 above unchanged.
 
-**A withdrawn call posted again** (final review F04). When an unexecuted
-signal is withdrawn through its own message -- VOIDED by a deletion or an
-edit into chatter, or INVALID by an edit -- and the same call, posted
-again on that channel, still stands as a stored copy of it (not deleted,
-still read as a signal; `relay_repo.standing_copies_on`), the earliest
-such repost is promoted in the same writer job: re-read with the
-channel's parser, given its `signals` row and its ENTRY rows, unlinked,
-and announced with a WARNING `SIGNAL_REPOST_PROMOTED` naming both
-messages. The channel's other standing copies then repeat the promoted
-signal. An executed signal is never replaced (trading its repost would
-open the trade twice), and a copy on another channel is never promoted.
-(A repost posted *after* the withdrawal is not a copy at all: see
-`relay_repo`.)
+**A withdrawn call posted again** (final review F04). Every post that
+withdraws or invalidates a signal is recorded on it
+(`signals.closed_by_channel_id` / `closed_by_message_id`, the first one
+kept). When an unexecuted signal is withdrawn -- VOIDED by a deletion or
+an edit into chatter, or INVALID by an edit -- through a post on channel
+X, and the same call, posted again on X, still stands as a stored copy
+of it (not deleted, still read as a signal, not the post that withdrew
+it; `relay_repo.standing_copies_on`), the earliest such repost is
+promoted in the same writer job: re-read with the channel's parser,
+given its `signals` row (`promoted_from_signal_id` naming the signal it
+replaces) and its ENTRY rows, unlinked, and announced with a WARNING
+`SIGNAL_REPOST_PROMOTED` naming both messages. X's other standing copies
+then repeat the promoted signal. X is usually the signal's own channel;
+it is the copy's channel when a relay's copy was stored first and holds
+the signal, and the poster's own post -- its copy -- is what they
+deleted. Never promoted: a repost of an executed signal (trading it
+would open the trade twice), a copy on any channel other than X, and
+anything when the post that withdrew the call is a repeat on the
+signal's own channel (a double post re-aimed: the other post still
+stands). (A repost posted *after* the withdrawal is not a copy at all:
+see `relay_repo`.)
 
 **A deletion inferred from absence can be reversed.** The window re-read
 (`ingest/edits.py`) infers a deletion when a message stops coming back --
@@ -790,6 +797,9 @@ def _invalidate(
 ) -> EditResult:
     signal_id = row["signal_id"]
     signals_repo.set_signal_state(ctx.conn, signal_id=signal_id, state="INVALID")
+    signals_repo.record_closed_by(
+        ctx.conn, signal_id=signal_id, channel_id=ctx.channel_id, message_id=ctx.message_id
+    )
     skipped = outbox.skip_queued(
         ctx.conn, kind="ENTRY", signal_id=signal_id, reason=f"signal invalidated: {reason}"
     )
@@ -827,6 +837,9 @@ def _withdraw_signal(
     are still managed."""
     signal_id = row["signal_id"]
     signals_repo.mark_withdrawn(ctx.conn, signal_id=signal_id, now_utc=ctx.now_utc)
+    signals_repo.record_closed_by(
+        ctx.conn, signal_id=signal_id, channel_id=ctx.channel_id, message_id=ctx.message_id
+    )
     skipped = outbox.skip_queued(
         ctx.conn, kind="ENTRY", signal_id=signal_id, reason=f"signal withdrawn: {via}"
     )
@@ -862,24 +875,31 @@ def _withdraw_signal(
 
 def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> tuple[int, int] | None:
     """The poster withdrew `withdrawn` (deleted it, edited it into
-    something else, or broke it) before anything was executed. If the
-    same call, posted again on the same channel, still stands -- a stored
-    copy of this signal there, not deleted, still read as a signal -- the
-    earliest such repost becomes the signal: re-read with the channel's
-    parser, given its `signals` row and its ENTRY rows (in this same
-    writer job), unlinked, and announced with a WARNING naming both
+    something else, or broke it) before anything was executed, through
+    `ctx`'s post: the signal's own message, or a relay copy of it on
+    another channel (the copy was the poster's own post; a relay's copy
+    had been stored first). If the same call, posted again on that post's
+    channel, still stands -- a stored copy of this signal there, not
+    deleted, still read as a signal, not the withdrawing post itself --
+    the earliest such repost becomes the signal: re-read with the
+    channel's parser, given its `signals` row and its ENTRY rows (in this
+    same writer job), unlinked, and announced with a WARNING naming both
     messages. The channel's other standing copies now repeat the promoted
     signal, and follow-ups that replied to the repost now target it.
 
-    Only a withdrawal through the signal's own message promotes: a copy
-    on another channel is never promoted, and a withdrawal that reached
-    the signal through a copy (another channel withdrew the call) leaves
-    it withdrawn. Returns (new signal id, alert id) or None."""
-    if ctx.via_copy is not None:
+    A copy on any other channel is never promoted -- in particular not a
+    repeat on the signal's own channel when another channel withdrew the
+    call. Nothing is promoted when the withdrawing post is itself a
+    repeat on the signal's own channel (a double post re-aimed: the
+    signal's own post still stands). Returns (new signal id, alert id)
+    or None."""
+    if ctx.via_copy is not None and withdrawn["channel_id"] == ctx.channel_id:
         return None
     conn = ctx.conn
     old_id = withdrawn["signal_id"]
     for repost in relay_repo.standing_copies_on(conn, signal_id=old_id, channel_id=ctx.channel_id):
+        if repost["message_id"] == ctx.message_id:
+            continue  # the post that withdrew the call (re-aimed, it still reads as a signal)
         posted_at = datetime.fromisoformat(repost["posted_at_utc"])
         routed = route(
             repost["raw_text"],
@@ -898,7 +918,11 @@ def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> tuple[int, int] | None
             )
             continue
         new_id = signals_repo.insert_signal(
-            conn, channel_id=ctx.channel_id, message_id=repost["message_id"], signal=routed.signal
+            conn,
+            channel_id=ctx.channel_id,
+            message_id=repost["message_id"],
+            signal=routed.signal,
+            promoted_from_signal_id=old_id,
         )
         queued = outbox.fan_out_checked(
             conn,
@@ -912,10 +936,14 @@ def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> tuple[int, int] | None
             "UPDATE messages SET relay_of_signal_id = NULL WHERE channel_id = ? AND message_id = ?",
             (ctx.channel_id, repost["message_id"]),
         )
+        # The channel's other copies of the call now repeat the promoted
+        # signal -- not the post that withdrew it, which keeps naming the
+        # signal it closed.
         conn.execute(
             "UPDATE messages SET relay_of_signal_id = ? "
-            "WHERE relay_of_signal_id = ? AND channel_id = ? AND deleted_at_utc IS NULL",
-            (new_id, old_id, ctx.channel_id),
+            "WHERE relay_of_signal_id = ? AND channel_id = ? AND deleted_at_utc IS NULL "
+            "  AND message_id != ?",
+            (new_id, old_id, ctx.channel_id, ctx.message_id),
         )
         conn.execute(
             "UPDATE followups SET target_signal_id = ?, resolution_path = ? "
@@ -931,7 +959,7 @@ def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> tuple[int, int] | None
         alert = ctx.alert(
             "WARNING",
             SIGNAL_REPOST_PROMOTED,
-            f"signal {old_id} (message {ctx.message_id}) was withdrawn before anything was "
+            f"message {ctx.message_id} withdrew signal {old_id} before anything was "
             f"executed, but the same call posted again as message {repost['message_id']} on "
             f"this channel still stands: it is now signal {new_id}, and {queued} trade "
             f"entr{'y is' if queued == 1 else 'ies are'} queued for it. If the poster meant to "

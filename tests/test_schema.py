@@ -798,6 +798,7 @@ _V4_COLUMNS = {
         "fwd_from_post_id",
         "fwd_from_date_utc",
     ),
+    "signals": ("closed_by_channel_id", "closed_by_message_id", "promoted_from_signal_id"),
 }
 
 
@@ -878,6 +879,13 @@ def test_upgrading_a_version_3_database_to_4_preserves_every_row(tmp_path):
     assert conn.execute(f"SELECT {new_message_columns} FROM messages").fetchall() == [
         (None,) * len(_V4_COLUMNS["messages"])
     ] * 2
+    # ... and every new signals column (final review F04: who closed a
+    # signal, and which signal a promoted repost replaced).
+    new_signal_columns = ", ".join(_V4_COLUMNS["signals"])
+    signal_rows = conn.execute(f"SELECT {new_signal_columns} FROM signals").fetchall()
+    assert signal_rows and signal_rows == [(None,) * len(_V4_COLUMNS["signals"])] * len(
+        signal_rows
+    )
     # A channel whose pointer is above 0 was seeded by an earlier run:
     # it is marked seeded as of the migration. A pointer-0 row (only the
     # parse-failure counter) was never seeded and stays unmarked. No
