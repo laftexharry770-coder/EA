@@ -1928,3 +1928,60 @@ def test_the_same_instruction_said_twice_on_one_channel_is_two_instructions(
     queued = _q(conn, "SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP' AND state = 'QUEUED'")
     assert queued == [(2 * len(ACCOUNTS),)]
     assert _metric(conn, relay_repo.RELAY_DUPLICATE_FOLLOWUPS_METRIC) == 0
+
+
+# -- F08: a forwarded follow-up stored before the post it forwards ---------------------
+
+
+@pytest.mark.parametrize("holder_first", [True, False], ids=["vip-holds", "relay-holds"])
+@pytest.mark.parametrize("order", ["original-first", "forward-first"])
+def test_a_forwarded_follow_up_knows_its_signal_whichever_post_is_stored_first(
+    conn, order, holder_first
+):
+    """The relay forwards the VIP's call and the VIP's "close half" (a
+    forward carries no reply). Whichever of the two follow-ups is stored
+    first holds the instruction, and it targets the call either way."""
+    if holder_first:
+        holder = _ingest(conn, VIP, 4001)
+        _ingest(conn, RELAY, 7001, posted=POSTED + timedelta(seconds=2), fwd=(VIP.channel_id, 4001))
+        path = "reply"
+    else:
+        holder = _ingest(
+            conn, RELAY, 7001, posted=POSTED + timedelta(seconds=2), fwd=(VIP.channel_id, 4001)
+        )
+        _ingest(conn, VIP, 4001)
+        path = "relay-reply"
+    at = POSTED + timedelta(minutes=5)
+
+    def original():
+        return _ingest(conn, VIP, 4002, CLOSE_HALF, posted=at, reply_to=4001)
+
+    def forward():
+        return _ingest(
+            conn, RELAY, 7002, CLOSE_HALF, posted=at + timedelta(seconds=2),
+            fwd=(VIP.channel_id, 4002),
+        )
+
+    if order == "original-first":
+        first, second = original(), forward()
+    else:
+        first, second = forward(), original()
+
+    assert (first.outcome, second.outcome) == ("new", "relay_duplicate")
+    assert second.relay_of_followup_id == first.followup_id
+    (held,) = _followups(conn)
+    assert held[0] == first.followup_id
+    assert held[5:] == (holder.signal_id, path if order == "original-first" else "copy-reply")
+    queued = _q(conn, "SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP'")
+    assert queued == [(len(ACCOUNTS),)]
+
+
+def test_a_follow_ups_target_is_never_replaced_by_its_copys(conn):
+    """The follow-up held keeps the target it was stored with; a copy only
+    fills in a target the held one lacks."""
+    holder = _ingest(conn, VIP, 4001)
+    _ingest(conn, RELAY, 5001, posted=POSTED + timedelta(seconds=60))
+    at = POSTED + timedelta(minutes=5)
+    _ingest(conn, VIP, 4002, CLOSE_HALF, posted=at, reply_to=4001)
+    _ingest(conn, RELAY, 5002, CLOSE_HALF, posted=at, reply_to=5001)  # 'relay-reply' of its own
+    assert _followups(conn)[0][5:] == (holder.signal_id, "reply")

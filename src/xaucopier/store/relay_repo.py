@@ -55,6 +55,13 @@ withdrew one and said it again. A follow-up that replies to nothing is
 never matched by its text: two channels each saying "close half" may be
 two genuine instructions.
 
+When the follow-up held (the first one stored) is a forward, which
+carries no reply, and its copy -- the original post, stored second --
+replies to a stored signal message, the held follow-up is given that
+target (`resolution_path` `'copy-reply'`): which of the two Telegram
+delivered first must not decide whether the instruction knows its
+signal. A target the held follow-up already has is never replaced.
+
 **Every copy is visible.** `record_signal_copy` / `record_followup_copy`
 store the link on the copy's `messages` row, log it at INFO with both
 messages, and bump the durable counters `relay_duplicates` /
@@ -85,6 +92,9 @@ COPY_OF_WITHDRAWN_SIGNAL = "COPY_OF_WITHDRAWN_SIGNAL"
 REPLY_PATH = "reply"
 #: ... and of one replying to a stored copy of a signal.
 RELAY_REPLY_PATH = "relay-reply"
+#: ... and of a follow-up with no reply of its own (a forward) whose copy
+#: -- the post it forwards -- replies to a stored signal message.
+COPY_REPLY_PATH = "copy-reply"
 
 MatchVia = Literal["forward", "hash"]
 
@@ -340,14 +350,35 @@ def record_followup_copy(
     channel_id: int,
     message_id: int,
     match: FollowupMatch,
+    target_signal_id: int | None,
     now_utc: datetime,
 ) -> None:
     """Store that (`channel_id`, `message_id`) repeats `match`'s follow-up:
-    the link, the INFO line, the counter."""
+    the link, the INFO line, the counter. `target_signal_id` is the signal
+    the copy itself replies to (`resolve_reply_target`), if any: the
+    follow-up held is given it when it has none (see the module
+    docstring)."""
     conn.execute(
         "UPDATE messages SET relay_of_followup_id = ? WHERE channel_id = ? AND message_id = ?",
         (match.followup_id, channel_id, message_id),
     )
+    if target_signal_id is not None:
+        filled = conn.execute(
+            "UPDATE followups SET target_signal_id = ?, resolution_path = ? "
+            "WHERE followup_id = ? AND target_signal_id IS NULL",
+            (target_signal_id, COPY_REPLY_PATH, match.followup_id),
+        ).rowcount
+        if filled:
+            logger.info(
+                "follow-up %s (channel %s message %s) targets signal %s: its copy, channel %s "
+                "message %s, replies to that signal",
+                match.followup_id,
+                match.channel_id,
+                match.message_id,
+                target_signal_id,
+                channel_id,
+                message_id,
+            )
     metrics.bump(
         conn, day_key=metrics.day_key_for(now_utc), name=RELAY_DUPLICATE_FOLLOWUPS_METRIC
     )

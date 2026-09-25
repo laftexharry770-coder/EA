@@ -50,7 +50,9 @@ records the signal it replies to (`followups.target_signal_id`, path
 `'reply'`, or `'relay-reply'` through a copy) and is itself a
 "relay_duplicate" -- stored, linked by `relay_of_followup_id`, logged and
 counted, but no followups row and no outbox row -- when it repeats a
-stored follow-up (F08). `UNIQUE(channel_id,
+stored follow-up (F08); a target it resolves is given to the follow-up
+it repeats when that one has none (a forward stored first: path
+`'copy-reply'`). `UNIQUE(channel_id,
 message_id)` cannot express "the other channel relayed the same call":
 the user's own channel is itself a relay of a VIP channel, so the
 identical trade legitimately shows up twice. See `relay_repo` for the
@@ -417,7 +419,12 @@ def _ingest_new(
         )
         if relay is not None:
             relay_repo.record_followup_copy(
-                conn, channel_id=channel_id, message_id=message_id, match=relay, now_utc=now_utc
+                conn,
+                channel_id=channel_id,
+                message_id=message_id,
+                match=relay,
+                target_signal_id=target_signal_id,
+                now_utc=now_utc,
             )
             return IngestResult(
                 outcome="relay_duplicate",
