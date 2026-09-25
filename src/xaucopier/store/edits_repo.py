@@ -1361,8 +1361,9 @@ def _deletion_of_copy(ctx: _Ctx, holder: sqlite3.Row, kind: str) -> DeletionResu
     signal itself -- one source withdrew the call: VOIDED if nothing was
     executed, a CRITICAL flag if it was. Either way the alert names both
     messages, and nothing is said when the signal was withdrawn already
-    (the same deletion reaching another post). A repost is never promoted
-    from here."""
+    (the same deletion reaching another post). Voiding it through a copy
+    on another channel promotes that channel's standing repost, if any
+    (`_promote_repost`): the copy was the poster's own post."""
     signal_id = holder["signal_id"]
     copy_ctx = _as_copy(ctx, holder)
 
@@ -1375,6 +1376,7 @@ def _deletion_of_copy(ctx: _Ctx, holder: sqlite3.Row, kind: str) -> DeletionResu
             None,
             0 if partial is None else partial.skipped,
             () if partial is None else partial.alert_ids,
+            None if partial is None else partial.promoted_signal_id,
         )
 
     if holder["channel_id"] == ctx.channel_id:

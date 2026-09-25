@@ -1889,3 +1889,16 @@ def test_the_first_post_to_close_a_signal_is_the_one_recorded(conn):
     assert _q(conn, "SELECT closed_by_channel_id, closed_by_message_id FROM signals") == [
         (VIP.channel_id, 4001)
     ]
+
+
+def test_a_deletion_through_a_copy_reports_the_repost_it_promoted(conn):
+    holder = _ingest(conn, RELAY, 7001, posted=POSTED + timedelta(seconds=2))
+    _ingest(conn, VIP, 4001)  # the VIP's own post: a copy of the relay's
+    _ingest(conn, VIP, 4012, posted=POSTED + timedelta(minutes=2))
+    result = edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4001, now_utc=POSTED, accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    assert (result.outcome, result.signal_id) == ("voided", holder.signal_id)
+    assert result.promoted_signal_id == holder.signal_id + 1
+    assert _signals(conn)[1] == (holder.signal_id + 1, VIP.channel_id, 4012, "NEW")
