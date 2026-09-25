@@ -186,8 +186,8 @@ def record_signal_copy(
     )
     metrics.bump(conn, day_key=metrics.day_key_for(now_utc), name=RELAY_DUPLICATES_METRIC)
     logger.info(
-        "channel %s message %s is a copy of signal %s (channel %s message %s, %s; matched "
-        "by %s): stored, not traded again",
+        "channel %s message %s is a relayed copy of signal %s (channel %s message %s, %s; "
+        "matched by %s): stored, not traded again",
         channel_id,
         message_id,
         match.signal_id,
@@ -340,8 +340,8 @@ def record_followup_copy(
         conn, day_key=metrics.day_key_for(now_utc), name=RELAY_DUPLICATE_FOLLOWUPS_METRIC
     )
     logger.info(
-        "channel %s message %s is a copy of follow-up %s (channel %s message %s; matched by "
-        "%s): stored, not dispatched again",
+        "channel %s message %s is a relayed copy of follow-up %s (channel %s message %s; "
+        "matched by %s): stored, not dispatched again",
         channel_id,
         message_id,
         match.followup_id,

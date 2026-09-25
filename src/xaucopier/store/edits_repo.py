@@ -1331,9 +1331,10 @@ def _deletion_of_copy(ctx: _Ctx, holder: sqlite3.Row, kind: str) -> DeletionResu
     ruling C2). On the signal's own channel it is a double post tidied up:
     a WARNING, nothing else. On another channel it is a deletion of the
     signal itself -- one source withdrew the call: VOIDED if nothing was
-    executed, a CRITICAL flag if it was -- unless the signal was withdrawn
-    already (the same deletion reaching another copy). Either way the
-    alert names both messages; a repost is never promoted from here."""
+    executed, a CRITICAL flag if it was. Either way the alert names both
+    messages, and nothing is said when the signal was withdrawn already
+    (the same deletion reaching another post). A repost is never promoted
+    from here."""
     signal_id = holder["signal_id"]
     copy_ctx = _as_copy(ctx, holder)
 
@@ -1349,8 +1350,17 @@ def _deletion_of_copy(ctx: _Ctx, holder: sqlite3.Row, kind: str) -> DeletionResu
         )
 
     if holder["channel_id"] == ctx.channel_id:
-        if kind != "signal":
-            return result("deleted")  # edited away before: said then
+        if kind != "signal" or holder["withdrawn_at_utc"] is not None:
+            # Edited away before (said then), or the call is withdrawn
+            # already (said when it was): nothing to add.
+            logger.info(
+                "channel %s message %s, a repeat of signal %s, deleted, found by %s; marked",
+                ctx.channel_id,
+                ctx.message_id,
+                signal_id,
+                ctx.detected_by,
+            )
+            return result("deleted")
         alert = _repeat_removed(copy_ctx, holder, how=f"deleted, found by {ctx.detected_by}")
         return dataclasses.replace(result("deleted"), alert_ids=(alert,))
     status = trade_status(ctx.conn, signal_id=signal_id)

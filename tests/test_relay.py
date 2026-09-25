@@ -313,6 +313,7 @@ def test_every_copy_is_logged_with_both_messages_and_counted(conn, caplog):
     ):
         assert f"channel {channel} message {message_id}" in line
         assert f"channel {VIP.channel_id} message 4001" in line
+        assert "relayed copy" in line
     assert "forward" in lines[1]
     assert _alerts(conn) == []  # a copy of a live call is no alert
 
@@ -1685,3 +1686,20 @@ def test_a_follow_ups_target_and_its_path_go_together(conn):
                 conn, channel_id=VIP.channel_id, message_id=1, followup=followup,
                 target_signal_id=target, resolution_path=path,
             )
+
+
+def test_a_repeat_deleted_after_its_withdrawn_signal_says_nothing_more(tmp_path):
+    """The poster deleted both posts of an executed call: the first
+    deletion flags it; the second has nothing to add."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(seconds=30)))
+        _mark_executed(db_path)
+        assert await client.emit_delete(V, CALL)
+        assert await client.emit_delete(V, REPOST)
+
+    _run(db_path, body)
+
+    assert _codes(_state(db_path)) == [("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED)]
