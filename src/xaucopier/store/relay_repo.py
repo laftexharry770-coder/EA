@@ -226,6 +226,14 @@ def copies_of(conn: sqlite3.Connection, *, signal_id: int) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def has_copies(conn: sqlite3.Connection, *, signal_id: int) -> bool:
+    """Whether any stored message is recorded as a copy of `signal_id`."""
+    row = conn.execute(
+        "SELECT 1 FROM messages WHERE relay_of_signal_id = ? LIMIT 1", (signal_id,)
+    ).fetchone()
+    return row is not None
+
+
 def standing_copies_on(
     conn: sqlite3.Connection, *, signal_id: int, channel_id: int
 ) -> list[sqlite3.Row]:

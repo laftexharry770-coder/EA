@@ -60,6 +60,29 @@ worker died holding it), and entries not yet taken (`QUEUED`) are
 skipped. A deleted follow-up's queued rows are skipped. Everything else
 is only marked. A signal edited into chatter is withdrawn the same way.
 
+**A relay copy** (final review F02, ruling C2). A signal message stored
+as a copy of a call we already have (`messages.relay_of_signal_id`; see
+`relay_repo`) has no `signals` row of its own. An edit of it is
+reconciled against the signal it repeats exactly like an edit of that
+signal's own message -- amend, invalidate, void, flag -- and every alert
+names the copy and the signal's own message. A deletion of a copy on
+another channel is a deletion of the signal: one source withdrew the
+call (VOIDED if nothing was executed, a CRITICAL flag if it was). A copy
+on the signal's *own* channel -- a double post -- that is deleted, or
+edited into something that is no signal, only warns
+(`SIGNAL_REPEAT_REMOVED`): the call still stands in the other post. A
+change that came through a copy never promotes a repost (below).
+
+**The same change on every post of a relayed call is applied once.** A
+relay that mirrors edits and deletions delivers each change twice. For a
+signal that has copies (or a change through one), a version that would
+only close it the way it is closed already -- withdraw a withdrawn
+signal, invalidate an INVALID one by a re-aim or an unparseable text --
+is logged, not alerted, and a deletion of a post of an already-withdrawn
+relayed signal is only marked; an SL/TP correction the signal already
+carries changes nothing anyway. A call nobody copied keeps the policy
+above unchanged.
+
 **A withdrawn call posted again** (final review F04). When an unexecuted
 signal is withdrawn through its own message -- VOIDED by a deletion or an
 edit into chatter, or INVALID by an edit -- and the same call, posted
@@ -134,6 +157,10 @@ EDIT_CREATED_SIGNAL = "EDIT_CREATED_SIGNAL"
 EDIT_CREATED_FOLLOWUP = "EDIT_CREATED_FOLLOWUP"
 #: WARNING: a material edit of a signal that is already INVALID or VOIDED.
 EDIT_OF_CLOSED_SIGNAL = "EDIT_OF_CLOSED_SIGNAL"
+#: WARNING: a repeat of a signal on the signal's own channel (a double post)
+#: was deleted, or edited into something that is no signal; the signal
+#: stands (final review F02).
+SIGNAL_REPEAT_REMOVED = "SIGNAL_REPEAT_REMOVED"
 #: WARNING: an unexecuted signal was withdrawn by its own poster, and the
 #: same call posted again on that channel still stands: the repost is now
 #: the signal, queued for trading (final review F04).
@@ -414,6 +441,7 @@ def reconcile(
         followup_id=signals_repo.get_followup_id(
             conn, channel_id=channel_id, message_id=message_id
         ),
+        relay_of_signal_id=existing["relay_of_signal_id"],
     )
 
     reversal: tuple[int, ...] = ()
@@ -514,14 +542,16 @@ def _reverse_window_deletion(ctx: _Ctx, existing: sqlite3.Row) -> int:
         "WHERE channel_id = ? AND message_id = ?",
         (ctx.channel_id, ctx.message_id),
     )
+    own = ctx.signal_id is not None
     row = (
         signals_repo.get_signal(ctx.conn, channel_id=ctx.channel_id, message_id=ctx.message_id)
-        if ctx.signal_id is not None
-        else None
+        if own
+        else _holder_of_copy(ctx)
     )
     if row is not None:
         consequence = (
-            f"signal {row['signal_id']} is {row['state']}"
+            f"signal {row['signal_id']}{'' if own else ' (this message is a copy of it)'} "
+            f"is {row['state']}"
             f"{' and marked withdrawn' if row['withdrawn_at_utc'] else ''}; entries skipped "
             "when it was withdrawn stay skipped, and claim() will not hand out its "
             "remaining ones. Trade status: "
@@ -548,18 +578,43 @@ def _edit_of_signal(ctx: _Ctx, route_result: RouteResult) -> EditResult:
         if ctx.signal_id is not None
         else None
     )
-    if row is None:
-        # Never traded: a relay duplicate, or a signal only an edit made.
-        # Nothing to correct, and still nothing to trade.
+    if row is not None:
+        return _edit_of_signal_row(ctx, row, route_result)
+    holder = _holder_of_copy(ctx)
+    if holder is not None:
+        # A relay copy (final review F02): the edit is reconciled against
+        # the signal it repeats, exactly like an edit of that signal's own
+        # message, and every alert names both messages.
+        return _edit_of_signal_row(_as_copy(ctx, holder), holder, route_result)
+    # Never traded and a copy of nothing: a signal only an edit made (or a
+    # copy stored before copies were linked). Nothing to correct, and still
+    # nothing to trade.
+    logger.info(
+        "edit of signal message %s/%s, which has no trade on file (now %s); recorded",
+        ctx.channel_id,
+        ctx.message_id,
+        new_kind,
+    )
+    return ctx.result("recorded", new_kind, "no trade on file for this signal")
+
+
+def _edit_of_signal_row(ctx: _Ctx, row: sqlite3.Row, route_result: RouteResult) -> EditResult:
+    """The edit policy for signal `row`, reached through its own message
+    or (`ctx.via_copy`) through a copy of it."""
+    new_kind = route_result.kind
+    status = trade_status(ctx.conn, signal_id=row["signal_id"])
+    again = _closes_it_again(ctx, row, route_result)
+    if again is not None:
         logger.info(
-            "edit of signal message %s/%s, which has no trade on file (now %s); recorded",
+            "edit of channel %s message %s (now %s): signal %s is %s already; the same "
+            "change reaching another copy of the call, so nothing more is done",
             ctx.channel_id,
             ctx.message_id,
             new_kind,
+            row["signal_id"],
+            again,
         )
-        return ctx.result("recorded", new_kind, "no trade on file for this signal")
-
-    status = trade_status(ctx.conn, signal_id=row["signal_id"])
+        return ctx.result("recorded", new_kind, f"signal {row['signal_id']} is {again} already")
     if row["state"] != "NEW":
         alert = ctx.alert(
             "WARNING",
@@ -582,6 +637,13 @@ def _edit_of_signal(ctx: _Ctx, route_result: RouteResult) -> EditResult:
             new_kind=new_kind,
         )
     # skip or followup: the call is withdrawn -- a deletion in all but name.
+    if ctx.via_copy is not None and row["channel_id"] == ctx.channel_id:
+        # ...unless it is only a repeat on the signal's own channel: a
+        # double post tidied up, as its deletion would be.
+        alert = _repeat_removed(ctx, row, how=f"edited into {new_kind}")
+        return ctx.result(
+            "recorded", new_kind, "a repeat on the same channel edited away", alert_ids=(alert,)
+        )
     return _withdraw_signal(
         ctx,
         row,
@@ -597,15 +659,7 @@ def _signal_to_signal(
     ctx: _Ctx, row: sqlite3.Row, status: TradeStatus, new: Signal
 ) -> EditResult:
     old = json.loads(row["parsed_json"])
-    reaimed = []
-    if old["side"] != new.side.value:
-        reaimed.append(f"side {old['side']} -> {new.side.value}")
-    if old["symbol_alias"] != new.symbol_alias:
-        reaimed.append(f"symbol {old['symbol_alias']} -> {new.symbol_alias}")
-    if not (_same(old["zone"]["lo"], new.zone.lo) and _same(old["zone"]["hi"], new.zone.hi)):
-        reaimed.append(
-            f"entry {old['zone']['lo']}-{old['zone']['hi']} -> {new.zone.lo}-{new.zone.hi}"
-        )
+    reaimed = _reaims(old, new)
     if reaimed:
         return _invalidate(
             ctx,
@@ -625,13 +679,22 @@ def _signal_to_signal(
     )
     ladder_changed = len(old_tps) != len(new.tps)
     if not (sl_changed or tp_changes or ladder_changed):
-        # The hash is over these same fields, so this is unreachable in
-        # practice; a hash change with equal levels is still nothing to do.
+        # The signal already says this: the same correction reaching another
+        # copy of the call (the edited message's own hash did change).
         return ctx.result("cosmetic", "signal", "levels unchanged")
 
     signal_id = row["signal_id"]
+    if ctx.via_copy is not None:
+        # The copy's correction, recorded as the signal's own: its message,
+        # and the date the call was first posted.
+        new = dataclasses.replace(
+            new,
+            channel_id=row["channel_id"],
+            message_id=row["message_id"],
+            posted_at_utc=datetime.fromisoformat(old["posted_at_utc"]),
+        )
     signals_repo.update_signal_on_edit(
-        ctx.conn, channel_id=ctx.channel_id, message_id=ctx.message_id, signal=new
+        ctx.conn, channel_id=row["channel_id"], message_id=row["message_id"], signal=new
     )
     change = _describe_levels(old, new)
     amendments: list[int] = []
@@ -639,9 +702,9 @@ def _signal_to_signal(
     if status != "pending":
         raw = f"edit of signal {signal_id} ({ctx.channel_id}/{ctx.message_id}): {change}"
         if sl_changed:
-            amendments.append(_amend(ctx, signal_id, FollowUpOp.AMEND_SL, new.sl, None, raw))
+            amendments.append(_amend(ctx, row, FollowUpOp.AMEND_SL, new.sl, None, raw))
         for index, price in tp_changes:
-            amendments.append(_amend(ctx, signal_id, FollowUpOp.AMEND_TP, price, index, raw))
+            amendments.append(_amend(ctx, row, FollowUpOp.AMEND_TP, price, index, raw))
         if ladder_changed:
             raised.append(
                 ctx.alert(
@@ -671,28 +734,31 @@ def _signal_to_signal(
 
 def _amend(
     ctx: _Ctx,
-    signal_id: int,
+    row: sqlite3.Row,
     op: FollowUpOp,
     price: float,
     tp_index: int | None,
     raw: str,
 ) -> int:
+    """One AMEND_* follow-up for signal `row`, keyed by the signal's own
+    message -- also when the edit came through a copy of it (`raw` names
+    the message that was edited)."""
     followup = FollowUp(
-        channel_id=ctx.channel_id,
-        message_id=ctx.message_id,
+        channel_id=row["channel_id"],
+        message_id=row["message_id"],
         op=op,
         posted_at_utc=ctx.edit_date_utc,
-        reply_to_message_id=ctx.message_id,
+        reply_to_message_id=row["message_id"],
         price_hint=price,
         tp_index_hint=tp_index,
         raw=raw,
     )
     followup_id = signals_repo.insert_edit_amendment(
         ctx.conn,
-        channel_id=ctx.channel_id,
-        message_id=ctx.message_id,
+        channel_id=row["channel_id"],
+        message_id=row["message_id"],
         followup=followup,
-        target_signal_id=signal_id,
+        target_signal_id=row["signal_id"],
     )
     outbox.fan_out_checked(
         ctx.conn,
@@ -878,6 +944,80 @@ def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> tuple[int, int] | None
     return None
 
 
+def _holder_of_copy(ctx: _Ctx) -> sqlite3.Row | None:
+    """The `signals` row of the signal this message is a relay copy of
+    (`messages.relay_of_signal_id`), or None."""
+    if ctx.relay_of_signal_id is None:
+        return None
+    return ctx.conn.execute(
+        "SELECT * FROM signals WHERE signal_id = ?", (ctx.relay_of_signal_id,)
+    ).fetchone()
+
+
+def _as_copy(ctx: _Ctx, holder: sqlite3.Row) -> _Ctx:
+    """`ctx` for a change that reaches signal `holder` through a copy of
+    it: results and alerts carry the signal, and every alert first names
+    the copy and the signal's own message."""
+    return dataclasses.replace(
+        ctx,
+        signal_id=holder["signal_id"],
+        via_copy=(
+            f"message {ctx.message_id} on channel {ctx.channel_id} is a copy of signal "
+            f"{holder['signal_id']} (message {holder['message_id']} on channel "
+            f"{holder['channel_id']})"
+        ),
+    )
+
+
+def _reaims(old: dict, new: Signal) -> list[str]:
+    """How `new` re-aims the stored parse `old`: side, symbol, entry zone."""
+    reaimed = []
+    if old["side"] != new.side.value:
+        reaimed.append(f"side {old['side']} -> {new.side.value}")
+    if old["symbol_alias"] != new.symbol_alias:
+        reaimed.append(f"symbol {old['symbol_alias']} -> {new.symbol_alias}")
+    if not (_same(old["zone"]["lo"], new.zone.lo) and _same(old["zone"]["hi"], new.zone.hi)):
+        reaimed.append(
+            f"entry {old['zone']['lo']}-{old['zone']['hi']} -> {new.zone.lo}-{new.zone.hi}"
+        )
+    return reaimed
+
+
+def _closes_it_again(ctx: _Ctx, row: sqlite3.Row, route_result: RouteResult) -> str | None:
+    """For a relayed call only -- this is a copy, or the signal has copies:
+    whether this version would only close the signal the way it is closed
+    already (withdraw a withdrawn one; invalidate an INVALID one by a
+    re-aim or an unparseable text). The same edit typically reaches every
+    copy of a relayed call, and the first one already did all there is to
+    do and said so. Returns how it is closed, or None. A call nobody
+    copied keeps its own policy unchanged."""
+    if ctx.via_copy is None and not relay_repo.has_copies(ctx.conn, signal_id=row["signal_id"]):
+        return None
+    new_kind = route_result.kind
+    if new_kind in ("skip", "followup") and row["withdrawn_at_utc"] is not None:
+        return "withdrawn"
+    if row["state"] == "INVALID" and (
+        new_kind == "parse_failed"
+        or (new_kind == "signal" and _reaims(json.loads(row["parsed_json"]), route_result.signal))
+    ):
+        return "INVALID"
+    return None
+
+
+def _repeat_removed(ctx: _Ctx, row: sqlite3.Row, *, how: str) -> int:
+    """WARNING: a repeat of signal `row` on its own channel went away (a
+    double post tidied up); the signal stands. `ctx` is `_as_copy`'s."""
+    status = trade_status(ctx.conn, signal_id=row["signal_id"])
+    return ctx.alert(
+        "WARNING",
+        SIGNAL_REPEAT_REMOVED,
+        f"it was {how}. Signal {row['signal_id']} stands (it is {row['state']}, trade "
+        f"status {status}): the same call is still posted as message {row['message_id']}, "
+        "so this looks like a double post tidied up. If the poster meant to withdraw the "
+        "call, check the channel.",
+    )
+
+
 def _alerts_of(promoted: tuple[int, int] | None) -> tuple[int, ...]:
     return () if promoted is None else (promoted[1],)
 
@@ -966,6 +1106,18 @@ def _edit_of_other(ctx: _Ctx, stored_kind: str, route_result: RouteResult) -> Ed
 
 
 def _created_alert(ctx: _Ctx, route_result: RouteResult) -> int:
+    holder = _holder_of_copy(ctx) if route_result.kind == "signal" else None
+    if holder is not None:
+        return ctx.alert(
+            "WARNING",
+            EDIT_CREATED_SIGNAL,
+            f"an edit turned message {ctx.message_id} back into a signal "
+            f"({_describe(route_result)}). It is a copy of signal {holder['signal_id']} "
+            f"(message {holder['message_id']} on channel {holder['channel_id']}), which is "
+            f"{holder['state']}{', withdrawn' if holder['withdrawn_at_utc'] else ''}. Edits "
+            "never open trades: nothing was queued.",
+            signal_id=holder["signal_id"],
+        )
     if route_result.kind == "signal":
         return ctx.alert(
             "WARNING",
@@ -1043,6 +1195,7 @@ def apply_deletion(
         detected_by=detected_by,
         signal_id=signal_id,
         followup_id=followup_id,
+        relay_of_signal_id=existing["relay_of_signal_id"],
     )
 
     # Decided on the signals row, not on `kind`: a signal an earlier edit
@@ -1055,7 +1208,19 @@ def apply_deletion(
     )
     if row is not None:
         status = trade_status(conn, signal_id=signal_id)
-        if row["state"] == "NEW" or status != "pending":
+        if row["withdrawn_at_utc"] is not None and relay_repo.has_copies(
+            conn, signal_id=signal_id
+        ):
+            # Withdrawn already -- by a copy's deletion or edit: the same
+            # deletion reaching each post of a relayed call is said once.
+            logger.info(
+                "channel %s message %s deleted, found by %s: signal %s was withdrawn already",
+                channel_id,
+                message_id,
+                detected_by,
+                signal_id,
+            )
+        elif row["state"] == "NEW" or status != "pending":
             result = _withdraw_signal(
                 ctx,
                 row,
@@ -1082,6 +1247,10 @@ def apply_deletion(
         return DeletionResult(
             "withdrawn", message_id, kind, signal_id, followup_id, partial.skipped, partial.alert_ids
         )
+    else:
+        holder = _holder_of_copy(ctx)
+        if holder is not None:
+            return _deletion_of_copy(ctx, holder, kind)
 
     logger.info(
         "channel %s message %s (%s) deleted, found by %s; marked",
@@ -1091,6 +1260,57 @@ def apply_deletion(
         detected_by,
     )
     return DeletionResult("deleted", message_id, kind, signal_id, followup_id, 0, ())
+
+
+def _deletion_of_copy(ctx: _Ctx, holder: sqlite3.Row, kind: str) -> DeletionResult:
+    """A relay copy of signal `holder` was deleted (final review F02,
+    ruling C2). On the signal's own channel it is a double post tidied up:
+    a WARNING, nothing else. On another channel it is a deletion of the
+    signal itself -- one source withdrew the call: VOIDED if nothing was
+    executed, a CRITICAL flag if it was -- unless the signal was withdrawn
+    already (the same deletion reaching another copy). Either way the
+    alert names both messages; a repost is never promoted from here."""
+    signal_id = holder["signal_id"]
+    copy_ctx = _as_copy(ctx, holder)
+
+    def result(outcome: DeletionOutcome, partial: EditResult | None = None) -> DeletionResult:
+        return DeletionResult(
+            outcome,
+            ctx.message_id,
+            kind,
+            signal_id,
+            None,
+            0 if partial is None else partial.skipped,
+            () if partial is None else partial.alert_ids,
+        )
+
+    if holder["channel_id"] == ctx.channel_id:
+        if kind != "signal":
+            return result("deleted")  # edited away before: said then
+        alert = _repeat_removed(copy_ctx, holder, how=f"deleted, found by {ctx.detected_by}")
+        return dataclasses.replace(result("deleted"), alert_ids=(alert,))
+    status = trade_status(ctx.conn, signal_id=signal_id)
+    if holder["withdrawn_at_utc"] is None and (holder["state"] == "NEW" or status != "pending"):
+        withdrawn = _withdraw_signal(
+            copy_ctx,
+            holder,
+            status,
+            via=f"this copy was deleted, found by {ctx.detected_by}",
+            pending_code=SIGNAL_VOIDED_BY_DELETION,
+            live_code=LIVE_SIGNAL_DELETED,
+            new_kind=kind,
+        )
+        return result(withdrawn.outcome, withdrawn)  # "voided" or "flagged"
+    logger.info(
+        "channel %s message %s, a copy of signal %s (%s%s), deleted, found by %s; marked",
+        ctx.channel_id,
+        ctx.message_id,
+        signal_id,
+        holder["state"],
+        ", withdrawn" if holder["withdrawn_at_utc"] else "",
+        ctx.detected_by,
+    )
+    return result("deleted")
 
 
 # -- helpers -----------------------------------------------------------------
@@ -1119,6 +1339,8 @@ class _Ctx:
     #: Set when the change reaches a signal through one of its relay copies
     #: (this message): what every alert then says first, naming both.
     via_copy: str | None = None
+    #: The changed message's own `messages.relay_of_signal_id`.
+    relay_of_signal_id: int | None = None
 
     @property
     def channel_id(self) -> int:

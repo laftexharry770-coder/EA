@@ -882,3 +882,526 @@ def test_a_repost_that_no_longer_reads_as_a_signal_is_passed_over(conn, caplog):
     assert _signals(conn)[1] == (holder.signal_id + 1, VIP.channel_id, 4013, "NEW")
     assert any("4012" in r.getMessage() and "not promoted" in r.getMessage()
                for r in caplog.records)
+
+
+# -- F02: an edit or a deletion of a copy reaches the signal it repeats ----------
+#
+# The VIP's post (V/4001) and the relay's copy of it (R/7001, 2 s later).
+# Whichever was stored first holds the signal; the other is its copy. In
+# the finding's scenarios the VIP's post is the copy: its update was
+# dropped, the relay's arrived, and the poll recovered the VIP's later.
+
+RELAY_POST = _post(COPY, after=timedelta(seconds=2))
+
+
+def _claim(db_path: Path, account_id: str = "acct-2"):
+    from xaucopier.store import outbox
+
+    conn = db.connect(db_path, role="writer")
+    try:
+        row = outbox.claim(conn, account_id=account_id, pid=4242, now_utc=NOW)
+        conn.commit()
+        return None if row is None else (row.kind, row.signal_id)
+    finally:
+        conn.close()
+
+
+async def _relay_holds(client, listener, time, db_path, *, how: str = "blackout") -> None:
+    """The relay's copy holds signal 1; the VIP's post is its copy."""
+    if how == "blackout":  # F1a: the VIP's update dropped, the relay's delivered
+        with client.blackout():
+            await client.emit(V, _post(CALL))
+        assert await client.emit(R, RELAY_POST)
+    elif how == "relay-first":  # F1e: both delivered, the relay's first
+        assert await client.emit(R, RELAY_POST)
+        assert await client.emit(V, _post(CALL))
+    elif how == "both-dropped":  # F1h: both dropped; the poll reads them in config order
+        with client.blackout():
+            await client.emit(V, _post(CALL))
+            await client.emit(R, RELAY_POST)
+    elif how != "posted-while-down":  # F1g: history before start, backfilled
+        raise AssertionError(how)
+    for _ in range(2):
+        await _round(listener, time)
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "NEW", 0)], state
+    assert state["links"] == [(V, CALL, 1)]
+
+
+def _posted_while_down() -> FakeTelegramClient:
+    client = FakeTelegramClient()
+    client.add_to_history(V, _post(CALL))
+    client.add_to_history(R, RELAY_POST)
+    return client
+
+
+@pytest.mark.parametrize(
+    ("how", "channels"),
+    [
+        ("blackout", (VIP, RELAY)),  # F1a
+        ("relay-first", (VIP, RELAY)),  # F1e
+        ("posted-while-down", (RELAY, VIP)),  # F1g
+        ("both-dropped", (RELAY, VIP)),  # F1h
+    ],
+)
+def test_a_copy_re_aimed_invalidates_the_signal_it_repeats(tmp_path, how, channels):
+    db_path = tmp_path / "store.db"
+    client = _posted_while_down() if how == "posted-while-down" else None
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path, how=how)
+        assert await client.emit_edit(V, CALL, DIRECTION_EDIT, edit_date=EDIT_1)
+
+    _run(db_path, body, channels=channels, client=client)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "INVALID", 0)]
+    assert state["queued"] == []
+    assert state["alerts"] == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT, V, CALL, 1)]
+    detail = _alert_detail(db_path, edits_repo.SIGNAL_INVALIDATED_BY_EDIT)
+    assert f"message {CALL} on channel {V}" in detail  # the copy
+    assert f"message {COPY} on channel {R}" in detail  # the signal's own message
+    assert _claim(db_path) is None
+
+
+def test_a_copy_deleted_voids_the_unexecuted_signal_it_repeats(tmp_path):
+    """F1b: another channel's copy deleted -- one source withdrew the call."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        assert await client.emit_delete(V, CALL)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "VOIDED", 1)]
+    assert state["queued"] == []
+    assert state["alerts"] == [("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION, V, CALL, 1)]
+    detail = _alert_detail(db_path, edits_repo.SIGNAL_VOIDED_BY_DELETION)
+    assert f"message {COPY} on channel {R}" in detail
+    assert _claim(db_path) is None
+
+
+def test_a_copy_deleted_flags_the_executed_signal_it_repeats(tmp_path):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        _mark_executed(db_path)
+        assert await client.emit_delete(V, CALL)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "NEW", 1)]
+    assert state["alerts"] == [("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED, V, CALL, 1)]
+    assert _claim(db_path) is None  # acct-2's entry is skipped, and the signal withdrawn
+
+
+def test_a_copys_sl_edit_amends_the_executed_signal_it_repeats(tmp_path):
+    """F1c."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        _mark_executed(db_path)
+        assert await client.emit_edit(V, CALL, SL_EDIT, edit_date=EDIT_1)
+
+    _run(db_path, body)
+
+    (version, sl, posted) = _db_rows(
+        db_path,
+        "SELECT version, json_extract(parsed_json, '$.sl'), "
+        "json_extract(parsed_json, '$.posted_at_utc') FROM signals",
+    )[0]
+    assert (version, sl) == (2, 4460.0)
+    # Still the signal's own post date, not the copy's.
+    assert posted == (POSTED + timedelta(seconds=2)).isoformat()
+    amendments = _db_rows(
+        db_path,
+        "SELECT channel_id, message_id, op, target_signal_id, resolution_path FROM followups",
+    )
+    assert amendments == [(R, COPY, "amend_sl", 1, "edit")]
+    assert _db_rows(db_path, "SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP'") == [(N,)]
+
+
+def test_a_copy_re_aimed_after_execution_is_loud_and_skips_the_rest(tmp_path):
+    """F1d: the live BUY is not re-aimed; acct-2's queued BUY is skipped."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        _mark_executed(db_path)
+        assert await client.emit_edit(V, CALL, DIRECTION_EDIT, edit_date=EDIT_1)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "INVALID", 0)]
+    assert state["alerts"] == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT, V, CALL, 1)]
+    assert "NOT closed or re-aimed" in _alert_detail(db_path, edits_repo.SIGNAL_INVALIDATED_BY_EDIT)
+    assert _claim(db_path) is None
+
+
+@pytest.mark.parametrize("found_by", ["window", "forward-read"])
+def test_a_copys_edit_the_update_stream_dropped_reaches_the_signal(tmp_path, found_by):
+    """Every arrival path: the window re-read (the copy is at or below the
+    pointer) and the poll's forward read (the copy was stored live, above
+    it)."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        if found_by == "window":
+            await _relay_holds(client, listener, time, db_path)
+        else:
+            assert await client.emit(R, RELAY_POST)
+            assert await client.emit(V, _post(CALL))  # stored live: a copy, pointer below it
+        with client.blackout():
+            assert not await client.emit_edit(V, CALL, DIRECTION_EDIT, edit_date=EDIT_1)
+        await _round(listener, time)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "INVALID", 0)]
+    assert state["alerts"] == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT, V, CALL, 1)]
+
+
+def test_a_copys_deletion_the_update_stream_dropped_reaches_the_signal(tmp_path):
+    """The window re-read infers it (two reads); it voids the signal the
+    copy repeats and the window's summary names that signal."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        with client.blackout():
+            await client.emit(V, _post(CALL))
+            for message_id in VIP_CHATTER:
+                await client.emit(V, _post(message_id, CHATTER_TEXT))
+        assert await client.emit(R, RELAY_POST)
+        await _round(listener, time)
+        assert _state(db_path)["links"] == [(V, CALL, 1)]
+        with client.blackout():
+            assert not await client.emit_delete(V, CALL)
+        for _ in range(3):
+            await _round(listener, time)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "VOIDED", 1)]
+    assert ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION, V, CALL, 1) in state["alerts"]
+    assert ("CRITICAL", edits_repo.WINDOW_VOIDED_SIGNALS) in _codes(state)
+    assert "[1]" in _alert_detail(db_path, edits_repo.WINDOW_VOIDED_SIGNALS)
+
+
+# -- F02: mirrored edits and deletions are applied once ------------------------------
+
+
+@pytest.mark.parametrize("first", ["copy", "holder"])
+def test_a_re_aim_mirrored_on_both_posts_is_one_alert(tmp_path, first):
+    """F1f and its reverse: the relay mirrors the edit. Whichever arrives
+    first invalidates the signal; the other is a no-op."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        order = [(V, CALL), (R, COPY)] if first == "copy" else [(R, COPY), (V, CALL)]
+        for index, (channel_id, message_id) in enumerate(order):
+            relay_text = DIRECTION_EDIT + ("\nvia VIP" if channel_id == R else "")
+            assert await client.emit_edit(
+                channel_id, message_id, relay_text, edit_date=EDIT_1 + timedelta(seconds=index)
+            )
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "INVALID", 0)]
+    assert _codes(state) == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT)]
+
+
+@pytest.mark.parametrize("executed", [False, True], ids=["unexecuted", "executed"])
+@pytest.mark.parametrize("first", ["copy", "holder"])
+def test_a_deletion_mirrored_on_both_posts_is_one_alert(tmp_path, first, executed):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        if executed:
+            _mark_executed(db_path)
+        order = [(V, CALL), (R, COPY)] if first == "copy" else [(R, COPY), (V, CALL)]
+        for channel_id, message_id in order:
+            assert await client.emit_delete(channel_id, message_id)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "NEW" if executed else "VOIDED", 1)]
+    assert _codes(state) == [
+        ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED)
+        if executed
+        else ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)
+    ]
+
+
+@pytest.mark.parametrize("first", ["copy", "holder"])
+def test_an_sl_edit_mirrored_on_both_posts_is_amended_once(tmp_path, first):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        _mark_executed(db_path)
+        order = [(V, CALL), (R, COPY)] if first == "copy" else [(R, COPY), (V, CALL)]
+        for index, (channel_id, message_id) in enumerate(order):
+            assert await client.emit_edit(
+                channel_id, message_id, SL_EDIT, edit_date=EDIT_1 + timedelta(seconds=index)
+            )
+
+    _run(db_path, body)
+
+    assert _db_rows(db_path, "SELECT op FROM followups") == [("amend_sl",)]
+    assert _db_rows(db_path, "SELECT version FROM signals") == [(2,)]
+    assert _state(db_path)["alerts"] == []
+
+
+def test_a_copy_edited_back_after_its_signal_was_closed_is_a_warning(tmp_path):
+    """Not a mirror: the copy now reads as a live call again, while the
+    signal stays INVALID -- said once, as for the signal's own message."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        assert await client.emit_edit(V, CALL, DIRECTION_EDIT, edit_date=EDIT_1)
+        assert await client.emit_edit(V, CALL, SIGNAL_TEXT, edit_date=EDIT_2)
+
+    _run(db_path, body)
+
+    assert _codes(_state(db_path)) == [
+        ("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT),
+        ("WARNING", edits_repo.EDIT_OF_CLOSED_SIGNAL),
+    ]
+
+
+# -- F02: a copy on the same channel (a double post) ---------------------------------
+
+
+@pytest.mark.parametrize("change", ["deleted", "edited-away"])
+def test_a_double_post_tidied_up_only_warns(tmp_path, change):
+    """The poster posts the call twice and removes the second: the call
+    stands, still queued; a WARNING says so."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(seconds=30)))
+        if change == "deleted":
+            assert await client.emit_delete(V, REPOST)
+        else:
+            assert await client.emit_edit(V, REPOST, ".", edit_date=EDIT_1)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "NEW", 0)]
+    assert state["queued"] == [(1, N)]
+    assert state["alerts"] == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, REPOST, 1)]
+    detail = _alert_detail(db_path, edits_repo.SIGNAL_REPEAT_REMOVED)
+    assert f"message {CALL}" in detail
+
+
+def test_a_double_post_re_aimed_invalidates_the_signal(tmp_path):
+    """A re-aim is not a tidy-up: whichever post says it, the call is in
+    doubt."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(seconds=30)))
+        assert await client.emit_edit(V, REPOST, DIRECTION_EDIT, edit_date=EDIT_1)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "INVALID", 0)]
+    assert state["alerts"] == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT, V, REPOST, 1)]
+
+
+def test_a_copy_edited_into_chatter_on_another_channel_withdraws_the_signal(tmp_path):
+    """As its deletion would: another source withdrew the call."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        assert await client.emit_edit(V, CALL, EDIT_CHATTER, edit_date=EDIT_1)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "VOIDED", 1)]
+    assert state["alerts"] == [("WARNING", edits_repo.SIGNAL_RETRACTED_BY_EDIT, V, CALL, 1)]
+
+
+def test_a_copys_withdrawal_never_promotes_a_repost(tmp_path):
+    """The VIP double-posted; the relay deleted its copy. One source
+    withdrew the call: the VIP's repost is not promoted over that."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(seconds=30)))
+        assert await client.emit(R, _post(COPY, after=timedelta(seconds=40)))
+        assert await client.emit_delete(R, COPY)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "VOIDED", 1)]
+    assert state["queued"] == []
+    assert state["links"] == [(R, COPY, 1), (V, REPOST, 1)]
+
+
+def test_a_repeat_edited_back_into_the_call_says_it_is_a_copy(tmp_path):
+    """Edits never open trades -- and the warning must not invite the user
+    to trade by hand a call that is already queued."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(seconds=30)))
+        assert await client.emit_edit(V, REPOST, ".", edit_date=EDIT_1)
+        assert await client.emit_edit(V, REPOST, SIGNAL_TEXT, edit_date=EDIT_2)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["queued"] == [(1, N)]
+    assert _codes(state) == [
+        ("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED),
+        ("WARNING", edits_repo.EDIT_CREATED_SIGNAL),
+    ]
+    detail = _alert_detail(db_path, edits_repo.EDIT_CREATED_SIGNAL)
+    assert "copy of signal 1" in detail and "by hand" not in detail
+
+
+def test_a_copys_window_deletion_reversed_names_the_signal_it_voided(tmp_path):
+    from test_edits import ScriptedClient, _without
+
+    db_path = tmp_path / "store.db"
+    client = ScriptedClient()
+
+    async def body(client, listener, time):
+        with client.blackout():
+            await client.emit(V, _post(CALL))
+            for message_id in VIP_CHATTER:
+                await client.emit(V, _post(message_id, CHATTER_TEXT))
+        assert await client.emit(R, RELAY_POST)
+        await _round(listener, time)
+        # Each round reads the VIP's window, then the relay's: two misses
+        # of the VIP's post in a row, then it is back.
+        client.ids_answers = [_without(CALL)] * 4
+        for _ in range(3):
+            await _round(listener, time)
+
+    _run(db_path, body, client=client)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "VOIDED", 1)]
+    assert ("CRITICAL", edits_repo.DELETION_REVERSED) in _codes(state)
+    detail = _alert_detail(db_path, edits_repo.DELETION_REVERSED)
+    assert "signal 1 (this message is a copy of it) is VOIDED" in detail
+
+
+@pytest.mark.parametrize("executed", [False, True], ids=["unexecuted", "executed"])
+@pytest.mark.parametrize("first", ["copy", "holder"])
+def test_a_retraction_mirrored_on_both_posts_is_one_alert(tmp_path, first, executed):
+    """Both posts edited into chatter: the call is withdrawn once."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        if executed:
+            _mark_executed(db_path)
+        order = [(V, CALL), (R, COPY)] if first == "copy" else [(R, COPY), (V, CALL)]
+        for index, (channel_id, message_id) in enumerate(order):
+            assert await client.emit_edit(
+                channel_id, message_id, f"{EDIT_CHATTER} {index}",
+                edit_date=EDIT_1 + timedelta(seconds=index),
+            )
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "NEW" if executed else "VOIDED", 1)]
+    assert _codes(state) == [
+        ("CRITICAL", edits_repo.LIVE_SIGNAL_RETRACTED_BY_EDIT)
+        if executed
+        else ("WARNING", edits_repo.SIGNAL_RETRACTED_BY_EDIT)
+    ]
+
+
+def test_a_copy_re_aimed_then_deleted_is_one_alert(tmp_path):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _relay_holds(client, listener, time, db_path)
+        assert await client.emit_edit(V, CALL, DIRECTION_EDIT, edit_date=EDIT_1)
+        assert await client.emit_delete(V, CALL)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, R, COPY, "INVALID", 0)]
+    assert _codes(state) == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT)]
+
+
+def test_a_repeat_edited_away_then_deleted_is_one_warning(tmp_path):
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(seconds=30)))
+        assert await client.emit_edit(V, REPOST, ".", edit_date=EDIT_1)
+        assert await client.emit_delete(V, REPOST)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["queued"] == [(1, N)]
+    assert _codes(state) == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED)]
+
+
+def test_a_call_nobody_copied_keeps_its_own_policy_for_a_second_closing_edit(tmp_path):
+    """The mirror rule is for relayed calls only: a signal re-aimed, then
+    edited into something unparseable, still warns the second time."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit_edit(V, CALL, DIRECTION_EDIT, edit_date=EDIT_1)
+        assert await client.emit_edit(V, CALL, UNPARSEABLE_EDIT, edit_date=EDIT_2)
+
+    _run(db_path, body)
+
+    assert _codes(_state(db_path)) == [
+        ("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT),
+        ("WARNING", edits_repo.EDIT_OF_CLOSED_SIGNAL),
+    ]
+
+
+def test_a_call_nobody_copied_keeps_its_own_policy_for_a_deletion_after_a_retraction(tmp_path):
+    """The mirror rule for deletions is for relayed calls only: an executed
+    signal edited into chatter and then deleted says both, as before."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        _mark_executed(db_path)
+        assert await client.emit_edit(V, CALL, EDIT_CHATTER, edit_date=EDIT_1)
+        assert await client.emit_delete(V, CALL)
+
+    _run(db_path, body)
+
+    assert _codes(_state(db_path)) == [
+        ("CRITICAL", edits_repo.LIVE_SIGNAL_RETRACTED_BY_EDIT),
+        ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED),
+    ]
