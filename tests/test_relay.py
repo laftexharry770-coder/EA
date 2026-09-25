@@ -25,18 +25,36 @@ against the fake Telegram client.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from fakes.telegram import FakeMessage, FakeTelegramClient
+from test_edits import ACCOUNTS as LIVE_ACCOUNTS
+from test_edits import CHATTER_TEXT as EDIT_CHATTER
+from test_edits import (
+    DIRECTION_EDIT,
+    EDIT_1,
+    EDIT_2,
+    NOW,
+    SL_EDIT,
+    UNPARSEABLE_EDIT,
+    ScriptedClient,
+    SteppedTime,
+    _round,
+    _until_asleep,
+    _without,
+)
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.ingest.listener import HistoryIngest
-from xaucopier.ingest.poll import split_new
-from xaucopier.store import db, relay_repo
+from xaucopier.domain.signal import FollowUp, FollowUpOp
+from xaucopier.ingest.listener import HistoryIngest, Listener
+from xaucopier.ingest.poll import HistoryPoll, split_new
+from xaucopier.store import db, edits_repo, outbox, relay_repo, signals_repo
 from xaucopier.store.messages_repo import IngestResult, ingest
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json"
@@ -348,26 +366,6 @@ def test_a_copy_only_a_history_read_found_counts_as_missed_by_the_update_stream(
 
 
 # == the arrival paths: the real listener and poll, the fake Telegram ===========
-
-import asyncio  # noqa: E402 -- the path tests' own imports
-
-from fakes.telegram import FakeMessage, FakeTelegramClient  # noqa: E402
-from test_edits import ACCOUNTS as LIVE_ACCOUNTS  # noqa: E402
-from test_edits import CHATTER_TEXT as EDIT_CHATTER  # noqa: E402
-from test_edits import (  # noqa: E402
-    DIRECTION_EDIT,
-    EDIT_1,
-    EDIT_2,
-    NOW,
-    SL_EDIT,
-    UNPARSEABLE_EDIT,
-    SteppedTime,
-    _round,
-    _until_asleep,
-)
-from xaucopier.ingest.listener import Listener  # noqa: E402
-from xaucopier.ingest.poll import HistoryPoll  # noqa: E402
-from xaucopier.store import edits_repo  # noqa: E402
 
 V = VIP.channel_id
 R = RELAY.channel_id
@@ -822,8 +820,6 @@ def test_a_promotion_is_part_of_the_deletion_that_caused_it(conn, monkeypatch):
     """One writer job: a crash while the repost's entries are fanned out
     rolls the deletion back too, so it is retried whole -- never a VOIDED
     original with an unpromoted repost."""
-    from xaucopier.store import outbox
-
     holder = _ingest(conn, VIP, 4001)
     _ingest(conn, VIP, 4012, posted=POSTED + timedelta(minutes=2))
 
@@ -896,8 +892,6 @@ RELAY_POST = _post(COPY, after=timedelta(seconds=2))
 
 
 def _claim(db_path: Path, account_id: str = "acct-2"):
-    from xaucopier.store import outbox
-
     conn = db.connect(db_path, role="writer")
     try:
         row = outbox.claim(conn, account_id=account_id, pid=4242, now_utc=NOW)
@@ -1285,8 +1279,6 @@ def test_a_repeat_edited_back_into_the_call_says_it_is_a_copy(tmp_path):
 
 
 def test_a_copys_window_deletion_reversed_names_the_signal_it_voided(tmp_path):
-    from test_edits import ScriptedClient, _without
-
     db_path = tmp_path / "store.db"
     client = ScriptedClient()
 
@@ -1433,8 +1425,6 @@ def _followup_link(conn, channel: ChannelCfg, message_id: int) -> int | None:
 
 
 def _claims(conn) -> list[tuple]:
-    from xaucopier.store import outbox
-
     claimed = []
     while (row := outbox.claim(
         conn, account_id="acct-1", pid=1, now_utc=POSTED + timedelta(hours=1)
@@ -1674,9 +1664,6 @@ def test_a_forward_of_a_follow_up_copy_repeats_the_follow_up_it_copied(conn):
 
 
 def test_a_follow_ups_target_and_its_path_go_together(conn):
-    from xaucopier.domain.signal import FollowUp, FollowUpOp
-    from xaucopier.store import signals_repo
-
     followup = FollowUp(
         channel_id=VIP.channel_id, message_id=1, op=FollowUpOp.CLOSE_ALL, posted_at_utc=POSTED
     )
