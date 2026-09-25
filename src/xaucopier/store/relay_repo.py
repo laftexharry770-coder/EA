@@ -46,13 +46,14 @@ its repost would open the same trade twice.
 
 **What is a copy of a follow-up** (`find_followup_relay`, F08): the same
 post (forwards, as above), or -- for a follow-up whose target signal is
-known because it replies to a stored signal message -- a stored
-follow-up with the same instruction (`op`) and the same normalised text
-targeting the same signal within the window. A follow-up that replies to
-nothing is never matched by its text: two channels each saying "close
-half" may be two genuine instructions. A stored follow-up whose message
-was deleted, or edited into something else, no longer counts on its own
-channel (the poster withdrew it and may post it again).
+known because it replies to a stored signal message -- a follow-up *on
+another channel* with the same instruction (`op`) and the same
+normalised text targeting the same signal within the window. A relay is
+another channel: a poster saying "close half" at TP1 and again at TP2 on
+its own channel gives two instructions, and so does a poster who
+withdrew one and said it again. A follow-up that replies to nothing is
+never matched by its text: two channels each saying "close half" may be
+two genuine instructions.
 
 **Every copy is visible.** `record_signal_copy` / `record_followup_copy`
 store the link on the copy's `messages` row, log it at INFO with both
@@ -317,8 +318,7 @@ def find_followup_relay(
     if target_signal_id is None:
         return None  # never matched by its text alone
     rows = conn.execute(
-        "SELECT f.followup_id, f.channel_id, f.message_id, m.posted_at_utc, "
-        "       m.deleted_at_utc, m.kind "
+        "SELECT f.followup_id, f.channel_id, f.message_id, m.posted_at_utc "
         "FROM followups f "
         "JOIN messages m ON m.channel_id = f.channel_id AND m.message_id = f.message_id "
         "WHERE f.edit_seq = 0 AND f.target_signal_id IS ? AND f.op = ? AND m.content_hash = ? "
@@ -327,11 +327,8 @@ def find_followup_relay(
     ).fetchall()
     window = timedelta(seconds=relay_window_seconds)
     for row in rows:
-        if (row["channel_id"], row["message_id"]) == (channel_id, message_id):
-            continue
-        withdrawn = row["deleted_at_utc"] is not None or row["kind"] != "followup"
-        if withdrawn and row["channel_id"] == channel_id:
-            continue  # the poster withdrew it here and said it again
+        if row["channel_id"] == channel_id:
+            continue  # said again on its own channel: another instruction, not a relay
         if abs(datetime.fromisoformat(row["posted_at_utc"]) - posted_at_utc) <= window:
             return FollowupMatch(row["followup_id"], row["channel_id"], row["message_id"], "hash")
     return None

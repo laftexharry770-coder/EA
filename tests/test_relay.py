@@ -1902,3 +1902,29 @@ def test_a_deletion_through_a_copy_reports_the_repost_it_promoted(conn):
     assert (result.outcome, result.signal_id) == ("voided", holder.signal_id)
     assert result.promoted_signal_id == holder.signal_id + 1
     assert _signals(conn)[1] == (holder.signal_id + 1, VIP.channel_id, 4012, "NEW")
+
+
+# -- F08: the same instruction twice on one channel ---------------------------------
+
+
+@pytest.mark.parametrize("second_reply_to", [4001, 4012], ids=["same-post", "its-repost"])
+def test_the_same_instruction_said_twice_on_one_channel_is_two_instructions(
+    conn, second_reply_to
+):
+    """A relay is another channel. A poster saying "close half" at TP1 and
+    again at TP2, seven minutes apart, gives two instructions -- replying
+    to the call, or to the poster's own repost of it."""
+    holder = _ingest(conn, VIP, 4001)
+    _ingest(conn, VIP, 4012, posted=POSTED + timedelta(minutes=1))  # a repeat: a copy of 4001
+    first = _ingest(conn, VIP, 4002, CLOSE_HALF, posted=POSTED + timedelta(minutes=5), reply_to=4001)
+    again = _ingest(
+        conn, VIP, 4003, CLOSE_HALF, posted=POSTED + timedelta(minutes=12),
+        reply_to=second_reply_to,
+    )
+    assert (first.outcome, again.outcome) == ("new", "new")
+    assert again.relay_of_followup_id is None
+    assert [row[2] for row in _followups(conn)] == [4002, 4003]
+    assert {row[5] for row in _followups(conn)} == {holder.signal_id}
+    queued = _q(conn, "SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP' AND state = 'QUEUED'")
+    assert queued == [(2 * len(ACCOUNTS),)]
+    assert _metric(conn, relay_repo.RELAY_DUPLICATE_FOLLOWUPS_METRIC) == 0
