@@ -192,7 +192,8 @@ DeletionOutcome = Literal[
     "deleted",  # anything else: marked only
 ]
 
-TradeStatus = Literal["pending", "in_flight", "executed"]
+#: `signals_repo.trade_status`'s answer (defined there, used here).
+TradeStatus = signals_repo.TradeStatus
 
 
 class _ChannelCfgLike(Protocol):
@@ -265,15 +266,9 @@ def content_hash_for(route_result: RouteResult, text: str) -> str:
     return hashlib.sha1(normalize(text).encode("utf-8")).hexdigest()
 
 
-def trade_status(conn: sqlite3.Connection, *, signal_id: int) -> TradeStatus:
-    """Whether a signal has been traded -- by its ENTRY outbox rows, the
-    proxy until Plan 3's legs table exists (see the module docstring)."""
-    counts = outbox.state_counts(conn, kind="ENTRY", signal_id=signal_id)
-    if counts.get("DONE"):
-        return "executed"
-    if counts.get("CLAIMED"):
-        return "in_flight"
-    return "pending"
+#: Whether a signal has been traded -- `signals_repo.trade_status`, the one
+#: definition (see the module docstring's "Executed is the outbox").
+trade_status = signals_repo.trade_status
 
 
 def window_versions(

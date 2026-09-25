@@ -157,7 +157,12 @@ two backfills every existing row keeps every value it had.
   holds a different value (a row that is not JSON, or has no such key,
   is left alone). ``json_set`` re-serialises only those rows, compactly.
 - ``messages.relay_of_signal_id``: the signal a message was classified
-  as a relay duplicate of, at ingest (F02).
+  as a relay duplicate of, at ingest (F02), with the index
+  ``idx_messages_relay_of_signal`` -- a signal's copies are looked up by
+  it when one of them is edited or deleted, and when a withdrawn signal's
+  standing repost is promoted (F04). ``messages.relay_of_followup_id``
+  is the same for a follow-up (F08): the follow-up a relayed copy
+  repeated. See ``store/relay_repo.py``.
 - ``messages.sender_kind`` (``'user'`` / ``'channel'`` / ``'chat'``),
   ``sender_id`` and ``is_post`` (0/1): who posted a message, so a group
   member's chatter can be told from the channel's own posts (F05).
@@ -291,6 +296,8 @@ _MIGRATION_4: tuple[str, ...] = (
     "ALTER TABLE channel_state ADD COLUMN seed_cutoff_utc TEXT",
     "ALTER TABLE channel_state ADD COLUMN seeded_at_utc TEXT",
     "ALTER TABLE messages ADD COLUMN relay_of_signal_id INTEGER",
+    "ALTER TABLE messages ADD COLUMN relay_of_followup_id INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_messages_relay_of_signal ON messages(relay_of_signal_id)",
     "ALTER TABLE messages ADD COLUMN sender_kind TEXT "
     "CHECK (sender_kind IN ('user', 'channel', 'chat'))",
     "ALTER TABLE messages ADD COLUMN sender_id INTEGER",

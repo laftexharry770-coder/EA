@@ -36,14 +36,20 @@ parse*, never the raw text: for a routed signal it is `Signal.content_hash`
 as a correction), and for anything else (followup, skip, parse_failed) it
 is a hash of the normalised text, for the same reason.
 
-Cross-channel relay dedup (spec G7): before a *signal* is inserted, any
-already-accepted signal from *any* channel sharing the same trade_hash
-within `relay_window_seconds` of this message's posted_at_utc makes this
-one a "relay_duplicate" -- the messages row is still inserted (every
-message is a fixture; Plan 3's replay needs it), but no signals row is.
-`UNIQUE(channel_id, message_id)` cannot express "the other channel
-relayed the same call": the user's own channel is itself a relay of a
-VIP channel, so the identical trade legitimately shows up twice.
+Cross-channel relay dedup (spec G7): before a *signal* is inserted,
+`relay_repo.find_signal_relay` asks whether it repeats a call we already
+have -- a forward of a stored post (or of another stored copy of it),
+however late (final review F09), or the same trade hash within
+`relay_window_seconds` of this message's posted_at_utc, a withdrawn call
+on the same channel excepted (F04). A match makes this one a
+"relay_duplicate": the messages row is still inserted (every message is
+a fixture; Plan 3's replay needs it), with `relay_of_signal_id` naming
+the signal it repeats (F02: an edit or deletion of the copy reaches that
+signal), logged and counted -- but no signals row is. `UNIQUE(channel_id,
+message_id)` cannot express "the other channel relayed the same call":
+the user's own channel is itself a relay of a VIP channel, so the
+identical trade legitimately shows up twice. See `relay_repo` for the
+rules.
 
 `now_utc` arrives as an explicit parameter rather than being read from
 the wall clock, mirroring the pure core's rule that "now" always comes
@@ -96,7 +102,8 @@ not a timezone-aware datetime, a non-bool ``is_post`` or an unknown
 ``sender_kind`` is a ``ValueError``. They are written once, when the
 message is first stored; a later version of the same message does not
 change them. (``messages.relay_of_signal_id`` is ingest's own finding,
-not an argument.)
+not an argument.) The forward pair is also what recognises a relay copy
+exactly (see above).
 """
 from __future__ import annotations
 
@@ -106,7 +113,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
 from xaucopier.parsing.router import RouteResult, route
-from xaucopier.store import edits_repo, outbox, signals_repo
+from xaucopier.store import edits_repo, outbox, relay_repo, signals_repo
 
 IngestOutcome = Literal["new", "duplicate", "edited", "relay_duplicate"]
 SenderKind = Literal["user", "channel", "chat"]
@@ -141,6 +148,9 @@ class IngestResult:
     followup_id: int | None
     kind: str
     detail: str
+    #: For a "relay_duplicate" signal message: the signal it repeats
+    #: (also stored as `messages.relay_of_signal_id`). None otherwise.
+    relay_of_signal_id: int | None = None
 
 
 def _get_message(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> sqlite3.Row | None:
@@ -398,19 +408,27 @@ def _ingest_new(
     signals_repo.reset_parse_failures(conn, channel_id=channel_id)
     signal = route_result.signal
 
-    relay = signals_repo.find_relay_duplicate(
+    relay = relay_repo.find_signal_relay(
         conn,
+        channel_id=channel_id,
+        message_id=message_id,
         trade_hash=signal.content_hash,
         posted_at_utc=posted_at_utc,
         relay_window_seconds=relay_window_seconds,
+        fwd_from_channel_id=provenance["fwd_from_channel_id"],
+        fwd_from_post_id=provenance["fwd_from_post_id"],
     )
     if relay is not None:
+        relay_repo.record_signal_copy(
+            conn, channel_id=channel_id, message_id=message_id, match=relay, now_utc=now_utc
+        )
         return IngestResult(
             outcome="relay_duplicate",
             signal_id=None,
             followup_id=None,
             kind=kind,
             detail=route_result.detail,
+            relay_of_signal_id=relay.signal_id,
         )
 
     signal_id = signals_repo.insert_signal(

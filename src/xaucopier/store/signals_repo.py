@@ -28,9 +28,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
+from typing import Literal
 
 from xaucopier.domain.signal import FollowUp, Signal
+from xaucopier.store import outbox
+
+TradeStatus = Literal["pending", "in_flight", "executed"]
 
 
 def signal_to_json(signal: Signal, *, source: str) -> str:
@@ -83,49 +87,19 @@ def followup_to_json(followup: FollowUp) -> str:
     )
 
 
-def find_relay_duplicate(
-    conn: sqlite3.Connection,
-    *,
-    trade_hash: str,
-    posted_at_utc: datetime,
-    relay_window_seconds: int,
-) -> sqlite3.Row | None:
-    """Look for an already-accepted signal -- from *any* channel -- that
-    shares `trade_hash` and whose own message was posted within
-    `relay_window_seconds` of `posted_at_utc` (spec G7).
-
-    "Shares `trade_hash`" means either the signal's current trade hash or
-    the one it was first accepted with (`first_trade_hash`): an SL/TP
-    edit rewrites `trade_hash`, and a relay of the *pre-edit* call is
-    still the same trade -- without the second match it would be a second
-    ENTRY (Task 10 review).
-
-    `UNIQUE(channel_id, message_id)` on `signals` cannot express this: the
-    user's channel is itself a relay of a VIP channel, so the same call
-    legitimately arrives twice under two different (channel_id,
-    message_id) pairs. `idx_signals_trade_hash` exists in schema.sql
-    specifically to make this lookup cheap.
-
-    Returns the first matching row (signal_id, channel_id, message_id,
-    posted_at_utc) or None. Deliberately not restricted to a different
-    channel than the caller's: two messages of the identical trade inside
-    one channel, close together, are just as much a relay-shaped
-    duplicate as a cross-channel one.
-    """
-    rows = conn.execute(
-        "SELECT s.signal_id, s.channel_id, s.message_id, m.posted_at_utc "
-        "FROM signals s "
-        "JOIN messages m ON m.channel_id = s.channel_id AND m.message_id = s.message_id "
-        "WHERE s.trade_hash = ? OR s.first_trade_hash = ?",
-        (trade_hash, trade_hash),
-    ).fetchall()
-
-    window = timedelta(seconds=relay_window_seconds)
-    for row in rows:
-        other_posted = datetime.fromisoformat(row["posted_at_utc"])
-        if abs(other_posted - posted_at_utc) <= window:
-            return row
-    return None
+def trade_status(conn: sqlite3.Connection, *, signal_id: int) -> TradeStatus:
+    """Whether a signal has been traded -- by its ENTRY outbox rows, the
+    proxy until Plan 3's legs table exists: one `DONE` is executed; one
+    `CLAIMED` (a worker holds it, possibly mid order-send) is in flight.
+    The one definition: `edits_repo` (what an edit or deletion does) and
+    `relay_repo` (whether a withdrawn call was ever traded) both ask here.
+    Replace it with the legs table when Plan 3 lands."""
+    counts = outbox.state_counts(conn, kind="ENTRY", signal_id=signal_id)
+    if counts.get("DONE"):
+        return "executed"
+    if counts.get("CLAIMED"):
+        return "in_flight"
+    return "pending"
 
 
 def insert_signal(
@@ -160,7 +134,7 @@ def update_signal_on_edit(
     There is nothing to correct in that case; nothing to fabricate either.
 
     `first_trade_hash` is left alone: relay dedup keeps matching the call
-    as it was first accepted (see `find_relay_duplicate`). So is
+    as it was first accepted (see `relay_repo.find_signal_relay`). So is
     parsed_json's `source`: it stays the message's `messages.source`.
     """
     source = _message_source(conn, channel_id=channel_id, message_id=message_id)

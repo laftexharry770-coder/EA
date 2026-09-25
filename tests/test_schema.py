@@ -790,6 +790,7 @@ _V4_COLUMNS = {
     "channel_state": ("seed_cutoff_utc", "seeded_at_utc"),
     "messages": (
         "relay_of_signal_id",
+        "relay_of_followup_id",
         "sender_kind",
         "sender_id",
         "is_post",
@@ -958,6 +959,29 @@ def test_messages_forward_lookup_has_its_index(tmp_path):
         )
     )
     assert "idx_messages_fwd_from" in plan
+    conn.close()
+
+
+def test_messages_relay_link_lookup_has_its_index(tmp_path):
+    """A withdrawn signal's standing copies (promotion) and a family's
+    copies (edits and deletions of a relayed call) are found by
+    relay_of_signal_id (final review F02/F04)."""
+    conn = _connect(tmp_path)
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(messages)")}
+    assert "idx_messages_relay_of_signal" in indexes
+    columns = [
+        row[2] for row in conn.execute("PRAGMA index_info(idx_messages_relay_of_signal)")
+    ]
+    assert columns == ["relay_of_signal_id"]
+    plan = " ".join(
+        str(row[3])
+        for row in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT channel_id, message_id FROM messages "
+            "WHERE relay_of_signal_id = ?",
+            (1,),
+        )
+    )
+    assert "idx_messages_relay_of_signal" in plan
     conn.close()
 
 

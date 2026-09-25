@@ -209,19 +209,25 @@ def _retrieve_outcome(task: asyncio.Future[object]) -> None:
         task.exception()
 
 
+#: `ingest()` outcomes that mean the message was stored for the first time.
+_FIRST_STORED = frozenset({"new", "relay_duplicate"})
+
+
 def split_new(
     results: tuple[HistoryIngest, ...], *, live_from: datetime | None
 ) -> tuple[list[int], list[int]]:
-    """The ids of one history read's `"new"` messages, as (missed by the
-    update stream, backlog): a message dated at or after `live_from` was
-    posted while this watch ran and the stream should have delivered it;
-    one dated before it was posted while watch was stopped (final review
+    """The ids of one history read's first-stored messages -- `"new"`, or
+    a `"relay_duplicate"` (a copy of a call we already have is stored for
+    the first time too; final review F02) -- as (missed by the update
+    stream, backlog): a message dated at or after `live_from` was posted
+    while this watch ran and the stream should have delivered it; one
+    dated before it was posted while watch was stopped (final review
     F17). With no `live_from`, or no date, a message counts as missed --
     the side that can only over-count."""
     missed: list[int] = []
     backlog: list[int] = []
     for outcome in results:
-        if outcome.result is None or outcome.result.outcome != "new":
+        if outcome.result is None or outcome.result.outcome not in _FIRST_STORED:
             continue
         posted = outcome.posted_at_utc
         if live_from is not None and posted is not None and posted < live_from:
