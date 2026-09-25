@@ -1985,3 +1985,34 @@ def test_a_follow_ups_target_is_never_replaced_by_its_copys(conn):
     _ingest(conn, VIP, 4002, CLOSE_HALF, posted=at, reply_to=4001)
     _ingest(conn, RELAY, 5002, CLOSE_HALF, posted=at, reply_to=5001)  # 'relay-reply' of its own
     assert _followups(conn)[0][5:] == (holder.signal_id, "reply")
+
+
+# -- F09: a late forward of a withdrawn post ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("reposted", "forwarded"),
+    [
+        (timedelta(minutes=2), timedelta(minutes=3)),
+        (timedelta(minutes=2), timedelta(hours=2)),  # near the deleted post only
+        (timedelta(minutes=30), timedelta(minutes=31)),  # near the forward only
+    ],
+)
+def test_a_forward_of_a_withdrawn_post_repeats_the_live_repost_of_the_call(
+    conn, reposted, forwarded
+):
+    """The VIP deleted its call and posted it again (a new signal, queued);
+    the relay's forward of the deleted post arrives after both. It repeats
+    the live repost -- no alert telling the user to trade the call by hand
+    while it is queued already."""
+    _ingest(conn, VIP, 4001)
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4001, now_utc=POSTED + timedelta(minutes=1),
+        accounts=ACCOUNTS, detected_by="event",
+    )
+    repost = _ingest(conn, VIP, 4012, posted=POSTED + reposted)
+    forward = _ingest(conn, RELAY, 7001, posted=POSTED + forwarded, fwd=(VIP.channel_id, 4001))
+    assert repost.outcome == "new"
+    assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", repost.signal_id)
+    assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL not in [code for _, code, *_ in _alerts(conn)]
+    assert _queued_entries(conn) == [(repost.signal_id, "acct-1"), (repost.signal_id, "acct-2")]

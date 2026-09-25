@@ -39,7 +39,10 @@ and of which nothing was executed (`signals_repo.trade_status` is
   back -- one source withdrew the call -- but raises a CRITICAL alert
   naming both messages and the post that withdrew it
   (`COPY_OF_WITHDRAWN_SIGNAL`), because the call may be meant after all;
-- a live match is always preferred to a withdrawn one.
+- a live match is always preferred to a withdrawn one -- also for a
+  forward: a forward of a withdrawn post repeats the live signal the
+  poster posted again in its place (the same trade, posted within the
+  window of the withdrawn post or of the forward), if there is one.
 
 A signal that *was* executed and then withdrawn still matches: trading
 its repost would open the same trade twice.
@@ -166,8 +169,20 @@ def find_signal_relay(
         fwd_from_post_id=fwd_from_post_id,
     ):
         signal = _signal_of(conn, stored)
-        if signal is not None:
-            return _signal_match(conn, signal, via="forward")
+        if signal is None:
+            continue
+        if is_withdrawn_unexecuted(conn, signal):
+            # The post is withdrawn; the call may be live again as a repost.
+            live = _live_same_trade(
+                conn,
+                trade_hash=trade_hash,
+                around=(posted_at_utc, _posted_at(conn, signal)),
+                window=relay_window_seconds,
+                exclude=(channel_id, message_id),
+            )
+            if live is not None:
+                return _signal_match(conn, live, via="hash")
+        return _signal_match(conn, signal, via="forward")
 
     withdrawn_elsewhere: sqlite3.Row | None = None
     for signal in _same_trade(
@@ -470,6 +485,34 @@ def _same_trade(
         for row in rows
         if abs(datetime.fromisoformat(row["message_posted_at_utc"]) - posted_at_utc) <= limit
     ]
+
+
+def _posted_at(conn: sqlite3.Connection, signal: sqlite3.Row) -> datetime:
+    """When `signal`'s own message was posted."""
+    (posted,) = conn.execute(
+        "SELECT posted_at_utc FROM messages WHERE channel_id = ? AND message_id = ?",
+        (signal["channel_id"], signal["message_id"]),
+    ).fetchone()
+    return datetime.fromisoformat(posted)
+
+
+def _live_same_trade(
+    conn: sqlite3.Connection,
+    *,
+    trade_hash: str,
+    around: tuple[datetime, ...],
+    window: int,
+    exclude: tuple[int, int],
+) -> sqlite3.Row | None:
+    """The oldest signal on `trade_hash` posted within `window` seconds of
+    any of the `around` times that is not withdrawn-unexecuted, or None."""
+    for moment in around:
+        for signal in _same_trade(conn, trade_hash=trade_hash, posted_at_utc=moment, window=window):
+            if (signal["channel_id"], signal["message_id"]) == exclude:
+                continue
+            if not is_withdrawn_unexecuted(conn, signal):
+                return signal
+    return None
 
 
 def _signal_match(conn: sqlite3.Connection, signal: sqlite3.Row, *, via: MatchVia) -> SignalMatch:
