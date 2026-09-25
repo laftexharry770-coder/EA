@@ -2211,3 +2211,30 @@ def test_a_copys_edit_of_the_level_it_changes_still_wins(conn):
     assert result.outcome == "reparsed"
     assert _levels(conn)[:2] == (3, 4465.0)
     assert _amendments(conn) == [("amend_sl", 4460.0), ("amend_sl", 4465.0)]
+
+
+_THREE_TPS = "\n".join(line for line in SIGNAL_TEXT.split("\n") if "TP4" not in line)
+
+
+@pytest.mark.parametrize(
+    ("vip_edit", "relay_edit", "still_shows"),
+    [
+        (SL_EDIT, TP1_EDIT, "SL 4470"),
+        (SIGNAL_TEXT.replace("4495", "4497"), SIGNAL_TEXT.replace("4470", "4465"), "TP2 4495"),
+        (_THREE_TPS, SIGNAL_TEXT.replace("4470", "4465"), "4 take-profits"),
+    ],
+    ids=["stop", "a-target", "the-ladder"],
+)
+def test_every_level_the_poster_moved_is_protected_from_a_copys_edit(
+    conn, vip_edit, relay_edit, still_shows
+):
+    _copied_and_executed(conn)
+    _edit(conn, VIP, 4001, vip_edit, EDIT_1)
+    before = (_levels(conn), _amendments(conn))
+    result = _edit(conn, RELAY, 7001, relay_edit, EDIT_2)
+    assert result.outcome == "recorded"
+    assert (_levels(conn), _amendments(conn)) == before
+    out_of_date = _q(
+        conn, "SELECT detail FROM alerts WHERE code = ?", edits_repo.SIGNAL_COPY_OUT_OF_DATE
+    )
+    assert len(out_of_date) == 1 and still_shows in out_of_date[0][0]
