@@ -2088,3 +2088,38 @@ def test_a_window_deletion_reversed_after_a_promotion_names_the_promoted_repost(
     detail = _alert_detail(db_path, edits_repo.DELETION_REVERSED)
     assert f"message {REPOST}" in detail and "signal 2" in detail
     assert "twice" in detail
+
+
+# -- F04: the call and its repost deleted together -----------------------------------
+
+
+@pytest.mark.parametrize("ids", [(CALL, REPOST), (REPOST, CALL)], ids=["call-first", "repost-first"])
+@pytest.mark.parametrize("found_by", ["event", "window"])
+def test_a_call_deleted_with_its_repost_in_one_go_is_voided_once(tmp_path, ids, found_by):
+    """One deletion naming both posts (or one window read missing both):
+    the repost is not promoted in between -- its entries would be
+    claimable until the next job voided them -- and no double-post warning
+    claims the call still stands."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_call_stored(client, listener, time)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        await _round(listener, time)
+        if found_by == "event":
+            assert await client.emit_delete(V, *ids)
+        else:
+            with client.blackout():
+                assert not await client.emit_delete(V, *ids)
+            for _ in range(3):
+                await _round(listener, time)
+
+    _run(db_path, body)
+
+    state = _state(db_path)
+    assert state["signals"] == [(1, V, CALL, "VOIDED", 1)]
+    assert state["queued"] == []
+    expected = [("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)]
+    if found_by == "window":
+        expected.append(("CRITICAL", edits_repo.WINDOW_VOIDED_SIGNALS))
+    assert _codes(state) == expected

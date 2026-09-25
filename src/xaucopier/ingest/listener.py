@@ -736,15 +736,18 @@ class Listener:
         message_id: int,
         *,
         detected_by: str,
+        also_deleted: Iterable[int] = (),
     ) -> DeletionResult:
         """Record that `message_id` is gone from its channel --
         `edits_repo.apply_deletion()`, on the writer thread. Idempotent:
         the second report of the same deletion finds it marked. Never
         closes anything, never touches the pointer. (A withdrawn call's
         standing repost may be promoted in the same job, which is why the
-        accounts go along.)"""
+        accounts go along -- unless it is one of `also_deleted`, the
+        other ids the same report named deleted.)"""
         now_utc = self._now()
         accounts = self.accounts
+        others = frozenset(also_deleted)
 
         def job(conn: Connection) -> DeletionResult:
             return edits_repo.apply_deletion(
@@ -754,6 +757,7 @@ class Listener:
                 now_utc=now_utc,
                 accounts=accounts,
                 detected_by=detected_by,
+                also_deleted=others,
             )
 
         return await self._run_on_writer(job)
@@ -1752,7 +1756,10 @@ class Listener:
         for message_id in deletion.message_ids:
             try:
                 await self.ingest_deletion(  # 3. submit
-                    channel_cfg, message_id, detected_by=edits_repo.EVENT_DETECTOR
+                    channel_cfg,
+                    message_id,
+                    detected_by=edits_repo.EVENT_DETECTOR,
+                    also_deleted=deletion.message_ids,
                 )
             except Exception as exc:  # noqa: BLE001 -- recorded, never fatal
                 self._record_handler_error(channel_id, message_id, exc, source=LIVE_SOURCE)

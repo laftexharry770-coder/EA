@@ -303,7 +303,10 @@ async def reconcile_window(
                 try:
                     deletions.append(
                         await listener.ingest_deletion(
-                            channel_cfg, message_id, detected_by=WINDOW_SOURCE
+                            channel_cfg,
+                            message_id,
+                            detected_by=WINDOW_SOURCE,
+                            also_deleted=confirmed,
                         )
                     )
                 except db.WriterDeadError:

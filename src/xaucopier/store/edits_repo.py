@@ -108,6 +108,14 @@ signal's own channel (a double post re-aimed: the other post still
 stands). (A repost posted *after* the withdrawal is not a copy at all:
 see `relay_repo`.)
 
+**Several posts deleted at once.** One `MessageDeleted` event, or one
+window re-read, can name a call and its repost together; each id is
+still applied in its own writer job, but each job is told the others
+(`also_deleted`). A post deleted in the same report is never promoted
+(its entries would be claimable until the next job voided them), and a
+double post deleted together with the post it repeats says nothing of
+its own -- the call's own deletion speaks for both.
+
 **A deletion inferred from absence can be reversed.** The window re-read
 (`ingest/edits.py`) infers a deletion when a message stops coming back --
 guarded there by a circuit breaker and a second read, but still an
@@ -139,6 +147,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
+from collections.abc import Collection
 from datetime import datetime
 from typing import Literal, Protocol
 
@@ -921,6 +930,8 @@ def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> tuple[int, int] | None
     for repost in relay_repo.standing_copies_on(conn, signal_id=old_id, channel_id=ctx.channel_id):
         if repost["message_id"] == ctx.message_id:
             continue  # the post that withdrew the call (re-aimed, it still reads as a signal)
+        if repost["message_id"] in ctx.also_deleted:
+            continue  # deleted in the same report: its own job marks it next
         posted_at = datetime.fromisoformat(repost["posted_at_utc"])
         routed = route(
             repost["raw_text"],
@@ -1269,11 +1280,14 @@ def apply_deletion(
     now_utc: datetime,
     accounts: tuple[_AccountCfgLike, ...],
     detected_by: str,
+    also_deleted: Collection[int] = (),
 ) -> DeletionResult:
     """A message is gone from its channel (the event said so, or the
     window re-read found `None` where it used to be). Marks it deleted --
     exactly once: a second report finds the mark -- and applies the
     deletion policy in the module docstring. Never closes anything.
+    `also_deleted`: the other ids of the same channel that the same report
+    named deleted (see "Several posts deleted at once").
 
     `channel_cfg` and `accounts` are what promoting a withdrawn call's
     standing repost needs (its parser; its ENTRY fan-out): required, like
@@ -1320,6 +1334,7 @@ def apply_deletion(
         followup_id=followup_id,
         relay_of_signal_id=existing["relay_of_signal_id"],
         relay_of_followup_id=existing["relay_of_followup_id"],
+        also_deleted=frozenset(also_deleted) - {message_id},
     )
 
     # Decided on the signals row, not on `kind`: a signal an earlier edit
@@ -1417,9 +1432,14 @@ def _deletion_of_copy(ctx: _Ctx, holder: sqlite3.Row, kind: str) -> DeletionResu
         )
 
     if holder["channel_id"] == ctx.channel_id:
-        if kind != "signal" or holder["withdrawn_at_utc"] is not None:
-            # Edited away before (said then), or the call is withdrawn
-            # already (said when it was): nothing to add.
+        if (
+            kind != "signal"
+            or holder["withdrawn_at_utc"] is not None
+            or holder["message_id"] in ctx.also_deleted
+        ):
+            # Edited away before (said then), the call is withdrawn already
+            # (said when it was), or its own post is deleted in the same
+            # report (said by that post's job): nothing to add.
             logger.info(
                 "channel %s message %s, a repeat of signal %s, deleted, found by %s; marked",
                 ctx.channel_id,
@@ -1484,6 +1504,8 @@ class _Ctx:
     relay_of_signal_id: int | None = None
     #: ... and `messages.relay_of_followup_id`.
     relay_of_followup_id: int | None = None
+    #: A deletion's: the channel's other ids the same report deleted.
+    also_deleted: frozenset[int] = frozenset()
 
     @property
     def channel_id(self) -> int:
