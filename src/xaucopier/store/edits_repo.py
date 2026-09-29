@@ -177,7 +177,9 @@ so an SL edit of an executed signal still gets its AMEND. A post whose
 inferred deletion withdrew a signal, read back still showing that call
 while a newer signal carries it, stands again: a post of the call like
 any other read back (ruling R4-5, `_stands_again`) -- and so does such a
-post edited away and then edited back into the call. What the
+post edited away and then edited back into the call, and such a post read
+or edited back before its channel posted the call again, once it does
+(`relay_repo.record_replacement`). What the
 deletion did (a void, skipped entries, the withdrawal) is not undone
 automatically; the alert says what to review. A `MessageDeleted` event
 names its ids explicitly and is final.

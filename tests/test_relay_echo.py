@@ -201,6 +201,30 @@ def test_a_forward_of_a_withdrawn_post_matched_to_another_call_is_an_echo_when_r
 _EDITS_AWAY = {"cancelled": CANCELLED, "re-aimed": DIRECTION_EDIT, "unparseable": UNPARSEABLE_EDIT}
 
 
+def test_a_forward_of_a_post_of_no_call_is_never_an_echo(conn):  # noqa: F811
+    """The rule is about forwards of the call's own posts. A third channel's
+    copy stored before migration 4 linked copies is a post of no call; the
+    relay forwarded it (a copy of the VIP's call, matched by the same trade
+    close by) and both are removed. The relay's removal echoes nothing: it
+    is the relay's last post of the call, which is withdrawn (C2)."""
+    _ingest(conn, VIP, CALL)
+    assert _ingest(conn, OTHER, 8001, posted=POSTED + timedelta(seconds=20)).outcome == (
+        "relay_duplicate"
+    )
+    conn.execute(
+        "UPDATE messages SET relay_of_signal_id = NULL WHERE channel_id = ? AND message_id = 8001",
+        (O,),
+    )
+    conn.commit()
+    forward = _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30), fwd=(O, 8001))
+    assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", 1)
+    _delete(conn, OTHER, 8001, POSTED + timedelta(minutes=1))
+
+    gone = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=2))
+    assert (gone.outcome, gone.signal_id) == ("voided", 1)
+    assert _live(conn) == []
+
+
 @pytest.mark.parametrize("change", list(_EDITS_AWAY))
 @pytest.mark.parametrize("order", ORDERS)
 def test_an_edit_taking_a_forward_out_of_the_call_is_an_echo_too(
@@ -502,6 +526,33 @@ def test_a_reply_to_the_post_that_re_aimed_a_call_targets_nothing_when_it_is_pos
 
 
 @pytest.mark.parametrize("order", ORDERS)
+def test_the_post_that_re_aimed_a_call_posted_again_is_never_an_older_post_of_it(
+    conn, order  # noqa: F811
+):
+    """The VIP re-aimed its only post (the call is INVALID) and posted the
+    BUY again. Edited again into chatter, the SELL post still speaks for the
+    signal it closed, whichever post held it: a WARNING about that closed
+    signal, naming the call posted in its place -- never the doubt of an
+    older post of the call (it withdrew the signal itself), and nothing
+    reaches the call posted again."""
+    _store_call(conn, order)
+    assert _edit(conn, VIP, CALL, DIRECTION_EDIT, EDIT_1).outcome == "invalidated"
+    conn.commit()
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=6))
+    assert again.outcome == "new"
+
+    later = _edit(conn, VIP, CALL, CANCELLED, EDIT_2)
+    conn.commit()
+    assert (later.outcome, later.signal_id) == ("recorded", 1)
+    assert _live(conn) == [again.signal_id]
+    assert _queued_entries(conn) == [(again.signal_id, "acct-1"), (again.signal_id, "acct-2")]
+    detail = _detail(conn, edits_repo.EDIT_OF_CLOSED_SIGNAL)
+    assert "older post" not in detail and "old copy" not in detail
+    assert "trade it by hand" not in detail
+    assert f"signal {again.signal_id}" in detail
+
+
+@pytest.mark.parametrize("order", ORDERS)
 def test_a_reply_to_a_post_that_left_a_withdrawn_call_targets_nothing(
     conn, order  # noqa: F811
 ):
@@ -641,6 +692,92 @@ def test_a_post_edited_back_into_the_call_shows_it_again_whichever_post_holds_it
     assert (first.outcome, _live(conn)) == ("voided", [])
     for (detail,) in _q(conn, "SELECT detail FROM alerts"):
         assert "by hand" not in detail, detail
+
+
+def _read_back(conn, channel, message_id: int, at) -> None:  # noqa: F811
+    """The window reads back a post it had inferred deleted, as posted."""
+    back = edits_repo.apply_edit(
+        conn, channel_cfg=channel, message_id=message_id, text=SIGNAL_TEXT,
+        posted_at_utc=POSTED, edit_date_utc=None, reply_to_message_id=None, now_utc=at,
+        accounts=ACCOUNTS, detected_by="window",
+    )
+    conn.commit()
+    assert back.reversed_deletion
+
+
+@pytest.mark.parametrize("timing", ["read-back-first", "repost-first"])
+@pytest.mark.parametrize("relay", ["no-relay", *ORDERS])
+def test_a_post_read_back_stands_again_whether_the_call_was_posted_again_before_or_after(
+    conn, relay, timing  # noqa: F811
+):
+    """One channel is enough: the window inferred the VIP's only post of the
+    call deleted (its last post: the call is voided) and the VIP posted the
+    call again (a new signal, traded). The window also reads the first post
+    back -- before the repost or after it. Either way the VIP's channel
+    shows the call twice, so the first post stands again once a newer
+    signal carries the call: the VIP deleting its repost leaves the call
+    queued -- a repeat removal, or (relay-first, where the first post holds
+    no signal of its own) that post promoted in the repost's place -- and
+    deleting the first post too, its channel's last, withdraws it. (With the
+    read-back first, the first post had to stay the post that withdrew the
+    call until then, or the repost would have been held back against it.)"""
+    if relay == "no-relay":
+        _ingest(conn, VIP, CALL)
+    else:
+        _store_call(conn, relay)
+    assert _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1), by="window").outcome in (
+        "voided", "deleted"
+    )
+    if timing == "read-back-first":
+        _read_back(conn, VIP, CALL, POSTED + timedelta(minutes=2))
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=3))
+    if timing == "repost-first":
+        _read_back(conn, VIP, CALL, POSTED + timedelta(minutes=4))
+    assert again.outcome == "new"
+    assert _live(conn) == [again.signal_id]
+    assert relay_repo.signal_for_post(conn, channel_id=V, message_id=CALL) == again.signal_id
+
+    critical = [code for level, code in _codes(conn) if level == "CRITICAL"]
+    repost = _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=5))
+    (live,) = _live(conn)
+    assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
+    if relay == "relay-first":
+        assert (repost.outcome, repost.promoted_signal_id) == ("voided", live)
+        assert relay_repo.live_signal_for(conn, again.signal_id) == live
+    else:
+        assert (repost.outcome, live) == ("deleted", again.signal_id)
+        assert ("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, REPOST, live) in _alerts(conn)
+    assert [code for level, code in _codes(conn) if level == "CRITICAL"] == critical
+
+    first = _delete(conn, VIP, CALL, POSTED + timedelta(minutes=6))
+    assert (first.outcome, first.signal_id) == ("voided", live)
+    assert _live(conn) == []
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_another_channels_post_read_back_stays_with_the_signal_it_withdrew(
+    conn, order  # noqa: F811
+):
+    """Only the channel posting the call again has its own posts re-read
+    (with its own parser) when it does: the window inferred the relay's
+    only copy deleted (the call is voided) and read it back; the VIP then
+    deleted its post and posted the call again. The relay's post still
+    speaks for the signal it withdrew: when the relay really deletes it,
+    the VIP's new call is left trading."""
+    _store_call(conn, order)
+    assert _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=1), by="window").outcome == (
+        "voided"
+    )
+    _read_back(conn, RELAY, COPY, POSTED + timedelta(minutes=2))
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=3))
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=4))
+    assert again.outcome == "new"
+    assert relay_repo.signal_for_post(conn, channel_id=R, message_id=COPY) == 1
+
+    gone = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=5))
+    assert gone.signal_id == 1
+    assert _live(conn) == [again.signal_id]
+    assert _queued_entries(conn) == [(again.signal_id, "acct-1"), (again.signal_id, "acct-2")]
 
 
 @pytest.mark.parametrize("order", ORDERS)

@@ -34,7 +34,9 @@ of its call -- or, for the post that closed one of the chain's signals,
 that signal (its later edits are about the call it broke). Such a post
 that shows the call again -- read back after a false window deletion, or
 edited back -- while a newer signal carries it is that signal's closer no
-more: it stands again (ruling R4-5, `edits_repo._stands_again`).
+more: it stands again (ruling R4-5, `edits_repo._stands_again`) -- and so
+does one read or edited back first, once its channel posts the call again
+(`record_replacement`): which of the two came first does not matter.
 
 **An older post of a call** (ruling R4-1, `old_post`). When a call was
 withdrawn and posted again, the other channel's posts of the withdrawn
@@ -486,12 +488,23 @@ def old_post(
 
 
 def record_replacement(
-    conn: sqlite3.Connection, *, new_signal_id: int, replaced_signal_id: int, now_utc: datetime
+    conn: sqlite3.Connection,
+    *,
+    new_signal_id: int,
+    replaced_signal_id: int,
+    now_utc: datetime,
+    channel_cfg: _ChannelCfgLike | None = None,
 ) -> tuple[int, ...]:
     """Signal `new_signal_id` -- already stored with
     `promoted_from_signal_id = replaced_signal_id`, and fanned out -- now
     carries the call `replaced_signal_id` was withdrawn from (ruling
-    R3-P2). Every follow-up that targeted one of the call's earlier
+    R3-P2). With `channel_cfg`, the channel that posted the call again: a
+    post of that channel which closed one of the call's earlier signals
+    but shows the call again -- read back after a false window deletion,
+    or edited back, while nothing carried the call in its place -- stands
+    again now, a post of the call like any other (ruling R4-5, as
+    `edits_repo._stands_again` does when the call was posted again first).
+    Every follow-up that targeted one of the call's earlier
     signals targets it now (path `'reply'` when it replies to its own
     message, `'relay-reply'` for any other post) -- except one replying to
     the post that closed one of those signals, which stays with the
@@ -517,6 +530,8 @@ def record_replacement(
         replaced_signal_id,
         earlier,
     )
+    if channel_cfg is not None:
+        _release_closers_showing_call(conn, earlier=earlier, new=new, channel_cfg=channel_cfg)
     marks = ", ".join("?" for _ in earlier)
     conn.execute(
         "UPDATE followups SET target_signal_id = ?, resolution_path = CASE "
@@ -592,6 +607,45 @@ def record_replacement(
             )
         )
     return tuple(raised)
+
+
+def _release_closers_showing_call(
+    conn: sqlite3.Connection,
+    *,
+    earlier: list[int],
+    new: sqlite3.Row,
+    channel_cfg: _ChannelCfgLike,
+) -> None:
+    """For `record_replacement`: every post of `channel_cfg`'s channel that
+    closed one of the `earlier` signals of `new`'s call, is not deleted, and
+    re-read with the channel's parser shows the call, is that signal's
+    closer no more (`signals_repo.release_closed_by`): it stands again."""
+    marks = ", ".join("?" for _ in earlier)
+    closers = conn.execute(
+        "SELECT s.signal_id AS closed_signal_id, m.* FROM signals s "
+        "JOIN messages m ON m.channel_id = s.closed_by_channel_id "
+        "  AND m.message_id = s.closed_by_message_id "
+        f"WHERE s.signal_id IN ({marks}) AND m.channel_id = ? "
+        "  AND m.deleted_at_utc IS NULL AND m.kind = 'signal'",
+        (*earlier, channel_cfg.channel_id),
+    ).fetchall()
+    for post in closers:
+        if not post_shows_call(post, new, channel_cfg=channel_cfg):
+            continue
+        signals_repo.release_closed_by(
+            conn,
+            signal_id=post["closed_signal_id"],
+            channel_id=post["channel_id"],
+            message_id=post["message_id"],
+        )
+        logger.info(
+            "channel %s message %s, which withdrew signal %s, shows its call again: it stands "
+            "again, a post of the call signal %s carries now",
+            post["channel_id"],
+            post["message_id"],
+            post["closed_signal_id"],
+            new["signal_id"],
+        )
 
 
 # -- signals -------------------------------------------------------------------

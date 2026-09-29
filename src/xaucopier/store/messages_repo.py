@@ -547,7 +547,11 @@ def _ingest_new(
         # The channel that withdrew the call posted it again: this signal
         # carries the call now (relay_repo.record_replacement).
         relay_repo.record_replacement(
-            conn, new_signal_id=signal_id, replaced_signal_id=relay.replaces, now_utc=now_utc
+            conn,
+            new_signal_id=signal_id,
+            replaced_signal_id=relay.replaces,
+            now_utc=now_utc,
+            channel_cfg=channel_cfg,
         )
     return IngestResult(
         outcome="new", signal_id=signal_id, followup_id=None, kind=kind, detail=route_result.detail
