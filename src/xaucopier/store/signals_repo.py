@@ -203,6 +203,20 @@ def record_closed_by(
     )
 
 
+def release_closed_by(
+    conn: sqlite3.Connection, *, signal_id: int, channel_id: int, message_id: int
+) -> None:
+    """Forget that post (`channel_id`, `message_id`) closed this signal: the
+    window had inferred it deleted, it is back, and it still shows the call,
+    which a newer signal carries now (ruling R4-5; see
+    `edits_repo._stands_again`). Only that post's record is cleared."""
+    conn.execute(
+        "UPDATE signals SET closed_by_channel_id = NULL, closed_by_message_id = NULL "
+        "WHERE signal_id = ? AND closed_by_channel_id = ? AND closed_by_message_id = ?",
+        (signal_id, channel_id, message_id),
+    )
+
+
 def get_signal_id(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> int | None:
     row = conn.execute(
         "SELECT signal_id FROM signals WHERE channel_id = ? AND message_id = ?",

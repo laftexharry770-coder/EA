@@ -410,6 +410,54 @@ def test_a_reply_made_before_its_post_withdrew_the_call_stays_with_that_signal(
 # -- R4-5: a read-back withdrawing post stands; a replaced call stays protected -------------
 
 
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_post_read_back_after_a_false_window_deletion_shows_the_call_again(
+    conn, order  # noqa: F811
+):
+    """The window inferred the VIP's first post deleted (VIP-first it
+    withdrew signal 1 and the VIP's repost was promoted; relay-first it was
+    a repeat removal), then read it back. The VIP deleting its repost now
+    leaves the call standing -- the first post shows it -- and deleting the
+    first post too, its channel's last, withdraws the call."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=2), by="window")
+    assert _edit(conn, VIP, CALL, SIGNAL_TEXT, POSTED + timedelta(minutes=3)).reversed_deletion
+    conn.commit()
+    (live,) = _live(conn)
+
+    repost = _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=4))
+    assert (repost.outcome, _live(conn)) == ("deleted", [live])
+    assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
+    assert ("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, REPOST, live) in _alerts(conn)
+
+    first = _delete(conn, VIP, CALL, POSTED + timedelta(minutes=5))
+    assert (first.outcome, first.signal_id) == ("voided", live)
+    assert _live(conn) == []
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_call_voided_by_a_false_window_deletion_is_traded_when_posted_again(
+    conn, order  # noqa: F811
+):
+    """Control: the window inferred the VIP's only post deleted -- its
+    channel's last, so the call was voided -- and then read it back. Nothing
+    carries the call in its place, so that post is still the one that
+    withdrew it: the VIP posting the call again is a new signal, traded
+    (never held back against a call its own channel withdrew)."""
+    _store_call(conn, order)
+    assert _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1), by="window").outcome == (
+        "voided"
+    )
+    assert _edit(conn, VIP, CALL, SIGNAL_TEXT, POSTED + timedelta(minutes=2)).reversed_deletion
+    conn.commit()
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=3))
+
+    assert again.outcome == "new"
+    assert _promoted_from(conn, again.signal_id) == 1
+    assert _queued_entries(conn) == [(again.signal_id, "acct-1"), (again.signal_id, "acct-2")]
+
+
 @pytest.mark.parametrize("how", ["promoted", "posted-again"])
 @pytest.mark.parametrize("order", ORDERS)
 def test_a_replaced_call_keeps_its_stale_post_protection(conn, order, how):  # noqa: F811

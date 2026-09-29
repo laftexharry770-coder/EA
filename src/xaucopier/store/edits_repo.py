@@ -519,6 +519,7 @@ def reconcile(
             return ctx.result("deleted", stored_kind, "already deleted; an edit of it is ignored")
         # Only inferred, from absence -- and here the message is.
         reversal = (_reverse_window_deletion(ctx, existing),)
+        _stands_again(ctx, route_result)
     result = _reconcile_version(
         ctx, existing, text=text, route_result=route_result, new_hash=new_hash
     )
@@ -641,6 +642,43 @@ def _reverse_window_deletion(ctx: _Ctx, existing: sqlite3.Row) -> int:
         f"The mark is cleared; what the deletion did is NOT undone: {consequence}. "
         "Review by hand.",
     )
+
+
+def _stands_again(ctx: _Ctx, route_result: RouteResult) -> None:
+    """`ctx`'s post, which the window had inferred deleted, is back
+    (`_reverse_window_deletion`). If that deletion withdrew a signal whose
+    call lives on in a newer one (a promotion, or the call posted again),
+    and the post as read back still shows that call, it is no longer the
+    post that withdrew it: it stands again, a post of the call like any
+    other read back (ruling R4-5) -- counted as showing the call
+    (`relay_repo.standing_posts_on`), and its later edits, deletion and
+    replies reach the call's newest signal. A signal nothing replaced keeps
+    its closer: its channel withdrew the call, and may post it again."""
+    if route_result.kind != "signal":
+        return
+    for row in ctx.conn.execute(
+        "SELECT * FROM signals WHERE closed_by_channel_id = ? AND closed_by_message_id = ?",
+        (ctx.channel_id, ctx.message_id),
+    ).fetchall():
+        if relay_repo.live_signal_for(ctx.conn, row["signal_id"]) == row["signal_id"]:
+            continue
+        if not relay_repo.shows_call(route_result.signal, row):
+            continue
+        signals_repo.release_closed_by(
+            ctx.conn,
+            signal_id=row["signal_id"],
+            channel_id=ctx.channel_id,
+            message_id=ctx.message_id,
+        )
+        logger.info(
+            "channel %s message %s, which withdrew signal %s when the window inferred it "
+            "deleted, is back and still shows the call: it stands again, a post of the call "
+            "signal %s carries now",
+            ctx.channel_id,
+            ctx.message_id,
+            row["signal_id"],
+            relay_repo.live_signal_for(ctx.conn, row["signal_id"]),
+        )
 
 
 def _promoted_in_place_of(conn: sqlite3.Connection, signal_id: int) -> str:
