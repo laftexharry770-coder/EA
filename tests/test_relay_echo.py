@@ -1248,3 +1248,35 @@ def test_a_reply_to_a_relays_tidied_up_forward_reaches_the_live_call_in_either_o
     target, path = _followup_target(conn, 7010)
     assert (target, path) == (live, relay_repo.RELAY_REPLY_PATH)
     assert relay_repo.live_signal_for(conn, target) == live
+
+
+# == Round 5 (ruling R5-4): a held-back copy is no post of the call ============
+
+
+@pytest.mark.parametrize("copies", ["hand", "forward"])
+def test_a_channel_whose_only_post_was_held_back_cannot_repost_a_withdrawn_call(
+    conn, copies  # noqa: F811
+):
+    """X2: the VIP posts a call and deletes it (VOIDED). Another channel,
+    which never carried the call, posts it a minute later -- held back
+    with a CRITICAL alert -- deletes that copy and posts it again. That
+    channel never withdrew the call: the VIP did. Its repost is held back
+    too, loudly; nothing is traded, and the first CRITICAL stays standing."""
+    _ingest(conn, VIP, CALL)
+    assert _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1)).outcome == "voided"
+    fwd = (V, CALL) if copies == "forward" else None
+    held = _ingest(conn, OTHER, 8001, posted=POSTED + timedelta(minutes=2), fwd=fwd)
+    assert (held.outcome, held.relay_of_signal_id) == ("relay_duplicate", 1)
+    assert _delete(conn, OTHER, 8001, POSTED + timedelta(minutes=3)).outcome == "deleted"
+
+    again = _ingest(conn, OTHER, 8002, posted=POSTED + timedelta(minutes=4), fwd=fwd)
+
+    assert (again.outcome, again.relay_of_signal_id) == ("relay_duplicate", 1)
+    assert _q(conn, "SELECT signal_id, state FROM signals") == [(1, "VOIDED")]
+    assert _queued_entries(conn) == []
+    assert _entries_claimable(conn) == []
+    assert _q(
+        conn, "SELECT message_id, acked FROM alerts WHERE code = ? ORDER BY alert_id",
+        relay_repo.COPY_OF_WITHDRAWN_SIGNAL,
+    ) == [(8001, 0), (8002, 0)]
+    assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED not in [c for _, c in _codes(conn)]
