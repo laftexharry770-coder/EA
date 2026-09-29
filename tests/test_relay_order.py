@@ -794,6 +794,21 @@ def test_a_follow_up_replying_to_a_post_re_aimed_away_from_the_call_targets_noth
     ) == [(4020, None), (4021, live)]
 
 
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_follow_up_replying_to_the_post_that_re_aimed_the_call_targets_that_call(
+    conn, order  # noqa: F811
+):
+    """Control: the VIP re-aimed its only post -- the call is INVALID (C2).
+    A reply to that post is still about that call, which Plan 3 sees is
+    closed."""
+    _store_call(conn, order)
+    assert _edit(conn, VIP, CALL, DIRECTION_EDIT, EDIT_1).outcome == "invalidated"
+    conn.commit()
+    _ingest(conn, VIP, 4020, CLOSE_HALF, posted=POSTED + timedelta(minutes=8), reply_to=CALL)
+    assert _q(conn, "SELECT target_signal_id FROM followups") == [(1,)]
+    assert _q(conn, "SELECT state FROM signals") == [("INVALID",)]
+
+
 def test_a_follow_up_replying_to_a_replaced_signals_post_targets_the_new_one(conn):  # noqa: F811
     """A reply to any post of the call reaches its newest signal: stored
     ones are re-pointed when the call is replaced, later ones resolve to
