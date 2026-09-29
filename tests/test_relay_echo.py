@@ -36,6 +36,7 @@ from telethon.tl import types
 from fakes.telegram import FakeMessage
 from test_edits import DIRECTION_EDIT, EDIT_1, EDIT_2, _round
 from test_relay import (
+    ACCOUNTS,
     CALL,
     CHATTER_TEXT,
     CLOSE_HALF,
@@ -175,6 +176,27 @@ def test_a_forward_of_a_post_its_channel_replaced_is_an_echo_when_removed(
     assert (last.outcome, last.signal_id) == ("flagged" if executed else "voided", live)
 
 
+def test_a_forward_of_a_withdrawn_post_matched_to_another_call_is_an_echo_when_removed(
+    conn,  # noqa: F811
+):
+    """The VIP withdrew its call; 16 minutes later a third channel posts the
+    same trade (a call of its own, outside the window); the relay's late
+    forward of the VIP's deleted post, posted close to the third channel's,
+    repeats that live call. The relay removing its forward only echoes the
+    VIP's deletion: the third channel's call is not withdrawn by it."""
+    _ingest(conn, VIP, CALL)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    other = _ingest(conn, OTHER, 8001, posted=POSTED + timedelta(minutes=16))
+    assert other.outcome == "new"
+    forward = _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(minutes=20), fwd=(V, CALL))
+    assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", other.signal_id)
+
+    echo = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=21))
+    assert echo.outcome == "deleted"
+    assert _live(conn) == [other.signal_id]
+    assert _queued_entries(conn) == [(other.signal_id, "acct-1"), (other.signal_id, "acct-2")]
+
+
 def test_an_edit_taking_a_forward_out_of_the_call_is_an_echo_too(conn):  # noqa: F811
     """A forward's text cannot be edited in Telegram, but the rule does
     not depend on it: a forward of a post no longer standing, edited out of
@@ -275,7 +297,8 @@ def test_a_hand_copy_removed_after_the_repost_was_taken_flags_it_loudly(conn):  
     assert ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED, R, COPY, live) in _alerts(conn)
     detail = _detail(conn, edits_repo.LIVE_SIGNAL_DELETED)
     assert f"message {CALL} on channel {V}" in detail and f"message {REPOST}" in detail
-    assert "old copy" in detail
+    assert "old copy" in detail and "keep the trade" in detail
+    assert "trade it by hand" not in detail
 
 
 @pytest.mark.parametrize("change", ["cancelled", "re-aimed"])
@@ -450,6 +473,34 @@ def test_a_reply_to_a_post_that_left_a_withdrawn_call_targets_nothing(
     assert _q(conn, "SELECT target_signal_id FROM followups") == [(None,)]
 
 
+@pytest.mark.parametrize("how", ["deleted", "chatter"])
+def test_a_reply_to_the_post_that_withdrew_an_untraded_call_targets_nothing(
+    conn, how  # noqa: F811
+):
+    """The VIP withdrew its only post of the call -- deleted it, or edited
+    it into chatter; a reply to that post (the poll bringing it late) is
+    about no trade."""
+    _ingest(conn, VIP, CALL)
+    if how == "deleted":
+        _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    else:
+        _edit(conn, VIP, CALL, CHATTER_TEXT, POSTED + timedelta(minutes=1))
+        conn.commit()
+    _ingest(conn, VIP, 4005, CLOSE_HALF, posted=POSTED + timedelta(minutes=2), reply_to=CALL)
+    assert _q(conn, "SELECT target_signal_id FROM followups") == [(None,)]
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_reply_to_a_post_still_showing_a_withdrawn_call_keeps_it(conn, order):  # noqa: F811
+    """Control: the relay withdrew the call (its only copy deleted); the
+    VIP's post still shows it, and a reply to that post keeps the call's
+    signal -- withdrawn, which Plan 3 sees."""
+    _store_call(conn, order)
+    assert _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=1)).outcome == "voided"
+    _ingest(conn, VIP, 4005, CLOSE_HALF, posted=POSTED + timedelta(minutes=2), reply_to=CALL)
+    assert _q(conn, "SELECT target_signal_id FROM followups") == [(1,)]
+
+
 def test_a_reply_to_the_post_that_re_aimed_an_executed_call_keeps_that_call(conn):  # noqa: F811
     """Control: an executed call is never posted again in its place; a
     reply to its re-aimed post may be about its live legs, and keeps it."""
@@ -483,20 +534,28 @@ def test_a_reply_made_before_its_post_withdrew_the_call_stays_with_that_signal(
 # -- R4-5: a read-back withdrawing post stands; a replaced call stays protected -------------
 
 
+@pytest.mark.parametrize("edited", [False, True], ids=["as-posted", "edited"])
 @pytest.mark.parametrize("order", ORDERS)
 def test_a_post_read_back_after_a_false_window_deletion_shows_the_call_again(
-    conn, order  # noqa: F811
+    conn, order, edited  # noqa: F811
 ):
     """The window inferred the VIP's first post deleted (VIP-first it
     withdrew signal 1 and the VIP's repost was promoted; relay-first it was
-    a repeat removal), then read it back. The VIP deleting its repost now
-    leaves the call standing -- the first post shows it -- and deleting the
-    first post too, its channel's last, withdraws the call."""
+    a repeat removal), then read it back -- as posted (no edit date: the
+    same version as stored), or edited since. The VIP deleting its repost
+    now leaves the call standing -- the first post shows it -- and deleting
+    the first post too, its channel's last, withdraws the call."""
     _store_call(conn, order)
     _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
     _delete(conn, VIP, CALL, POSTED + timedelta(minutes=2), by="window")
-    assert _edit(conn, VIP, CALL, SIGNAL_TEXT, POSTED + timedelta(minutes=3)).reversed_deletion
+    back = edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=CALL, text=SIGNAL_TEXT + (" " if edited else ""),
+        posted_at_utc=POSTED, edit_date_utc=POSTED + timedelta(minutes=3) if edited else None,
+        reply_to_message_id=None, now_utc=POSTED + timedelta(minutes=3), accounts=ACCOUNTS,
+        detected_by="window",
+    )
     conn.commit()
+    assert back.reversed_deletion
     (live,) = _live(conn)
 
     repost = _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=4))

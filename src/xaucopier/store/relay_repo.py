@@ -31,10 +31,10 @@ post still reads as a signal) -- and is not the post that closed one of
 the chain's signals.
 `signal_for_post` says which signal a stored post acts on: the newest
 of its call -- or, for the post that closed one of the chain's signals,
-that signal (its later edits are about the call it broke). A post the
-window inferred deleted that reads back still showing a call a newer
-signal carries is that signal's closer no more: it stands again (ruling
-R4-5, `edits_repo`).
+that signal (its later edits are about the call it broke). Such a post
+that shows the call again -- read back after a false window deletion, or
+edited back -- while a newer signal carries it is that signal's closer no
+more: it stands again (ruling R4-5, `edits_repo._stands_again`).
 
 **An older post of a call** (ruling R4-1, `old_post`). When a call was
 withdrawn and posted again, the other channel's posts of the withdrawn
@@ -43,8 +43,8 @@ signal. Their *removal* -- deleted, edited away, re-aimed or broken --
 is told apart:
 
 - a forward of a post of the call that no longer stands (deleted,
-  edited away, or the post that withdrew one of its signals) is an
-  *echo*: its removal only repeats that post's, which was handled when it
+  edited away, re-aimed, or the post that withdrew one of its signals)
+  is an *echo*: its removal only repeats that post's, which was handled when it
   happened, and is recorded (INFO) without reaching any signal -- also
   when nothing was posted again, so that which post was stored first
   never matters;
@@ -131,8 +131,9 @@ the held follow-up already has is never replaced by a copy's; when the
 call is replaced, every follow-up targeting its earlier signals is moved
 to the new one (`record_replacement`) -- except one replying to the post
 that closed one of them, which stays with the signal that post closed
-(ruling R4-4). A reply to such a post of a call never traded, when the
-post no longer shows the call, gets no target at all
+(ruling R4-4). A reply to any post of a call withdrawn before anything
+was executed, when the post no longer shows the call -- the post that
+withdrew it above all -- gets no target at all
 (`edits_repo.post_left_withdrawn_call`).
 
 **Every copy is visible.** `record_signal_copy` / `record_followup_copy`
@@ -430,10 +431,9 @@ def old_post(
     re-aimed or broken (ruling R4-1). None when its removal is simply a
     removal of a post of that signal's call; else:
 
-    - "echo": the post is a forward (`fwd_from_*`) of a stored post of the
-      same call that no longer stands -- deleted, edited into something
-      that is no signal, or the post that withdrew one of the call's
-      signals. The removal only echoes that post's, which was said when
+    - "echo": the post is a forward (`fwd_from_*`) of a stored post of a
+      call that no longer stands -- deleted, edited into something that is
+      no signal, or the post that withdrew one of its call's signals. The removal only echoes that post's, which was said when
       it happened: it is recorded, and reaches no signal. (Whichever post
       of the call was stored first, and whether or not the call was
       posted again since.) A forwarded post still stored as a signal is
@@ -462,7 +462,7 @@ def old_post(
     chain = chain_ids(conn, start)
     forwarded = (message["fwd_from_channel_id"], message["fwd_from_post_id"])
     if None not in forwarded:
-        echoed = _gone_post_of_call(conn, forwarded, chain, channel_cfg)
+        echoed = _gone_post(conn, forwarded, channel_cfg)
         if echoed is not None:
             return OldPost("echo", echoed, forwarded)
     newest = chain[-1]
@@ -957,18 +957,19 @@ def post_shows_call(
     return routed.kind == "signal" and shows_call(routed.signal, row)
 
 
-def _gone_post_of_call(
+def _gone_post(
     conn: sqlite3.Connection,
     post: tuple[int, int],
-    chain: list[int],
     channel_cfg: _ChannelCfgLike | None = None,
 ) -> int | None:
-    """For `old_post`: the signal of `chain` that stored post `post` belongs
-    to (its own, or the one it copies), when that post no longer stands --
-    deleted, edited into something that is no signal, the post that closed
-    one of the chain's signals, or (re-read with `channel_cfg`) re-aimed
-    away from the call. None otherwise, or when it is no post of that
-    call."""
+    """For `old_post`: the signal stored post `post` was stored with (its
+    own, or the one it copies), when that post no longer stands -- deleted,
+    edited into something that is no signal, the post that closed one of
+    its call's signals, or (re-read with `channel_cfg`) re-aimed away from
+    its call. None otherwise, or when it is no post of a call. The call it
+    belongs to need not be the one its forward was matched to: a late
+    forward of a withdrawn post may repeat another call of the same trade,
+    and removing it still only echoes the withdrawn post."""
     row = conn.execute(
         "SELECT * FROM messages WHERE channel_id = ? AND message_id = ?", post
     ).fetchone()
@@ -977,8 +978,9 @@ def _gone_post_of_call(
     linked = signals_repo.get_signal_id(conn, channel_id=post[0], message_id=post[1])
     if linked is None:
         linked = row["relay_of_signal_id"]
-    if linked not in chain:
+    if linked is None:
         return None
+    chain = chain_ids(conn, linked)
     marks = ", ".join("?" for _ in chain)
     closer = conn.execute(
         f"SELECT 1 FROM signals WHERE signal_id IN ({marks}) "

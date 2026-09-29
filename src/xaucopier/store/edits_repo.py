@@ -176,7 +176,8 @@ a CRITICAL `DELETION_REVERSED`, and is then handled like any version,
 so an SL edit of an executed signal still gets its AMEND. A post whose
 inferred deletion withdrew a signal, read back still showing that call
 while a newer signal carries it, stands again: a post of the call like
-any other read back (ruling R4-5, `_stands_again`). What the
+any other read back (ruling R4-5, `_stands_again`) -- and so does such a
+post edited away and then edited back into the call. What the
 deletion did (a void, skipped entries, the withdrawal) is not undone
 automatically; the alert says what to review. A `MessageDeleted` event
 names its ids explicitly and is final.
