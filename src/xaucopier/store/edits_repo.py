@@ -1208,6 +1208,32 @@ def post_left_live_call(
     return routed.kind == "signal" and not _shows(routed, signal)
 
 
+def post_left_withdrawn_call(
+    conn: sqlite3.Connection, *, channel_cfg: _ChannelCfgLike, message_id: int, signal_id: int
+) -> bool:
+    """Whether stored post `message_id` of `channel_cfg`'s channel is the
+    post that withdrew signal `signal_id` before anything of it was
+    executed, and no longer shows its call -- deleted, edited into
+    something that is no signal, re-aimed or broken (ruling R4-4). A
+    follow-up replying to it is about a call never traded, so it gets no
+    target (`messages_repo.ingest`) -- whether or not the call was posted
+    again since, which it must never reach. A signal that was executed
+    keeps a reply to its closer: it may be about its live legs, and such a
+    signal is never replaced."""
+    signal = conn.execute("SELECT * FROM signals WHERE signal_id = ?", (signal_id,)).fetchone()
+    if signal is None or (signal["closed_by_channel_id"], signal["closed_by_message_id"]) != (
+        channel_cfg.channel_id,
+        message_id,
+    ):
+        return False
+    if not relay_repo.is_withdrawn_unexecuted(conn, signal):
+        return False
+    post = _get_message(conn, channel_id=channel_cfg.channel_id, message_id=message_id)
+    if post is None or post["deleted_at_utc"] is not None or post["kind"] != "signal":
+        return True
+    return not relay_repo.post_shows_call(post, signal, channel_cfg=channel_cfg)
+
+
 def _promotable(
     ctx: _Ctx, others: list[tuple[sqlite3.Row, RouteResult]]
 ) -> list[tuple[sqlite3.Row, RouteResult]]:

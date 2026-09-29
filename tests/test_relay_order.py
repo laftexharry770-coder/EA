@@ -797,17 +797,21 @@ def test_a_follow_up_replying_to_a_post_re_aimed_away_from_the_call_targets_noth
 
 
 @pytest.mark.parametrize("order", ORDERS)
-def test_a_follow_up_replying_to_the_post_that_re_aimed_the_call_targets_that_call(
+def test_a_follow_up_replying_to_the_post_that_re_aimed_the_call_targets_nothing(
     conn, order  # noqa: F811
 ):
-    """Control: the VIP re-aimed its only post -- the call is INVALID (C2).
-    A reply to that post is still about that call, which Plan 3 sees is
-    closed."""
+    """The VIP re-aimed its only post -- the call is INVALID (C2), never
+    traded. A reply to that post is about the SELL it shows now, a call
+    nobody traded: it targets nothing, as it would after the BUY is posted
+    again (test_relay_echo).
+
+    Round 4 (R4-4; round 3 gave it signal 1, which Plan 3 would then have
+    resolved onto the BUY posted again in its place)."""
     _store_call(conn, order)
     assert _edit(conn, VIP, CALL, DIRECTION_EDIT, EDIT_1).outcome == "invalidated"
     conn.commit()
     _ingest(conn, VIP, 4020, CLOSE_HALF, posted=POSTED + timedelta(minutes=8), reply_to=CALL)
-    assert _q(conn, "SELECT target_signal_id FROM followups") == [(1,)]
+    assert _q(conn, "SELECT target_signal_id FROM followups") == [(None,)]
     assert _q(conn, "SELECT state FROM signals") == [("INVALID",)]
 
 

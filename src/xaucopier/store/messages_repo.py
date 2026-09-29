@@ -54,8 +54,9 @@ held back against it move to the new signal. A *follow-up* records the
 signal it replies to (`followups.target_signal_id`: the newest signal of
 the replied-to post's call, path `'reply'` for that signal's own message
 or `'relay-reply'` for another post of the call; none when that post was
-re-aimed away from the live call, `edits_repo.post_left_live_call`) and
-is itself a
+re-aimed away from the live call, `edits_repo.post_left_live_call`, or
+is the post that withdrew a call never traded and no longer shows it,
+`edits_repo.post_left_withdrawn_call`, ruling R4-4) and is itself a
 "relay_duplicate" -- stored, linked by `relay_of_followup_id`, logged and
 counted, but no followups row and no outbox row -- when it repeats a
 stored follow-up (F08); a target it resolves is given to the follow-up
@@ -417,14 +418,24 @@ def _ingest_new(
         target = relay_repo.resolve_reply_target(
             conn, channel_id=channel_id, reply_to_message_id=followup.reply_to_message_id
         )
-        if target is not None and edits_repo.post_left_live_call(
-            conn,
-            channel_cfg=channel_cfg,
-            message_id=followup.reply_to_message_id,
-            signal_id=target[0],
+        if target is not None and (
+            edits_repo.post_left_live_call(
+                conn,
+                channel_cfg=channel_cfg,
+                message_id=followup.reply_to_message_id,
+                signal_id=target[0],
+            )
+            or edits_repo.post_left_withdrawn_call(
+                conn,
+                channel_cfg=channel_cfg,
+                message_id=followup.reply_to_message_id,
+                signal_id=target[0],
+            )
         ):
-            # It replies to a post re-aimed away from the call (another call
-            # now, never traded): not an instruction about the live trade.
+            # It replies to a post re-aimed away from the live call (another
+            # call now, never traded), or to the post that withdrew a call
+            # never traded and no longer shows it (R4-4): not an instruction
+            # about any trade.
             logger.info(
                 "channel %s message %s replies to message %s, which no longer shows the call "
                 "of signal %s: stored without a target",

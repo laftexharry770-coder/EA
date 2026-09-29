@@ -353,6 +353,30 @@ def test_a_forward_from_a_channel_that_never_had_the_call_is_held_back(conn):  #
 # -- R4-4: replies to the post that withdrew a call ------------------------------------
 
 
+@pytest.mark.parametrize("when", ["before-the-repost", "after-the-repost"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_reply_to_the_post_that_re_aimed_a_call_targets_nothing_when_it_is_posted_again(
+    conn, order, when  # noqa: F811
+):
+    """NEW-3: the VIP re-aimed its only post into a SELL (the call is
+    INVALID) and posted the BUY again (a new signal replacing it). "Close
+    half", replying to the SELL post, is about a call never traded: it
+    targets nothing -- whether it was stored before the repost or after."""
+    _store_call(conn, order)
+    assert _edit(conn, VIP, CALL, DIRECTION_EDIT, EDIT_1).outcome == "invalidated"
+    conn.commit()
+    if when == "before-the-repost":
+        _ingest(conn, VIP, 4005, CLOSE_HALF, posted=POSTED + timedelta(minutes=6), reply_to=CALL)
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=7))
+    if when == "after-the-repost":
+        _ingest(conn, VIP, 4005, CLOSE_HALF, posted=POSTED + timedelta(minutes=8), reply_to=CALL)
+
+    assert again.outcome == "new"
+    assert _live(conn) == [again.signal_id]
+    assert _q(conn, "SELECT target_signal_id, resolution_path FROM followups") == [(None, None)]
+    assert relay_repo.signal_for_post(conn, channel_id=V, message_id=CALL) == 1
+
+
 def test_a_reply_to_the_post_that_re_aimed_an_executed_call_keeps_that_call(conn):  # noqa: F811
     """Control: an executed call is never posted again in its place; a
     reply to its re-aimed post may be about its live legs, and keeps it."""
