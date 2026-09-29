@@ -499,6 +499,8 @@ def _ingest_new(
         relay_window_seconds=relay_window_seconds,
         fwd_from_channel_id=provenance["fwd_from_channel_id"],
         fwd_from_post_id=provenance["fwd_from_post_id"],
+        channel_cfg=channel_cfg,
+        signal=signal,
     )
     if relay.match is not None:
         relay_repo.record_signal_copy(

@@ -107,15 +107,23 @@ messages, and bump the durable counters `relay_duplicates` /
 """
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Literal, Protocol
 
+from xaucopier.domain.signal import Signal
+from xaucopier.parsing.router import route
 from xaucopier.store import alerts, metrics, signals_repo
 
 logger = logging.getLogger(__name__)
+
+
+class _ChannelCfgLike(Protocol):
+    channel_id: int
+    parser: str
 
 #: Counts every signal message stored as a copy of a signal we already have.
 RELAY_DUPLICATES_METRIC = "relay_duplicates"
@@ -171,9 +179,30 @@ class SignalRelay:
     #: The signal it repeats: store it as a copy (`record_signal_copy`).
     match: SignalMatch | None
     #: Else, when not None: it is a new signal replacing this withdrawn
-    #: one -- the channel that withdrew the call posted it again. Insert it
+    #: one -- a channel that withdrew the call posted it again. Insert it
     #: with `promoted_from_signal_id` set to this, then `record_replacement`.
     replaces: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OldPost:
+    """A stored post whose removal would reach its call's newest signal,
+    though the post echoes or predates that signal (ruling R4-1;
+    `old_post`)."""
+
+    #: "echo": a forward of a post that no longer stands -- its removal
+    #: only echoes that post's. "original": the post that a forward which
+    #: withdrew an earlier signal of the call copied -- the original poster
+    #: retracting. "earlier": any other post stored against an earlier,
+    #: replaced signal of the call, which another post withdrew -- it may
+    #: be a retraction, or only the other channel removing its old copy.
+    kind: Literal["echo", "original", "earlier"]
+    #: "echo": the signal the forwarded post belongs to; else the earlier
+    #: signal of the call that `post` withdrew.
+    signal_id: int
+    #: "echo": the forwarded post; else the post that withdrew `signal_id`
+    #: (channel id, message id).
+    post: tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +231,11 @@ def live_signal_for(conn: sqlite3.Connection, signal_id: int) -> int:
     resolves it through here: the edit and deletion policy, the reply
     targets of follow-ups -- and Plan 3, which must resolve every
     follow-up's `target_signal_id` through this before acting on it
-    (PLAN3-OBLIGATIONS #45)."""
+    (PLAN3-OBLIGATIONS #45), UNLESS the follow-up replies to that
+    signal's closer -- the post that withdrew or invalidated it
+    (`signals.closed_by_channel_id` / `closed_by_message_id`): such a
+    reply is about the signal that post closed, never about the call
+    posted in its place (ruling R4-4)."""
     replacements = _replacements(conn, signal_id)
     return replacements[-1] if replacements else signal_id
 
@@ -294,6 +327,102 @@ def standing_posts_on(
     ).fetchall()
 
 
+def withdrew_call(
+    conn: sqlite3.Connection,
+    *,
+    signal_id: int,
+    channel_id: int,
+    channel_cfg: _ChannelCfgLike | None = None,
+) -> bool:
+    """Whether channel `channel_id` withdrew `signal_id`'s call (ruling
+    R4-2): it had a post of the call -- a message of one of the chain's
+    signals, or a copy of one -- and none of them stands any more: each
+    was deleted, edited into something that is no signal, or closed one of
+    the chain's signals (`standing_posts_on`). With `channel_cfg`, the
+    channel's own config, each post still stored as a signal is re-read
+    with its parser too: one re-aimed away from the call does not stand
+    either. Every such channel, not only the one whose post withdrew the
+    call first, may post the call again as a new signal. (A signal closed
+    before migration 4 recorded no closer: then its own channel withdrew
+    it, as only a signal's own message could close it.)"""
+    signal = _signal_row(conn, signal_id)
+    if signal["closed_by_channel_id"] is None and channel_id == signal["channel_id"]:
+        return True
+    chain = chain_ids(conn, signal_id)
+    marks = ", ".join("?" for _ in chain)
+    had = conn.execute(
+        "SELECT 1 FROM messages m WHERE m.channel_id = ? "
+        f"  AND (m.relay_of_signal_id IN ({marks}) OR EXISTS ("
+        "    SELECT 1 FROM signals s WHERE s.channel_id = m.channel_id "
+        f"     AND s.message_id = m.message_id AND s.signal_id IN ({marks}))) LIMIT 1",
+        (channel_id, *chain, *chain),
+    ).fetchone()
+    if had is None:
+        return False
+    for post in standing_posts_on(conn, signal_id=signal_id, channel_id=channel_id):
+        if channel_cfg is None or post_shows_call(post, signal, channel_cfg=channel_cfg):
+            return False
+    return True
+
+
+def old_post(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> OldPost | None:
+    """How stored post (`channel_id`, `message_id`) stands to the newest
+    signal of its call, for a removal of it -- deleted, edited away,
+    re-aimed or broken (ruling R4-1). None when its removal is simply a
+    removal of a post of that signal's call; else:
+
+    - "echo": the post is a forward (`fwd_from_*`) of a stored post of the
+      same call that no longer stands -- deleted, edited into something
+      that is no signal, or the post that withdrew one of the call's
+      signals. The removal only echoes that post's, which was said when
+      it happened: it is recorded, and reaches no signal. (Whichever post
+      of the call was stored first, and whether or not the call was
+      posted again since.)
+    - "original": the post was stored against an earlier signal of the
+      call, since replaced, and the post that withdrew that signal was a
+      forward of *this* post: this is the original poster retracting, and
+      the removal reaches the newest signal like any.
+    - "earlier": stored against an earlier signal of the call, since
+      replaced, that another post withdrew, with no forward linking the
+      two: it may be a retraction or only the other channel removing its
+      old copy. The removal still reaches the newest signal -- doing
+      nothing is the safe side -- but loudly (`edits_repo`)."""
+    message = conn.execute(
+        "SELECT * FROM messages WHERE channel_id = ? AND message_id = ?", (channel_id, message_id)
+    ).fetchone()
+    if message is None:
+        return None
+    start = signals_repo.get_signal_id(conn, channel_id=channel_id, message_id=message_id)
+    if start is None:
+        start = message["relay_of_signal_id"]
+    if start is None:
+        return None
+    chain = chain_ids(conn, start)
+    forwarded = (message["fwd_from_channel_id"], message["fwd_from_post_id"])
+    if None not in forwarded:
+        echoed = _gone_post_of_call(conn, forwarded, chain)
+        if echoed is not None:
+            return OldPost("echo", echoed, forwarded)
+    newest = chain[-1]
+    closed = []
+    for signal_id in chain[chain.index(start) : chain.index(newest)]:
+        row = _signal_row(conn, signal_id)
+        closer = (row["closed_by_channel_id"], row["closed_by_message_id"])
+        if None in closer or closer == (channel_id, message_id):
+            continue
+        closer_row = conn.execute(
+            "SELECT fwd_from_channel_id, fwd_from_post_id FROM messages "
+            "WHERE channel_id = ? AND message_id = ?",
+            closer,
+        ).fetchone()
+        if closer_row is not None and tuple(closer_row) == (channel_id, message_id):
+            return OldPost("original", signal_id, closer)
+        closed.append((signal_id, closer))
+    if closed:
+        return OldPost("earlier", *closed[0])
+    return None
+
+
 def record_replacement(
     conn: sqlite3.Connection, *, new_signal_id: int, replaced_signal_id: int, now_utc: datetime
 ) -> tuple[int, ...]:
@@ -302,7 +431,9 @@ def record_replacement(
     carries the call `replaced_signal_id` was withdrawn from (ruling
     R3-P2). Every follow-up that targeted one of the call's earlier
     signals targets it now (path `'reply'` when it replies to its own
-    message, `'relay-reply'` for any other post). Every copy held back
+    message, `'relay-reply'` for any other post) -- except one replying to
+    the post that closed one of those signals, which stays with the
+    signal that post closed (ruling R4-4). Every copy held back
     against the withdrawn call (`COPY_OF_WITHDRAWN_SIGNAL`) repeats it
     now, and that CRITICAL alert -- which told the user to trade the call
     by hand -- is acknowledged and superseded by a WARNING
@@ -329,7 +460,10 @@ def record_replacement(
         "UPDATE followups SET target_signal_id = ?, resolution_path = CASE "
         "  WHEN resolution_path NOT IN (?, ?) THEN resolution_path "
         "  WHEN channel_id = ? AND reply_to_message_id = ? THEN ? ELSE ? END "
-        f"WHERE edit_seq = 0 AND target_signal_id IN ({marks})",
+        f"WHERE edit_seq = 0 AND target_signal_id IN ({marks}) "
+        "  AND NOT EXISTS (SELECT 1 FROM signals s "
+        f"    WHERE s.signal_id IN ({marks}) AND s.closed_by_channel_id = followups.channel_id "
+        "     AND s.closed_by_message_id = followups.reply_to_message_id)",
         (
             new_signal_id,
             REPLY_PATH,
@@ -338,6 +472,7 @@ def record_replacement(
             new["message_id"],
             REPLY_PATH,
             RELAY_REPLY_PATH,
+            *earlier,
             *earlier,
         ),
     )
@@ -417,12 +552,18 @@ def relay_of_signal(
     relay_window_seconds: int,
     fwd_from_channel_id: int | None,
     fwd_from_post_id: int | None,
+    channel_cfg: _ChannelCfgLike | None = None,
+    signal: Signal | None = None,
 ) -> SignalRelay:
     """What the new signal message (`channel_id`, `message_id`) is: a copy
     of a call we have (`match`), a new signal replacing a withdrawn call
     (`replaces`), or neither -- see the module docstring for the rules and
     their order. The new message's own row may already be stored; it is
-    never matched against itself, nor against a signal it holds."""
+    never matched against itself, nor against a signal it holds.
+    `channel_cfg` (the new message's channel) re-reads that channel's own
+    posts to decide whether it withdrew a call (`withdrew_call`); `signal`
+    (the new message's parse) tells whether a forward still shows the
+    call its post belongs to."""
     own = (channel_id, message_id)
     for stored in _same_post(
         conn,
@@ -431,24 +572,36 @@ def relay_of_signal(
         fwd_from_channel_id=fwd_from_channel_id,
         fwd_from_post_id=fwd_from_post_id,
     ):
-        signal = _signal_of(conn, stored)
-        if signal is None or (signal["channel_id"], signal["message_id"]) == own:
+        found = _signal_of(conn, stored)
+        if found is None or (found["channel_id"], found["message_id"]) == own:
             continue
-        if is_withdrawn_unexecuted(conn, signal):
-            # The post is withdrawn; the call may be live again as a repost.
-            live = _live_same_trade(
-                conn,
-                trade_hash=trade_hash,
-                around=(posted_at_utc, _posted_at(conn, signal)),
-                window=relay_window_seconds,
-                exclude=own,
-            )
-            if live is not None:
-                return SignalRelay(_signal_match(conn, live, via="hash"))
-            # Held back against the newest signal of the call (the post may
-            # have closed an earlier one of the chain): R3-P2.
-            signal = _signal_row(conn, live_signal_for(conn, signal["signal_id"]))
-        return SignalRelay(_signal_match(conn, signal, via="forward"))
+        if not is_withdrawn_unexecuted(conn, found):
+            return SignalRelay(_signal_match(conn, found, via="forward"))
+        # The post is withdrawn; the call may be live again as a repost.
+        live = _live_same_trade(
+            conn,
+            trade_hash=trade_hash,
+            around=(posted_at_utc, _posted_at(conn, found)),
+            window=relay_window_seconds,
+            exclude=own,
+        )
+        if live is not None:
+            return SignalRelay(_signal_match(conn, live, via="hash"))
+        # The newest signal of the call (the post may have closed an
+        # earlier one of the chain): R3-P2.
+        newest = _signal_row(conn, live_signal_for(conn, found["signal_id"]))
+        if signal is not None and not shows_call(signal, newest):
+            # A forward of a post that shows another call now (re-aimed):
+            # held back against the signal that post belongs to, loudly --
+            # never linked silently to the live call (ruling R4-6).
+            return SignalRelay(_signal_match(conn, found, via="forward"))
+        if is_withdrawn_unexecuted(conn, newest) and withdrew_call(
+            conn, signal_id=newest["signal_id"], channel_id=channel_id, channel_cfg=channel_cfg
+        ):
+            # This channel withdrew the call and forwards the same post
+            # again: a new signal in its place, as a hand repost (R4-3).
+            return SignalRelay(None, replaces=newest["signal_id"])
+        return SignalRelay(_signal_match(conn, newest, via="forward"))
 
     withdrawn_elsewhere: sqlite3.Row | None = None
     replaces: int | None = None
@@ -457,18 +610,20 @@ def relay_of_signal(
     ):
         if (candidate["channel_id"], candidate["message_id"]) == own:
             continue
-        signal = _signal_row(conn, live_signal_for(conn, candidate["signal_id"]))
-        if (signal["channel_id"], signal["message_id"]) == own:
+        newest = _signal_row(conn, live_signal_for(conn, candidate["signal_id"]))
+        if (newest["channel_id"], newest["message_id"]) == own:
             continue
-        if not is_withdrawn_unexecuted(conn, signal):
-            return SignalRelay(_signal_match(conn, signal, via="hash"))  # a live call wins
-        if channel_id == _closing_channel(signal):
-            # This channel's last post withdrew the call: posted again here,
-            # it is a new signal in its place.
+        if not is_withdrawn_unexecuted(conn, newest):
+            return SignalRelay(_signal_match(conn, newest, via="hash"))  # a live call wins
+        if withdrew_call(
+            conn, signal_id=newest["signal_id"], channel_id=channel_id, channel_cfg=channel_cfg
+        ):
+            # This channel's last post of the call was withdrawn: posted
+            # again here, it is a new signal in its place (R3-P3, R4-2).
             if replaces is None:
-                replaces = signal["signal_id"]
+                replaces = newest["signal_id"]
         elif withdrawn_elsewhere is None:
-            withdrawn_elsewhere = signal
+            withdrawn_elsewhere = newest
     if withdrawn_elsewhere is not None:
         return SignalRelay(_signal_match(conn, withdrawn_elsewhere, via="hash"))
     return SignalRelay(None, replaces)
@@ -484,6 +639,8 @@ def find_signal_relay(
     relay_window_seconds: int,
     fwd_from_channel_id: int | None,
     fwd_from_post_id: int | None,
+    channel_cfg: _ChannelCfgLike | None = None,
+    signal: Signal | None = None,
 ) -> SignalMatch | None:
     """The signal the new signal message (`channel_id`, `message_id`)
     repeats, or None: `relay_of_signal(...).match`. A caller about to
@@ -498,6 +655,8 @@ def find_signal_relay(
         relay_window_seconds=relay_window_seconds,
         fwd_from_channel_id=fwd_from_channel_id,
         fwd_from_post_id=fwd_from_post_id,
+        channel_cfg=channel_cfg,
+        signal=signal,
     ).match
 
 
@@ -694,11 +853,75 @@ def _replacements(conn: sqlite3.Connection, signal_id: int) -> list[int]:
         chain.append(current)
 
 
-def _closing_channel(signal: sqlite3.Row) -> int:
-    """The channel whose post withdrew or invalidated `signal`: recorded
-    since migration 4; before it, only a signal's own message closed it."""
-    closed = signal["closed_by_channel_id"]
-    return signal["channel_id"] if closed is None else closed
+def same_price(a: float, b: float) -> bool:
+    """Price equality at the resolution the trade hash uses (3 dp), so a
+    diff never disagrees with the hash about whether anything changed."""
+    return f"{a:.3f}" == f"{b:.3f}"
+
+
+def reaims(parsed: dict, signal: Signal) -> list[str]:
+    """How `signal` re-aims the stored parse `parsed` (a `signals` row's
+    `parsed_json`): its side, symbol and entry zone, each described. Empty
+    when `signal` shows the same call (its stop and targets may differ)."""
+    reaimed = []
+    if parsed["side"] != signal.side.value:
+        reaimed.append(f"side {parsed['side']} -> {signal.side.value}")
+    if parsed["symbol_alias"] != signal.symbol_alias:
+        reaimed.append(f"symbol {parsed['symbol_alias']} -> {signal.symbol_alias}")
+    zone = parsed["zone"]
+    if not (same_price(zone["lo"], signal.zone.lo) and same_price(zone["hi"], signal.zone.hi)):
+        reaimed.append(f"entry {zone['lo']}-{zone['hi']} -> {signal.zone.lo}-{signal.zone.hi}")
+    return reaimed
+
+
+def shows_call(signal: Signal, row: sqlite3.Row) -> bool:
+    """Whether a post parsed as `signal` shows the call of signals row
+    `row`: the same side, symbol and entry zone."""
+    return not reaims(json.loads(row["parsed_json"]), signal)
+
+
+def post_shows_call(
+    post: sqlite3.Row, row: sqlite3.Row, *, channel_cfg: _ChannelCfgLike
+) -> bool:
+    """Whether stored post `post` (a `messages` row of `channel_cfg`'s
+    channel), re-read with the channel's parser, shows the call of signals
+    row `row`."""
+    routed = route(
+        post["raw_text"],
+        channel_cfg=channel_cfg,
+        message_id=post["message_id"],
+        posted_at_utc=datetime.fromisoformat(post["posted_at_utc"]),
+    )
+    return routed.kind == "signal" and shows_call(routed.signal, row)
+
+
+def _gone_post_of_call(
+    conn: sqlite3.Connection, post: tuple[int, int], chain: list[int]
+) -> int | None:
+    """For `old_post`: the signal of `chain` that stored post `post` belongs
+    to (its own, or the one it copies), when that post no longer stands --
+    deleted, edited into something that is no signal, or the post that
+    closed one of the chain's signals. None otherwise, or when it is no
+    post of that call."""
+    row = conn.execute(
+        "SELECT * FROM messages WHERE channel_id = ? AND message_id = ?", post
+    ).fetchone()
+    if row is None:
+        return None
+    linked = signals_repo.get_signal_id(conn, channel_id=post[0], message_id=post[1])
+    if linked is None:
+        linked = row["relay_of_signal_id"]
+    if linked not in chain:
+        return None
+    marks = ", ".join("?" for _ in chain)
+    closer = conn.execute(
+        f"SELECT 1 FROM signals WHERE signal_id IN ({marks}) "
+        "  AND closed_by_channel_id = ? AND closed_by_message_id = ?",
+        (*chain, *post),
+    ).fetchone()
+    if row["deleted_at_utc"] is not None or row["kind"] != "signal" or closer is not None:
+        return linked
+    return None
 
 
 def _signal_row(conn: sqlite3.Connection, signal_id: int) -> sqlite3.Row:

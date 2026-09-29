@@ -1576,9 +1576,10 @@ def test_a_promoted_repost_takes_over_the_follow_ups_that_replied_to_it(conn):
     )
     assert [row[5:] for row in _followups(conn)] == [
         (result.promoted_signal_id, "reply"),
-        # It replied to the deleted post: still an instruction about the
-        # call, which the promoted signal carries now (R3-P2).
-        (result.promoted_signal_id, "relay-reply"),
+        # Round 4 (R4-4; round 3 moved it to the promoted signal too): it
+        # replied to the post that withdrew signal 1, so it stays with the
+        # signal that post closed -- and Plan 3 resolves it no further.
+        (holder.signal_id, "reply"),
     ]
 
 

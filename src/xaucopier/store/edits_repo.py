@@ -1133,9 +1133,7 @@ def _shows(route_result: RouteResult, row: sqlite3.Row) -> bool:
     """Whether a post reading `route_result` shows the call of signal
     `row`: a signal on its side, symbol and entry zone (its stop and
     targets may lag behind -- a hand copy that never followed an edit)."""
-    return route_result.kind == "signal" and not _reaims(
-        json.loads(row["parsed_json"]), route_result.signal
-    )
+    return route_result.kind == "signal" and relay_repo.shows_call(route_result.signal, row)
 
 
 def _standing_others(ctx: _Ctx, row: sqlite3.Row) -> list[tuple[sqlite3.Row, RouteResult]]:
@@ -1405,18 +1403,9 @@ def _as_copy(ctx: _Ctx, holder: sqlite3.Row) -> _Ctx:
     return dataclasses.replace(ctx, signal_id=holder["signal_id"], via_copy=via)
 
 
-def _reaims(old: dict, new: Signal) -> list[str]:
-    """How `new` re-aims the stored parse `old`: side, symbol, entry zone."""
-    reaimed = []
-    if old["side"] != new.side.value:
-        reaimed.append(f"side {old['side']} -> {new.side.value}")
-    if old["symbol_alias"] != new.symbol_alias:
-        reaimed.append(f"symbol {old['symbol_alias']} -> {new.symbol_alias}")
-    if not (_same(old["zone"]["lo"], new.zone.lo) and _same(old["zone"]["hi"], new.zone.hi)):
-        reaimed.append(
-            f"entry {old['zone']['lo']}-{old['zone']['hi']} -> {new.zone.lo}-{new.zone.hi}"
-        )
-    return reaimed
+#: How a parse re-aims a stored one: side, symbol, entry zone (the one
+#: definition is `relay_repo.reaims`, which the relay rules share).
+_reaims = relay_repo.reaims
 
 
 def _closes_it_again(ctx: _Ctx, row: sqlite3.Row, route_result: RouteResult) -> str | None:
@@ -1986,10 +1975,8 @@ def _levels_not_on(old: dict, new: Signal, signal_id: int) -> list[str]:
     return parts
 
 
-def _same(a: float, b: float) -> bool:
-    """Price equality at the resolution the trade hash uses (3 dp), so a
-    diff never disagrees with the hash about whether anything changed."""
-    return f"{a:.3f}" == f"{b:.3f}"
+#: Price equality at the trade hash's resolution (`relay_repo.same_price`).
+_same = relay_repo.same_price
 
 
 def _parse_utc(value: str | None) -> datetime | None:

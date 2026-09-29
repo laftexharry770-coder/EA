@@ -249,18 +249,20 @@ def test_a_relay_deleting_its_only_copy_and_posting_it_again_trades_it_once(
 # -- R3-P3: closing channel only (review round 2, H1 / H1b) ------------------------------
 
 
-@pytest.mark.parametrize("relay_deletes_first", [False, True], ids=["H1", "H1b"])
 @pytest.mark.parametrize("order", ORDERS)
 def test_the_relay_posting_a_call_again_after_the_vip_withdrew_it_is_held_back(
-    conn, order, relay_deletes_first  # noqa: F811
+    conn, order  # noqa: F811
 ):
-    """The VIP withdrew the call; the relay then posts it again by hand
-    (having deleted its own copy first, or not). The VIP's channel withdrew
-    the call, so the relay's post is held back loudly -- in either order."""
+    """H1: the VIP withdrew the call; the relay, whose copy still shows it,
+    then posts it again by hand. The VIP's channel withdrew the call, so the
+    relay's post is held back loudly -- in either order.
+
+    Round 4 (R4-2; round 3 also held back H1b, the relay deleting its own
+    copy first): a relay that removed its only copy withdrew the call too,
+    and its repost is a new signal -- see
+    test_relay_echo.test_a_channel_posting_again_a_call_it_withdrew_after_the_other_did_is_traded."""
     _store_call(conn, order)
     _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
-    if relay_deletes_first:
-        _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=2))
     again = _ingest(conn, RELAY, COPY + 2, posted=POSTED + timedelta(minutes=3))
 
     assert (again.outcome, again.relay_of_signal_id) == ("relay_duplicate", 1)
@@ -812,7 +814,11 @@ def test_a_follow_up_replying_to_the_post_that_re_aimed_the_call_targets_that_ca
 def test_a_follow_up_replying_to_a_replaced_signals_post_targets_the_new_one(conn):  # noqa: F811
     """A reply to any post of the call reaches its newest signal: stored
     ones are re-pointed when the call is replaced, later ones resolve to
-    it at once."""
+    it at once -- except a reply to the post that withdrew the call.
+
+    Round 4 (R4-4; round 3 moved `before` to the new signal too): `before`
+    replied to the relay's copy, the post that then withdrew signal 1, so
+    it stays with signal 1."""
     _ingest(conn, VIP, CALL)
     _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30))
     before = _ingest(
@@ -828,7 +834,7 @@ def test_a_follow_up_replying_to_a_replaced_signals_post_targets_the_new_one(con
         "ORDER BY followup_id"
     )
     assert rows == [
-        (before.followup_id, again.signal_id, "relay-reply"),
+        (before.followup_id, 1, "relay-reply"),
         (after.followup_id, again.signal_id, "relay-reply"),
     ]
 
