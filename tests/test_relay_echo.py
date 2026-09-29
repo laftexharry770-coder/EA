@@ -762,7 +762,8 @@ def test_another_channels_post_read_back_stays_with_the_signal_it_withdrew(
     (with its own parser) when it does: the window inferred the relay's
     only copy deleted (the call is voided) and read it back; the VIP then
     deleted its post and posted the call again. The relay's post still
-    speaks for the signal it withdrew: when the relay really deletes it,
+    speaks for the signal it withdrew: a third channel's forward of it,
+    removed, only echoes it (R4-1 a), and when the relay really deletes it,
     the VIP's new call is left trading."""
     _store_call(conn, order)
     assert _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=1), by="window").outcome == (
@@ -774,7 +775,12 @@ def test_another_channels_post_read_back_stays_with_the_signal_it_withdrew(
     assert again.outcome == "new"
     assert relay_repo.signal_for_post(conn, channel_id=R, message_id=COPY) == 1
 
-    gone = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=5))
+    forward = _ingest(conn, OTHER, 8001, posted=POSTED + timedelta(minutes=5), fwd=(R, COPY))
+    assert forward.outcome == "relay_duplicate"
+    assert _delete(conn, OTHER, 8001, POSTED + timedelta(minutes=6)).outcome == "deleted"
+    assert _live(conn) == [again.signal_id]
+
+    gone = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=7))
     assert gone.signal_id == 1
     assert _live(conn) == [again.signal_id]
     assert _queued_entries(conn) == [(again.signal_id, "acct-1"), (again.signal_id, "acct-2")]
