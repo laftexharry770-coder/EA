@@ -131,35 +131,61 @@ def test_a_relays_forward_removed_after_the_vip_posted_its_call_again_is_an_echo
     assert _entries_claimable(conn) == [live]
 
 
+#: How the VIP takes its first post out of the call.
+_REMOVALS = {"deleted": None, "chatter": CHATTER_TEXT, "re-aimed": DIRECTION_EDIT}
+
+
+@pytest.mark.parametrize("how", list(_REMOVALS))
 @pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
 @pytest.mark.parametrize("order", ORDERS)
 def test_a_forward_of_a_post_its_channel_replaced_is_an_echo_when_removed(
-    conn, order, executed  # noqa: F811
+    conn, order, executed, how  # noqa: F811
 ):
-    """The VIP double-posted its call and deleted the first post; the
-    relay's forward of that post is removed after it. The VIP's channel
-    still shows the call, so the relay's removal only echoes that deletion
-    -- whichever post holds the signal (VIP-first the repost was promoted,
-    or kept the trade; relay-first the relay's forward holds the call and
-    the VIP's deletion was a repeat removal). The VIP deleting its repost,
-    its channel's last post, then withdraws the call."""
+    """The VIP double-posted its call and took the first post out of it --
+    deleted, edited into chatter or re-aimed; the relay's forward of that
+    post is removed after it. The VIP's channel still shows the call, so
+    the relay's removal only echoes the VIP's -- whichever post holds the
+    signal (VIP-first the repost was promoted, or kept the trade;
+    relay-first the relay's forward holds the call and the VIP's change was
+    a repeat removal). The VIP deleting its repost, its channel's last
+    post, then withdraws the call."""
     _store_call(conn, order, forwards=True)
     _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
     if executed:
         _take_entry(conn, 1)
-    assert _delete(conn, VIP, CALL, POSTED + timedelta(minutes=2)).outcome in ("voided", "deleted")
+    moment = POSTED + timedelta(minutes=2)
+    if how == "deleted":
+        _delete(conn, VIP, CALL, moment)
+    else:
+        _edit(conn, VIP, CALL, _REMOVALS[how], moment)
+        conn.commit()
+    (live,) = _live(conn)
+    alerts = _alerts(conn)
     echo = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=3))
 
     assert echo.outcome == "deleted"
-    (live,) = _live(conn)
+    assert _live(conn) == [live]
     if executed:
         assert (live, _queued_entries(conn)) == (1, [(1, "acct-2")])
     else:
         assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
-    assert "CRITICAL" not in [level for level, _ in _codes(conn)]
+    assert _alerts(conn) == alerts  # the echo says nothing
 
     last = _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=4))
     assert (last.outcome, last.signal_id) == ("flagged" if executed else "voided", live)
+
+
+def test_an_edit_taking_a_forward_out_of_the_call_is_an_echo_too(conn):  # noqa: F811
+    """A forward's text cannot be edited in Telegram, but the rule does
+    not depend on it: a forward of a post no longer standing, edited out of
+    the call, is recorded only, like its removal."""
+    _store_call(conn, "vip-first", forwards=True)
+    live = _vip_deletes_and_posts_again(conn)
+    edited = _edit(conn, RELAY, COPY, CANCELLED, POSTED + timedelta(minutes=3))
+    conn.commit()
+    assert edited.outcome == "recorded"
+    assert _live(conn) == [live]
+    assert _codes(conn) == [("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)]
 
 
 def test_a_held_back_forward_the_vip_posted_again_is_an_echo_when_removed(conn):  # noqa: F811
@@ -348,6 +374,28 @@ def test_a_relay_forwarding_a_call_again_after_removing_its_only_forward_trades_
     _the_vip_manages_the_trade(conn, again.signal_id)
 
 
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_channel_whose_other_post_left_the_call_posting_it_again_is_traded(
+    conn, order  # noqa: F811
+):
+    """The VIP re-aimed its repost (a repeat removal), then deleted its
+    first post -- its channel's last post still showing the call, which is
+    withdrawn. The re-aimed repost still reads as a signal, but not as this
+    call: the VIP posting the call again withdrew it, and is traded."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    assert _edit(conn, VIP, REPOST, DIRECTION_EDIT, POSTED + timedelta(minutes=2)).outcome == (
+        "recorded"
+    )
+    conn.commit()
+    assert _delete(conn, VIP, CALL, POSTED + timedelta(minutes=3)).outcome == "voided"
+    again = _ingest(conn, VIP, 4020, posted=POSTED + timedelta(minutes=4))
+
+    assert again.outcome == "new"
+    assert _promoted_from(conn, again.signal_id) == 1
+    assert _queued_entries(conn) == [(again.signal_id, "acct-1"), (again.signal_id, "acct-2")]
+
+
 def test_a_forward_from_a_channel_that_never_had_the_call_is_held_back(conn):  # noqa: F811
     """Control: a forward of the withdrawn post by a channel with no post
     of the call is held back loudly."""
@@ -383,6 +431,23 @@ def test_a_reply_to_the_post_that_re_aimed_a_call_targets_nothing_when_it_is_pos
     assert _live(conn) == [again.signal_id]
     assert _q(conn, "SELECT target_signal_id, resolution_path FROM followups") == [(None, None)]
     assert relay_repo.signal_for_post(conn, channel_id=V, message_id=CALL) == 1
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_reply_to_a_post_that_left_a_withdrawn_call_targets_nothing(
+    conn, order  # noqa: F811
+):
+    """The VIP re-aimed its repost (a repeat removal: the call stood on its
+    first post), then deleted the first post, withdrawing the call. A reply
+    to the re-aimed post is about the SELL it shows, never traded: no
+    target, like a reply to the post that withdrew the call."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    _edit(conn, VIP, REPOST, DIRECTION_EDIT, POSTED + timedelta(minutes=2))
+    conn.commit()
+    assert _delete(conn, VIP, CALL, POSTED + timedelta(minutes=3)).outcome == "voided"
+    _ingest(conn, VIP, 4005, CLOSE_HALF, posted=POSTED + timedelta(minutes=4), reply_to=REPOST)
+    assert _q(conn, "SELECT target_signal_id FROM followups") == [(None,)]
 
 
 def test_a_reply_to_the_post_that_re_aimed_an_executed_call_keeps_that_call(conn):  # noqa: F811
@@ -442,6 +507,36 @@ def test_a_post_read_back_after_a_false_window_deletion_shows_the_call_again(
     first = _delete(conn, VIP, CALL, POSTED + timedelta(minutes=5))
     assert (first.outcome, first.signal_id) == ("voided", live)
     assert _live(conn) == []
+
+
+@pytest.mark.parametrize("change", ["chatter", "re-aimed"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_post_edited_back_into_the_call_shows_it_again_whichever_post_holds_it(
+    conn, order, change  # noqa: F811
+):
+    """The VIP double-posted, took its first post out of the call (VIP-first
+    it withdrew signal 1 and the repost was promoted; relay-first it was a
+    repeat removal) and edited it back. It shows the call again, in either
+    order: the VIP deleting its repost leaves the call standing, and
+    deleting the first post too, its channel's last, withdraws it. Edits
+    never open trades: nothing more is queued, and no alert says to trade
+    the call by hand."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    _edit(conn, VIP, CALL, _REMOVALS[change], EDIT_1)
+    back = _edit(conn, VIP, CALL, SIGNAL_TEXT, EDIT_2)
+    conn.commit()
+    (live,) = _live(conn)
+    assert back.outcome in ("reclassified", "cosmetic", "recorded")
+    assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
+    assert relay_repo.signal_for_post(conn, channel_id=V, message_id=CALL) == live
+
+    repost = _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=12))
+    assert (repost.outcome, _live(conn)) == ("deleted", [live])
+    first = _delete(conn, VIP, CALL, POSTED + timedelta(minutes=13))
+    assert (first.outcome, _live(conn)) == ("voided", [])
+    for (detail,) in _q(conn, "SELECT detail FROM alerts"):
+        assert "by hand" not in detail, detail
 
 
 @pytest.mark.parametrize("order", ORDERS)

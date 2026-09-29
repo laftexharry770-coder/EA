@@ -602,6 +602,9 @@ def _reconcile_version(
         metrics.bump(
             conn, day_key=metrics.day_key_for(now_utc), name=EDIT_MISSED_BY_EVENTSTREAM_METRIC
         )
+    # A post that withdrew a signal, edited back into its call while a newer
+    # signal carries it, stands again (R4-5, as a post read back).
+    _stands_again(ctx, route_result)
 
     if new_hash == stored_hash:
         logger.info(
@@ -664,15 +667,18 @@ def _reverse_window_deletion(ctx: _Ctx, existing: sqlite3.Row) -> int:
 
 
 def _stands_again(ctx: _Ctx, route_result: RouteResult) -> None:
-    """`ctx`'s post, which the window had inferred deleted, is back
-    (`_reverse_window_deletion`). If that deletion withdrew a signal whose
-    call lives on in a newer one (a promotion, or the call posted again),
-    and the post as read back still shows that call, it is no longer the
-    post that withdrew it: it stands again, a post of the call like any
-    other read back (ruling R4-5) -- counted as showing the call
-    (`relay_repo.standing_posts_on`), and its later edits, deletion and
-    replies reach the call's newest signal. A signal nothing replaced keeps
-    its closer: its channel withdrew the call, and may post it again."""
+    """`ctx`'s post, which withdrew a signal, shows its call again: the
+    window had inferred it deleted and it is back (`_reverse_window_deletion`),
+    or it was edited away and is now edited back. If a newer signal carries
+    that call (a promotion, or the call posted again), the post is no
+    longer the one that withdrew it: it stands again, a post of the call
+    like any other read or edited back (ruling R4-5) -- counted as showing
+    the call (`relay_repo.standing_posts_on`), and its later edits,
+    deletion and replies reach the call's newest signal. So it does not
+    matter whether the post held the signal (VIP-first: it withdrew it) or
+    was a copy (relay-first: a repeat removal). A signal nothing replaced
+    keeps its closer: its channel withdrew the call, and may post it
+    again; and an edit never opens a trade."""
     if route_result.kind != "signal":
         return
     for row in ctx.conn.execute(
@@ -690,9 +696,8 @@ def _stands_again(ctx: _Ctx, route_result: RouteResult) -> None:
             message_id=ctx.message_id,
         )
         logger.info(
-            "channel %s message %s, which withdrew signal %s when the window inferred it "
-            "deleted, is back and still shows the call: it stands again, a post of the call "
-            "signal %s carries now",
+            "channel %s message %s, which withdrew signal %s, shows its call again: it "
+            "stands again, a post of the call signal %s carries now",
             ctx.channel_id,
             ctx.message_id,
             row["signal_id"],
@@ -746,7 +751,10 @@ def _edit_of_signal(ctx: _Ctx, route_result: RouteResult) -> EditResult:
         ctx = dataclasses.replace(
             ctx,
             old_post=relay_repo.old_post(
-                ctx.conn, channel_id=ctx.channel_id, message_id=ctx.message_id
+                ctx.conn,
+                channel_id=ctx.channel_id,
+                message_id=ctx.message_id,
+                channel_cfg=ctx.channel_cfg,
             ),
         )
         if row["signal_id"] == ctx.signal_id:
@@ -1268,22 +1276,18 @@ def post_left_live_call(
 def post_left_withdrawn_call(
     conn: sqlite3.Connection, *, channel_cfg: _ChannelCfgLike, message_id: int, signal_id: int
 ) -> bool:
-    """Whether stored post `message_id` of `channel_cfg`'s channel is the
-    post that withdrew signal `signal_id` before anything of it was
-    executed, and no longer shows its call -- deleted, edited into
-    something that is no signal, re-aimed or broken (ruling R4-4). A
-    follow-up replying to it is about a call never traded, so it gets no
-    target (`messages_repo.ingest`) -- whether or not the call was posted
-    again since, which it must never reach. A signal that was executed
-    keeps a reply to its closer: it may be about its live legs, and such a
-    signal is never replaced."""
+    """Whether stored post `message_id` of `channel_cfg`'s channel, a post
+    of signal `signal_id` -- withdrawn before anything of it was executed --
+    no longer shows its call: deleted, edited into something that is no
+    signal, re-aimed or broken. The post that withdrew the signal, above
+    all (ruling R4-4), or one that had left the call while another post
+    kept it standing. A follow-up replying to it is about no trade, so it
+    gets no target (`messages_repo.ingest`) -- whether or not the call was
+    posted again since, which it must never reach. A signal that was
+    executed keeps such a reply: it may be about its live legs, and such
+    a signal is never replaced."""
     signal = conn.execute("SELECT * FROM signals WHERE signal_id = ?", (signal_id,)).fetchone()
-    if signal is None or (signal["closed_by_channel_id"], signal["closed_by_message_id"]) != (
-        channel_cfg.channel_id,
-        message_id,
-    ):
-        return False
-    if not relay_repo.is_withdrawn_unexecuted(conn, signal):
+    if signal is None or not relay_repo.is_withdrawn_unexecuted(conn, signal):
         return False
     post = _get_message(conn, channel_id=channel_cfg.channel_id, message_id=message_id)
     if post is None or post["deleted_at_utc"] is not None or post["kind"] != "signal":
@@ -1905,7 +1909,10 @@ def apply_deletion(
         status = trade_status(conn, signal_id=row["signal_id"])
         own = row["signal_id"] == signal_id
         ctx = dataclasses.replace(
-            ctx, old_post=relay_repo.old_post(conn, channel_id=channel_id, message_id=message_id)
+            ctx,
+            old_post=relay_repo.old_post(
+                conn, channel_id=channel_id, message_id=message_id, channel_cfg=channel_cfg
+            ),
         )
         post_ctx = ctx if own else _as_copy(ctx, row)
         relayed = relay_repo.is_relayed(conn, signal_id=row["signal_id"])

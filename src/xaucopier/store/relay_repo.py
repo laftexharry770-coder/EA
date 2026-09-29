@@ -418,7 +418,13 @@ def withdrew_call(
     return True
 
 
-def old_post(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> OldPost | None:
+def old_post(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    message_id: int,
+    channel_cfg: _ChannelCfgLike | None = None,
+) -> OldPost | None:
     """How stored post (`channel_id`, `message_id`) stands to the newest
     signal of its call, for a removal of it -- deleted, edited away,
     re-aimed or broken (ruling R4-1). None when its removal is simply a
@@ -430,7 +436,10 @@ def old_post(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> O
       signals. The removal only echoes that post's, which was said when
       it happened: it is recorded, and reaches no signal. (Whichever post
       of the call was stored first, and whether or not the call was
-      posted again since.)
+      posted again since.) A forwarded post still stored as a signal is
+      re-read with `channel_cfg`, the forward's own channel's config -- it
+      read the forwarded post's words as this call -- so one re-aimed away
+      no longer stands either.
     - "original": the post was stored against an earlier signal of the
       call, since replaced, and the post that withdrew that signal was a
       forward of *this* post: this is the original poster retracting, and
@@ -453,7 +462,7 @@ def old_post(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> O
     chain = chain_ids(conn, start)
     forwarded = (message["fwd_from_channel_id"], message["fwd_from_post_id"])
     if None not in forwarded:
-        echoed = _gone_post_of_call(conn, forwarded, chain)
+        echoed = _gone_post_of_call(conn, forwarded, chain, channel_cfg)
         if echoed is not None:
             return OldPost("echo", echoed, forwarded)
     newest = chain[-1]
@@ -949,13 +958,17 @@ def post_shows_call(
 
 
 def _gone_post_of_call(
-    conn: sqlite3.Connection, post: tuple[int, int], chain: list[int]
+    conn: sqlite3.Connection,
+    post: tuple[int, int],
+    chain: list[int],
+    channel_cfg: _ChannelCfgLike | None = None,
 ) -> int | None:
     """For `old_post`: the signal of `chain` that stored post `post` belongs
     to (its own, or the one it copies), when that post no longer stands --
-    deleted, edited into something that is no signal, or the post that
-    closed one of the chain's signals. None otherwise, or when it is no
-    post of that call."""
+    deleted, edited into something that is no signal, the post that closed
+    one of the chain's signals, or (re-read with `channel_cfg`) re-aimed
+    away from the call. None otherwise, or when it is no post of that
+    call."""
     row = conn.execute(
         "SELECT * FROM messages WHERE channel_id = ? AND message_id = ?", post
     ).fetchone()
@@ -973,6 +986,10 @@ def _gone_post_of_call(
         (*chain, *post),
     ).fetchone()
     if row["deleted_at_utc"] is not None or row["kind"] != "signal" or closer is not None:
+        return linked
+    if channel_cfg is not None and not post_shows_call(
+        row, _signal_row(conn, linked), channel_cfg=channel_cfg
+    ):
         return linked
     return None
 
