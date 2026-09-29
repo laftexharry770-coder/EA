@@ -1576,10 +1576,11 @@ def test_a_promoted_repost_takes_over_the_follow_ups_that_replied_to_it(conn):
     )
     assert [row[5:] for row in _followups(conn)] == [
         (result.promoted_signal_id, "reply"),
-        # Round 4 (R4-4; round 3 moved it to the promoted signal too): it
-        # replied to the post that withdrew signal 1, so it stays with the
-        # signal that post closed -- and Plan 3 resolves it no further.
-        (holder.signal_id, "reply"),
+        # Round 5 (R5-3; round 4 kept it on signal 1 under R4-4): 4001 was
+        # deleted while its channel still showed the call in 4012, which was
+        # promoted -- the call never stopped, so a reply to 4001 moves to the
+        # promoted signal too, as any other post's reply does.
+        (result.promoted_signal_id, "relay-reply"),
     ]
 
 

@@ -1081,7 +1081,7 @@ def test_a_channels_bump_deleted_with_its_original_withdraws_the_call(conn, exec
 
 
 @pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
-@pytest.mark.parametrize("order", ["vip-first"])
+@pytest.mark.parametrize("order", ORDERS)
 def test_two_channels_forwarding_each_others_posts_withdraw_the_call_when_all_go(
     conn, order, executed  # noqa: F811
 ):
@@ -1163,3 +1163,88 @@ def test_a_channels_bump_removed_last_through_the_listener_withdraws_the_call(
             db_path, "SELECT code FROM alerts WHERE level = 'CRITICAL' AND code = ?",
             (edits_repo.LIVE_SIGNAL_DELETED,),
         ) == [(edits_repo.LIVE_SIGNAL_DELETED,)]
+
+
+# == Round 5 (ruling R5-3): a promotion is no withdrawal ========================
+#
+# The R4-4 carve-out -- a reply to the post that closed a signal stays with
+# that signal -- holds for the closer of a WITHDRAWN call (its channel's
+# last post) and for a post re-aimed to another call. A holder removed
+# while its own channel still showed the call was replaced by a promotion:
+# the call never stopped, so a reply to that post reaches the promoted
+# signal, whether it was stored before the removal or after.
+
+MOVE_SL_TO_BE = "Move SL to BE"
+#: How the VIP takes its first post out of the call while its double stands.
+_PROMOTIONS = {"deleted": None, "chatter": CHATTER_TEXT, "re-aimed": DIRECTION_EDIT}
+
+
+def _followup_target(conn, message_id: int) -> tuple:  # noqa: F811
+    (row,) = _q(
+        conn, "SELECT target_signal_id, resolution_path FROM followups WHERE message_id = ?",
+        message_id,
+    )
+    return row
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+@pytest.mark.parametrize("how", list(_PROMOTIONS))
+def test_a_reply_to_a_post_replaced_by_a_promotion_reaches_the_promoted_call(
+    conn, how, when  # noqa: F811
+):
+    """X4, one channel: the VIP double-posts its call, a "move SL to break
+    even" replies to the first post, and the first post goes -- the double
+    is promoted in its place. Deleted or edited into chatter, the call
+    never stopped: the instruction targets the promoted signal, stored
+    before the removal or after. Re-aimed, the first post shows another
+    call now: a reply to it stays with the signal it closed, or (stored
+    after) gets no target (R4-4)."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(seconds=30))
+    reply_at = POSTED + timedelta(minutes=1 if when == "before" else 3)
+    if when == "before":
+        _ingest(conn, VIP, 4005, MOVE_SL_TO_BE, posted=reply_at, reply_to=CALL)
+    moment = POSTED + timedelta(minutes=2)
+    if how == "deleted":
+        gone = _delete(conn, VIP, CALL, moment)
+    else:
+        gone = _edit(conn, VIP, CALL, _PROMOTIONS[how], moment)
+        conn.commit()
+    assert gone.promoted_signal_id == 2
+    if when == "after":
+        _ingest(conn, VIP, 4005, MOVE_SL_TO_BE, posted=reply_at, reply_to=CALL)
+
+    if how == "re-aimed":
+        assert _followup_target(conn, 4005) == (
+            (1, relay_repo.REPLY_PATH) if when == "before" else (None, None)
+        )
+    else:
+        assert _followup_target(conn, 4005) == (2, relay_repo.RELAY_REPLY_PATH)
+    assert _live(conn) == [2]
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_reply_to_a_relays_tidied_up_forward_reaches_the_live_call_in_either_order(
+    conn, order, when  # noqa: F811
+):
+    """X5, two channels: the relay forwards the VIP's call (R/7001) and
+    also posts it by hand (R/7002); "close half" replies to R/7001, and the
+    relay deletes R/7001 -- a tidy-up, its channel still shows the call.
+    VIP-first that is a repeat removal; relay-first R/7001 held the signal
+    and R/7002 is promoted. Either way the instruction reaches the live
+    call, stored before the deletion or after."""
+    _store_call(conn, order, forwards=True)
+    _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(minutes=1))
+    reply_at = POSTED + timedelta(minutes=2 if when == "before" else 4)
+    if when == "before":
+        _ingest(conn, RELAY, 7010, CLOSE_HALF, posted=reply_at, reply_to=COPY)
+    _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=3))
+    if when == "after":
+        _ingest(conn, RELAY, 7010, CLOSE_HALF, posted=reply_at, reply_to=COPY)
+
+    (live,) = _live(conn)
+    assert live == (1 if order == "vip-first" else 2)
+    target, path = _followup_target(conn, 7010)
+    assert (target, path) == (live, relay_repo.RELAY_REPLY_PATH)
+    assert relay_repo.live_signal_for(conn, target) == live

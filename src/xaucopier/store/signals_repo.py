@@ -35,6 +35,8 @@ from xaucopier.domain.signal import FollowUp, Signal
 from xaucopier.store import outbox
 
 TradeStatus = Literal["pending", "in_flight", "executed"]
+#: How a signal replaced a withdrawn one (`signals.replacement_kind`).
+ReplacementKind = Literal["promoted", "posted_again"]
 
 
 def signal_to_json(signal: Signal, *, source: str) -> str:
@@ -109,19 +111,28 @@ def insert_signal(
     message_id: int,
     signal: Signal,
     promoted_from_signal_id: int | None = None,
+    replacement_kind: ReplacementKind | None = None,
 ) -> int:
     """A new NEW signal for an already-stored message; parsed_json's
     `source` is that message's `messages.source` (F39).
     `promoted_from_signal_id` is set for a signal that replaces a
-    withdrawn one -- a standing repost promoted, or the call posted again
-    by the channel that withdrew it (final review F04, ruling R3-P2):
+    withdrawn one (final review F04, ruling R3-P2), with
+    `replacement_kind` saying how: `"promoted"`, a standing repost
+    promoted when the signal lost its own message while its channel still
+    showed the call -- the call never stopped (ruling R5-3) -- or
+    `"posted_again"`, the call posted again by a channel that withdrew it.
     `relay_repo.live_signal_for` follows these links to the signal that
     carries a call now."""
+    if (promoted_from_signal_id is None) != (replacement_kind is None):
+        raise ValueError(
+            "promoted_from_signal_id and replacement_kind go together: "
+            f"{promoted_from_signal_id!r}, {replacement_kind!r}"
+        )
     source = _message_source(conn, channel_id=channel_id, message_id=message_id)
     cursor = conn.execute(
         "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, "
-        "first_trade_hash, state, version, promoted_from_signal_id) "
-        "VALUES (?, ?, ?, ?, ?, 'NEW', 1, ?)",
+        "first_trade_hash, state, version, promoted_from_signal_id, replacement_kind) "
+        "VALUES (?, ?, ?, ?, ?, 'NEW', 1, ?, ?)",
         (
             channel_id,
             message_id,
@@ -129,6 +140,7 @@ def insert_signal(
             signal.content_hash,
             signal.content_hash,
             promoted_from_signal_id,
+            replacement_kind,
         ),
     )
     return cursor.lastrowid

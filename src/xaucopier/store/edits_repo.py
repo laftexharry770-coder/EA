@@ -103,8 +103,11 @@ The post that closed one of the chain's signals stays with that signal.
   replaces) and its ENTRY rows in the same writer job, unlinked, and
   announced with a WARNING `SIGNAL_REPOST_PROMOTED` naming both messages;
   every other copy of the call then repeats it, and every follow-up that
-  targeted the withdrawn signal targets it (`relay_repo.record_replacement`;
-  not one replying to the post that withdrew it, ruling R4-4).
+  targeted the withdrawn signal targets it (`relay_repo.record_replacement`).
+  The call never stopped, so the post that lost it is no withdrawal
+  either (ruling R5-3): a reply to it reaches the promoted signal too --
+  unless it was re-aimed to another call, when it stays with the signal
+  it closed (ruling R4-4; `relay_repo.kept_closer`).
   Never promoted: a repost of an executed
   signal (trading it would open the trade twice), and a post on any other
   channel. (A repost posted *after* the withdrawal is not a copy at all:
@@ -1426,6 +1429,7 @@ def _promote_repost(
             message_id=repost["message_id"],
             signal=routed.signal,
             promoted_from_signal_id=old_id,
+            replacement_kind="promoted",
         )
         queued = outbox.fan_out_checked(
             conn,

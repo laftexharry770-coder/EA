@@ -171,9 +171,13 @@ two backfills every existing row keeps every value it had.
   for a signal that replaces a withdrawn one -- a standing repost
   promoted, or the call posted again by the channel that withdrew it --
   the signal it replaces; ``relay_repo.live_signal_for`` follows these
-  links to the signal carrying a call now (R3-P2). All three are NULL on
-  rows stored before migration 4 (then only a signal's own message could
-  close it, and nothing replaced a signal).
+  links to the signal carrying a call now (R3-P2).
+  ``signals.replacement_kind`` says which of the two such a signal is:
+  ``'promoted'`` -- its channel still showed the call when the signal it
+  replaces lost its own message, so the call never stopped (ruling
+  R5-3) -- or ``'posted_again'``; NULL when it replaces nothing. All four
+  are NULL on rows stored before migration 4 (then only a signal's own
+  message could close it, and nothing replaced a signal).
 - ``messages.sender_kind`` (``'user'`` / ``'channel'`` / ``'chat'``),
   ``sender_id`` and ``is_post`` (0/1): who posted a message, so a group
   member's chatter can be told from the channel's own posts (F05).
@@ -319,6 +323,8 @@ _MIGRATION_4: tuple[str, ...] = (
     "ALTER TABLE signals ADD COLUMN closed_by_channel_id INTEGER",
     "ALTER TABLE signals ADD COLUMN closed_by_message_id INTEGER",
     "ALTER TABLE signals ADD COLUMN promoted_from_signal_id INTEGER",
+    "ALTER TABLE signals ADD COLUMN replacement_kind TEXT "
+    "CHECK (replacement_kind IN ('promoted', 'posted_again'))",
     "CREATE INDEX IF NOT EXISTS idx_messages_fwd_from "
     "ON messages(fwd_from_channel_id, fwd_from_post_id)",
     # A pointer above 0 was written by a seed (or by ingest after one):

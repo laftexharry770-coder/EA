@@ -31,7 +31,13 @@ post still reads as a signal) -- and is not the post that closed one of
 the chain's signals.
 `signal_for_post` says which signal a stored post acts on: the newest
 of its call -- or, for the post that closed one of the chain's signals,
-that signal (its later edits are about the call it broke). Such a post
+that signal (its later edits are about the call it broke;
+`kept_closer`). A *promotion* is no such closing (ruling R5-3): a
+signal's own message deleted, edited away or broken while its channel
+still showed the call in another post, promoted in its place
+(`signals.replacement_kind` 'promoted', `closed_by_promotion`) -- the
+call never stopped, so that post acts on the newest signal like any
+other; only one re-aimed to another call stays with the signal. Such a post
 that shows the call again -- read back after a false window deletion, or
 edited back -- while a newer signal carries it is that signal's closer no
 more: it stands again (ruling R4-5, `edits_repo._stands_again`) -- and so
@@ -137,11 +143,13 @@ first must not decide whether the instruction knows its signal. A target
 the held follow-up already has is never replaced by a copy's; when the
 call is replaced, every follow-up targeting its earlier signals is moved
 to the new one (`record_replacement`) -- except one replying to the post
-that closed one of them, which stays with the signal that post closed
-(ruling R4-4). A reply to any post of a call withdrawn before anything
-was executed, when the post no longer shows the call -- the post that
-withdrew it above all -- gets no target at all
-(`edits_repo.post_left_withdrawn_call`).
+that closed one of them and stays with it (`kept_closer`: the post that
+withdrew the call, or one re-aimed to another call), which stays with the
+signal that post closed (rulings R4-4, R5-3). A reply to any post of a
+call withdrawn before anything was executed, when the post no longer
+shows the call -- the post that withdrew it above all -- gets no target
+at all (`edits_repo.post_left_withdrawn_call`). `signal_for_followup` is
+the one place that says which signal a follow-up acts on now.
 
 **Every copy is visible.** `record_signal_copy` / `record_followup_copy`
 store the link on the copy's `messages` row, log it at INFO with both
@@ -299,10 +307,11 @@ def live_signal_for(conn: sqlite3.Connection, signal_id: int) -> int:
     targets of follow-ups -- and Plan 3, which must resolve every
     follow-up's `target_signal_id` through this before acting on it
     (PLAN3-OBLIGATIONS #45), UNLESS the follow-up replies to that
-    signal's closer -- the post that withdrew or invalidated it
-    (`signals.closed_by_channel_id` / `closed_by_message_id`): such a
-    reply is about the signal that post closed, never about the call
-    posted in its place (ruling R4-4)."""
+    signal's closer and that closer stays with it (`kept_closer`: the
+    post that withdrew the call, or one re-aimed to another call -- not
+    a post a promotion replaced, ruling R5-3): such a reply is about the
+    signal that post closed, never about the call posted in its place
+    (ruling R4-4). `signal_for_followup` does exactly that."""
     replacements = _replacements(conn, signal_id)
     return replacements[-1] if replacements else signal_id
 
@@ -342,13 +351,72 @@ def signal_for_post(conn: sqlite3.Connection, *, channel_id: int, message_id: in
             return None
         start = row[0]
     for signal_id in (start, *_replacements(conn, start)):
-        closed = conn.execute(
-            "SELECT closed_by_channel_id, closed_by_message_id FROM signals WHERE signal_id = ?",
-            (signal_id,),
-        ).fetchone()
-        if closed is not None and (closed[0], closed[1]) == (channel_id, message_id):
+        if kept_closer(conn, signal_id) == (channel_id, message_id):
             return signal_id
     return live_signal_for(conn, start)
+
+
+def closed_by_promotion(conn: sqlite3.Connection, signal_id: int) -> bool:
+    """Whether signal `signal_id` lost its own message -- deleted, edited
+    away, re-aimed or broken -- while its channel still showed the call in
+    another post, which was promoted in its place in the same writer job
+    (`signals.replacement_kind` 'promoted' on the signal replacing it). The
+    call never stopped: that post's closing withdrew nothing (ruling
+    R5-3)."""
+    row = conn.execute(
+        "SELECT 1 FROM signals WHERE promoted_from_signal_id = ? AND signal_id > ? "
+        "  AND replacement_kind = 'promoted' LIMIT 1",
+        (signal_id, signal_id),
+    ).fetchone()
+    return row is not None
+
+
+def kept_closer(conn: sqlite3.Connection, signal_id: int) -> tuple[int, int] | None:
+    """The post (channel id, message id) that closed signal `signal_id`,
+    when that post stays with it -- what the post says now, and the
+    follow-ups replying to it, are about `signal_id`, never about the call
+    posted in its place (ruling R4-4, as limited by R5-3): the post that
+    withdrew the call (its channel's last post of it), or a post that now
+    shows another call (re-aimed, still a signal and not deleted). None
+    when nothing closed the signal, or when a promotion replaced it and
+    its closer was deleted, edited into something that is no signal, or
+    broken: the call never stopped, so that post acts on the call's newest
+    signal like any other post of it."""
+    row = conn.execute(
+        "SELECT closed_by_channel_id, closed_by_message_id FROM signals WHERE signal_id = ?",
+        (signal_id,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    closer = (row[0], row[1])
+    if not closed_by_promotion(conn, signal_id):
+        return closer
+    post = conn.execute(
+        "SELECT kind, deleted_at_utc FROM messages WHERE channel_id = ? AND message_id = ?",
+        closer,
+    ).fetchone()
+    if post is not None and post["kind"] == "signal" and post["deleted_at_utc"] is None:
+        return closer  # re-aimed: it shows another call now
+    return None
+
+
+def signal_for_followup(conn: sqlite3.Connection, *, followup_id: int) -> int | None:
+    """**The signal follow-up `followup_id` acts on now** -- what Plan 3
+    must act on (PLAN3-OBLIGATIONS #45): its `target_signal_id` resolved
+    through `live_signal_for`, unless it replies to the post that closed
+    that signal and that post stays with it (`kept_closer`), when it is
+    that signal itself. None when it has no target."""
+    row = conn.execute(
+        "SELECT channel_id, reply_to_message_id, target_signal_id FROM followups "
+        "WHERE followup_id = ?",
+        (followup_id,),
+    ).fetchone()
+    if row is None or row["target_signal_id"] is None:
+        return None
+    target = row["target_signal_id"]
+    if kept_closer(conn, target) == (row["channel_id"], row["reply_to_message_id"]):
+        return target
+    return live_signal_for(conn, target)
 
 
 def is_relayed(conn: sqlite3.Connection, *, signal_id: int) -> bool:
@@ -520,8 +588,9 @@ def record_replacement(
     Every follow-up that targeted one of the call's earlier
     signals targets it now (path `'reply'` when it replies to its own
     message, `'relay-reply'` for any other post) -- except one replying to
-    the post that closed one of those signals, which stays with the
-    signal that post closed (ruling R4-4). Every copy held back
+    the post that closed one of those signals and stays with it
+    (`kept_closer`), which stays with the signal that post closed (rulings
+    R4-4, R5-3). Every copy held back
     against the withdrawn call (`COPY_OF_WITHDRAWN_SIGNAL`) repeats it
     now, and that CRITICAL alert -- which told the user to trade the call
     by hand -- is acknowledged and superseded by a WARNING
@@ -546,26 +615,25 @@ def record_replacement(
     if channel_cfg is not None:
         _release_closers_showing_call(conn, earlier=earlier, new=new, channel_cfg=channel_cfg)
     marks = ", ".join("?" for _ in earlier)
-    conn.execute(
-        "UPDATE followups SET target_signal_id = ?, resolution_path = CASE "
-        "  WHEN resolution_path NOT IN (?, ?) THEN resolution_path "
-        "  WHEN channel_id = ? AND reply_to_message_id = ? THEN ? ELSE ? END "
-        f"WHERE edit_seq = 0 AND target_signal_id IN ({marks}) "
-        "  AND NOT EXISTS (SELECT 1 FROM signals s "
-        f"    WHERE s.signal_id IN ({marks}) AND s.closed_by_channel_id = followups.channel_id "
-        "     AND s.closed_by_message_id = followups.reply_to_message_id)",
-        (
-            new_signal_id,
-            REPLY_PATH,
-            RELAY_REPLY_PATH,
-            new["channel_id"],
-            new["message_id"],
-            REPLY_PATH,
-            RELAY_REPLY_PATH,
-            *earlier,
-            *earlier,
-        ),
-    )
+    kept = {closer for sid in earlier if (closer := kept_closer(conn, sid)) is not None}
+    for followup in conn.execute(
+        "SELECT followup_id, channel_id, reply_to_message_id, resolution_path FROM followups "
+        f"WHERE edit_seq = 0 AND target_signal_id IN ({marks}) ORDER BY followup_id",
+        earlier,
+    ).fetchall():
+        if (followup["channel_id"], followup["reply_to_message_id"]) in kept:
+            continue  # about the signal that post closed (R4-4, R5-3)
+        path = followup["resolution_path"]
+        if path in (REPLY_PATH, RELAY_REPLY_PATH):
+            own = (followup["channel_id"], followup["reply_to_message_id"]) == (
+                new["channel_id"],
+                new["message_id"],
+            )
+            path = REPLY_PATH if own else RELAY_REPLY_PATH
+        conn.execute(
+            "UPDATE followups SET target_signal_id = ?, resolution_path = ? WHERE followup_id = ?",
+            (new_signal_id, path, followup["followup_id"]),
+        )
     held_back = conn.execute(
         "SELECT alert_id, channel_id, message_id, signal_id, acked FROM alerts "
         f"WHERE code = ? AND signal_id IN ({marks}) ORDER BY alert_id",
@@ -1037,7 +1105,9 @@ def _gone_post(
       re-aimed it): its removal was said when it happened -- an echo;
     - it no longer stands -- deleted, edited into something that is no
       signal, or (re-read with `channel_cfg`) re-aimed away -- without
-      closing anything: a repeat removal on its channel. The forward echoes
+      closing anything, or closing a signal only for a promotion
+      (`closed_by_promotion`: its channel still showed the call): a
+      repeat removal on its channel. The forward echoes
       it only while that channel still shows the call in a standing post
       (re-read now). Once that channel's last post is gone too, nothing
       said the call was withdrawn, so the forward's removal is a removal
@@ -1062,11 +1132,11 @@ def _gone_post(
     chain = chain_ids(conn, linked)
     marks = ", ".join("?" for _ in chain)
     closer = conn.execute(
-        f"SELECT 1 FROM signals WHERE signal_id IN ({marks}) "
+        f"SELECT signal_id FROM signals WHERE signal_id IN ({marks}) "
         "  AND closed_by_channel_id = ? AND closed_by_message_id = ?",
         (*chain, *post),
     ).fetchone()
-    if closer is not None:
+    if closer is not None and not closed_by_promotion(conn, closer["signal_id"]):
         return linked  # its removal withdrew one of the call's signals: said then
     gone = (
         row["deleted_at_utc"] is not None

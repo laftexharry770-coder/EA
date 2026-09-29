@@ -56,7 +56,9 @@ the replied-to post's call, path `'reply'` for that signal's own message
 or `'relay-reply'` for another post of the call; none when that post was
 re-aimed away from the live call, `edits_repo.post_left_live_call`, or
 is the post that withdrew a call never traded and no longer shows it,
-`edits_repo.post_left_withdrawn_call`, ruling R4-4) and is itself a
+`edits_repo.post_left_withdrawn_call`, ruling R4-4 -- a post a promotion
+replaced withdrew nothing: a reply to it reaches the promoted signal,
+ruling R5-3) and is itself a
 "relay_duplicate" -- stored, linked by `relay_of_followup_id`, logged and
 counted, but no followups row and no outbox row -- when it repeats a
 stored follow-up (F08); a target it resolves is given to the follow-up
@@ -532,6 +534,7 @@ def _ingest_new(
         message_id=message_id,
         signal=signal,
         promoted_from_signal_id=relay.replaces,
+        replacement_kind=None if relay.replaces is None else "posted_again",
     )
     # Same transaction as the signal insert above -- see the module
     # docstring and tests/test_outbox.py's atomicity tests.

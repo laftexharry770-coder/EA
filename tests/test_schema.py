@@ -798,7 +798,12 @@ _V4_COLUMNS = {
         "fwd_from_post_id",
         "fwd_from_date_utc",
     ),
-    "signals": ("closed_by_channel_id", "closed_by_message_id", "promoted_from_signal_id"),
+    "signals": (
+        "closed_by_channel_id",
+        "closed_by_message_id",
+        "promoted_from_signal_id",
+        "replacement_kind",
+    ),
 }
 
 
@@ -1004,6 +1009,20 @@ def test_sender_columns_accept_only_their_values(tmp_path, column, bad):
         conn.execute(f"UPDATE messages SET {column} = ?", (good,))
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(f"UPDATE messages SET {column} = ?", (bad,))
+    conn.close()
+
+
+@pytest.mark.parametrize("bad", ["Promoted", "reposted", ""])
+def test_replacement_kind_accepts_only_its_values(tmp_path, bad):
+    """signals.replacement_kind (ruling R5-3): how a signal replaced a
+    withdrawn one -- a standing repost promoted, or the call posted again."""
+    conn = _connect(tmp_path)
+    _insert_message(conn, message_id=100)
+    _insert_signal(conn)
+    for good in ("promoted", "posted_again", None):
+        conn.execute("UPDATE signals SET replacement_kind = ?", (good,))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE signals SET replacement_kind = ?", (bad,))
     conn.close()
 
 
