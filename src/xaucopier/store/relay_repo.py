@@ -160,6 +160,12 @@ watched channels carrying the same calls):
   channel's other post (so nothing was closed) is linked to the live
   call without an alert; it is never traded, and its edits and removal
   change nothing, as it does not show the call.
+- A post read back after a false window deletion that had withdrawn the
+  call stands again when the call is posted again on its own channel
+  (`record_replacement` re-reads that channel's posts). Posted again by
+  another channel -- whose ingest does not have the first channel's
+  parser -- it stays the post that withdrew its signal: its later removal
+  changes nothing, and a forward of it removed is an echo.
 """
 from __future__ import annotations
 
