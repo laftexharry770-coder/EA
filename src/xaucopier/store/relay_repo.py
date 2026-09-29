@@ -73,6 +73,14 @@ is told apart:
 A promotion re-links every copy of the call, on any channel, to the
 promoted signal: the call never stopped, so none of them is an older post.
 
+**The call's last standing post is never an echo, nor an older post**
+(ruling R5-6, INV-1). Whatever a removal echoes, when no other post of
+the call still stands on any channel (`_call_stands_elsewhere`), it is a
+removal like any other and withdraws the call: a call no post shows is
+never left to trade. Echoes can otherwise chain -- each channel's last
+post judged an echo of the other's -- and no rule about one pair of
+posts can rule that out.
+
 **What is a copy of a signal** (`find_signal_relay`), in this order:
 
 1. *The same post, however late* (F09). A forward carries the post it
@@ -145,9 +153,11 @@ first must not decide whether the instruction knows its signal. A target
 the held follow-up already has is never replaced by a copy's; when the
 call is replaced, every follow-up targeting its earlier signals is moved
 to the new one (`record_replacement`) -- except one replying to the post
-that closed one of them and stays with it (`kept_closer`: the post that
-withdrew the call, or one re-aimed to another call), which stays with the
-signal that post closed (rulings R4-4, R5-3). A reply to any post of a
+that withdrew the call (its channel's last post), which stays with the
+signal that post closed (rulings R4-4, R5-3). A promotion moves every
+reply, even one to a post re-aimed to another call: it was given while
+the post showed the call, which never stopped -- as when the re-aimed
+post held no signal and the call simply stood (INV-2). A reply to any post of a
 call withdrawn before anything was executed, when the post no longer
 shows the call -- the post that withdrew it above all -- gets no target
 at all (`edits_repo.post_left_withdrawn_call`). `signal_for_followup` is
@@ -549,6 +559,26 @@ def old_post(
         start = message["relay_of_signal_id"]
     if start is None:
         return None
+    found = _old_post_kind(conn, message, start, channel_cfg)
+    if found is not None and not _call_stands_elsewhere(
+        conn, signal_id=start, post=(channel_id, message_id), channel_cfg=channel_cfg
+    ):
+        # The call's last standing post, on every channel: its removal is a
+        # removal like any other, whatever it echoes -- a call no post shows
+        # is never left to trade (ruling R5-6, INV-1).
+        return None
+    return found
+
+
+def _old_post_kind(
+    conn: sqlite3.Connection,
+    message: sqlite3.Row,
+    start: int,
+    channel_cfg: _ChannelCfgLike | None,
+) -> OldPost | None:
+    """`old_post`'s classification of stored post `message`, stored with
+    signal `start`, before the last-standing-post check."""
+    channel_id, message_id = message["channel_id"], message["message_id"]
     chain = chain_ids(conn, start)
     forwarded = (message["fwd_from_channel_id"], message["fwd_from_post_id"])
     if None not in forwarded and forwarded[0] != channel_id:
@@ -597,8 +627,8 @@ def record_replacement(
     Every follow-up that targeted one of the call's earlier
     signals targets it now (path `'reply'` when it replies to its own
     message, `'relay-reply'` for any other post) -- except one replying to
-    the post that closed one of those signals and stays with it
-    (`kept_closer`), which stays with the signal that post closed (rulings
+    the post that withdrew one of those signals (a closing no promotion
+    followed), which stays with the signal that post closed (rulings
     R4-4, R5-3). Every copy held back
     against the withdrawn call (`COPY_OF_WITHDRAWN_SIGNAL`) repeats it
     now, and that CRITICAL alert -- which told the user to trade the call
@@ -624,7 +654,11 @@ def record_replacement(
     if channel_cfg is not None:
         _release_closers_showing_call(conn, earlier=earlier, new=new, channel_cfg=channel_cfg)
     marks = ", ".join("?" for _ in earlier)
-    kept = {closer for sid in earlier if (closer := kept_closer(conn, sid)) is not None}
+    kept = {
+        closer
+        for sid in earlier
+        if not closed_by_promotion(conn, sid) and (closer := kept_closer(conn, sid)) is not None
+    }
     for followup in conn.execute(
         "SELECT followup_id, channel_id, reply_to_message_id, resolution_path FROM followups "
         f"WHERE edit_seq = 0 AND target_signal_id IN ({marks}) ORDER BY followup_id",
@@ -1163,6 +1197,41 @@ def _gone_post(
         if channel_cfg is None or post_shows_call(other, newest, channel_cfg=channel_cfg):
             return linked
     return None
+
+
+def _call_stands_elsewhere(
+    conn: sqlite3.Connection,
+    *,
+    signal_id: int,
+    post: tuple[int, int],
+    channel_cfg: _ChannelCfgLike | None,
+) -> bool:
+    """Whether a post of `signal_id`'s call other than `post` still stands,
+    on any channel: not deleted, still stored as a signal, not the post
+    that closed one of the call's signals (`standing_posts_on`) and -- with
+    `channel_cfg`, the changed post's channel config -- re-read still
+    showing the call of its newest signal. A post of another channel is
+    re-read with that config too (its own is not at hand here): one that
+    does not read as the call with it counts as not standing, which only
+    makes a removal withdraw the call -- the safe side."""
+    newest = _signal_row(conn, live_signal_for(conn, signal_id))
+    chain = chain_ids(conn, signal_id)
+    marks = ", ".join("?" for _ in chain)
+    for other in conn.execute(
+        "SELECT m.* FROM messages m "
+        "WHERE m.deleted_at_utc IS NULL AND m.kind = 'signal' "
+        "  AND NOT (m.channel_id = ? AND m.message_id = ?) "
+        f"  AND (m.relay_of_signal_id IN ({marks}) OR EXISTS ("
+        "    SELECT 1 FROM signals s WHERE s.channel_id = m.channel_id "
+        f"     AND s.message_id = m.message_id AND s.signal_id IN ({marks}))) "
+        "  AND NOT EXISTS (SELECT 1 FROM signals s "
+        f"    WHERE s.signal_id IN ({marks}) AND s.closed_by_channel_id = m.channel_id "
+        "     AND s.closed_by_message_id = m.message_id)",
+        (*post, *chain, *chain, *chain),
+    ).fetchall():
+        if channel_cfg is None or post_shows_call(other, newest, channel_cfg=channel_cfg):
+            return True
+    return False
 
 
 def _signal_row(conn: sqlite3.Connection, signal_id: int) -> sqlite3.Row:

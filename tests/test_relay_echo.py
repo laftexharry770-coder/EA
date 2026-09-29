@@ -1194,11 +1194,12 @@ def test_a_reply_to_a_post_replaced_by_a_promotion_reaches_the_promoted_call(
 ):
     """X4, one channel: the VIP double-posts its call, a "move SL to break
     even" replies to the first post, and the first post goes -- the double
-    is promoted in its place. Deleted or edited into chatter, the call
-    never stopped: the instruction targets the promoted signal, stored
-    before the removal or after. Re-aimed, the first post shows another
-    call now: a reply to it stays with the signal it closed, or (stored
-    after) gets no target (R4-4)."""
+    is promoted in its place. The call never stopped: an instruction given
+    while the post showed it targets the promoted signal. Deleted or
+    edited into chatter, so does one stored after. Re-aimed, the first
+    post shows another call now: a reply to it stored after the re-aim is
+    about no trade and gets no target -- as when the re-aimed post held no
+    signal and the call simply stood (INV-2)."""
     _ingest(conn, VIP, CALL)
     _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(seconds=30))
     reply_at = POSTED + timedelta(minutes=1 if when == "before" else 3)
@@ -1214,10 +1215,8 @@ def test_a_reply_to_a_post_replaced_by_a_promotion_reaches_the_promoted_call(
     if when == "after":
         _ingest(conn, VIP, 4005, MOVE_SL_TO_BE, posted=reply_at, reply_to=CALL)
 
-    if how == "re-aimed":
-        assert _followup_target(conn, 4005) == (
-            (1, relay_repo.REPLY_PATH) if when == "before" else (None, None)
-        )
+    if how == "re-aimed" and when == "after":
+        assert _followup_target(conn, 4005) == (None, None)
     else:
         assert _followup_target(conn, 4005) == (2, relay_repo.RELAY_REPLY_PATH)
     assert _live(conn) == [2]
@@ -1280,3 +1279,119 @@ def test_a_channel_whose_only_post_was_held_back_cannot_repost_a_withdrawn_call(
         relay_repo.COPY_OF_WITHDRAWN_SIGNAL,
     ) == [(8001, 0), (8002, 0)]
     assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED not in [c for _, c in _codes(conn)]
+
+
+# == Round 5 (ruling R5-6): what the invariant tests found =====================
+#
+# tests/test_relay_invariants.py checks, on generated scenarios, that a call
+# every post of which is withdrawn is never traded (INV-1), that storage
+# order changes nothing (INV-2) and that no account can trade a call twice
+# (INV-3). These pin the scenarios its first runs found.
+
+
+@pytest.mark.parametrize("first", [CALL, REPOST], ids=["holder-first", "double-first"])
+@pytest.mark.parametrize("how", ["re-aimed", "chatter"])
+def test_a_double_post_deleted_with_its_holder_that_had_left_the_call_withdraws_it(
+    conn, how, first  # noqa: F811
+):
+    """Retraction seed 1549, one channel: the VIP double-posts, acct-1 takes
+    the entry, and the VIP takes the first post out of the call (re-aimed or
+    edited into chatter: a repeat removal, the trade continues). Then both
+    posts are deleted in one report. The first post's deletion says nothing
+    -- it had left the call -- so the double's deletion, the channel's last
+    post of the call, must say it, whichever job runs first: a CRITICAL
+    flag, and acct-2's entry skipped."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(seconds=30))
+    _take_entry(conn, 1)
+    _edit(conn, VIP, CALL, _REMOVALS[how], POSTED + timedelta(minutes=1))
+    conn.commit()
+    assert _live(conn) == [1]
+
+    both = (CALL, REPOST)
+    for message_id in (first, REPOST if first == CALL else CALL):
+        _delete(conn, VIP, message_id, POSTED + timedelta(minutes=2), also=both)
+
+    _withdrawn_everywhere(conn, executed=True, signal_id=1)
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_call_posted_again_by_forwarding_a_post_the_other_channel_broke_is_withdrawn_last(
+    conn, order  # noqa: F811
+):
+    """Order seed 6299: the relay's copy is edited into broken text (its
+    last post: signal 1 INVALID), the VIP deletes its post, the relay
+    edits its copy back, and the VIP forwards that copy twice -- the VIP
+    posting the call again (signal 2). The VIP deletes both forwards and
+    the relay re-aims its copy. Each forward's removal looked like an echo
+    of the relay's post that broke signal 1; the VIP's last one is not:
+    nothing of the call is left to claim."""
+    _store_call(conn, order)
+    _edit(conn, RELAY, COPY, UNPARSEABLE_EDIT, POSTED + timedelta(minutes=1))
+    conn.commit()
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=2))
+    _edit(conn, RELAY, COPY, SIGNAL_TEXT, POSTED + timedelta(minutes=3))
+    conn.commit()
+    first = _ingest(conn, VIP, 4002, posted=POSTED + timedelta(minutes=4), fwd=(R, COPY))
+    assert first.outcome == "new"
+    _ingest(conn, VIP, 4003, posted=POSTED + timedelta(minutes=5), fwd=(R, COPY))
+    assert _live(conn) == [first.signal_id]
+
+    _delete(conn, VIP, 4002, POSTED + timedelta(minutes=6), by="window")
+    _delete(conn, VIP, 4003, POSTED + timedelta(minutes=7))
+    _edit(conn, RELAY, COPY, DIRECTION_EDIT, POSTED + timedelta(minutes=8))
+    conn.commit()
+
+    _withdrawn_everywhere(conn, executed=False, signal_id=first.signal_id)
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_two_channels_echoing_each_other_through_a_call_posted_again_withdraw_it_last(
+    conn, order  # noqa: F811
+):
+    """Order seed 5447: the relay forwards the VIP's call; the VIP deletes
+    it (signal 1 VOIDED); the relay forwards the deleted post again and
+    posts the call by hand (both held back); the VIP forwards the relay's
+    hand post -- the VIP posting the call again (signal 2). Then every post
+    is deleted. The VIP's forward goes while the relay's first forward
+    still shows the call (an echo of the relay's removal); the relay's
+    first forward, an echo of the VIP's withdrawal of signal 1, is by then
+    the call's last post: its deletion withdraws signal 2."""
+    _store_call(conn, order, forwards=True)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1), by="window")
+    _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(minutes=2), fwd=(V, CALL))
+    _ingest(conn, RELAY, 7003, posted=POSTED + timedelta(minutes=3))
+    again = _ingest(conn, VIP, 4002, posted=POSTED + timedelta(minutes=4), fwd=(R, 7003))
+    assert again.outcome == "new"
+    assert _live(conn) == [again.signal_id]
+
+    for step, (channel, message_id) in enumerate(
+        [(RELAY, 7003), (RELAY, 7002), (VIP, 4002), (RELAY, COPY)]
+    ):
+        _delete(conn, channel, message_id, POSTED + timedelta(minutes=5 + step))
+
+    _withdrawn_everywhere(conn, executed=False, signal_id=again.signal_id)
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_reply_given_before_its_post_was_re_aimed_follows_the_call_in_either_order(
+    conn, order  # noqa: F811
+):
+    """Order seeds 5187 and 5469: "close half" replies to the relay's copy,
+    the relay also forwards the VIP's post, and then re-aims its copy --
+    VIP-first a repeat removal, relay-first the copy held the signal and
+    the forward is promoted. The instruction was given while the post
+    showed the call: it acts on the live call either way. A reply to the
+    re-aimed post stored after the re-aim is about no trade, either way."""
+    _store_call(conn, order)
+    _ingest(conn, RELAY, 7002, CLOSE_HALF, posted=POSTED + timedelta(minutes=1), reply_to=COPY)
+    _ingest(conn, RELAY, 7003, posted=POSTED + timedelta(minutes=2), fwd=(V, CALL))
+    _edit(conn, RELAY, COPY, DIRECTION_EDIT, POSTED + timedelta(minutes=3))
+    conn.commit()
+    _ingest(conn, RELAY, 7004, CLOSE_HALF, posted=POSTED + timedelta(minutes=4), reply_to=COPY)
+
+    (live,) = _live(conn)
+    ((before,),) = _q(conn, "SELECT followup_id FROM followups WHERE message_id = 7002")
+    ((after,),) = _q(conn, "SELECT followup_id FROM followups WHERE message_id = 7004")
+    assert relay_repo.signal_for_followup(conn, followup_id=before) == live
+    assert relay_repo.signal_for_followup(conn, followup_id=after) is None

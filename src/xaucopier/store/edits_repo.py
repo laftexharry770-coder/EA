@@ -126,7 +126,9 @@ The post that closed one of the chain's signals stays with that signal.
   side -- but loudly: VOIDED with CRITICAL `OLD_POST_WITHDREW_CALL`, or the
   usual CRITICAL flag or invalidation, each naming the post that withdrew
   the earlier signal and the post that carries the call now, and saying
-  to trade the call by hand if only an old copy went.
+  to trade the call by hand if only an old copy went. Neither applies to
+  the call's last standing post on every channel: its removal withdraws
+  the call plainly (ruling R5-6).
 
 **A post's edit never puts back a level another post moved** (ruling
 R3-P4). A post of a relayed call is often a hand copy that mirrors some
@@ -167,7 +169,8 @@ still applied in its own writer job, but each job is told the others
 already: it is never promoted (its entries would be claimable until the
 next job voided them), and a repeat deleted together with its signal's
 own message says nothing of its own -- the signal's own deletion speaks
-for both.
+for both, when it will: not when that message had left the call before,
+or its removal is an echo (`_holder_speaks`; ruling R5-6).
 
 **A deletion inferred from absence can be reversed.** The window re-read
 (`ingest/edits.py`) infers a deletion when a message stops coming back --
@@ -1141,12 +1144,13 @@ def _withdraw_post(
 
     A post deleted in the same report counts as gone already; a repeat
     deleted together with the signal's own message leaves the saying to
-    that message's job."""
+    that message's job -- when that job will say it (`_holder_speaks`)."""
     if row["withdrawn_at_utc"] is None:
         if (
             not _is_holder(ctx, row)
             and row["channel_id"] == ctx.channel_id
             and row["message_id"] in ctx.also_deleted
+            and _holder_speaks(ctx, row)
         ):
             logger.info(
                 "channel %s message %s, a repeat of signal %s, %s together with the signal's "
@@ -1177,6 +1181,30 @@ def _withdraw_post(
         ctx, row, status, via=via, pending_code=pending_code, live_code=live_code,
         new_kind=new_kind, promote=False,
     )
+
+
+def _holder_speaks(ctx: _Ctx, row: sqlite3.Row) -> bool:
+    """For a repeat deleted in the same report as signal `row`'s own
+    message: whether that message's deletion will withdraw the call, so
+    the repeat's may leave the saying to it. Its job has not run yet (the
+    message is not marked deleted), it still shows the call (it had not
+    been re-aimed or edited away while the repeat stood), and its removal
+    is no echo of another post's (`relay_repo.old_post`). Otherwise the
+    repeat's deletion says it itself: a call is never left standing
+    because each post deleted together counted on the other (ruling R5-6,
+    INV-1)."""
+    holder = _get_message(ctx.conn, channel_id=row["channel_id"], message_id=row["message_id"])
+    if holder is None or holder["deleted_at_utc"] is not None:
+        return False
+    if not _shows(_reread(ctx, holder), row):
+        return False
+    old = relay_repo.old_post(
+        ctx.conn,
+        channel_id=row["channel_id"],
+        message_id=row["message_id"],
+        channel_cfg=ctx.channel_cfg,
+    )
+    return old is None or old.kind != "echo"
 
 
 def _break_post(
