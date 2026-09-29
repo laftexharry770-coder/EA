@@ -75,31 +75,36 @@ that is not that signal's own message is handled exactly like it --
 amend, invalidate, void, flag -- with every alert naming both messages.
 The post that closed one of the chain's signals stays with that signal.
 
-- **An edit that re-aims the call or breaks it** (side, symbol, entry
-  zone; unparseable), on any post: the signal is `INVALID`, as above.
-- **A post deleted, or edited into something that is no signal** (R3-P1):
-  a channel withdraws the call only when its *last* standing post of it
-  goes. One of several standing posts on a channel going is a repeat
-  removal: a WARNING `SIGNAL_REPEAT_REMOVED` names the post still showing
-  it, and the call stands. When the post that goes is the signal's own
-  message and its channel still shows the call in another post: if
-  nothing was executed, the signal is VOIDED and the earliest such post
-  is promoted in its place (below); if it was, only the WARNING -- the
-  post was replaced, the trade continues. When a channel's last post
-  goes, the call is withdrawn entirely, as a deletion of the signal's own
-  message would be (VOIDED, or a CRITICAL flag if executed) -- one source
-  withdrew the call -- and nothing is promoted on any channel.
+- **A post that stops showing the call** (R3-P1) -- deleted, edited into
+  something that is no signal, re-aimed (side, symbol, entry zone) or
+  broken (unparseable): a channel withdraws the call only when its *last*
+  standing post of it goes. A post *stands* while it is not deleted and,
+  re-read with its channel's parser, still shows the call: a signal on
+  the same side, symbol and entry zone. One of several standing posts on
+  a channel going is a repeat removal: a WARNING `SIGNAL_REPEAT_REMOVED`
+  names the post still showing it, and the call stands. When the post
+  that goes is the signal's own message and its channel still shows the
+  call in another post: if nothing was executed, the signal is VOIDED
+  (INVALID for a re-aim or a break, with its CRITICAL alert) and the
+  earliest such post is promoted in its place (below); if it was, only
+  the WARNING -- the post was replaced, the trade continues. When a
+  channel's last post goes, the call is withdrawn entirely, as a change
+  of the signal's own message would: deleted or edited away, VOIDED (or
+  a CRITICAL flag if executed); re-aimed or broken, `INVALID` with a
+  CRITICAL alert -- one source withdrew the call -- and nothing is
+  promoted on any channel. A post that has left the call says nothing
+  more: a later version that still does not show it, or its deletion, is
+  only recorded.
 - **A promotion** (final review F04) happens only on the signal's own
   channel: the earliest standing post of the call there (not deleted,
-  still read as a signal, not the post that withdrew it, not deleted in
+  still showing the call, not the post that withdrew it, not deleted in
   the same report) is re-read with the channel's parser, given its
   `signals` row (`promoted_from_signal_id` naming the signal it
   replaces) and its ENTRY rows in the same writer job, unlinked, and
   announced with a WARNING `SIGNAL_REPOST_PROMOTED` naming both messages;
   the channel's other copies then repeat it, and every follow-up that
   targeted the withdrawn signal targets it (`relay_repo.record_replacement`).
-  The same happens when the signal's own message is re-aimed or broken
-  while nothing was executed. Never promoted: a repost of an executed
+  Never promoted: a repost of an executed
   signal (trading it would open the trade twice), and a post on any other
   channel. (A repost posted *after* the withdrawal is not a copy at all:
   see `relay_repo`.)
@@ -115,7 +120,10 @@ the post changed and what it still shows; if what it changed is on the
 signal already (a mirrored edit), nothing is said. This holds for the
 signal's own message as for any other post of a relayed call, so it
 does not matter which post was stored first; a call nobody copied is
-never affected (its message always shows the stored parse).
+never affected (its message always shows the stored parse). A post that
+had left the call (re-aimed) and is edited back into it corrects
+nothing: levels it shows that the signal does not have are not applied,
+and the same WARNING says so.
 
 **The same change on every post of a relayed call is applied once.** A
 relay that mirrors edits and deletions delivers each change twice. For a
@@ -720,15 +728,31 @@ def _edit_of_signal_row(ctx: _Ctx, row: sqlite3.Row, route_result: RouteResult) 
         )
         return ctx.result("recorded", new_kind, "edit of a closed signal", alert_ids=(alert,))
 
+    shows_now = new_kind == "signal" and not _reaims(
+        json.loads(row["parsed_json"]), route_result.signal
+    )
+    if not shows_now and _left_call_before(ctx, row):
+        # This post had left the call already (re-aimed while another post
+        # of it stood); a version that still does not show it changes nothing.
+        logger.info(
+            "edit of channel %s message %s (now %s), which no longer showed the call of "
+            "signal %s; recorded",
+            ctx.channel_id,
+            ctx.message_id,
+            new_kind,
+            row["signal_id"],
+        )
+        return ctx.result("recorded", new_kind, "a post that had left the call")
     if new_kind == "signal":
         return _signal_to_signal(ctx, row, status, route_result.signal)
     if new_kind == "parse_failed":
-        return _invalidate(
+        return _break_post(
             ctx,
             row,
             status,
             code=SIGNAL_UNPARSEABLE_AFTER_EDIT,
             reason=f"the edited text no longer parses ({route_result.detail})",
+            how="edited so it no longer reads as a signal",
             new_kind=new_kind,
         )
     # skip or followup: the post no longer shows the call -- a deletion in
@@ -752,12 +776,13 @@ def _signal_to_signal(
     old = json.loads(row["parsed_json"])
     reaimed = _reaims(old, new)
     if reaimed:
-        return _invalidate(
+        return _break_post(
             ctx,
             row,
             status,
             code=SIGNAL_INVALIDATED_BY_EDIT,
             reason="the edit re-aims the trade: " + "; ".join(reaimed),
+            how=f"re-aimed ({'; '.join(reaimed)})",
             new_kind="signal",
         )
 
@@ -850,6 +875,25 @@ def _copy_out_of_date(
     if before.kind != "signal":
         return None
     prev = before.signal
+    if _reaims(old, prev):
+        # The post had left the call (re-aimed while another post of it
+        # stood) and shows it again: its version corrects nothing, so no
+        # level it shows is applied (the "levels unchanged" case returned
+        # before this).
+        alert = ctx.alert(
+            "WARNING",
+            SIGNAL_COPY_OUT_OF_DATE,
+            f"{_subject(ctx)} was edited back into the call of signal {row['signal_id']} "
+            f"after it had been re-aimed away from it, but it shows "
+            f"{', '.join(_levels_not_on(old, new, row['signal_id']))}. This post had left "
+            f"the call, so its version is no correction of it: signal {row['signal_id']} was "
+            "NOT changed and nothing was queued. If the poster meant the new level, review "
+            "it by hand.",
+            signal_id=row["signal_id"],
+        )
+        return ctx.result(
+            "recorded", "signal", "a post back in the call; not applied", alert_ids=(alert,)
+        )
     old_tps = tuple(old["tps"])
     changed: list[str] = []  # what the copy's edit changed
     pending: list[str] = []  # ... and is not on the signal yet
@@ -1025,20 +1069,14 @@ def _withdraw_post(
                 how,
             )
             return ctx.result("recorded", new_kind, "deleted with its signal's own message")
-        others = [
-            post
-            for post in relay_repo.standing_posts_on(
-                ctx.conn, signal_id=row["signal_id"], channel_id=ctx.channel_id
-            )
-            if post["message_id"] != ctx.message_id and post["message_id"] not in ctx.also_deleted
-        ]
+        others = _standing_others(ctx, row)
         if others:
             if _is_holder(ctx, row) and row["state"] == "NEW" and status == "pending":
                 return _withdraw_signal(
                     ctx, row, status, via=via, pending_code=pending_code, live_code=live_code,
                     new_kind=new_kind, promote=True,
                 )
-            alert = _repeat_removed(ctx, row, status, how=how, standing=others[0])
+            alert = _repeat_removed(ctx, row, status, how=how, standing=others[0][0])
             return ctx.result(
                 "recorded", new_kind, f"a repeat {how}; the call stands", alert_ids=(alert,)
             )
@@ -1046,6 +1084,98 @@ def _withdraw_post(
         ctx, row, status, via=via, pending_code=pending_code, live_code=live_code,
         new_kind=new_kind, promote=False,
     )
+
+
+def _break_post(
+    ctx: _Ctx,
+    row: sqlite3.Row,
+    status: TradeStatus,
+    *,
+    code: str,
+    reason: str,
+    how: str,
+    new_kind: str,
+) -> EditResult:
+    """`ctx`'s post of the call signal `row` carries was re-aimed or broken:
+    it no longer shows the call (ruling R3-P1, as `_withdraw_post`). Another
+    post of the call still standing on this channel: a repeat removal -- a
+    WARNING, the call stands -- unless the post is the signal's own message
+    and nothing was executed, when the signal is invalidated and that post
+    promoted (`_invalidate`). The channel's last post: the call is
+    invalidated, loudly, and nothing is promoted."""
+    others = _standing_others(ctx, row) if row["withdrawn_at_utc"] is None else []
+    if others and not (_is_holder(ctx, row) and status == "pending"):
+        alert = _repeat_removed(
+            ctx, row, status, how=how, standing=others[0][0], changed=True
+        )
+        return ctx.result(
+            "recorded", new_kind, f"a repeat {how}; the call stands", alert_ids=(alert,)
+        )
+    return _invalidate(ctx, row, status, code=code, reason=reason, new_kind=new_kind)
+
+
+def _reread(ctx: _Ctx, post: sqlite3.Row) -> RouteResult:
+    """A stored post of `ctx`'s channel, re-read with the channel's parser."""
+    return route(
+        post["raw_text"],
+        channel_cfg=ctx.channel_cfg,
+        message_id=post["message_id"],
+        posted_at_utc=datetime.fromisoformat(post["posted_at_utc"]),
+    )
+
+
+def _shows(route_result: RouteResult, row: sqlite3.Row) -> bool:
+    """Whether a post reading `route_result` shows the call of signal
+    `row`: a signal on its side, symbol and entry zone (its stop and
+    targets may lag behind -- a hand copy that never followed an edit)."""
+    return route_result.kind == "signal" and not _reaims(
+        json.loads(row["parsed_json"]), route_result.signal
+    )
+
+
+def _standing_others(ctx: _Ctx, row: sqlite3.Row) -> list[tuple[sqlite3.Row, RouteResult]]:
+    """The other posts of signal `row`'s call on `ctx`'s channel that still
+    stand (ruling R3-P1), earliest first, each with its re-read:
+    `relay_repo.standing_posts_on`, minus `ctx`'s own post, posts deleted in
+    the same report, and posts that no longer show the call -- a post
+    re-aimed while another stood still reads as a signal, but not as this
+    one."""
+    others = []
+    for post in relay_repo.standing_posts_on(
+        ctx.conn, signal_id=row["signal_id"], channel_id=ctx.channel_id
+    ):
+        if post["message_id"] == ctx.message_id or post["message_id"] in ctx.also_deleted:
+            continue
+        routed = _reread(ctx, post)
+        if _shows(routed, row):
+            others.append((post, routed))
+        elif routed.kind != "signal":
+            # Stored as a signal, no longer read as one: the parser changed.
+            logger.warning(
+                "channel %s message %s, a post of signal %s, no longer reads as a signal "
+                "(%s); not promoted or counted as showing the call",
+                ctx.channel_id,
+                post["message_id"],
+                row["signal_id"],
+                routed.detail,
+            )
+    return others
+
+
+def _left_call_before(ctx: _Ctx, row: sqlite3.Row) -> bool:
+    """Whether `ctx`'s post, in the version this edit replaces
+    (`ctx.previous_text`), no longer showed the call of signal `row`: it
+    was re-aimed away while another post of the call stood (a repeat
+    removal, so the signal stayed as it was)."""
+    if ctx.previous_text is None:
+        return False
+    before = route(
+        ctx.previous_text,
+        channel_cfg=ctx.channel_cfg,
+        message_id=ctx.message_id,
+        posted_at_utc=ctx.now_utc,
+    )
+    return not _shows(before, row)
 
 
 def _withdraw_signal(
@@ -1110,9 +1240,9 @@ def _promote_repost(
     """`withdrawn`'s own message -- `ctx`'s post -- was withdrawn (deleted,
     edited into something else, re-aimed or broken) before anything was
     executed, while its channel still shows the same call in another
-    standing post (`relay_repo.standing_posts_on`: not deleted, still
-    read as a signal, not the post that withdrew it; and not deleted in
-    the same report, nor carrying a signal of its own). The earliest such
+    standing post (`_standing_others`: not deleted, still showing the
+    call, not the post that withdrew it, not deleted in the same report;
+    and not carrying a signal of its own). The earliest such
     post becomes the signal: re-read with the channel's parser, given its
     `signals` row (recording the one it replaces) and its ENTRY rows, in
     this same writer job, unlinked, and announced with a WARNING naming
@@ -1122,32 +1252,13 @@ def _promote_repost(
     (new signal id, alert ids) or None."""
     conn = ctx.conn
     old_id = withdrawn["signal_id"]
-    for repost in relay_repo.standing_posts_on(conn, signal_id=old_id, channel_id=ctx.channel_id):
-        if repost["message_id"] == ctx.message_id:
-            continue  # the post that withdrew the call (re-aimed, it still reads as a signal)
-        if repost["message_id"] in ctx.also_deleted:
-            continue  # deleted in the same report: its own job marks it next
+    # Never the post that withdrew the call, a post deleted in the same
+    # report, or one that no longer shows the call (`_standing_others`).
+    for repost, routed in _standing_others(ctx, withdrawn):
         if signals_repo.get_signal_id(
             conn, channel_id=ctx.channel_id, message_id=repost["message_id"]
         ) is not None:
             continue  # it carried the call before: one post, one signals row
-        posted_at = datetime.fromisoformat(repost["posted_at_utc"])
-        routed = route(
-            repost["raw_text"],
-            channel_cfg=ctx.channel_cfg,
-            message_id=repost["message_id"],
-            posted_at_utc=posted_at,
-        )
-        if routed.kind != "signal":
-            logger.warning(
-                "channel %s message %s, a repost of withdrawn signal %s, no longer reads as a "
-                "signal (%s); not promoted",
-                ctx.channel_id,
-                repost["message_id"],
-                old_id,
-                routed.detail,
-            )
-            continue
         new_id = signals_repo.insert_signal(
             conn,
             channel_id=ctx.channel_id,
@@ -1284,20 +1395,32 @@ def _closes_it_again(ctx: _Ctx, row: sqlite3.Row, route_result: RouteResult) -> 
 
 
 def _repeat_removed(
-    ctx: _Ctx, row: sqlite3.Row, status: TradeStatus, *, how: str, standing: sqlite3.Row
+    ctx: _Ctx,
+    row: sqlite3.Row,
+    status: TradeStatus,
+    *,
+    how: str,
+    standing: sqlite3.Row,
+    changed: bool = False,
 ) -> int:
     """WARNING: `ctx`'s post of signal `row`'s call went while `standing`,
     another post of it on the same channel, still shows it (a double post
     tidied up, or the signal's own message replaced after execution); the
-    signal stands (ruling R3-P1)."""
+    signal stands (ruling R3-P1). `changed`: the post was re-aimed or
+    broken rather than removed."""
+    reading = (
+        "so the call stands and this post is no longer read as part of it"
+        if changed
+        else "so this looks like a double post tidied up"
+    )
     return ctx.alert(
         "WARNING",
         SIGNAL_REPEAT_REMOVED,
         f"{_subject(ctx)} was {how}. Signal {row['signal_id']} stands (it is {row['state']}, "
         f"trade status {status}): the same call is still posted as message "
-        f"{standing['message_id']} on this channel, so this looks like a double post tidied "
-        f"up{'' if status == 'pending' else ', and the trade continues'}. If the poster meant "
-        "to withdraw the call, check the channel.",
+        f"{standing['message_id']} on this channel, {reading}"
+        f"{'' if status == 'pending' else ', and the trade continues'}. If the poster meant "
+        f"to {'change' if changed else 'withdraw'} the call, check the channel.",
     )
 
 
@@ -1456,6 +1579,26 @@ def _created_alert(ctx: _Ctx, route_result: RouteResult) -> int:
             "trades: nothing was queued.",
             signal_id=holder["signal_id"],
         )
+    if route_result.kind == "signal" and ctx.signal_id is not None:
+        row = _call_row(ctx)
+        if (
+            row is not None
+            and row["state"] == "NEW"
+            and row["withdrawn_at_utc"] is None
+            and _shows(route_result, row)
+        ):
+            # This post left its call while another post of it stood (a
+            # repeat removal, ruling R3-P1): the call never stopped.
+            return ctx.alert(
+                "WARNING",
+                EDIT_CREATED_SIGNAL,
+                f"an edit turned message {ctx.message_id} back into a signal "
+                f"({_describe(route_result)}). It is the call of signal {row['signal_id']}"
+                f"{_relation(ctx, row)}, which still stands (it is NEW, trade status "
+                f"{trade_status(ctx.conn, signal_id=row['signal_id'])}): another post of it "
+                "showed the call all along. Edits never open trades: nothing more was queued.",
+                signal_id=row["signal_id"],
+            )
     if route_result.kind == "signal":
         return ctx.alert(
             "WARNING",
@@ -1559,9 +1702,10 @@ def apply_deletion(
             f"{detected_by}"
         )
         if row["withdrawn_at_utc"] is None and (row["state"] == "NEW" or status != "pending"):
-            if relayed and kind != "signal":
-                # A post of a relayed call edited into something else before:
-                # it stopped showing the call then, and that was said then.
+            if relayed and not _shows(_reread(ctx, existing), row):
+                # A post of a relayed call edited into something else, or
+                # re-aimed, before: it stopped showing the call then, and
+                # that was said then.
                 logger.info(
                     "channel %s message %s (%s), a post of signal %s edited away before, "
                     "deleted, found by %s; marked",
@@ -1777,6 +1921,23 @@ def _describe_levels(old: dict, new: Signal) -> str:
                 f"{'-' if after is None else f'{after:g}'}"
             )
     return ", ".join(parts)
+
+
+def _levels_not_on(old: dict, new: Signal, signal_id: int) -> list[str]:
+    """The levels `new` shows that signal `signal_id` (stored parse `old`)
+    does not have, each with the signal's own, for an alert."""
+    parts = []
+    if not _same(old["sl"], new.sl):
+        parts.append(f"SL {new.sl:g} (signal {signal_id} has {old['sl']:g})")
+    old_tps = old["tps"]
+    for index in range(min(len(old_tps), len(new.tps))):
+        if not _same(old_tps[index], new.tps[index]):
+            parts.append(
+                f"TP{index + 1} {new.tps[index]:g} (signal {signal_id} has {old_tps[index]:g})"
+            )
+    if len(old_tps) != len(new.tps):
+        parts.append(f"{len(new.tps)} take-profits (signal {signal_id} has {len(old_tps)})")
+    return parts
 
 
 def _same(a: float, b: float) -> bool:

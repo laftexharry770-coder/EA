@@ -32,7 +32,7 @@ from datetime import timedelta
 
 import pytest
 
-from test_edits import EDIT_1, EDIT_2, SL_EDIT, _round
+from test_edits import DIRECTION_EDIT, EDIT_1, EDIT_2, SL_EDIT, UNPARSEABLE_EDIT, _round
 from test_relay import (
     ACCOUNTS,
     CALL,
@@ -46,6 +46,7 @@ from test_relay import (
     VIP,
     VIP_CHATTER,
     R,
+    REPOST,
     V,
     _alerts,
     _db_rows,
@@ -452,6 +453,155 @@ def test_a_vip_post_edited_away_while_the_vip_reposted_the_call_leaves_it_standi
     assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
     assert relay_repo.signal_for_post(conn, channel_id=R, message_id=COPY) == live
     assert relay_repo.signal_for_post(conn, channel_id=V, message_id=4012) == live
+
+
+# -- R3-P1: a post re-aimed or broken is edited away too ----------------------------------
+#
+# A re-aimed post (another side, symbol or entry) or a broken one (no longer
+# parses) no longer shows the call, like a deleted one. Round 1 invalidated
+# the call for any post re-aimed -- except the signal's own message with a
+# repost standing, which promoted the repost -- so whether the call was
+# traded depended on which post was stored first.
+
+_BREAKS = {"reaim": DIRECTION_EDIT, "unparseable": UNPARSEABLE_EDIT}
+#: A later version of each: still not the call.
+_BREAKS_AGAIN = {
+    "reaim": DIRECTION_EDIT.replace("4490", "4491"),
+    "unparseable": UNPARSEABLE_EDIT.replace("4490", "4491"),
+}
+
+
+@pytest.mark.parametrize("change", list(_BREAKS))
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_post_re_aimed_while_its_channel_reposted_the_call_leaves_the_call_standing(
+    conn, order, change  # noqa: F811
+):
+    """The VIP posted its call again, then re-aimed (or broke) its first
+    post. Its channel still shows the call: it is traded once, whichever
+    post holds it -- VIP-first the repost is promoted over the invalidated
+    signal; relay-first the VIP's first post is only one of its channel's
+    two posts, and its re-aim a repeat removal. Either way the re-aimed
+    post has left the call: the VIP then deleting its repost is its
+    channel's last post, and withdraws the call."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=2))
+    result = _edit(conn, VIP, CALL, _BREAKS[change], EDIT_1)
+    conn.commit()
+
+    (live,) = _live(conn)
+    assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
+    for channel_id, message_id in ((V, REPOST), (R, COPY)):
+        assert relay_repo.signal_for_post(conn, channel_id=channel_id, message_id=message_id) == (
+            live
+        )
+    if order == "vip-first":
+        assert (result.outcome, result.promoted_signal_id) == ("invalidated", live)
+    else:
+        assert (result.outcome, live) == ("recorded", 1)
+        assert _alerts(conn) == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, CALL, 1)]
+        detail = _detail(conn, edits_repo.SIGNAL_REPEAT_REMOVED)
+        assert f"message {REPOST}" in detail
+        assert ("re-aimed" if change == "reaim" else "no longer reads as a signal") in detail
+        assert "no longer read as part of it" in detail and "tidied up" not in detail
+
+    gone = _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=8))
+    assert (gone.outcome, gone.promoted_signal_id) == ("voided", None)
+    assert _live(conn) == []
+    assert _queued_entries(conn) == []
+
+
+@pytest.mark.parametrize("change", list(_BREAKS))
+@pytest.mark.parametrize("order", ORDERS)
+def test_an_executed_call_whose_first_post_is_re_aimed_while_reposted_keeps_trading(
+    conn, order, change  # noqa: F811
+):
+    """R3-P1: executed, the post was replaced and the trade continues -- a
+    WARNING only, in both orders. The re-aimed post has left the call:
+    later versions of it, and its deletion, say nothing more; the VIP
+    deleting its repost, its channel's last post, flags the call."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=2))
+    _take_entry(conn, 1)
+    first = _edit(conn, VIP, CALL, _BREAKS[change], EDIT_1)
+    again = _edit(conn, VIP, CALL, _BREAKS_AGAIN[change], EDIT_2)
+    conn.commit()
+
+    assert (first.outcome, again.outcome) == ("recorded", "recorded")
+    assert _live(conn) == [1]
+    assert _levels(conn) == (1, 4470.0, [4490.0, 4495.0, 4500.0, 4505.0])
+    assert _queued_entries(conn) == [(1, "acct-2")]
+    assert _alerts(conn) == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, CALL, 1)]
+
+    assert _delete(conn, VIP, CALL, POSTED + timedelta(minutes=12)).outcome == "deleted"
+    assert len(_alerts(conn)) == 1
+    last = _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=13))
+    assert (last.outcome, last.signal_id) == ("flagged", 1)
+    assert ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED, V, REPOST, 1) in _alerts(conn)
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_repost_re_aimed_away_is_never_promoted(conn, order):  # noqa: F811
+    """The VIP re-aimed its repost (a repeat removal: its first post still
+    shows the call), then deleted its first post. Its channel no longer
+    shows the call, which is withdrawn -- the re-aimed repost, which still
+    reads as a signal, is never promoted into a trade."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=2))
+    assert _edit(conn, VIP, REPOST, DIRECTION_EDIT, EDIT_1).outcome == "recorded"
+    conn.commit()
+    assert _live(conn) == [1]
+
+    gone = _delete(conn, VIP, CALL, POSTED + timedelta(minutes=8))
+    assert (gone.outcome, gone.promoted_signal_id) == ("voided", None)
+    assert _live(conn) == []
+    assert _queued_entries(conn) == []
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_post_that_left_the_call_never_puts_back_a_level_when_it_shows_it_again(
+    conn, order  # noqa: F811
+):
+    """The VIP re-aimed its repost, moved the stop on its first post
+    (4470 -> 4480, amended), then edited the repost back into the call with
+    the old stop: its version is no correction of the call -- nothing is
+    applied, and a WARNING says why."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=2))
+    _take_entry(conn, 1)
+    _edit(conn, VIP, REPOST, DIRECTION_EDIT.replace("4470", "4520"), EDIT_1)
+    assert _edit(conn, VIP, CALL, SL_4480, EDIT_1).outcome == "reparsed"
+    back = _edit(conn, VIP, REPOST, SIGNAL_TEXT, EDIT_2)
+    conn.commit()
+
+    assert back.outcome == "recorded"
+    assert _levels(conn) == (2, 4480.0, [4490.0, 4495.0, 4500.0, 4505.0])
+    assert _q(
+        conn, "SELECT op, json_extract(parsed_json, '$.price_hint') FROM followups "
+        "WHERE edit_seq > 0"
+    ) == [("amend_sl", 4480.0)]
+    assert ("WARNING", edits_repo.SIGNAL_COPY_OUT_OF_DATE, V, REPOST, 1) in _alerts(conn)
+    assert "SL 4470" in _detail(conn, edits_repo.SIGNAL_COPY_OUT_OF_DATE)
+
+
+@pytest.mark.parametrize("change", ["chatter", *_BREAKS])
+def test_an_executed_call_its_post_left_and_shows_again_is_never_to_be_traded_by_hand(
+    conn, change  # noqa: F811
+):
+    """The call's own message was edited away while its repost stood (a
+    WARNING; the trade continues), then edited back into the call. Edits
+    never open trades -- and the warning must not invite the user to trade
+    by hand a call that is still live."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=2))
+    _take_entry(conn, 1)
+    _edit(conn, VIP, CALL, {"chatter": CHATTER_TEXT, **_BREAKS}[change], EDIT_1)
+    _edit(conn, VIP, CALL, SIGNAL_TEXT, EDIT_2)
+    conn.commit()
+
+    assert _live(conn) == [1]
+    assert _queued_entries(conn) == [(1, "acct-2")]
+    for (detail,) in _q(conn, "SELECT detail FROM alerts"):
+        assert "by hand" not in detail, detail
 
 
 # -- R3-P2: the chain and the one helper ---------------------------------------------

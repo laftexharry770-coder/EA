@@ -850,8 +850,11 @@ def test_a_promotion_is_part_of_the_deletion_that_caused_it(conn, monkeypatch):
     assert _signals(conn)[1] == (2, VIP.channel_id, 4012, "NEW")
 
 
-def test_an_executed_original_edited_away_leaves_its_repost_a_copy(tmp_path):
-    """Invalidation promotes only while nothing was executed."""
+def test_an_executed_original_re_aimed_while_its_repost_stands_keeps_trading(tmp_path):
+    """Round 3 (R3-P1; rounds 1-2 made the call INVALID): the executed
+    original re-aimed while the poster's repost of it stands. Its channel
+    still shows the call: the post was replaced, the trade continues -- a
+    WARNING only, and the repost stays a copy (never a second trade)."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -863,9 +866,9 @@ def test_an_executed_original_edited_away_leaves_its_repost_a_copy(tmp_path):
     _run(db_path, body)
 
     state = _state(db_path)
-    assert state["signals"] == [(1, V, CALL, "INVALID", 0)]
+    assert state["signals"] == [(1, V, CALL, "NEW", 0)]
     assert state["links"] == [(V, REPOST, 1)]
-    assert _codes(state) == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT)]
+    assert _codes(state) == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED)]
 
 
 def test_a_repost_that_no_longer_reads_as_a_signal_is_passed_over(conn, caplog):
@@ -1209,9 +1212,13 @@ def test_a_double_post_tidied_up_only_warns(tmp_path, change):
     assert f"message {CALL}" in detail
 
 
-def test_a_double_post_re_aimed_invalidates_the_signal(tmp_path):
-    """A re-aim is not a tidy-up: whichever post says it, the call is in
-    doubt."""
+def test_a_double_post_re_aimed_leaves_the_call_standing(tmp_path):
+    """Round 3 (R3-P1; rounds 1-2 made the call INVALID for a re-aim of any
+    post): the poster re-aims one of two posts of the call. The re-aimed
+    post has left the call, but the other still shows it: a repeat
+    removal -- the call stands, and a WARNING names the post still showing
+    it. (Re-aiming the first post instead promotes the second: the same
+    call traded once, whichever post is re-aimed.)"""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -1222,8 +1229,11 @@ def test_a_double_post_re_aimed_invalidates_the_signal(tmp_path):
     _run(db_path, body)
 
     state = _state(db_path)
-    assert state["signals"] == [(1, V, CALL, "INVALID", 0)]
-    assert state["alerts"] == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT, V, REPOST, 1)]
+    assert state["signals"] == [(1, V, CALL, "NEW", 0)]
+    assert state["queued"] == [(1, N)]
+    assert state["alerts"] == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, REPOST, 1)]
+    detail = _alert_detail(db_path, edits_repo.SIGNAL_REPEAT_REMOVED)
+    assert "re-aimed (side buy -> sell)" in detail and f"message {CALL}" in detail
 
 
 def test_a_copy_edited_into_chatter_on_another_channel_withdraws_the_signal(tmp_path):
@@ -1812,9 +1822,10 @@ def test_a_call_withdrawn_through_the_vips_copy_and_posted_again_is_a_new_signal
 def test_repost_then_edit_away_when_the_relays_copy_holds_the_call(tmp_path, change):
     """Round 3 (R3-P1; round 2 promoted the VIP's repost through its copy):
     nothing is ever promoted through a copy. The VIP's first post edited
-    into chatter is a repeat removal (its repost still shows the call,
-    which stands); re-aimed or broken, it invalidates the call, loudly,
-    as a re-aim of any post does."""
+    into chatter, re-aimed or broken is a repeat removal: its repost still
+    shows the call, which stands -- as when the VIP's post holds it, where
+    the repost is promoted instead
+    (test_a_standing_repost_is_promoted_when_the_original_is_edited_away)."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -1826,14 +1837,10 @@ def test_repost_then_edit_away_when_the_relays_copy_holds_the_call(tmp_path, cha
 
     state = _state(db_path)
     assert state["links"] == [(V, CALL, 1), (V, REPOST, 1)]
-    if change == "chatter":
-        assert state["signals"] == [(1, R, COPY, "NEW", 0)]
-        assert state["queued"] == [(1, N)]
-        assert state["alerts"] == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, CALL, 1)]
-    else:
-        assert state["signals"] == [(1, R, COPY, "INVALID", 0)]
-        assert state["queued"] == []
-        assert [level for level, *_ in state["alerts"]] == ["CRITICAL"]
+    assert state["signals"] == [(1, R, COPY, "NEW", 0)]
+    assert state["queued"] == [(1, N)]
+    assert state["alerts"] == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, CALL, 1)]
+    assert _claim(db_path) == ("ENTRY", 1)
 
 
 def test_the_relays_own_repost_of_a_call_the_vip_withdrew_is_held_back_too(tmp_path):
@@ -1879,9 +1886,9 @@ def test_a_third_channels_copy_of_a_call_the_vip_withdrew_is_held_back_loudly(tm
 
 
 def test_a_double_post_re_aimed_promotes_nothing_while_the_call_stands_elsewhere(tmp_path):
-    """Posted three times; the second post re-aimed: the call is in doubt
-    (INVALID), and the first post still shows it -- the third is not
-    promoted over that."""
+    """Posted three times; the second post re-aimed. Round 3 (R3-P1;
+    rounds 1-2 made the call INVALID): the first post still shows the call,
+    so it stands, still signal 1 -- nothing to promote."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -1893,9 +1900,9 @@ def test_a_double_post_re_aimed_promotes_nothing_while_the_call_stands_elsewhere
     _run(db_path, body)
 
     state = _state(db_path)
-    assert state["signals"] == [(1, V, CALL, "INVALID", 0)]
-    assert state["queued"] == []
-    assert _codes(state) == [("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT)]
+    assert state["signals"] == [(1, V, CALL, "NEW", 0)]
+    assert state["queued"] == [(1, N)]
+    assert _codes(state) == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED)]
 
 
 def test_the_first_post_to_close_a_signal_is_the_one_recorded(conn):
