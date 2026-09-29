@@ -34,7 +34,7 @@ import pytest
 from telethon.tl import types
 
 from fakes.telegram import FakeMessage
-from test_edits import DIRECTION_EDIT, EDIT_1, EDIT_2, _round
+from test_edits import DIRECTION_EDIT, EDIT_1, EDIT_2, UNPARSEABLE_EDIT, _round
 from test_relay import (
     ACCOUNTS,
     CALL,
@@ -197,16 +197,26 @@ def test_a_forward_of_a_withdrawn_post_matched_to_another_call_is_an_echo_when_r
     assert _queued_entries(conn) == [(other.signal_id, "acct-1"), (other.signal_id, "acct-2")]
 
 
-def test_an_edit_taking_a_forward_out_of_the_call_is_an_echo_too(conn):  # noqa: F811
+#: How a post is edited out of the call: a "cancel" edit, re-aimed, broken.
+_EDITS_AWAY = {"cancelled": CANCELLED, "re-aimed": DIRECTION_EDIT, "unparseable": UNPARSEABLE_EDIT}
+
+
+@pytest.mark.parametrize("change", list(_EDITS_AWAY))
+@pytest.mark.parametrize("order", ORDERS)
+def test_an_edit_taking_a_forward_out_of_the_call_is_an_echo_too(
+    conn, order, change  # noqa: F811
+):
     """A forward's text cannot be edited in Telegram, but the rule does
     not depend on it: a forward of a post no longer standing, edited out of
-    the call, is recorded only, like its removal."""
-    _store_call(conn, "vip-first", forwards=True)
+    the call -- a "cancel" edit, re-aimed or broken -- is recorded only,
+    like its removal, whichever post holds the call's first signal."""
+    _store_call(conn, order, forwards=True)
     live = _vip_deletes_and_posts_again(conn)
-    edited = _edit(conn, RELAY, COPY, CANCELLED, POSTED + timedelta(minutes=3))
+    edited = _edit(conn, RELAY, COPY, _EDITS_AWAY[change], POSTED + timedelta(minutes=3))
     conn.commit()
     assert edited.outcome == "recorded"
     assert _live(conn) == [live]
+    assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
     assert _codes(conn) == [("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)]
 
 
@@ -253,6 +263,38 @@ def test_the_vip_withdrawing_the_post_a_relay_forwarded_again_withdraws_the_rela
     assert "CRITICAL" not in [level for level, _ in _codes(conn)]
 
 
+@pytest.mark.parametrize("change", ["cancelled", "re-aimed"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_the_vip_editing_away_the_post_a_relay_forwarded_again_withdraws_the_relays_repost(
+    conn, order, change  # noqa: F811
+):
+    """The same, the VIP editing its post into "cancelled" or re-aiming it:
+    the original poster retracting. The call the relay's repost carries is
+    withdrawn as by any channel's last post -- VOIDED with the usual
+    WARNING, or INVALID with the usual CRITICAL -- never with the doubt
+    of an older post (no "only an old copy")."""
+    _store_call(conn, order, forwards=True)
+    assert _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=1)).outcome == "voided"
+    again = _ingest(conn, RELAY, COPY + 1, posted=POSTED + timedelta(minutes=2), fwd=(V, CALL))
+    assert again.outcome == "new"
+
+    text = CANCELLED if change == "cancelled" else DIRECTION_EDIT
+    gone = _edit(conn, VIP, CALL, text, POSTED + timedelta(minutes=3))
+    conn.commit()
+    assert _live(conn) == []
+    assert _queued_entries(conn) == []
+    if change == "cancelled":
+        assert (gone.outcome, gone.signal_id) == ("voided", again.signal_id)
+        code = edits_repo.SIGNAL_RETRACTED_BY_EDIT
+        assert ("WARNING", code, V, CALL, again.signal_id) in _alerts(conn)
+    else:
+        assert (gone.outcome, gone.signal_id) == ("invalidated", again.signal_id)
+        code = edits_repo.SIGNAL_INVALIDATED_BY_EDIT
+        assert ("CRITICAL", code, V, CALL, again.signal_id) in _alerts(conn)
+    assert edits_repo.OLD_POST_WITHDREW_CALL not in [code for _, code in _codes(conn)]
+    assert "old copy" not in _detail(conn, code)
+
+
 # -- R4-1 (c): an old hand copy removed -- ambiguous, so loud ------------------------------
 
 
@@ -285,10 +327,13 @@ def test_a_hand_copy_removed_after_the_vip_posted_its_call_again_withdraws_it_lo
     assert "VOIDED" in detail and "trade it by hand" in detail
 
 
-def test_a_hand_copy_removed_after_the_repost_was_taken_flags_it_loudly(conn):  # noqa: F811
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_hand_copy_removed_after_the_repost_was_taken_flags_it_loudly(
+    conn, order  # noqa: F811
+):
     """The same, after the repost's entry was taken: flagged, not closed,
     and the alert says the removal may only have been an old copy."""
-    _store_call(conn, "vip-first")
+    _store_call(conn, order)
     live = _vip_deletes_and_posts_again(conn)
     _take_entry(conn, live)
     gone = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=3))
@@ -675,6 +720,51 @@ def test_a_forward_of_a_post_re_aimed_away_from_a_reposted_call_is_held_back(
     assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", 1)
     assert ("CRITICAL", relay_repo.COPY_OF_WITHDRAWN_SIGNAL, R, COPY, 1) in _alerts(conn)
     assert _queued_entries(conn) == [(2, "acct-1"), (2, "acct-2")]
+
+
+@pytest.mark.parametrize("reaimed", [CALL, REPOST], ids=["first-post", "repost"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_forward_of_a_post_re_aimed_away_is_never_traded_whichever_post_holds_the_call(
+    conn, order, reaimed  # noqa: F811
+):
+    """The VIP double-posted the call (the relay copied it too) and
+    re-aimed one of its posts into a SELL; a third channel forwards the
+    SELL post. Whichever post holds the call and whichever was re-aimed,
+    the call is traded once, the forward is never traded, and its removal
+    and the replies to it change nothing.
+
+    The alert is not order-independent (a known limitation in relay_repo):
+    when the re-aim closed the call's signal (the VIP's first post held it)
+    the forward is held back against that signal with CRITICAL
+    COPY_OF_WITHDRAWN_SIGNAL (R4-6); when it was a repeat removal nothing
+    was closed, and the forward is linked to the live call with an INFO
+    line only -- as the VIP's own re-aim got only a WARNING then."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    _edit(conn, VIP, reaimed, DIRECTION_EDIT, EDIT_1)
+    conn.commit()
+    (live,) = _live(conn)
+    forward = _ingest(
+        conn, OTHER, 8001, DIRECTION_EDIT, posted=POSTED + timedelta(minutes=6), fwd=(V, reaimed)
+    )
+
+    assert forward.outcome == "relay_duplicate"
+    assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
+    closed = order == "vip-first" and reaimed == CALL
+    held_back = ("CRITICAL", relay_repo.COPY_OF_WITHDRAWN_SIGNAL, O, 8001, 1)
+    assert (held_back in _alerts(conn)) == closed
+    alerts = _alerts(conn)
+
+    reply = _ingest(
+        conn, OTHER, 8002, CLOSE_HALF, posted=POSTED + timedelta(minutes=7), reply_to=8001
+    )
+    assert _q(
+        conn, "SELECT target_signal_id FROM followups WHERE followup_id = ?", reply.followup_id
+    ) == [(None,)]
+    assert _delete(conn, OTHER, 8001, POSTED + timedelta(minutes=8)).outcome == "deleted"
+    assert _live(conn) == [live]
+    assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
+    assert _alerts(conn) == alerts
 
 
 # == the arrival paths: the real listener and poll, the fake Telegram ===========
