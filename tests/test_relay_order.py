@@ -47,6 +47,7 @@ from test_relay import (
     VIP_CHATTER,
     R,
     REPOST,
+    REPOST_2,
     V,
     _alerts,
     _db_rows,
@@ -602,6 +603,116 @@ def test_an_executed_call_its_post_left_and_shows_again_is_never_to_be_traded_by
     assert _queued_entries(conn) == [(1, "acct-2")]
     for (detail,) in _q(conn, "SELECT detail FROM alerts"):
         assert "by hand" not in detail, detail
+
+
+def test_a_post_that_left_the_call_and_shows_another_is_a_new_call_never_traded(
+    conn,  # noqa: F811
+):
+    """Control: the call's own message edited away while its repost stood,
+    then edited into a different call (SELL). That is not the live call
+    coming back: the usual warning for a signal an edit made -- not
+    traded; trade it by hand if it is real."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=2))
+    _take_entry(conn, 1)
+    _edit(conn, VIP, CALL, CHATTER_TEXT, EDIT_1)
+    _edit(conn, VIP, CALL, DIRECTION_EDIT, EDIT_2)
+    conn.commit()
+
+    assert _live(conn) == [1]
+    detail = _detail(conn, edits_repo.EDIT_CREATED_SIGNAL)
+    assert "trade it by hand" in detail and "still stands" not in detail
+
+
+def test_the_standing_posts_are_the_ones_still_showing_the_call(conn):  # noqa: F811
+    """`relay_repo.standing_posts_on`: a channel's posts of a call, minus
+    the ones deleted or edited into something that is no signal."""
+    for index, message_id in enumerate((CALL, 4012, 4013, 4014)):
+        _ingest(conn, VIP, message_id, posted=POSTED + timedelta(minutes=index))
+    _edit(conn, VIP, 4013, CHATTER_TEXT, EDIT_1)
+    _delete(conn, VIP, 4014, POSTED + timedelta(minutes=6))
+    conn.commit()
+    assert [
+        row["message_id"]
+        for row in relay_repo.standing_posts_on(conn, signal_id=1, channel_id=V)
+    ] == [CALL, 4012]
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_channel_still_showing_a_replaced_call_keeps_it_standing(conn, order):  # noqa: F811
+    """The relay deleted its only copy (the call is voided: the C2 cost) and
+    posted it again (signal 2 replaces signal 1). The VIP double-posted the
+    call: deleting one of its two posts -- both stored against signal 1 --
+    is a repeat removal of the call signal 2 carries now; deleting the
+    other, its channel's last, withdraws it."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    assert _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=2)).outcome == "voided"
+    again = _ingest(conn, RELAY, COPY + 1, posted=POSTED + timedelta(minutes=3))
+    assert (again.outcome, relay_repo.live_signal_for(conn, 1)) == ("new", again.signal_id)
+
+    first = _delete(conn, VIP, CALL, POSTED + timedelta(minutes=4))
+    assert (first.outcome, first.signal_id) == ("deleted", again.signal_id)
+    assert _live(conn) == [again.signal_id]
+    assert _queued_entries(conn) == [(again.signal_id, "acct-1"), (again.signal_id, "acct-2")]
+    assert [
+        row["message_id"]
+        for row in relay_repo.standing_posts_on(conn, signal_id=again.signal_id, channel_id=V)
+    ] == [REPOST]
+
+    last = _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=5))
+    assert (last.outcome, last.signal_id) == ("voided", again.signal_id)
+    assert _live(conn) == []
+
+
+def test_a_holder_withdrawn_while_an_older_post_of_its_call_stands_leaves_the_call_standing(
+    conn,  # noqa: F811
+):
+    """A standing post that already carries a signal of the call (its own
+    signals row) cannot be promoted -- one post, one signal. Reached here
+    through a window deletion read back: the VIP's first post (signal 1)
+    stood again after the call had moved to signal 3 on the VIP's own
+    repost. The VIP deleting that repost leaves its channel still showing
+    the call in the first post: the call stands (a repeat removal),
+    rather than being voided with nothing in its place."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30))
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=2))  # the relay's last post: voided
+    assert _ingest(conn, RELAY, COPY + 1, posted=POSTED + timedelta(minutes=3)).signal_id == 2
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=4), by="window")  # a repeat removal
+    _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=5))  # the VIP's last post: voided
+    third = _ingest(conn, VIP, REPOST_2, posted=POSTED + timedelta(minutes=6))
+    assert (third.outcome, _live(conn)) == ("new", [3])
+    _edit(conn, VIP, CALL, SIGNAL_TEXT, POSTED + timedelta(minutes=7))  # read back
+    conn.commit()
+
+    gone = _delete(conn, VIP, REPOST_2, POSTED + timedelta(minutes=8))
+    assert (gone.outcome, gone.promoted_signal_id) == ("deleted", None)
+    assert _live(conn) == [3]
+    assert _queued_entries(conn) == [(3, "acct-1"), (3, "acct-2")]
+    assert _q(conn, "SELECT COUNT(*) FROM signals WHERE message_id = ?", CALL) == [(1,)]
+    assert ("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, REPOST_2, 3) in _alerts(conn)
+
+
+def test_a_late_copy_of_a_call_posted_three_times_repeats_its_newest_signal(
+    conn,  # noqa: F811
+):
+    """The VIP deleted and posted its call again twice, 10 minutes apart
+    (signals 1 -> 2 -> 3). The relay's hand copy of the first post, stored
+    late, is within the window of the first two signals only -- both
+    withdrawn -- yet repeats the live one, the newest of the call."""
+    for index, message_id in enumerate((CALL, 4012, 4013)):
+        _ingest(conn, VIP, message_id, posted=POSTED + timedelta(minutes=10 * index))
+        if index < 2:
+            _delete(conn, VIP, message_id, POSTED + timedelta(minutes=10 * index + 1))
+    assert _live(conn) == [3]
+    assert relay_repo.chain_ids(conn, 1) == [1, 2, 3]
+
+    late = _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(minutes=1))
+    assert (late.outcome, late.relay_of_signal_id) == ("relay_duplicate", 3)
+    assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL not in [code for _, code in _codes(conn)]
+    assert _queued_entries(conn) == [(3, "acct-1"), (3, "acct-2")]
 
 
 # -- R3-P2: the chain and the one helper ---------------------------------------------

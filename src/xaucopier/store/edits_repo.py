@@ -1071,7 +1071,12 @@ def _withdraw_post(
             return ctx.result("recorded", new_kind, "deleted with its signal's own message")
         others = _standing_others(ctx, row)
         if others:
-            if _is_holder(ctx, row) and row["state"] == "NEW" and status == "pending":
+            if (
+                _is_holder(ctx, row)
+                and row["state"] == "NEW"
+                and status == "pending"
+                and _promotable(ctx, others)
+            ):
                 return _withdraw_signal(
                     ctx, row, status, via=via, pending_code=pending_code, live_code=live_code,
                     new_kind=new_kind, promote=True,
@@ -1104,7 +1109,7 @@ def _break_post(
     promoted (`_invalidate`). The channel's last post: the call is
     invalidated, loudly, and nothing is promoted."""
     others = _standing_others(ctx, row) if row["withdrawn_at_utc"] is None else []
-    if others and not (_is_holder(ctx, row) and status == "pending"):
+    if others and not (_is_holder(ctx, row) and status == "pending" and _promotable(ctx, others)):
         alert = _repeat_removed(
             ctx, row, status, how=how, standing=others[0][0], changed=True
         )
@@ -1160,6 +1165,24 @@ def _standing_others(ctx: _Ctx, row: sqlite3.Row) -> list[tuple[sqlite3.Row, Rou
                 routed.detail,
             )
     return others
+
+
+def _promotable(
+    ctx: _Ctx, others: list[tuple[sqlite3.Row, RouteResult]]
+) -> list[tuple[sqlite3.Row, RouteResult]]:
+    """The standing posts among `others` that can be promoted: every one but
+    a post that already carries a signals row of its own -- an earlier
+    signal of the call, its own message standing again (a window deletion
+    read back). One post, one signal: while only such posts stand, the
+    call is not withdrawn but stands, a repeat removal."""
+    return [
+        (post, routed)
+        for post, routed in others
+        if signals_repo.get_signal_id(
+            ctx.conn, channel_id=ctx.channel_id, message_id=post["message_id"]
+        )
+        is None
+    ]
 
 
 def _left_call_before(ctx: _Ctx, row: sqlite3.Row) -> bool:
@@ -1253,12 +1276,9 @@ def _promote_repost(
     conn = ctx.conn
     old_id = withdrawn["signal_id"]
     # Never the post that withdrew the call, a post deleted in the same
-    # report, or one that no longer shows the call (`_standing_others`).
-    for repost, routed in _standing_others(ctx, withdrawn):
-        if signals_repo.get_signal_id(
-            conn, channel_id=ctx.channel_id, message_id=repost["message_id"]
-        ) is not None:
-            continue  # it carried the call before: one post, one signals row
+    # report, one that no longer shows the call, or one with a signals row
+    # of its own (`_standing_others`, `_promotable`).
+    for repost, routed in _promotable(ctx, _standing_others(ctx, withdrawn)):
         new_id = signals_repo.insert_signal(
             conn,
             channel_id=ctx.channel_id,

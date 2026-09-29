@@ -2160,6 +2160,8 @@ def test_a_call_deleted_with_its_repost_in_one_go_is_voided_once(tmp_path, ids, 
     if found_by == "window":
         expected.append(("CRITICAL", edits_repo.WINDOW_VOIDED_SIGNALS))
     assert _codes(state) == expected
+    # The call's own message says it, whichever job ran first.
+    assert ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION, V, CALL, 1) in state["alerts"]
 
 
 # -- F02: a copy's edit never reverts what the poster moved since -----------------------
