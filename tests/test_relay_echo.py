@@ -52,7 +52,9 @@ from test_relay import (
     R,
     V,
     _alerts,
+    _claim,
     _db_rows,
+    _db_write,
     _edit,
     _ingest,
     _link,
@@ -985,3 +987,179 @@ def test_a_relays_copy_removed_unseen_after_the_vip_posted_again_through_the_lis
         assert _live_rows(db_path) == []
         assert queued == []
         assert ("CRITICAL", edits_repo.OLD_POST_WITHDREW_CALL, COPY) in codes
+
+
+# == Round 5: a channel's forward of its own post, and mutual forwards =========
+#
+# Ruling R5-1 (X1): a forward of a post of the SAME channel is that
+# channel's own post -- a "bump" of its call -- never an echo of another
+# channel's removal. Ruling R5-2 (X3): a forward of a post removed as a
+# repeat (it closed nothing) echoes that removal only while the forwarded
+# post's channel still shows the call; once that channel's last post is
+# gone too, removing the forward is a removal like any other.
+
+#: The VIP's forward of its own call V/4001 (a "bump").
+BUMP = 4002
+
+
+def _vip_bumps_its_call(conn, *, executed: bool) -> None:  # noqa: F811
+    _ingest(conn, VIP, CALL)
+    bump = _ingest(conn, VIP, BUMP, posted=POSTED + timedelta(minutes=1), fwd=(V, CALL))
+    assert (bump.outcome, bump.relay_of_signal_id) == ("relay_duplicate", 1)
+    if executed:
+        _take_entry(conn, 1)
+
+
+def _withdrawn_everywhere(conn, *, executed: bool, signal_id: int) -> None:  # noqa: F811
+    """Nothing of the call is claimable any more; an executed call carries
+    a CRITICAL flag."""
+    assert _live(conn) == []
+    assert _queued_entries(conn) == []
+    assert _entries_claimable(conn) == []
+    if executed:
+        assert ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED) in _codes(conn)
+        assert _q(
+            conn, "SELECT state, withdrawn_at_utc IS NOT NULL FROM signals WHERE signal_id = ?",
+            signal_id,
+        ) == [("NEW", 1)]
+
+
+@pytest.mark.parametrize("by", ["event", "window"])
+@pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
+def test_a_channels_forward_of_its_own_call_removed_last_withdraws_the_call(
+    conn, executed, by  # noqa: F811
+):
+    """X1, one channel: the VIP forwards its own call (a bump), deletes the
+    original, then deletes the bump -- its last post of the call. The bump
+    is the VIP's own post, not an echo of another channel: the call is
+    withdrawn (VOIDED, or a CRITICAL flag once executed), nothing left to
+    claim."""
+    _vip_bumps_its_call(conn, executed=executed)
+    first = _delete(conn, VIP, CALL, POSTED + timedelta(minutes=2), by=by)
+    if executed:
+        assert (first.outcome, first.promoted_signal_id) == ("deleted", None)  # a repeat
+    else:
+        assert (first.outcome, first.promoted_signal_id) == ("voided", 2)
+
+    last = _delete(conn, VIP, BUMP, POSTED + timedelta(minutes=3), by=by)
+
+    assert (last.outcome, last.signal_id) == (
+        ("flagged", 1) if executed else ("voided", 2)
+    )
+    _withdrawn_everywhere(conn, executed=executed, signal_id=1)
+
+
+@pytest.mark.parametrize("how", ["re-aimed", "chatter"])
+@pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
+def test_a_channels_bump_removed_after_its_original_left_the_call_withdraws_it(
+    conn, executed, how  # noqa: F811
+):
+    """X1 variants: the VIP takes its original out of the call (re-aimed, or
+    edited into chatter) while its bump stands -- the bump is promoted, or
+    keeps the executed trade -- and then deletes the bump, its last post of
+    the call: the call is withdrawn."""
+    _vip_bumps_its_call(conn, executed=executed)
+    _edit(conn, VIP, CALL, _REMOVALS[how], POSTED + timedelta(minutes=2))
+    conn.commit()
+    live = 1 if executed else 2
+    assert _live(conn) == [live]
+
+    last = _delete(conn, VIP, BUMP, POSTED + timedelta(minutes=3))
+
+    assert (last.outcome, last.signal_id) == ("flagged" if executed else "voided", live)
+    _withdrawn_everywhere(conn, executed=executed, signal_id=1)
+
+
+@pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
+def test_a_channels_bump_deleted_with_its_original_withdraws_the_call(conn, executed):  # noqa: F811
+    """X1 control: the original and its bump deleted in one report."""
+    _vip_bumps_its_call(conn, executed=executed)
+    both = (CALL, BUMP)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=2), also=both)
+    _delete(conn, VIP, BUMP, POSTED + timedelta(minutes=2), also=both)
+    _withdrawn_everywhere(conn, executed=executed, signal_id=1)
+
+
+@pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
+@pytest.mark.parametrize("order", ["vip-first"])
+def test_two_channels_forwarding_each_others_posts_withdraw_the_call_when_all_go(
+    conn, order, executed  # noqa: F811
+):
+    """X3: the VIP double-posts (V/4001, V/4002); the relay forwards V/4002
+    (R/7001) and copies the call by hand (R/7002); the VIP forwards R/7002
+    (V/4003). Every post is deleted, one at a time: V/4002 and R/7002 are
+    repeats, V/4001 goes while V/4003 stands, and then each channel's last
+    post. R/7001 is removed while the VIP still shows the call -- an echo
+    of V/4002's removal -- but V/4003, a forward of R/7002, goes after the
+    relay's last post: the call is withdrawn, nothing left to claim."""
+    vip_first = order == "vip-first"
+    posts = [
+        (VIP, CALL, 0, None),
+        (VIP, 4002, 20, None),
+        (RELAY, 7001, 40, (V, 4002)),
+        (RELAY, 7002, 60, None),
+        (VIP, 4003, 80, (R, 7002)),
+    ]
+    stored = posts if vip_first else [posts[3], *posts[:3], posts[4]]
+    for channel, message_id, after, fwd in stored:
+        _ingest(conn, channel, message_id, posted=POSTED + timedelta(seconds=after), fwd=fwd)
+    assert len(_live(conn)) == 1
+    (holder,) = _live(conn)
+    if executed:
+        _take_entry(conn, holder)
+
+    for step, (channel, message_id) in enumerate(
+        [(VIP, 4002), (RELAY, 7002), (VIP, CALL), (RELAY, 7001), (VIP, 4003)]
+    ):
+        _delete(conn, channel, message_id, POSTED + timedelta(minutes=2 + step))
+
+    _withdrawn_everywhere(conn, executed=executed, signal_id=holder)
+
+
+@pytest.mark.parametrize("via", ["event", "window"])
+@pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
+def test_a_channels_bump_removed_last_through_the_listener_withdraws_the_call(
+    tmp_path, executed, via
+):
+    """X1 end to end: the VIP forwards its own call through Telegram (a
+    forward header naming its own channel), then deletes the original and
+    the bump, one report each -- seen by the event, or inferred by the
+    window re-read. Nothing is left to claim."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        assert await client.emit(V, _post(CALL))
+        assert await client.emit(V, _forward_of_call(BUMP, after=timedelta(minutes=1)))
+        for message_id in (BUMP + 1, BUMP + 2, BUMP + 3):  # chatter: a window re-read to believe
+            assert await client.emit(
+                V, _post(message_id, CHATTER_TEXT, after=timedelta(minutes=1))
+            )
+        await _round(listener, time)
+        if executed:
+            _db_write(
+                db_path,
+                "UPDATE outbox SET state = 'DONE' WHERE kind = 'ENTRY' "
+                "AND account_id = 'acct-1' AND signal_id = 1",
+            )
+        for message_id in (CALL, BUMP):
+            if via == "event":
+                assert await client.emit_delete(V, message_id)
+                await _round(listener, time)
+            else:
+                with client.blackout():
+                    assert not await client.emit_delete(V, message_id)
+                for _ in range(3):
+                    await _round(listener, time)
+
+    _run(db_path, body, channels=(VIP,))
+
+    assert _db_rows(
+        db_path, "SELECT signal_id FROM outbox WHERE kind = 'ENTRY' AND state = 'QUEUED'"
+    ) == []
+    assert _live_rows(db_path) == []
+    assert _claim(db_path) is None
+    if executed:
+        assert _db_rows(
+            db_path, "SELECT code FROM alerts WHERE level = 'CRITICAL' AND code = ?",
+            (edits_repo.LIVE_SIGNAL_DELETED,),
+        ) == [(edits_repo.LIVE_SIGNAL_DELETED,)]

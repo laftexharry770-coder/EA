@@ -44,12 +44,17 @@ signal are still posts of the call, and their edits reach its newest
 signal. Their *removal* -- deleted, edited away, re-aimed or broken --
 is told apart:
 
-- a forward of a post of the call that no longer stands (deleted,
-  edited away, re-aimed, or the post that withdrew one of its signals)
-  is an *echo*: its removal only repeats that post's, which was handled when it
-  happened, and is recorded (INFO) without reaching any signal -- also
-  when nothing was posted again, so that which post was stored first
-  never matters;
+- a forward of *another channel's* post of the call that no longer
+  stands (deleted, edited away, re-aimed, or the post that withdrew one of
+  its signals) is an *echo*: its removal only repeats that post's, which
+  was handled when it happened, and is recorded (INFO) without reaching
+  any signal -- also when nothing was posted again, so that which post
+  was stored first never matters. A forward of the channel's *own* post
+  (a "bump") is that channel's own post, never an echo (ruling R5-1). A
+  forwarded post removed as a repeat -- it withdrew nothing, as its
+  channel still showed the call -- is echoed only while that channel
+  still shows the call; once its last post is gone too, the forward's
+  removal is a removal like any other (R5-2);
 - the post a withdrawing forward copied is the *original*: its removal is
   the original poster retracting, and reaches the newest signal as any
   removal does;
@@ -469,7 +474,9 @@ def old_post(
         return None
     chain = chain_ids(conn, start)
     forwarded = (message["fwd_from_channel_id"], message["fwd_from_post_id"])
-    if None not in forwarded:
+    if None not in forwarded and forwarded[0] != channel_id:
+        # A forward of the channel's OWN post is that channel's own post of
+        # the call (a "bump"), never an echo of another channel (R5-1).
         echoed = _gone_post(conn, forwarded, channel_cfg)
         if echoed is not None:
             return OldPost("echo", echoed, forwarded)
@@ -1023,13 +1030,25 @@ def _gone_post(
     channel_cfg: _ChannelCfgLike | None = None,
 ) -> int | None:
     """For `old_post`: the signal stored post `post` was stored with (its
-    own, or the one it copies), when that post no longer stands -- deleted,
-    edited into something that is no signal, the post that closed one of
-    its call's signals, or (re-read with `channel_cfg`) re-aimed away from
-    its call. None otherwise, or when it is no post of a call. The call it
-    belongs to need not be the one its forward was matched to: a late
-    forward of a withdrawn post may repeat another call of the same trade,
-    and removing it still only echoes the withdrawn post."""
+    own, or the one it copies), when a forward of it is an echo of its
+    removal. None otherwise, or when it is no post of a call:
+
+    - the post closed one of its call's signals (it withdrew, broke or
+      re-aimed it): its removal was said when it happened -- an echo;
+    - it no longer stands -- deleted, edited into something that is no
+      signal, or (re-read with `channel_cfg`) re-aimed away -- without
+      closing anything: a repeat removal on its channel. The forward echoes
+      it only while that channel still shows the call in a standing post
+      (re-read now). Once that channel's last post is gone too, nothing
+      said the call was withdrawn, so the forward's removal is a removal
+      like any other (ruling R5-2) -- two channels forwarding each other's
+      posts can never echo each other's repeats into keeping a call nobody
+      shows;
+    - it still stands: None.
+
+    The call it belongs to need not be the one its forward was matched to:
+    a late forward of a withdrawn post may repeat another call of the same
+    trade, and removing it still only echoes the withdrawn post."""
     row = conn.execute(
         "SELECT * FROM messages WHERE channel_id = ? AND message_id = ?", post
     ).fetchone()
@@ -1047,12 +1066,23 @@ def _gone_post(
         "  AND closed_by_channel_id = ? AND closed_by_message_id = ?",
         (*chain, *post),
     ).fetchone()
-    if row["deleted_at_utc"] is not None or row["kind"] != "signal" or closer is not None:
-        return linked
-    if channel_cfg is not None and not post_shows_call(
-        row, _signal_row(conn, linked), channel_cfg=channel_cfg
-    ):
-        return linked
+    if closer is not None:
+        return linked  # its removal withdrew one of the call's signals: said then
+    gone = (
+        row["deleted_at_utc"] is not None
+        or row["kind"] != "signal"
+        or (
+            channel_cfg is not None
+            and not post_shows_call(row, _signal_row(conn, linked), channel_cfg=channel_cfg)
+        )
+    )
+    if not gone:
+        return None
+    # A repeat removal: echoed only while its channel still shows the call.
+    newest = _signal_row(conn, live_signal_for(conn, linked))
+    for other in standing_posts_on(conn, signal_id=linked, channel_id=post[0]):
+        if channel_cfg is None or post_shows_call(other, newest, channel_cfg=channel_cfg):
+            return linked
     return None
 
 
