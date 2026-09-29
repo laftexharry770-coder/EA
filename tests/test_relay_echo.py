@@ -31,10 +31,13 @@ import logging
 from datetime import timedelta
 
 import pytest
+from telethon.tl import types
 
-from test_edits import DIRECTION_EDIT, EDIT_1, EDIT_2
+from fakes.telegram import FakeMessage
+from test_edits import DIRECTION_EDIT, EDIT_1, EDIT_2, _round
 from test_relay import (
     CALL,
+    CHATTER_TEXT,
     CLOSE_HALF,
     COPY,
     OTHER,
@@ -44,14 +47,18 @@ from test_relay import (
     SIGNAL_TEXT,
     TP1_EDIT,
     VIP,
+    VIP_CHATTER,
     R,
     V,
     _alerts,
+    _db_rows,
     _edit,
     _ingest,
     _link,
+    _post,
     _q,
     _queued_entries,
+    _run,
     conn,  # noqa: F401 -- the fixture
 )
 from test_relay_order import (
@@ -62,6 +69,7 @@ from test_relay_order import (
     _detail,
     _entries_claimable,
     _live,
+    _live_rows,
     _store_call,
     _take_entry,
     _the_vip_manages_the_trade,
@@ -513,3 +521,80 @@ def test_a_forward_of_a_post_re_aimed_away_from_a_reposted_call_is_held_back(
     assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", 1)
     assert ("CRITICAL", relay_repo.COPY_OF_WITHDRAWN_SIGNAL, R, COPY, 1) in _alerts(conn)
     assert _queued_entries(conn) == [(2, "acct-1"), (2, "acct-2")]
+
+
+# == the arrival paths: the real listener and poll, the fake Telegram ===========
+
+#: The VIP channel's bare id, as a forward header names it.
+_V_BARE = -V - 10**12
+
+
+def _forward_of_call(message_id: int, *, after: timedelta) -> FakeMessage:
+    """The relay's forward of the VIP's call V/4001."""
+    return FakeMessage(
+        id=message_id,
+        message=SIGNAL_TEXT,
+        date=POSTED + after,
+        fwd_from=types.MessageFwdHeader(
+            date=POSTED, from_id=types.PeerChannel(channel_id=_V_BARE), channel_post=CALL
+        ),
+    )
+
+
+async def _vip_and_relay(client, order: str, *, forwards: bool) -> None:
+    """The VIP's call and chatter, the relay's copy (a forward, or by hand)
+    and chatter: VIP-first, or the relay's copy delivered first."""
+    copy = _forward_of_call(COPY, after=timedelta(seconds=30)) if forwards else _post(
+        COPY, after=timedelta(seconds=30)
+    )
+    if order == "vip-first":
+        assert await client.emit(V, _post(CALL))
+        assert await client.emit(R, copy)
+    else:
+        assert await client.emit(R, copy)
+        assert await client.emit(V, _post(CALL))
+    for message_id in VIP_CHATTER:
+        assert await client.emit(V, _post(message_id, CHATTER_TEXT))
+    for message_id in (COPY + 1, COPY + 2, COPY + 3):
+        assert await client.emit(R, _post(message_id, CHATTER_TEXT, after=timedelta(minutes=1)))
+
+
+@pytest.mark.parametrize("copies", ["forward", "hand"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_relays_copy_removed_unseen_after_the_vip_posted_again_through_the_listener(
+    tmp_path, order, copies
+):
+    """NEW-1 end to end: the VIP deletes its call and posts it again; the
+    relay's removal of its copy is dropped and found later by the window
+    re-read. A forward's removal is an echo -- the repost still trades; a
+    hand copy's withdraws the repost, loudly."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        await _vip_and_relay(client, order, forwards=copies == "forward")
+        await _round(listener, time)
+        assert await client.emit_delete(V, CALL)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=2)))
+        await _round(listener, time)
+        (live,) = _live_rows(db_path)
+        with client.blackout():
+            assert not await client.emit_delete(R, COPY)
+        for _ in range(3):
+            await _round(listener, time)
+        return live
+
+    live = _run(db_path, body)
+
+    codes = _db_rows(db_path, "SELECT level, code, message_id FROM alerts ORDER BY alert_id")
+    queued = _db_rows(
+        db_path, "SELECT signal_id, COUNT(*) FROM outbox WHERE kind = 'ENTRY' AND state = 'QUEUED' "
+        "GROUP BY signal_id"
+    )
+    if copies == "forward":
+        assert _live_rows(db_path) == [live]
+        assert queued == [(live, 2)]
+        assert [code for _, code, _ in codes] == [edits_repo.SIGNAL_VOIDED_BY_DELETION]
+    else:
+        assert _live_rows(db_path) == []
+        assert queued == []
+        assert ("CRITICAL", edits_repo.OLD_POST_WITHDREW_CALL, COPY) in codes
