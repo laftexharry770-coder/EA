@@ -102,7 +102,7 @@ The post that closed one of the chain's signals stays with that signal.
   `signals` row (`promoted_from_signal_id` naming the signal it
   replaces) and its ENTRY rows in the same writer job, unlinked, and
   announced with a WARNING `SIGNAL_REPOST_PROMOTED` naming both messages;
-  the channel's other copies then repeat it, and every follow-up that
+  every other copy of the call then repeats it, and every follow-up that
   targeted the withdrawn signal targets it (`relay_repo.record_replacement`).
   Never promoted: a repost of an executed
   signal (trading it would open the trade twice), and a post on any other
@@ -219,6 +219,12 @@ SIGNAL_REPEAT_REMOVED = "SIGNAL_REPEAT_REMOVED"
 #: channel still showed the same call in another post: that post is now the
 #: signal, queued for trading (final review F04).
 SIGNAL_REPOST_PROMOTED = "SIGNAL_REPOST_PROMOTED"
+#: CRITICAL: an older post of a call -- stored with a signal of it that
+#: another post had withdrawn, before the call was posted again -- was
+#: deleted or edited away, and that voided the call's newest signal. It may
+#: be a retraction, or only the other channel removing its old copy (ruling
+#: R4-1).
+OLD_POST_WITHDREW_CALL = "OLD_POST_WITHDREW_CALL"
 #: WARNING: an edit of one post of a relayed call was not applied: its
 #: version still shows a level another post has moved since (review round
 #: 1, minor 4; ruling R3-P4).
@@ -680,6 +686,12 @@ def _edit_of_signal(ctx: _Ctx, route_result: RouteResult) -> EditResult:
     new_kind = route_result.kind
     row = _call_row(ctx)
     if row is not None:
+        ctx = dataclasses.replace(
+            ctx,
+            old_post=relay_repo.old_post(
+                ctx.conn, channel_id=ctx.channel_id, message_id=ctx.message_id
+            ),
+        )
         if row["signal_id"] == ctx.signal_id:
             return _edit_of_signal_row(ctx, row, route_result)
         # Another post of the call -- a relay copy (final review F02), or
@@ -743,6 +755,10 @@ def _edit_of_signal_row(ctx: _Ctx, row: sqlite3.Row, route_result: RouteResult) 
             row["signal_id"],
         )
         return ctx.result("recorded", new_kind, "a post that had left the call")
+    if not shows_now and _is_echo(ctx):
+        # A forward of a post of the call that no longer stands (R4-1 a).
+        _log_echo(ctx, row, how=f"edited into {new_kind}")
+        return ctx.result("recorded", new_kind, "an echo of another post's removal")
     if new_kind == "signal":
         return _signal_to_signal(ctx, row, status, route_result.signal)
     if new_kind == "parse_failed":
@@ -1010,7 +1026,8 @@ def _invalidate(
         "CRITICAL",
         code,
         f"signal {signal_id} is now INVALID: {reason}. {skipped} queued entr"
-        f"{'y' if skipped == 1 else 'ies'} skipped. {_live_clause(status)}",
+        f"{'y' if skipped == 1 else 'ies'} skipped. {_live_clause(status)}"
+        f"{_old_post_doubt(ctx, status, changed=True)}",
         signal_id=signal_id,
     )
     # The signal's own message re-aimed or broken while nothing was
@@ -1254,13 +1271,23 @@ def _withdraw_signal(
     entries = f"{skipped} queued entr{'y' if skipped == 1 else 'ies'} skipped"
     if status == "pending":
         signals_repo.set_signal_state(ctx.conn, signal_id=signal_id, state="VOIDED")
-        alert = ctx.alert(
-            "WARNING",
-            pending_code,
-            f"signal {signal_id} VOIDED: the poster withdrew it ({via}). Nothing had been "
-            f"executed; {entries}.",
-            signal_id=signal_id,
-        )
+        if _is_older_post(ctx):
+            # R4-1 (c): a retraction, or only an old copy removed -- loudly.
+            alert = ctx.alert(
+                "CRITICAL",
+                OLD_POST_WITHDREW_CALL,
+                f"signal {signal_id} is now VOIDED ({via}). Nothing had been executed; "
+                f"{entries}.{_old_post_doubt(ctx, status, changed=False)}",
+                signal_id=signal_id,
+            )
+        else:
+            alert = ctx.alert(
+                "WARNING",
+                pending_code,
+                f"signal {signal_id} VOIDED: the poster withdrew it ({via}). Nothing had been "
+                f"executed; {entries}.",
+                signal_id=signal_id,
+            )
         promoted = _promote_repost(ctx, row) if promote else None
         return ctx.result(
             "voided",
@@ -1275,7 +1302,7 @@ def _withdraw_signal(
         live_code,
         f"signal {signal_id} was withdrawn by the poster ({via}) but is {status}. Its live "
         f"legs were NOT closed -- a deletion or rewrite can be cosmetic -- review them by "
-        f"hand. {entries}.",
+        f"hand. {entries}.{_old_post_doubt(ctx, status, changed=False)}",
         signal_id=signal_id,
     )
     return ctx.result("flagged", new_kind, via, alert_ids=(alert,), skipped=skipped)
@@ -1293,7 +1320,7 @@ def _promote_repost(
     post becomes the signal: re-read with the channel's parser, given its
     `signals` row (recording the one it replaces) and its ENTRY rows, in
     this same writer job, unlinked, and announced with a WARNING naming
-    both messages. The channel's other copies of the call now repeat it,
+    both messages. Every other copy of the call now repeats it,
     and `relay_repo.record_replacement` moves the call's follow-ups to
     it. Only ever on the signal's own channel (ruling R3-P1). Returns
     (new signal id, alert ids) or None."""
@@ -1322,13 +1349,14 @@ def _promote_repost(
             "UPDATE messages SET relay_of_signal_id = NULL WHERE channel_id = ? AND message_id = ?",
             (ctx.channel_id, repost["message_id"]),
         )
-        # The channel's other copies of the call now repeat the promoted
-        # signal -- not the post that withdrew it, which keeps naming the
-        # signal it closed.
+        # Every other copy of the call, on any channel, now repeats the
+        # promoted signal -- not the post that withdrew it, which keeps
+        # naming the signal it closed. The call never stopped: none of them
+        # is an older post of a withdrawn call (ruling R4-1).
         conn.execute(
             "UPDATE messages SET relay_of_signal_id = ? "
-            "WHERE relay_of_signal_id = ? AND channel_id = ? AND deleted_at_utc IS NULL "
-            "  AND message_id != ?",
+            "WHERE relay_of_signal_id = ? AND deleted_at_utc IS NULL "
+            "  AND NOT (channel_id = ? AND message_id = ?)",
             (new_id, old_id, ctx.channel_id, ctx.message_id),
         )
         replaced = relay_repo.record_replacement(
@@ -1387,12 +1415,30 @@ def _subject(ctx: _Ctx) -> str:
 def _as_copy(ctx: _Ctx, holder: sqlite3.Row) -> _Ctx:
     """`ctx` for a change that reaches signal `holder` through another post
     of its call: results and alerts carry the signal, and every alert
-    first names this post and the signal's own message."""
-    if ctx.signal_id is not None:
+    first names this post and the signal's own message -- for an older
+    post of the call (`_is_older_post`), also the post that withdrew the
+    signal it was stored with."""
+    stored_with = ctx.signal_id if ctx.signal_id is not None else ctx.relay_of_signal_id
+    old = ctx.old_post
+    if old is not None and old.kind == "earlier":
+        via = (
+            f"message {ctx.message_id} on channel {ctx.channel_id} is an older post of this "
+            f"call: it was first recorded with signal {stored_with}, and message "
+            f"{old.post[1]} on channel {old.post[0]} had already withdrawn signal "
+            f"{old.signal_id}; the call was posted again as message {holder['message_id']} "
+            f"on channel {holder['channel_id']}, which is signal {holder['signal_id']}"
+        )
+    elif ctx.signal_id is not None:
         via = (
             f"message {ctx.message_id} on channel {ctx.channel_id} first carried this call as "
             f"signal {ctx.signal_id}; signal {holder['signal_id']} (message "
             f"{holder['message_id']} on channel {holder['channel_id']}) carries it now"
+        )
+    elif stored_with is not None and stored_with != holder["signal_id"]:
+        via = (
+            f"message {ctx.message_id} on channel {ctx.channel_id} is a copy of signal "
+            f"{stored_with}, whose call signal {holder['signal_id']} (message "
+            f"{holder['message_id']} on channel {holder['channel_id']}) carries now"
         )
     else:
         via = (
@@ -1401,6 +1447,53 @@ def _as_copy(ctx: _Ctx, holder: sqlite3.Row) -> _Ctx:
             f"{holder['channel_id']})"
         )
     return dataclasses.replace(ctx, signal_id=holder["signal_id"], via_copy=via)
+
+
+def _is_echo(ctx: _Ctx) -> bool:
+    """Whether `ctx`'s post is an echo (`relay_repo.old_post`): a forward of
+    a post of the call that no longer stands. Its removal was said when
+    that post went; this one is only recorded (ruling R4-1 a)."""
+    return ctx.old_post is not None and ctx.old_post.kind == "echo"
+
+
+def _is_older_post(ctx: _Ctx) -> bool:
+    """Whether `ctx`'s post is an older post of its call
+    (`relay_repo.old_post` "earlier"): stored with a signal another post
+    withdrew before the call was posted again, and no forward tells whether
+    its removal is a retraction or only an old copy going (R4-1 c)."""
+    return ctx.old_post is not None and ctx.old_post.kind == "earlier"
+
+
+def _old_post_doubt(ctx: _Ctx, status: TradeStatus, *, changed: bool) -> str:
+    """For an alert about an older post's removal or change (`_is_older_post`):
+    the doubt, and what to do if it was only the other channel tidying up.
+    "" for any other post."""
+    if not _is_older_post(ctx):
+        return ""
+    what = "changing" if changed else "removing"
+    doubt = (
+        f" This post may only have been channel {ctx.channel_id} {what} its old copy of the "
+        "call: if so, the call is still meant --"
+    )
+    if status == "pending":
+        return f"{doubt} trade it by hand."
+    return f"{doubt} keep the trade, and trade by hand the entries that were skipped."
+
+
+def _log_echo(ctx: _Ctx, row: sqlite3.Row, *, how: str) -> None:
+    """INFO: `ctx`'s post, an echo (`_is_echo`), was `how`: recorded only."""
+    old = ctx.old_post
+    logger.info(
+        "channel %s message %s, a forward of message %s on channel %s -- a post of the call "
+        "that no longer stands -- was %s: only an echo of that post's removal, which was "
+        "handled when it happened; signal %s is left as it is",
+        ctx.channel_id,
+        ctx.message_id,
+        old.post[1],
+        old.post[0],
+        how,
+        row["signal_id"],
+    )
 
 
 #: How a parse re-aims a stored one: side, symbol, entry zone (the one
@@ -1728,6 +1821,9 @@ def apply_deletion(
     if row is not None:
         status = trade_status(conn, signal_id=row["signal_id"])
         own = row["signal_id"] == signal_id
+        ctx = dataclasses.replace(
+            ctx, old_post=relay_repo.old_post(conn, channel_id=channel_id, message_id=message_id)
+        )
         post_ctx = ctx if own else _as_copy(ctx, row)
         relayed = relay_repo.is_relayed(conn, signal_id=row["signal_id"])
         via = (
@@ -1750,6 +1846,13 @@ def apply_deletion(
                     row["signal_id"],
                     detected_by,
                 )
+                return DeletionResult(
+                    "deleted", message_id, kind, row["signal_id"], followup_id, 0, ()
+                )
+            if _is_echo(ctx):
+                # A forward of a post of the call that no longer stands: its
+                # removal echoes that post's (ruling R4-1 a).
+                _log_echo(ctx, row, how=f"deleted, found by {detected_by}")
                 return DeletionResult(
                     "deleted", message_id, kind, row["signal_id"], followup_id, 0, ()
                 )
@@ -1871,6 +1974,10 @@ class _Ctx:
     also_deleted: frozenset[int] = frozenset()
     #: An edit of a stored signal message: the text it replaces.
     previous_text: str | None = None
+    #: How the changed post stands to the newest signal of its call, when
+    #: its removal would reach that signal though the post echoes or
+    #: predates it (`relay_repo.old_post`, ruling R4-1).
+    old_post: relay_repo.OldPost | None = None
 
     @property
     def channel_id(self) -> int:

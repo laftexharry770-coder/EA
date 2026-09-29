@@ -91,6 +91,85 @@ def _vip_deletes_and_posts_again(conn) -> int:  # noqa: F811
 # -- R4-1 (a): an echo of the withdrawal is only recorded ------------------------------
 
 
+@pytest.mark.parametrize("by", ["event", "window"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_relays_forward_removed_after_the_vip_posted_its_call_again_is_an_echo(
+    conn, order, by, caplog  # noqa: F811
+):
+    """NEW-1 with a forwarding relay: the VIP deleted its call and posted it
+    again; the relay's forward of the deleted post is removed afterwards --
+    a late event, the window's inference, a relay mirroring deletions. That
+    only echoes the VIP's deletion: the VIP's repost is still traded, and
+    the relay forwarding the repost repeats it."""
+    _store_call(conn, order, forwards=True)
+    live = _vip_deletes_and_posts_again(conn)
+    with caplog.at_level(logging.INFO, logger="xaucopier.store.edits_repo"):
+        echo = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=3), by=by)
+
+    assert (echo.outcome, echo.promoted_signal_id) == ("deleted", None)
+    assert _live(conn) == [live]
+    assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
+    assert _codes(conn) == [("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)]
+    lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any(
+        f"message {COPY}" in line and f"message {CALL}" in line and "echo" in line
+        for line in lines
+    ), lines
+
+    forward = _ingest(
+        conn, RELAY, COPY + 1, posted=POSTED + timedelta(minutes=3, seconds=5), fwd=(V, REPOST)
+    )
+    assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", live)
+    assert _entries_claimable(conn) == [live]
+
+
+@pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_forward_of_a_post_its_channel_replaced_is_an_echo_when_removed(
+    conn, order, executed  # noqa: F811
+):
+    """The VIP double-posted its call and deleted the first post; the
+    relay's forward of that post is removed after it. The VIP's channel
+    still shows the call, so the relay's removal only echoes that deletion
+    -- whichever post holds the signal (VIP-first the repost was promoted,
+    or kept the trade; relay-first the relay's forward holds the call and
+    the VIP's deletion was a repeat removal). The VIP deleting its repost,
+    its channel's last post, then withdraws the call."""
+    _store_call(conn, order, forwards=True)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    if executed:
+        _take_entry(conn, 1)
+    assert _delete(conn, VIP, CALL, POSTED + timedelta(minutes=2)).outcome in ("voided", "deleted")
+    echo = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=3))
+
+    assert echo.outcome == "deleted"
+    (live,) = _live(conn)
+    if executed:
+        assert (live, _queued_entries(conn)) == (1, [(1, "acct-2")])
+    else:
+        assert _queued_entries(conn) == [(live, "acct-1"), (live, "acct-2")]
+    assert "CRITICAL" not in [level for level, _ in _codes(conn)]
+
+    last = _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=4))
+    assert (last.outcome, last.signal_id) == ("flagged" if executed else "voided", live)
+
+
+def test_a_held_back_forward_the_vip_posted_again_is_an_echo_when_removed(conn):  # noqa: F811
+    """The relay's forward of a post the VIP had deleted was held back; the
+    VIP then posted the call again, which the forward now repeats. The
+    relay removing its forward of the deleted post only echoes the VIP."""
+    _ingest(conn, VIP, CALL)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(minutes=2), fwd=(V, CALL))
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=3))
+    assert _link(conn, RELAY, COPY) == again.signal_id
+
+    echo = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=4))
+    assert echo.outcome == "deleted"
+    assert _live(conn) == [again.signal_id]
+    assert _queued_entries(conn) == [(again.signal_id, "acct-1"), (again.signal_id, "acct-2")]
+
+
 # -- R4-1 (b): the original the withdrawing forward copied ---------------------------------
 
 
@@ -119,6 +198,78 @@ def test_the_vip_withdrawing_the_post_a_relay_forwarded_again_withdraws_the_rela
 
 
 # -- R4-1 (c): an old hand copy removed -- ambiguous, so loud ------------------------------
+
+
+@pytest.mark.parametrize("by", ["event", "window"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_hand_copy_removed_after_the_vip_posted_its_call_again_withdraws_it_loudly(
+    conn, order, by  # noqa: F811
+):
+    """NEW-1 with a hand copy: nothing links the relay's post to the VIP's
+    deleted one, so its removal may be a genuine retraction or only the
+    relay tidying up its old copy. The call is withdrawn (the safe side)
+    and a CRITICAL alert says which posts are involved, and to trade the
+    call by hand if the relay only removed its old copy."""
+    _store_call(conn, order)
+    live = _vip_deletes_and_posts_again(conn)
+    gone = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=3), by=by)
+
+    assert (gone.outcome, gone.signal_id) == ("voided", live)
+    assert _live(conn) == []
+    assert _queued_entries(conn) == []
+    assert ("CRITICAL", edits_repo.OLD_POST_WITHDREW_CALL, R, COPY, live) in _alerts(conn)
+    assert _codes(conn) == [
+        ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION),
+        ("CRITICAL", edits_repo.OLD_POST_WITHDREW_CALL),
+    ]
+    detail = _detail(conn, edits_repo.OLD_POST_WITHDREW_CALL)
+    assert f"message {COPY} on channel {R}" in detail
+    assert f"message {CALL} on channel {V}" in detail  # the post that withdrew it first
+    assert f"message {REPOST} on channel {V}" in detail and f"signal {live}" in detail
+    assert "VOIDED" in detail and "trade it by hand" in detail
+
+
+def test_a_hand_copy_removed_after_the_repost_was_taken_flags_it_loudly(conn):  # noqa: F811
+    """The same, after the repost's entry was taken: flagged, not closed,
+    and the alert says the removal may only have been an old copy."""
+    _store_call(conn, "vip-first")
+    live = _vip_deletes_and_posts_again(conn)
+    _take_entry(conn, live)
+    gone = _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=3))
+
+    assert (gone.outcome, gone.signal_id) == ("flagged", live)
+    assert ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED, R, COPY, live) in _alerts(conn)
+    detail = _detail(conn, edits_repo.LIVE_SIGNAL_DELETED)
+    assert f"message {CALL} on channel {V}" in detail and f"message {REPOST}" in detail
+    assert "old copy" in detail
+
+
+@pytest.mark.parametrize("change", ["cancelled", "re-aimed"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_hand_copy_edited_away_after_the_vip_posted_its_call_again_withdraws_it_loudly(
+    conn, order, change  # noqa: F811
+):
+    """NEW-1 (a): the relay edits its old copy into "cancelled" (or re-aims
+    it) after the VIP's delete-and-repost. The same as a removal: the call
+    is withdrawn, loudly, with the same explanation."""
+    _store_call(conn, order)
+    live = _vip_deletes_and_posts_again(conn)
+    text = CANCELLED if change == "cancelled" else DIRECTION_EDIT
+    result = _edit(conn, RELAY, COPY, text, POSTED + timedelta(minutes=3))
+    conn.commit()
+
+    assert _live(conn) == []
+    assert _queued_entries(conn) == []
+    if change == "cancelled":
+        assert result.outcome == "voided"
+        code = edits_repo.OLD_POST_WITHDREW_CALL
+    else:
+        assert result.outcome == "invalidated"
+        code = edits_repo.SIGNAL_INVALIDATED_BY_EDIT
+    assert ("CRITICAL", code, R, COPY, live) in _alerts(conn)
+    detail = _detail(conn, code)
+    assert f"message {CALL} on channel {V}" in detail and f"message {REPOST}" in detail
+    assert "trade it by hand" in detail
 
 
 # -- R4-2 / R4-3: every channel that withdrew the call may post it again -------------
@@ -235,16 +386,21 @@ def test_a_reply_made_before_its_post_withdrew_the_call_stays_with_that_signal(
 # -- R4-5: a read-back withdrawing post stands; a replaced call stays protected -------------
 
 
+@pytest.mark.parametrize("how", ["promoted", "posted-again"])
 @pytest.mark.parametrize("order", ORDERS)
-def test_a_replaced_call_keeps_its_stale_post_protection(conn, order):  # noqa: F811
-    """The VIP double-posted and deleted its first post (VIP-first its
-    repost is promoted, and the relay's copy still points at the signal it
-    replaced). The relay's copy moves the stop; the VIP's repost, which
-    never did, then edits only its TP1: that must not put the old stop
-    back, whichever post holds the call."""
+def test_a_replaced_call_keeps_its_stale_post_protection(conn, order, how):  # noqa: F811
+    """NEW-4 (b): the VIP's repost carries the call -- promoted over its
+    deleted first post, or posted again after it -- and the relay's copy
+    moves the stop. The VIP's repost, which never did, then edits only its
+    TP1: that must not put the old stop back, whichever post holds the
+    call. Posted again, the relay's copy still points at the signal the
+    repost replaced: the call is relayed through its chain of signals."""
     _store_call(conn, order)
-    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
-    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=2))
+    if how == "promoted":
+        _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+        _delete(conn, VIP, CALL, POSTED + timedelta(minutes=2))
+    else:
+        _vip_deletes_and_posts_again(conn)
     (live,) = _live(conn)
     _take_entry(conn, live)
     assert _edit(conn, RELAY, COPY, SL_4480, EDIT_1).outcome == "reparsed"
