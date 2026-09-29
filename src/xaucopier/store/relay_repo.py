@@ -23,9 +23,12 @@ replaces (`signals.promoted_from_signal_id`). The *newest* signal of the
 chain carries the call: `live_signal_for` -- the one helper every
 consumer resolves through, Plan 3 included. The call's *posts* are the
 chain's own messages and every message stored as a copy of one of them
-(`messages.relay_of_signal_id`); a post *stands* while it is not deleted
-and still reads as a signal, and is not the post that closed one of the
-chain's signals (a re-aimed post no longer shows the call).
+(`messages.relay_of_signal_id`); a post *stands* while it is not deleted,
+still shows the call -- a signal on the same side, symbol and entry zone
+(`standing_posts_on` keeps the posts still stored as signals;
+`edits_repo` re-reads them with their channel's parser, as a re-aimed
+post still reads as a signal) -- and is not the post that closed one of
+the chain's signals.
 `signal_for_post` says which signal a stored post acts on: the newest
 of its call -- or, for the post that closed one of the chain's signals,
 that signal (its later edits are about the call it broke).
@@ -268,11 +271,13 @@ def has_copies(conn: sqlite3.Connection, *, signal_id: int) -> bool:
 def standing_posts_on(
     conn: sqlite3.Connection, *, signal_id: int, channel_id: int
 ) -> list[sqlite3.Row]:
-    """The posts of `signal_id`'s call on `channel_id` that still stand
-    (ruling R3-P1): the chain's own messages and the copies of any of its
-    signals there, not deleted, still read as a signal, and not the post
-    that closed one of the chain's signals. Lowest message id (the
-    earliest post) first."""
+    """The posts of `signal_id`'s call on `channel_id` that may still
+    stand (ruling R3-P1): the chain's own messages and the copies of any of
+    its signals there, not deleted, still stored as a signal, and not the
+    post that closed one of the chain's signals. Lowest message id (the
+    earliest post) first. A post re-aimed away from the call is still
+    stored as a signal: the caller re-reads each one
+    (`edits_repo._standing_others`)."""
     chain = chain_ids(conn, signal_id)
     marks = ", ".join("?" for _ in chain)
     return conn.execute(

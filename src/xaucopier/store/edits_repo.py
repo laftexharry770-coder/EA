@@ -1167,6 +1167,32 @@ def _standing_others(ctx: _Ctx, row: sqlite3.Row) -> list[tuple[sqlite3.Row, Rou
     return others
 
 
+def post_left_live_call(
+    conn: sqlite3.Connection, *, channel_cfg: _ChannelCfgLike, message_id: int, signal_id: int
+) -> bool:
+    """Whether stored post `message_id` of `channel_cfg`'s channel, re-read
+    with the channel's parser, shows another call than live signal
+    `signal_id` (another side, symbol or entry zone): it was re-aimed away
+    while another post kept the call standing (ruling R3-P1), so it is no
+    post of that call any more. A follow-up replying to it is not about
+    the live trade (`messages_repo.ingest`). False when the signal is
+    closed -- a reply to the post that closed it is about that signal --
+    and for a post that no longer reads as a signal at all."""
+    post = _get_message(conn, channel_id=channel_cfg.channel_id, message_id=message_id)
+    signal = conn.execute("SELECT * FROM signals WHERE signal_id = ?", (signal_id,)).fetchone()
+    if post is None or signal is None or post["kind"] != "signal":
+        return False
+    if signal["state"] != "NEW" or signal["withdrawn_at_utc"] is not None:
+        return False
+    routed = route(
+        post["raw_text"],
+        channel_cfg=channel_cfg,
+        message_id=message_id,
+        posted_at_utc=datetime.fromisoformat(post["posted_at_utc"]),
+    )
+    return routed.kind == "signal" and not _shows(routed, signal)
+
+
 def _promotable(
     ctx: _Ctx, others: list[tuple[sqlite3.Row, RouteResult]]
 ) -> list[tuple[sqlite3.Row, RouteResult]]:

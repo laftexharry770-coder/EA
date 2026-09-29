@@ -768,6 +768,32 @@ def test_live_signal_for_follows_the_call_to_its_newest_signal(conn):  # noqa: F
     assert relay_repo.signal_for_post(conn, channel_id=V, message_id=4013) == 3
 
 
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_follow_up_replying_to_a_post_re_aimed_away_from_the_call_targets_nothing(
+    conn, order  # noqa: F811
+):
+    """The VIP re-aimed its repost (BUY -> SELL: a repeat removal, the BUY
+    call stands on its first post) and then says "close half" replying to
+    the re-aimed post. That post shows another call now, which was never
+    traded: the instruction is not given the live BUY signal. A reply to
+    the first post still is."""
+    _store_call(conn, order)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=2))
+    assert _edit(conn, VIP, REPOST, DIRECTION_EDIT, EDIT_1).outcome == "recorded"
+    conn.commit()
+    (live,) = _live(conn)
+    to_repost = _ingest(
+        conn, VIP, 4020, CLOSE_HALF, posted=POSTED + timedelta(minutes=8), reply_to=REPOST
+    )
+    to_call = _ingest(
+        conn, VIP, 4021, "Move SL to BE", posted=POSTED + timedelta(minutes=9), reply_to=CALL
+    )
+    assert (to_repost.outcome, to_call.outcome) == ("new", "new")
+    assert _q(
+        conn, "SELECT message_id, target_signal_id FROM followups ORDER BY followup_id"
+    ) == [(4020, None), (4021, live)]
+
+
 def test_a_follow_up_replying_to_a_replaced_signals_post_targets_the_new_one(conn):  # noqa: F811
     """A reply to any post of the call reaches its newest signal: stored
     ones are re-pointed when the call is replaced, later ones resolve to
