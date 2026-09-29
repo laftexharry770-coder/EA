@@ -310,6 +310,15 @@ def record_replacement(
             f"signal {new_signal_id} does not record that it replaces signal {replaced_signal_id}"
         )
     earlier = [sid for sid in chain_ids(conn, new_signal_id) if sid != new_signal_id]
+    logger.info(
+        "signal %s (channel %s message %s) carries the call of withdrawn signal %s now "
+        "(the call's earlier signals: %s)",
+        new_signal_id,
+        new["channel_id"],
+        new["message_id"],
+        replaced_signal_id,
+        earlier,
+    )
     marks = ", ".join("?" for _ in earlier)
     conn.execute(
         "UPDATE followups SET target_signal_id = ?, resolution_path = CASE "
@@ -431,6 +440,9 @@ def relay_of_signal(
             )
             if live is not None:
                 return SignalRelay(_signal_match(conn, live, via="hash"))
+            # Held back against the newest signal of the call (the post may
+            # have closed an earlier one of the chain): R3-P2.
+            signal = _signal_row(conn, live_signal_for(conn, signal["signal_id"]))
         return SignalRelay(_signal_match(conn, signal, via="forward"))
 
     withdrawn_elsewhere: sqlite3.Row | None = None

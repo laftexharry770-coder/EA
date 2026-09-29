@@ -607,6 +607,28 @@ def test_an_executed_call_its_post_left_and_shows_again_is_never_to_be_traded_by
 # -- R3-P2: the chain and the one helper ---------------------------------------------
 
 
+def test_a_late_forward_of_a_call_withdrawn_twice_names_its_newest_signal(conn):  # noqa: F811
+    """The VIP deleted its call, posted it again (signal 2 replaces signal
+    1) and deleted that too. A forward of the first post arriving hours
+    later is held back loudly -- against the newest signal of the call,
+    and naming the post that withdrew that one."""
+    _ingest(conn, VIP, CALL)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=2))
+    assert _q(conn, "SELECT promoted_from_signal_id FROM signals WHERE signal_id = 2") == [(1,)]
+    _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=3))
+    forward = _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(hours=3), fwd=(V, CALL))
+
+    assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", again.signal_id)
+    assert _queued_entries(conn) == []
+    assert ("CRITICAL", relay_repo.COPY_OF_WITHDRAWN_SIGNAL, R, COPY, again.signal_id) in (
+        _alerts(conn)
+    )
+    assert f"withdrawn by message {REPOST} on channel {V}" in _detail(
+        conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL
+    )
+
+
 def test_live_signal_for_follows_the_call_to_its_newest_signal(conn):  # noqa: F811
     for index, message_id in enumerate((CALL, 4012, 4013)):
         _ingest(conn, VIP, message_id, posted=POSTED + timedelta(minutes=index))
