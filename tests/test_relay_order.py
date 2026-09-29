@@ -665,16 +665,20 @@ def test_a_channel_still_showing_a_replaced_call_keeps_it_standing(conn, order):
     assert _live(conn) == []
 
 
+@pytest.mark.parametrize("another", [False, True], ids=["alone", "with-another-repost"])
+@pytest.mark.parametrize("how", ["deleted", "re-aimed"])
 def test_a_holder_withdrawn_while_an_older_post_of_its_call_stands_leaves_the_call_standing(
-    conn,  # noqa: F811
+    conn, how, another  # noqa: F811
 ):
     """A standing post that already carries a signal of the call (its own
     signals row) cannot be promoted -- one post, one signal. Reached here
     through a window deletion read back: the VIP's first post (signal 1)
     stood again after the call had moved to signal 3 on the VIP's own
-    repost. The VIP deleting that repost leaves its channel still showing
-    the call in the first post: the call stands (a repeat removal),
-    rather than being voided with nothing in its place."""
+    repost. The VIP deleting (or re-aiming) that repost leaves its channel
+    still showing the call in the first post: the call stands (a repeat
+    removal), rather than being voided with nothing in its place -- or,
+    with another repost of the VIP's standing too, that one is promoted,
+    never the first post."""
     _ingest(conn, VIP, CALL)
     _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30))
     _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
@@ -684,15 +688,29 @@ def test_a_holder_withdrawn_while_an_older_post_of_its_call_stands_leaves_the_ca
     _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=5))  # the VIP's last post: voided
     third = _ingest(conn, VIP, REPOST_2, posted=POSTED + timedelta(minutes=6))
     assert (third.outcome, _live(conn)) == ("new", [3])
+    if another:
+        _ingest(conn, VIP, 4014, posted=POSTED + timedelta(minutes=6, seconds=30))
     _edit(conn, VIP, CALL, SIGNAL_TEXT, POSTED + timedelta(minutes=7))  # read back
     conn.commit()
 
-    gone = _delete(conn, VIP, REPOST_2, POSTED + timedelta(minutes=8))
-    assert (gone.outcome, gone.promoted_signal_id) == ("deleted", None)
-    assert _live(conn) == [3]
-    assert _queued_entries(conn) == [(3, "acct-1"), (3, "acct-2")]
+    if how == "deleted":
+        result = _delete(conn, VIP, REPOST_2, POSTED + timedelta(minutes=8))
+    else:
+        result = _edit(conn, VIP, REPOST_2, DIRECTION_EDIT, POSTED + timedelta(minutes=8))
+        conn.commit()
     assert _q(conn, "SELECT COUNT(*) FROM signals WHERE message_id = ?", CALL) == [(1,)]
-    assert ("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, REPOST_2, 3) in _alerts(conn)
+    if another:
+        assert result.promoted_signal_id == 4
+        assert _q(conn, "SELECT message_id FROM signals WHERE signal_id = 4") == [(4014,)]
+        assert _live(conn) == [4]
+        assert _queued_entries(conn) == [(4, "acct-1"), (4, "acct-2")]
+    else:
+        assert (result.outcome, result.promoted_signal_id) == (
+            "deleted" if how == "deleted" else "recorded", None
+        )
+        assert _live(conn) == [3]
+        assert _queued_entries(conn) == [(3, "acct-1"), (3, "acct-2")]
+        assert ("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, REPOST_2, 3) in _alerts(conn)
 
 
 def test_a_late_copy_of_a_call_posted_three_times_repeats_its_newest_signal(
