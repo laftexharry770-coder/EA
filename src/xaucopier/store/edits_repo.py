@@ -103,11 +103,27 @@ The post that closed one of the chain's signals stays with that signal.
   replaces) and its ENTRY rows in the same writer job, unlinked, and
   announced with a WARNING `SIGNAL_REPOST_PROMOTED` naming both messages;
   every other copy of the call then repeats it, and every follow-up that
-  targeted the withdrawn signal targets it (`relay_repo.record_replacement`).
+  targeted the withdrawn signal targets it (`relay_repo.record_replacement`;
+  not one replying to the post that withdrew it, ruling R4-4).
   Never promoted: a repost of an executed
   signal (trading it would open the trade twice), and a post on any other
   channel. (A repost posted *after* the withdrawal is not a copy at all:
   see `relay_repo`.)
+- **An older post of a call withdrawn and posted again** (ruling R4-1,
+  `relay_repo.old_post`) -- a post stored with a signal that another post
+  withdrew entirely, before the call was posted again. Its edits reach
+  the newest signal like any post's; its *removal* (deleted, edited away,
+  re-aimed, broken) depends on what it is. A forward of a post of the
+  call that no longer stands is an echo of that post's removal: only
+  recorded, with an INFO line naming both -- whichever post was stored
+  first, and also when nothing was posted again. The post a withdrawing
+  forward copied is the original poster retracting: handled as above. Any
+  other (a hand copy) may be a retraction or only the other channel
+  removing its old copy: it still reaches the newest signal -- the safe
+  side -- but loudly: VOIDED with CRITICAL `OLD_POST_WITHDREW_CALL`, or the
+  usual CRITICAL flag or invalidation, each naming the post that withdrew
+  the earlier signal and the post that carries the call now, and saying
+  to trade the call by hand if only an old copy went.
 
 **A post's edit never puts back a level another post moved** (ruling
 R3-P4). A post of a relayed call is often a hand copy that mirrors some
@@ -157,7 +173,10 @@ inference. So a mark it made (`deleted_detected_by = 'window'`) is never
 final: its row stays in the window, and any later version of the message
 -- the window reading it back, or an edit event -- clears the mark, raises
 a CRITICAL `DELETION_REVERSED`, and is then handled like any version,
-so an SL edit of an executed signal still gets its AMEND. What the
+so an SL edit of an executed signal still gets its AMEND. A post whose
+inferred deletion withdrew a signal, read back still showing that call
+while a newer signal carries it, stands again: a post of the call like
+any other read back (ruling R4-5, `_stands_again`). What the
 deletion did (a void, skipped entries, the withdrawal) is not undone
 automatically; the alert says what to review. A `MessageDeleted` event
 names its ids explicitly and is final.

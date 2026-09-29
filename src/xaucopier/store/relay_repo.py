@@ -1,5 +1,5 @@
 """Relay copies: the same call, or the same follow-up, reaching us twice
-(spec G7; final review F02, F04, F08, F09; relay review round 3).
+(spec G7; final review F02, F04, F08, F09; relay review rounds 3-4).
 
 The user's channels copy each other: a free channel forwards the VIP's
 posts, the user's own channel re-posts them, a poster deletes a call and
@@ -18,7 +18,7 @@ delivery. So the rules speak of *the call* and *its posts*, never of
 **The call and its posts.** A call is one signal, or a chain of them:
 when a signal is withdrawn before anything was executed and the same
 call is posted again (a repost promoted in its place, or posted again by
-the channel that withdrew it), the new signal records the one it
+a channel that withdrew it), the new signal records the one it
 replaces (`signals.promoted_from_signal_id`). The *newest* signal of the
 chain carries the call: `live_signal_for` -- the one helper every
 consumer resolves through, Plan 3 included. The call's *posts* are the
@@ -31,7 +31,34 @@ post still reads as a signal) -- and is not the post that closed one of
 the chain's signals.
 `signal_for_post` says which signal a stored post acts on: the newest
 of its call -- or, for the post that closed one of the chain's signals,
-that signal (its later edits are about the call it broke).
+that signal (its later edits are about the call it broke). A post the
+window inferred deleted that reads back still showing a call a newer
+signal carries is that signal's closer no more: it stands again (ruling
+R4-5, `edits_repo`).
+
+**An older post of a call** (ruling R4-1, `old_post`). When a call was
+withdrawn and posted again, the other channel's posts of the withdrawn
+signal are still posts of the call, and their edits reach its newest
+signal. Their *removal* -- deleted, edited away, re-aimed or broken --
+is told apart:
+
+- a forward of a post of the call that no longer stands (deleted,
+  edited away, or the post that withdrew one of its signals) is an
+  *echo*: its removal only repeats that post's, which was handled when it
+  happened, and is recorded (INFO) without reaching any signal -- also
+  when nothing was posted again, so that which post was stored first
+  never matters;
+- the post a withdrawing forward copied is the *original*: its removal is
+  the original poster retracting, and reaches the newest signal as any
+  removal does;
+- any other post stored with an earlier signal that another post
+  withdrew (a hand copy, nothing linking the two) is ambiguous: a
+  retraction, or only the other channel removing its old copy. Its
+  removal still reaches the newest signal -- doing nothing is the safe
+  side -- with a CRITICAL alert saying so (`edits_repo`).
+
+A promotion re-links every copy of the call, on any channel, to the
+promoted signal: the call never stopped, so none of them is an older post.
 
 **What is a copy of a signal** (`find_signal_relay`), in this order:
 
@@ -49,21 +76,22 @@ that signal (its later edits are about the call it broke).
    side, taken to the newest signal of its call. This is how a call
    re-posted by hand is recognised.
 
-**A withdrawn call** (F04, ruling R3-P3). A call whose newest signal is
-VOIDED, INVALID or withdrawn and of which nothing was executed
-(`signals_repo.trade_status` is "pending") is no longer a call anyone
-acts on:
+**A withdrawn call** (F04, rulings R3-P3, R4-2, R4-3, R4-6). A call whose
+newest signal is VOIDED, INVALID or withdrawn and of which nothing was
+executed (`signals_repo.trade_status` is "pending") is no longer a call
+anyone acts on:
 
-- a same-trade post *on the channel whose last post withdrew it*
-  (`signals.closed_by_channel_id`; the signal's own channel for a row
-  closed before migration 4) is not a copy of it: that channel withdrew
-  the call and posted it again, and the new post is a new signal
-  *replacing* the withdrawn one (`SignalRelay.replaces`;
-  `record_replacement`);
+- a same-trade post, or a forward of the same post, *on a channel that
+  withdrew the call* -- every channel whose last post of it was
+  withdrawn, not only the one that withdrew it first (`withdrew_call`;
+  for a row closed before migration 4, the signal's own channel) -- is
+  not a copy of it: that channel withdrew the call and posted it again,
+  and the new post is a new signal *replacing* the withdrawn one
+  (`SignalRelay.replaces`; `record_replacement`);
 - a copy of it from any other channel, or a forward of it, is held back
   -- one source withdrew the call -- with a CRITICAL alert naming both
   messages and the post that withdrew it (`COPY_OF_WITHDRAWN_SIGNAL`),
-  because the call may be meant after all. When the withdrawing channel
+  because the call may be meant after all. When a withdrawing channel
   later posts the call again, those held-back copies repeat the new
   signal, their CRITICAL alerts are acknowledged and a WARNING says so
   (`COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED`): no "trade it by hand" is left
@@ -72,7 +100,10 @@ acts on:
   forward: a forward of a withdrawn post repeats the live signal of its
   call, or the live signal the poster posted again in its place (the
   same trade, posted within the window of the withdrawn post or of the
-  forward), if there is one.
+  forward), if there is one -- but only when the forward's own text
+  shows that call: a forward of a post re-aimed away (a SELL where the
+  live call is a BUY) is held back against the signal its post belongs
+  to, loudly, never linked silently to the live call.
 
 A signal that *was* executed and then withdrawn still matches: trading
 its repost would open the same trade twice.
@@ -98,12 +129,34 @@ replies to a stored post, the held follow-up is given that target
 first must not decide whether the instruction knows its signal. A target
 the held follow-up already has is never replaced by a copy's; when the
 call is replaced, every follow-up targeting its earlier signals is moved
-to the new one (`record_replacement`).
+to the new one (`record_replacement`) -- except one replying to the post
+that closed one of them, which stays with the signal that post closed
+(ruling R4-4). A reply to such a post of a call never traded, when the
+post no longer shows the call, gets no target at all
+(`edits_repo.post_left_withdrawn_call`).
 
 **Every copy is visible.** `record_signal_copy` / `record_followup_copy`
 store the link on the copy's `messages` row, log it at INFO with both
 messages, and bump the durable counters `relay_duplicates` /
 `relay_duplicate_followups`.
+
+**Known limitations** (accepted, ruling G3 round 4; each needs two
+watched channels carrying the same calls):
+
+- A copy held back and then re-linked to a call posted again is re-linked
+  again, with a second `COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED` warning, if
+  the call is withdrawn and posted again a second time.
+- When two different withdrawn calls with the same trade hash are in the
+  window -- one withdrawn by this channel, one by another -- a new post
+  is held back against the other channel's rather than treated as this
+  channel's call posted again.
+- A forward held back because it shows another call than the live one
+  (a forward of a re-aimed post) is re-linked like any held-back copy if
+  that call is withdrawn and posted again.
+- A forward of a post re-aimed away while the call stood on that
+  channel's other post (so nothing was closed) is linked to the live
+  call without an alert; it is never traded, and its edits and removal
+  change nothing, as it does not show the call.
 """
 from __future__ import annotations
 
