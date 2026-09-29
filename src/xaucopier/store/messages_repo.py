@@ -37,17 +37,23 @@ as a correction), and for anything else (followup, skip, parse_failed) it
 is a hash of the normalised text, for the same reason.
 
 Cross-channel relay dedup (spec G7): before a *signal* is inserted,
-`relay_repo.find_signal_relay` asks whether it repeats a call we already
+`relay_repo.relay_of_signal` asks whether it repeats a call we already
 have -- a forward of a stored post (or of another stored copy of it),
 however late (final review F09), or the same trade hash within
-`relay_window_seconds` of this message's posted_at_utc, a withdrawn call
-on the same channel excepted (F04). A match makes this one a
-"relay_duplicate": the messages row is still inserted (every message is
-a fixture; Plan 3's replay needs it), with `relay_of_signal_id` naming
-the signal it repeats (F02: an edit or deletion of the copy reaches that
-signal), logged and counted -- but no signals row is. A *follow-up*
-records the signal it replies to (`followups.target_signal_id`, path
-`'reply'`, or `'relay-reply'` through a copy) and is itself a
+`relay_window_seconds` of this message's posted_at_utc, a call withdrawn
+by this channel's last post excepted (F04, ruling R3-P3). A match makes
+this one a "relay_duplicate": the messages row is still inserted (every
+message is a fixture; Plan 3's replay needs it), with
+`relay_of_signal_id` naming the signal it repeats (F02: an edit or
+deletion of the copy reaches that signal's call), logged and counted --
+but no signals row is. The excepted case -- the channel that withdrew a
+call posting it again -- is a new signal that records the one it
+replaces (`promoted_from_signal_id`), in the same transaction as
+`relay_repo.record_replacement`: the call's follow-ups and the copies
+held back against it move to the new signal. A *follow-up* records the
+signal it replies to (`followups.target_signal_id`: the newest signal of
+the replied-to post's call, path `'reply'` for that signal's own message
+or `'relay-reply'` for another post of the call) and is itself a
 "relay_duplicate" -- stored, linked by `relay_of_followup_id`, logged and
 counted, but no followups row and no outbox row -- when it repeats a
 stored follow-up (F08); a target it resolves is given to the follow-up
@@ -460,7 +466,7 @@ def _ingest_new(
     signals_repo.reset_parse_failures(conn, channel_id=channel_id)
     signal = route_result.signal
 
-    relay = relay_repo.find_signal_relay(
+    relay = relay_repo.relay_of_signal(
         conn,
         channel_id=channel_id,
         message_id=message_id,
@@ -470,9 +476,9 @@ def _ingest_new(
         fwd_from_channel_id=provenance["fwd_from_channel_id"],
         fwd_from_post_id=provenance["fwd_from_post_id"],
     )
-    if relay is not None:
+    if relay.match is not None:
         relay_repo.record_signal_copy(
-            conn, channel_id=channel_id, message_id=message_id, match=relay, now_utc=now_utc
+            conn, channel_id=channel_id, message_id=message_id, match=relay.match, now_utc=now_utc
         )
         return IngestResult(
             outcome="relay_duplicate",
@@ -480,11 +486,15 @@ def _ingest_new(
             followup_id=None,
             kind=kind,
             detail=route_result.detail,
-            relay_of_signal_id=relay.signal_id,
+            relay_of_signal_id=relay.match.signal_id,
         )
 
     signal_id = signals_repo.insert_signal(
-        conn, channel_id=channel_id, message_id=message_id, signal=signal
+        conn,
+        channel_id=channel_id,
+        message_id=message_id,
+        signal=signal,
+        promoted_from_signal_id=relay.replaces,
     )
     # Same transaction as the signal insert above -- see the module
     # docstring and tests/test_outbox.py's atomicity tests.
@@ -496,6 +506,12 @@ def _ingest_new(
         accounts=accounts,
         now_utc=now_utc,
     )
+    if relay.replaces is not None:
+        # The channel that withdrew the call posted it again: this signal
+        # carries the call now (relay_repo.record_replacement).
+        relay_repo.record_replacement(
+            conn, new_signal_id=signal_id, replaced_signal_id=relay.replaces, now_utc=now_utc
+        )
     return IngestResult(
         outcome="new", signal_id=signal_id, followup_id=None, kind=kind, detail=route_result.detail
     )

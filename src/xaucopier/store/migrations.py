@@ -165,13 +165,15 @@ two backfills every existing row keeps every value it had.
   repeated. See ``store/relay_repo.py``.
 - ``signals.closed_by_channel_id`` / ``closed_by_message_id``: the post
   whose deletion or edit first withdrew or invalidated the signal -- its
-  own message, or a relay copy of it on another channel. A withdrawn
-  call posted again *on that channel* is a new signal, whichever post
-  was stored first (F04). ``signals.promoted_from_signal_id``: for a
-  standing repost promoted to a signal when the call it repeated was
-  withdrawn, the signal it replaces (F04). All three are NULL on rows
-  stored before migration 4 (then only a signal's own message could
-  close it, and nothing was promoted).
+  own message, or another post of its call. A withdrawn call posted
+  again *on that post's channel* is a new signal, whichever post was
+  stored first (F04, ruling R3-P3). ``signals.promoted_from_signal_id``:
+  for a signal that replaces a withdrawn one -- a standing repost
+  promoted, or the call posted again by the channel that withdrew it --
+  the signal it replaces; ``relay_repo.live_signal_for`` follows these
+  links to the signal carrying a call now (R3-P2). All three are NULL on
+  rows stored before migration 4 (then only a signal's own message could
+  close it, and nothing replaced a signal).
 - ``messages.sender_kind`` (``'user'`` / ``'channel'`` / ``'chat'``),
   ``sender_id`` and ``is_post`` (0/1): who posted a message, so a group
   member's chatter can be told from the channel's own posts (F05).

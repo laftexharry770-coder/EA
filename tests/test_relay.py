@@ -631,7 +631,11 @@ def test_a_standing_repost_is_promoted_when_the_original_is_edited_away(tmp_path
     assert ("WARNING", edits_repo.SIGNAL_REPOST_PROMOTED, V, REPOST, 2) in state["alerts"]
 
 
-def test_an_executed_original_is_never_replaced_by_its_repost(tmp_path):
+def test_an_executed_original_deleted_while_its_repost_stands_keeps_trading(tmp_path):
+    """Round 3 (R3-P1; round 1 withdrew and flagged it): the original was
+    executed, then deleted while the poster's repost of it stands. The
+    post was replaced, the trade continues -- a WARNING, nothing
+    withdrawn, and the repost stays a copy (never a second trade)."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -643,9 +647,10 @@ def test_an_executed_original_is_never_replaced_by_its_repost(tmp_path):
     _run(db_path, body)
 
     state = _state(db_path)
-    assert state["signals"] == [(1, V, CALL, "NEW", 1)]
-    assert state["queued"] == []
+    assert state["signals"] == [(1, V, CALL, "NEW", 0)]
+    assert state["queued"] == [(1, N - 1)]  # acct-2's entry is still to be taken
     assert state["links"] == [(V, REPOST, 1)]
+    assert state["alerts"] == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, CALL, 1)]
 
 
 def test_the_earliest_standing_repost_is_promoted_and_the_rest_follow_it(tmp_path):
@@ -1561,7 +1566,9 @@ def test_a_promoted_repost_takes_over_the_follow_ups_that_replied_to_it(conn):
     )
     assert [row[5:] for row in _followups(conn)] == [
         (result.promoted_signal_id, "reply"),
-        (holder.signal_id, "reply"),  # it replied to the deleted post
+        # It replied to the deleted post: still an instruction about the
+        # call, which the promoted signal carries now (R3-P2).
+        (result.promoted_signal_id, "relay-reply"),
     ]
 
 
@@ -1619,6 +1626,8 @@ def test_a_follow_up_copy_changed_is_a_warning_naming_both(conn, change):
     ]
     (detail,) = _q(conn, "SELECT detail FROM alerts")[0]
     assert f"follow-up {first.followup_id}" in detail and "message 4002" in detail
+    assert f"message 5002 on channel {RELAY.channel_id}" in detail
+    assert "stands as first recorded" in detail  # round 3: the accepted deviation's wording
     assert _followups(conn)[0][3] == "close_half"  # unchanged
     queued = _q(conn, "SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP' AND state = 'QUEUED'")
     assert queued == [(len(ACCOUNTS),)]
@@ -1675,9 +1684,10 @@ def test_a_follow_ups_target_and_its_path_go_together(conn):
             )
 
 
-def test_a_repeat_deleted_after_its_withdrawn_signal_says_nothing_more(tmp_path):
+def test_an_executed_call_deleted_post_by_post_is_flagged_when_the_last_goes(tmp_path):
     """The poster deleted both posts of an executed call: the first
-    deletion flags it; the second has nothing to add."""
+    deletion only warns -- the repost still shows the call (R3-P1) -- and
+    the second, the channel's last post of it, flags it."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -1689,17 +1699,20 @@ def test_a_repeat_deleted_after_its_withdrawn_signal_says_nothing_more(tmp_path)
 
     _run(db_path, body)
 
-    assert _codes(_state(db_path)) == [("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED)]
+    assert _codes(_state(db_path)) == [
+        ("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED),
+        ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED),
+    ]
 
 
 # -- F04 when the relay's copy holds the call ---------------------------------------
 #
 # The relay's copy was stored first (delivered first, or the VIP's update
 # was dropped), so it holds signal 1 and the VIP's own post is its copy.
-# The VIP deleting or breaking its post and posting the call again must be
-# traded exactly as when the VIP's post holds the signal: what counts is
-# the channel whose post withdrew the call, not which post was stored
-# first.
+# What counts is the channel whose post withdrew the call, and whether it
+# still shows the call in another post -- never which post was stored
+# first (rulings R3-P1 and R3-P3; tests/test_relay_order.py runs the
+# review's scenarios in both orders).
 
 
 async def _relay_holds_with_chatter(client, listener, time, db_path, *, how: str) -> None:
@@ -1726,9 +1739,14 @@ async def _relay_holds_with_chatter(client, listener, time, db_path, *, how: str
 
 @pytest.mark.parametrize("found_by", ["event", "window"])
 @pytest.mark.parametrize("how", ["relay-first", "blackout"])
-def test_repost_then_delete_promotes_the_repost_when_the_relays_copy_holds_the_call(
+def test_repost_then_delete_leaves_the_call_standing_when_the_relays_copy_holds_it(
     tmp_path, how, found_by
 ):
+    """Round 3 (R3-P1; round 2 promoted the VIP's repost through its copy):
+    the VIP posts the call again, then deletes its first post. Its channel
+    still shows the call, so nothing is withdrawn: the call is traded once,
+    as signal 1 -- as when the VIP's post holds it, where the repost is
+    promoted instead (test_repost_then_delete_promotes_the_standing_repost)."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -1747,18 +1765,12 @@ def test_repost_then_delete_promotes_the_repost_when_the_relays_copy_holds_the_c
     _run(db_path, body)
 
     state = _state(db_path)
-    assert state["signals"] == [(1, R, COPY, "VOIDED", 1), (2, V, REPOST, "NEW", 0)]
-    assert state["queued"] == [(2, N)]
-    assert state["links"] == [(V, CALL, 1)]  # the deleted post still names what it voided
-    assert ("WARNING", edits_repo.SIGNAL_REPOST_PROMOTED, V, REPOST, 2) in state["alerts"]
-    assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL not in [code for _, code in _codes(state)]
-    assert _claim(db_path) == ("ENTRY", 2)
-    assert _db_rows(
-        db_path, "SELECT signal_id, promoted_from_signal_id FROM signals ORDER BY 1"
-    ) == [(1, None), (2, 1)]
-    assert _db_rows(
-        db_path, "SELECT closed_by_channel_id, closed_by_message_id FROM signals ORDER BY signal_id"
-    ) == [(V, CALL), (None, None)]
+    assert state["signals"] == [(1, R, COPY, "NEW", 0)]
+    assert state["queued"] == [(1, N)]
+    assert state["links"] == [(V, CALL, 1), (V, REPOST, 1)]
+    assert state["alerts"] == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, CALL, 1)]
+    assert f"message {REPOST}" in _alert_detail(db_path, edits_repo.SIGNAL_REPEAT_REMOVED)
+    assert _claim(db_path) == ("ENTRY", 1)
 
 
 _WITHDRAWING_EDITS = {
@@ -1797,12 +1809,12 @@ def test_a_call_withdrawn_through_the_vips_copy_and_posted_again_is_a_new_signal
 
 
 @pytest.mark.parametrize("change", list(_WITHDRAWING_EDITS))
-def test_repost_then_edit_away_promotes_the_repost_when_the_relays_copy_holds_the_call(
-    tmp_path, change
-):
-    """Promotion through the VIP's copy picks the repost, never the edited
-    post itself (a re-aimed post still reads as a signal), and leaves the
-    edited post naming the signal it closed."""
+def test_repost_then_edit_away_when_the_relays_copy_holds_the_call(tmp_path, change):
+    """Round 3 (R3-P1; round 2 promoted the VIP's repost through its copy):
+    nothing is ever promoted through a copy. The VIP's first post edited
+    into chatter is a repeat removal (its repost still shows the call,
+    which stands); re-aimed or broken, it invalidates the call, loudly,
+    as a re-aim of any post does."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -1813,17 +1825,22 @@ def test_repost_then_edit_away_promotes_the_repost_when_the_relays_copy_holds_th
     _run(db_path, body)
 
     state = _state(db_path)
-    closed, withdrawn = _WITHDRAWING_EDITS[change][1:]
-    assert state["signals"] == [(1, R, COPY, closed, withdrawn), (2, V, REPOST, "NEW", 0)]
-    assert state["queued"] == [(2, N)]
-    assert state["links"] == [(V, CALL, 1)]
-    assert ("WARNING", edits_repo.SIGNAL_REPOST_PROMOTED, V, REPOST, 2) in state["alerts"]
+    assert state["links"] == [(V, CALL, 1), (V, REPOST, 1)]
+    if change == "chatter":
+        assert state["signals"] == [(1, R, COPY, "NEW", 0)]
+        assert state["queued"] == [(1, N)]
+        assert state["alerts"] == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, V, CALL, 1)]
+    else:
+        assert state["signals"] == [(1, R, COPY, "INVALID", 0)]
+        assert state["queued"] == []
+        assert [level for level, *_ in state["alerts"]] == ["CRITICAL"]
 
 
-def test_the_relays_own_repost_of_a_call_the_vip_withdrew_is_new_too(tmp_path):
-    """The relay's copy holds signal 1 and the VIP deleted its post. The
-    relay posting the call again on its own channel is a new signal, as
-    for any channel reposting its own call."""
+def test_the_relays_own_repost_of_a_call_the_vip_withdrew_is_held_back_too(tmp_path):
+    """Round 3 (R3-P3; round 2 traded it): the relay's copy holds signal 1
+    and the VIP deleted its post. The VIP's channel withdrew the call, so
+    the relay posting it again is held back loudly -- exactly as when the
+    VIP's post holds the signal."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -1834,8 +1851,9 @@ def test_the_relays_own_repost_of_a_call_the_vip_withdrew_is_new_too(tmp_path):
     _run(db_path, body)
 
     state = _state(db_path)
-    assert state["signals"] == [(1, R, COPY, "VOIDED", 1), (2, R, COPY + 1, "NEW", 0)]
-    assert state["queued"] == [(2, N)]
+    assert state["signals"] == [(1, R, COPY, "VOIDED", 1)]
+    assert state["queued"] == []
+    assert ("CRITICAL", relay_repo.COPY_OF_WITHDRAWN_SIGNAL, R, COPY + 1, 1) in state["alerts"]
 
 
 def test_a_third_channels_copy_of_a_call_the_vip_withdrew_is_held_back_loudly(tmp_path):
@@ -1891,7 +1909,12 @@ def test_the_first_post_to_close_a_signal_is_the_one_recorded(conn):
     ]
 
 
-def test_a_deletion_through_a_copy_reports_the_repost_it_promoted(conn):
+def test_a_deletion_through_a_copy_while_its_channel_still_shows_the_call_promotes_nothing(
+    conn,
+):
+    """Round 3 (R3-P1; round 2 voided and promoted): the VIP's post is a copy
+    of the relay's and the VIP posted the call again; deleting its first
+    post is a repeat removal, reported against the signal it reaches."""
     holder = _ingest(conn, RELAY, 7001, posted=POSTED + timedelta(seconds=2))
     _ingest(conn, VIP, 4001)  # the VIP's own post: a copy of the relay's
     _ingest(conn, VIP, 4012, posted=POSTED + timedelta(minutes=2))
@@ -1899,9 +1922,12 @@ def test_a_deletion_through_a_copy_reports_the_repost_it_promoted(conn):
         conn, channel_cfg=VIP, message_id=4001, now_utc=POSTED, accounts=ACCOUNTS,
         detected_by="event",
     )
-    assert (result.outcome, result.signal_id) == ("voided", holder.signal_id)
-    assert result.promoted_signal_id == holder.signal_id + 1
-    assert _signals(conn)[1] == (holder.signal_id + 1, VIP.channel_id, 4012, "NEW")
+    assert (result.outcome, result.signal_id) == ("deleted", holder.signal_id)
+    assert result.promoted_signal_id is None
+    assert _signals(conn) == [(holder.signal_id, RELAY.channel_id, 7001, "NEW")]
+    assert _alerts(conn) == [
+        ("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, VIP.channel_id, 4001, holder.signal_id)
+    ]
 
 
 # -- F08: the same instruction twice on one channel ---------------------------------

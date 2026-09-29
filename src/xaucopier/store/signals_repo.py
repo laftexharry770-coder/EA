@@ -112,8 +112,11 @@ def insert_signal(
 ) -> int:
     """A new NEW signal for an already-stored message; parsed_json's
     `source` is that message's `messages.source` (F39).
-    `promoted_from_signal_id` is set for a standing repost promoted to a
-    signal: the withdrawn signal it replaces (final review F04)."""
+    `promoted_from_signal_id` is set for a signal that replaces a
+    withdrawn one -- a standing repost promoted, or the call posted again
+    by the channel that withdrew it (final review F04, ruling R3-P2):
+    `relay_repo.live_signal_for` follows these links to the signal that
+    carries a call now."""
     source = _message_source(conn, channel_id=channel_id, message_id=message_id)
     cursor = conn.execute(
         "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, "
@@ -192,7 +195,7 @@ def record_closed_by(
     signal -- its own message, or a relay copy of it. Kept once set: the
     first post to close a signal is the one that did. A withdrawn call
     posted again on that post's channel is a new signal (final review
-    F04; see `relay_repo.find_signal_relay`)."""
+    F04, ruling R3-P3; see `relay_repo.relay_of_signal`)."""
     conn.execute(
         "UPDATE signals SET closed_by_channel_id = ?, closed_by_message_id = ? "
         "WHERE signal_id = ? AND closed_by_channel_id IS NULL",
@@ -220,7 +223,9 @@ def insert_followup(
     """A message's own follow-up (`edit_seq` 0). `target_signal_id` /
     `resolution_path` are the signal it replies to, when ingest could
     resolve it (`relay_repo.resolve_reply_target`: `'reply'` or
-    `'relay-reply'`); NULL when it replies to nothing stored."""
+    `'relay-reply'`); NULL when it replies to nothing stored. The target
+    moves to the new signal when the call is replaced
+    (`relay_repo.record_replacement`)."""
     if (target_signal_id is None) != (resolution_path is None):
         raise ValueError("target_signal_id and resolution_path go together")
     cursor = conn.execute(
