@@ -155,7 +155,22 @@ def source_kind(entity: object) -> SourceKind:
 
 class AlreadyRunningError(Exception):
     """Raised when another process already holds the xaucopier listener
-    lock (`Global\\xaucopier_listener`)."""
+    lock (`Global\\xaucopier_listener`). `hint`, when there is one, is a
+    plain sentence for the user about where that process probably is; the
+    message itself is for the log (group-2 review leftover G2L-1)."""
+
+    def __init__(self, message: str, *, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.hint = hint
+
+
+#: What the user is told when this window may not even see the lock: the
+#: holder was started as administrator (final review F36).
+ADMINISTRATOR_WINDOW_HINT = (
+    "It is probably running in a window opened as administrator, which this "
+    "window is not allowed to see. Find that window and stop it there (press "
+    "Ctrl+C, then answer Y)."
+)
 
 
 class SingleInstanceLock:
@@ -202,7 +217,8 @@ def acquire_single_instance_lock() -> SingleInstanceLock:
         raise AlreadyRunningError(
             "xaucopier is already running on this computer, probably in a window "
             "opened as administrator (this window is not allowed to see it). Find "
-            "that window and stop it there (Ctrl+C, then Y) before starting again."
+            "that window and stop it there (Ctrl+C, then Y) before starting again.",
+            hint=ADMINISTRATOR_WINDOW_HINT,
         ) from exc
     already_exists = win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS
     if already_exists:

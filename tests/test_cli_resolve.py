@@ -445,3 +445,161 @@ def test_a_permanent_telegram_error_mid_lookup_exits_with_its_code(
     assert rig.channels_path.read_bytes() == before
     assert words in capsys.readouterr().err
     assert "disconnect" in rig.client.calls
+
+
+# -- F37 / F24 / F23 / G2L-1: connecting, waiting, and the session held ----------------------
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "words"),
+    [
+        (errors.ConnectionApiIdInvalidError(request=None), 5, "my.telegram.org"),
+        (errors.AuthKeyUnregisteredError(request=None), 3, "setup-login"),
+    ],
+    ids=["api_id rejected at connect", "session unknown at connect"],
+)
+def test_a_permanent_error_from_the_connect_itself_exits_with_its_code(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    error: Exception, code: int, words: str,
+) -> None:
+    """Final review F37: connect() was outside the try, so a bad api_id --
+    which Telegram reports at the connect -- was a raw traceback, exit 1."""
+    async def refused(*args: Any, **kwargs: Any) -> None:
+        rig.client.calls.append("connect")
+        raise error
+
+    monkeypatch.setattr(rig.client, "connect", refused)
+    before = rig.channels_path.read_bytes()
+
+    assert cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes")) == code
+
+    assert rig.channels_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert words in err and "Traceback" not in err
+    assert "disconnect" in rig.client.calls and rig.lock.released == 1
+
+
+def test_with_no_network_it_gives_up_after_its_wait_and_says_so(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+
+    monkeypatch.setattr(resolve_module, "CONNECT_TIMEOUT_SECONDS", 0.1)
+
+    async def never(*args: Any, **kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(rig.client, "connect", never)
+
+    assert cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes")) == 1
+
+    err = capsys.readouterr().err
+    assert "Could not reach Telegram within 0.1 seconds" in err
+    assert "`.\\xaucopier resolve-channels` again" in err and "Nothing was changed." in err
+    assert rig.lock.released == 1
+
+
+def test_told_to_wait_by_telegram_it_says_how_long(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def wait_please(*args: Any, **kwargs: Any) -> Any:
+        raise errors.FloodWaitError(request=None, capture=61)
+
+    monkeypatch.setattr(rig.client, "get_dialogs", wait_please)
+    rig.answers.append("")
+    before = rig.channels_path.read_bytes()
+
+    assert cli_main.main(rig.argv()) == exit_codes.EXIT_FAILED
+
+    assert rig.channels_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert "Telegram asks to wait about 1 minute, then run it again" in err
+    assert "Nothing was changed." in err and "Traceback" not in err
+
+
+def test_any_other_telegram_error_is_one_plain_sentence(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def trouble(*args: Any, **kwargs: Any) -> Any:
+        raise errors.RpcCallFailError(request=None)
+
+    monkeypatch.setattr(rig.client, "is_user_authorized", trouble)
+
+    assert cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes")) == 1
+
+    err = capsys.readouterr().err
+    assert "Telegram could not do this just now (Telegram error 500)" in err
+    assert "Nothing was changed." in err and "Traceback" not in err
+
+
+def test_closed_input_is_explained_not_a_traceback(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def closed(*args: Any, **kwargs: Any) -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", closed)
+    before = rig.channels_path.read_bytes()
+
+    assert cli_main.main(rig.argv()) == exit_codes.EXIT_FAILED
+
+    assert rig.channels_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert "input was closed" in err and "was not saved" in err
+    assert rig.lock.released == 1
+
+
+def test_while_an_administrator_window_holds_the_session_it_says_so(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pywintypes
+    import winerror
+
+    import xaucopier.ingest.client as client_module
+
+    def denied(*args: object) -> object:
+        raise pywintypes.error(winerror.ERROR_ACCESS_DENIED, "CreateMutex", "Access is denied.")
+
+    monkeypatch.setattr(client_module.win32event, "CreateMutex", denied)
+    monkeypatch.setattr(resolve_module, "acquire_single_instance_lock",
+                        client_module.acquire_single_instance_lock)
+
+    assert cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity")) == 6
+
+    err = capsys.readouterr().err
+    assert "Stop it first" in err and "administrator" in err
+    assert rig.client.calls == []
+
+
+def test_a_failure_after_one_channel_was_saved_keeps_it_and_says_so(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two channels waiting for their id: the first is saved, then Telegram
+    asks to wait. "Nothing was changed" would be false; the message says the
+    first is kept."""
+    second = RESOLVED_BLOCK.replace("channel_id = -1009999999999   # do not touch", "channel_id = 0") \
+        .replace('"Already Resolved"', '"Second Placeholder"').replace("enabled    = true", "enabled    = false") \
+        .replace("ordinal    = 2", "ordinal    = 3")
+    rig.channels_path.write_bytes((SHIPPED + RESOLVED_BLOCK + second).encode("utf-8"))
+    real_get_entity = rig.client.get_entity
+    asked = {"n": 0}
+
+    async def get_entity(entity: Any) -> Any:
+        asked["n"] += 1
+        if asked["n"] == 2:
+            raise errors.FloodWaitError(request=None, capture=600)
+        return await real_get_entity(entity)
+
+    monkeypatch.setattr(rig.client, "get_entity", get_entity)
+    rig.answers.extend(["https://t.me/mmhcommunity", "yes", "https://t.me/second"])
+
+    assert cli_main.main(rig.argv()) == exit_codes.EXIT_FAILED
+
+    loaded = load_channels(rig.channels_path)
+    assert [(c.name, c.channel_id) for c in loaded if c.enabled] == [
+        ("MARKET MASTERY HUB / COMMUNITY", MMH_ID), ("Already Resolved", -1009999999999)
+    ]
+    err = capsys.readouterr().err
+    assert "Telegram asks to wait about 10 minutes" in err
+    assert "The 1 channel(s) saved above are kept; nothing else was changed." in err
+    assert "Nothing was changed." not in err

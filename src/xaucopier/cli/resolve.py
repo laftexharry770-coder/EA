@@ -71,7 +71,7 @@ import pywintypes
 import win32api
 import win32event
 import winerror
-from telethon import utils
+from telethon import errors, utils
 from telethon.tl import types
 
 from xaucopier.cli import exit_codes, paths
@@ -81,12 +81,31 @@ from xaucopier.ingest.client import (
     API_CREDENTIAL_ERRORS,
     PERMANENT_TELEGRAM_ERRORS,
     AlreadyRunningError,
+    TelegramUnreachableError,
     acquire_single_instance_lock,
     build_client,
+    connect_within,
 )
 
 #: `channel_id` of a channel whose id has not been looked up yet.
 PLACEHOLDER_ID = 0
+
+#: How long `setup-login`, `channels add` and `resolve-channels` wait for
+#: the connection to Telegram before they give up with exit 1 (final
+#: review F24; ruling F06). Telethon's own connect never gives up, so with
+#: no network these commands ran for ever, holding the session.
+CONNECT_TIMEOUT_SECONDS = 30.0
+
+#: Telegram failures that are neither permanent (`PERMANENT_TELEGRAM_ERRORS`)
+#: nor a lookup that found nothing: no connection, a wait Telegram asks
+#: for, Telegram's own trouble. `report_telegram_trouble()` says each.
+TELEGRAM_TROUBLE: tuple[type[BaseException], ...] = (
+    TelegramUnreachableError,
+    errors.RPCError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+)
 
 _HEADER = re.compile(r"^\s*\[")
 _CHANNELS_HEADER = re.compile(r"^\s*\[\[\s*channels\s*\]\]\s*(#.*)?$")
@@ -551,6 +570,8 @@ async def resolve_link(client: Any, text: str, *, again: str = "resolve-channels
         entity = await client.get_entity(link)
     except PERMANENT_TELEGRAM_ERRORS:
         raise
+    except (errors.FloodError, errors.ServerError, ConnectionError, TimeoutError):
+        raise  # a wait, Telegram's own trouble or no connection: not "not found" (F23)
     except Exception as exc:  # noqa: BLE001 -- Telethon raises ValueError or an RPCError
         raise ResolveError(f"Telegram could not find {link!r}: {exc}") from None
     return _as_channel(entity, asked=link)
@@ -608,6 +629,55 @@ def report_not_logged_in() -> int:
     return exit_codes.EXIT_TERMINAL_AUTH
 
 
+async def connect_one_shot(client: Any) -> None:
+    """Connect a one-shot command (`setup-login`, `channels add`,
+    `resolve-channels`) to Telegram, waiting at most
+    `CONNECT_TIMEOUT_SECONDS`; past that, `TelegramUnreachableError`
+    (final review F24). Only the connect is bounded -- never the time the
+    user takes to type an answer."""
+    await connect_within(client, CONNECT_TIMEOUT_SECONDS)
+
+
+def report_telegram_trouble(exc: BaseException, *, again: str, nothing: str) -> int:
+    """One plain sentence for a `TELEGRAM_TROUBLE` failure of a one-shot
+    command, and its exit code, 1 (final review F23/F24): Telegram out of
+    reach within `CONNECT_TIMEOUT_SECONDS`, a wait Telegram asks for (in
+    minutes), or any other Telegram error (named by its number). `again`
+    is the command to run again; `nothing` says what was not done."""
+    command = f"`{paths.USER_COMMAND} {again}`"
+    if isinstance(exc, TelegramUnreachableError):
+        text = f"{exc} Then run {command} again. {nothing}"
+    elif isinstance(exc, errors.FloodError):
+        seconds = getattr(exc, "seconds", None)
+        if isinstance(seconds, int | float) and not isinstance(seconds, bool):
+            minutes = max(1, round(seconds / 60))
+            wait = f"about {minutes} minute{'' if minutes == 1 else 's'}"
+        else:
+            wait = "a while (an hour is safe)"
+        text = f"Telegram asks to wait {wait}, then run it again ({command}). {nothing}"
+    elif isinstance(exc, errors.RPCError):
+        text = (
+            f"Telegram could not do this just now (Telegram error {exc.code}). Wait a "
+            f"minute, then run {command} again. {nothing}"
+        )
+    else:
+        text = (
+            f"Could not reach Telegram ({type(exc).__name__}). Check the internet "
+            f"connection, then run {command} again. {nothing}"
+        )
+    print(text, file=sys.stderr)
+    return exit_codes.EXIT_FAILED
+
+
+def report_already_running(message: str, exc: AlreadyRunningError) -> int:
+    """`message`, then the lock's own hint about where the other program
+    probably is, if it has one (G2L-1); exit code 6."""
+    print(message, file=sys.stderr)
+    if exc.hint:
+        print(exc.hint, file=sys.stderr)
+    return exit_codes.EXIT_ALREADY_RUNNING
+
+
 def report_permanent_error(exc: BaseException) -> int:
     """One plain sentence for a Telegram error no retry can fix, and its
     exit code: 5 for a rejected api_id/api_hash, 3 for a dead session or
@@ -636,20 +706,28 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
         print("--link can only be used when exactly one channel needs resolving.", file=sys.stderr)
         return exit_codes.EXIT_USAGE
 
-    await client.connect()
+    saved = 0
+
+    def nothing() -> str:
+        if not saved:
+            return "Nothing was changed."
+        return f"The {saved} channel(s) saved above are kept; nothing else was changed."
+
     try:
+        # Inside the try: a bad api_id is reported by the connect itself
+        # (final review F37); bounded, so no network is not a hang (F24).
+        await connect_one_shot(client)
         if not await client.is_user_authorized():
             return report_not_logged_in()
-        saved = 0
         for index, cfg in pending:
             print(f"\nChannel {cfg.name!r} does not have its numeric id yet.")
             try:
                 resolved = await _choose(client, repr(cfg.name), args.link)
             except ResolveError as exc:
-                print(f"Could not resolve {cfg.name!r}: {exc}. Nothing was changed.", file=sys.stderr)
+                print(f"Could not resolve {cfg.name!r}: {exc}. {nothing()}", file=sys.stderr)
                 return exit_codes.EXIT_FAILED
             if resolved is None:
-                print("Cancelled. Nothing was changed.")
+                print(f"Cancelled. {nothing()}")
                 return exit_codes.EXIT_FAILED
             clash = next(
                 (c for c in channels if c.channel_id == resolved.channel_id and c is not cfg), None
@@ -698,6 +776,8 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
             print(f"Saved: {cfg.name!r} is now channel {resolved.channel_id}, switched on.")
     except PERMANENT_TELEGRAM_ERRORS as exc:
         return report_permanent_error(exc)
+    except TELEGRAM_TROUBLE as exc:
+        return report_telegram_trouble(exc, again="resolve-channels", nothing=nothing())
     finally:
         await client.disconnect()
 
@@ -721,14 +801,14 @@ def cmd_resolve_channels(args: argparse.Namespace) -> int:
         return exit_codes.EXIT_CONFIG_ERROR
     try:
         lock = acquire_single_instance_lock()
-    except AlreadyRunningError:
-        print(
-            "xaucopier watch is running. Stop it first -- click in its window, press "
-            f"Ctrl+C and answer Y -- then run `{paths.USER_COMMAND} resolve-channels` "
-            "again: two programs must never use the Telegram session at once.",
-            file=sys.stderr,
+    except AlreadyRunningError as exc:
+        return report_already_running(
+            "xaucopier watch is running (or another xaucopier command is using the "
+            "Telegram login). Stop it first -- click in its window, press Ctrl+C and "
+            f"answer Y -- then run `{paths.USER_COMMAND} resolve-channels` again: two "
+            "programs must never use the Telegram session at once.",
+            exc,
         )
-        return exit_codes.EXIT_ALREADY_RUNNING
     try:
         client = build_client(blob)
         return asyncio.run(_resolve_all(args, client, channels))
@@ -736,5 +816,13 @@ def cmd_resolve_channels(args: argparse.Namespace) -> int:
         print()
         print("Cancelled (Ctrl+C). channels.toml was not changed by the channel in progress.")
         return exit_codes.EXIT_INTERRUPTED
+    except EOFError:
+        print(
+            "No answer could be read: the input was closed. Run "
+            f"`{paths.USER_COMMAND} resolve-channels` in an ordinary PowerShell window and "
+            "type the answers there. The channel it was asking about was not saved.",
+            file=sys.stderr,
+        )
+        return exit_codes.EXIT_FAILED
     finally:
         lock.release()

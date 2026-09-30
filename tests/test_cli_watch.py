@@ -482,3 +482,40 @@ def test_a_stream_that_cannot_be_reconfigured_is_left_as_it_is(
     with pytest.raises(SystemExit):
         cli_main.main(["--help"])
     assert "exit codes:" in "".join(plain.text)
+
+
+def test_a_second_watch_names_every_command_that_can_hold_the_session(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final review F24: `channels add` holds the session too, and a watch
+    refused while it ran named only resolve-channels."""
+    def held() -> None:
+        raise AlreadyRunningError("held elsewhere")
+
+    monkeypatch.setattr(watch_module, "acquire_single_instance_lock", held)
+
+    assert cli_main.main(rig.argv()) == 6
+    err = capsys.readouterr().err
+    assert "resolve-channels" in err and "channels add" in err
+    assert "held elsewhere" not in err  # the lock's own words are not for the user
+
+
+def test_a_watch_held_off_by_an_administrator_window_says_so(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Group-2 review leftover G2L-1: the real lock's hint reaches the user."""
+    import pywintypes
+    import winerror
+
+    import xaucopier.ingest.client as client_module
+
+    def denied(*args: object) -> object:
+        raise pywintypes.error(winerror.ERROR_ACCESS_DENIED, "CreateMutex", "Access is denied.")
+
+    monkeypatch.setattr(client_module.win32event, "CreateMutex", denied)
+    monkeypatch.setattr(watch_module, "acquire_single_instance_lock", acquire_single_instance_lock)
+
+    assert cli_main.main(rig.argv()) == 6
+    err = capsys.readouterr().err
+    assert "administrator" in err
+    assert rig.built == []

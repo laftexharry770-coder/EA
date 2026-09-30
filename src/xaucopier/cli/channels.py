@@ -54,12 +54,16 @@ from typing import Any
 from xaucopier.cli import exit_codes, paths
 from xaucopier.cli.resolve import (
     PLACEHOLDER_ID,
+    TELEGRAM_TROUBLE,
     ChangedMeanwhileError,
     ResolveError,
     _ask,
     _choose,
+    connect_one_shot,
+    report_already_running,
     report_not_logged_in,
     report_permanent_error,
+    report_telegram_trouble,
     save_added,
     save_failure_code,
     save_switch,
@@ -428,7 +432,8 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
     """Look the channel up on Telegram, then -- offline -- check it and
     append it. The Telegram connection is closed before the file is read."""
     try:
-        await client.connect()
+        # Bounded: with no network Telethon's connect never gives up (F24).
+        await connect_one_shot(client)
         if not await client.is_user_authorized():
             return report_not_logged_in()
         try:
@@ -438,12 +443,8 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
             return exit_codes.EXIT_FAILED
     except PERMANENT_TELEGRAM_ERRORS as exc:
         return report_permanent_error(exc)
-    except (ConnectionError, TimeoutError, OSError) as exc:
-        complain(
-            f"Could not reach Telegram ({type(exc).__name__}). Check the internet "
-            f"connection, then run `{_CMD} channels add` again. Nothing was added."
-        )
-        return exit_codes.EXIT_FAILED
+    except TELEGRAM_TROUBLE as exc:  # no connection, a wait, Telegram's trouble (F23)
+        return report_telegram_trouble(exc, again="channels add", nothing="Nothing was added.")
     finally:
         await client.disconnect()
     if resolved is None:
@@ -542,9 +543,8 @@ def cmd_add(args: argparse.Namespace) -> int:
         return exit_codes.EXIT_CONFIG_ERROR
     try:
         lock = acquire_single_instance_lock()
-    except AlreadyRunningError:
-        complain(ADD_WHILE_WATCH_RUNS)
-        return exit_codes.EXIT_ALREADY_RUNNING
+    except AlreadyRunningError as exc:
+        return report_already_running(ADD_WHILE_WATCH_RUNS, exc)
     try:
         client = build_client(blob)
         return asyncio.run(_add(args, client, path))

@@ -43,6 +43,7 @@ class _FakeClientSuccess:
         self.session = _FakeSession(_FAKE_SESSION_AFTER_LOGIN)
         self.start_kwargs: dict[str, Any] = {}
         self.disconnected = False
+        self.connected = False
         self.authorized = authorized
 
     async def start(self, **kwargs: Any) -> "_FakeClientSuccess":
@@ -51,6 +52,12 @@ class _FakeClientSuccess:
 
     async def is_user_authorized(self) -> bool:
         return self.authorized
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    async def connect(self) -> None:
+        self.connected = True
 
     async def disconnect(self) -> None:
         self.disconnected = True
@@ -63,9 +70,16 @@ class _FakeClientTerminalFailure:
     def __init__(self) -> None:
         self.session = _FakeSession("")
         self.disconnected = False
+        self.connected = False
 
     async def start(self, **kwargs: Any) -> None:
         raise SessionRevokedError(request=None)
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    async def connect(self) -> None:
+        self.connected = True
 
     async def disconnect(self) -> None:
         self.disconnected = True
@@ -192,9 +206,16 @@ class _FakeClientRaising:
         self.session = _FakeSession("")
         self.error = error
         self.disconnected = False
+        self.connected = False
 
     async def start(self, **kwargs: Any) -> None:
         raise self.error
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    async def connect(self) -> None:
+        self.connected = True
 
     async def disconnect(self) -> None:
         self.disconnected = True
@@ -527,3 +548,75 @@ def test_an_empty_answer_is_explained_before_anything_is_sent(
     assert cli_main.main(["setup-login", "--path", str(tmp_path / "s.dpapi")]) == 1
     err = capsys.readouterr().err
     assert words in err and "Traceback" not in err
+
+
+# -- F24: no network is exit 1, not a hang; typing is never timed ---------------------------
+
+
+def test_setup_login_with_no_network_gives_up_after_its_wait(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final review F24: Telethon's connect never gives up, so with no
+    network setup-login never ended. The connect now has 30 s (0.1 s here)."""
+    import asyncio
+
+    import xaucopier.cli.resolve as resolve_module
+
+    monkeypatch.setattr(resolve_module, "CONNECT_TIMEOUT_SECONDS", 0.1)
+
+    class NeverConnects(_FakeClientSuccess):
+        async def connect(self) -> None:
+            await asyncio.Event().wait()
+
+    fake_client = NeverConnects()
+    monkeypatch.setattr(cli_main, "build_client", lambda blob: fake_client)
+    _answers(monkeypatch, "builtins.input", [_FAKE_API_ID, _FAKE_PHONE])
+    _answers(monkeypatch, "getpass.getpass", [_FAKE_API_HASH])
+    target = tmp_path / "session.dpapi"
+
+    assert cli_main.main(["setup-login", "--path", str(target)]) == 1
+
+    err = capsys.readouterr().err
+    assert "Could not reach Telegram within 0.1 seconds" in err
+    assert "`.\\xaucopier setup-login` again" in err and "Nothing was saved" in err
+    assert fake_client.start_kwargs == {}  # never got as far as asking for a code
+    assert fake_client.disconnected and not target.exists()
+
+
+def test_the_time_taken_to_type_the_login_code_is_never_cut_short(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only the connect is bounded: a user who takes longer than the wait to
+    type the code still logs in."""
+    import asyncio
+    import time
+
+    import xaucopier.cli.resolve as resolve_module
+
+    monkeypatch.setattr(resolve_module, "CONNECT_TIMEOUT_SECONDS", 0.1)
+
+    class Typing(_FakeClientSuccess):
+        async def start(self, **kwargs: Any) -> "Typing":
+            assert self.connected, "start() before the bounded connect"
+            self.start_kwargs = kwargs
+            kwargs["code_callback"]()  # Telethon calls it without awaiting
+            await asyncio.sleep(0.01)  # then sends the code to Telegram
+            return self
+
+    fake_client = Typing()
+    monkeypatch.setattr(cli_main, "build_client", lambda blob: fake_client)
+
+    answers = iter([_FAKE_API_ID, _FAKE_PHONE, "12345"])
+
+    def slow_typist(*_args: Any, **_kwargs: Any) -> str:
+        answer = next(answers)
+        if answer == "12345":
+            time.sleep(0.3)
+        return answer
+
+    monkeypatch.setattr("builtins.input", slow_typist)
+    _answers(monkeypatch, "getpass.getpass", [_FAKE_API_HASH])
+    target = tmp_path / "session.dpapi"
+
+    assert cli_main.main(["setup-login", "--path", str(target)]) == 0
+    assert load(target).session_string == _FAKE_SESSION_AFTER_LOGIN

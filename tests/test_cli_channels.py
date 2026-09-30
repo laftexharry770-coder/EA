@@ -1100,3 +1100,107 @@ def test_the_write_lock_is_one_per_file_however_its_path_is_spelled(tmp_path: Pa
         tmp_path / "other" / "channels.toml"
     )
     assert resolve_module.config_lock_name(path).startswith("Local\\xaucopier_config_")
+
+
+# -- F24 / F23 / G2L-1: Telegram out of reach, busy, or the session held ---------------------
+
+
+def test_add_with_no_network_gives_up_after_its_wait_and_says_so(
+    add_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final review F24: Telethon's connect never gives up, so with no
+    network `channels add` ran for ever, holding the session. The connect
+    now has 30 s (0.1 s here): exit 1, one plain sentence."""
+    import asyncio
+
+    monkeypatch.setattr(resolve_module, "CONNECT_TIMEOUT_SECONDS", 0.1)
+
+    async def never(*args: Any, **kwargs: Any) -> None:
+        add_rig.client.calls.append("connect")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(add_rig.client, "connect", never)
+    before = add_rig.rig.channels_path.read_bytes()
+
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes")) == 1
+
+    assert add_rig.rig.channels_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert "Could not reach Telegram within 0.1 seconds" in err
+    assert "`.\\xaucopier channels add` again" in err and "Nothing was added." in err
+    assert "Traceback" not in err
+    assert "disconnect" in add_rig.client.calls and add_rig.lock.released == 1
+
+
+@pytest.mark.parametrize("where", ["get_dialogs", "get_entity", "is_user_authorized"])
+def test_add_told_to_wait_by_telegram_says_how_long_in_minutes(
+    add_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], where: str
+) -> None:
+    """Final review F23: a wait Telegram asks for (longer than the 120 s
+    this program waits out by itself) was a raw traceback."""
+    async def wait_please(*args: Any, **kwargs: Any) -> Any:
+        raise errors.FloodWaitError(request=None, capture=300)
+
+    monkeypatch.setattr(add_rig.client, where, wait_please)
+    add_rig.answers.append("")  # Enter: pick from the list (get_dialogs)
+    before = add_rig.rig.channels_path.read_bytes()
+    argv = add_rig.argv("--link", "https://t.me/silver") if where == "get_entity" else add_rig.argv()
+
+    assert cli_main.main(argv) == exit_codes.EXIT_FAILED
+
+    assert add_rig.rig.channels_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert "Telegram asks to wait about 5 minutes, then run it again" in err
+    assert "`.\\xaucopier channels add`" in err and "Nothing was added." in err
+    assert "Traceback" not in err and "flood" not in err.lower()
+    assert len([line for line in err.splitlines() if line.strip()]) == 1
+    assert "disconnect" in add_rig.client.calls and add_rig.lock.released == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [errors.RpcCallFailError(request=None), errors.BadRequestError(request=None, message="SOMETHING")],
+    ids=["telegram trouble (500)", "a request Telegram refuses (400)"],
+)
+def test_add_meeting_any_other_telegram_error_is_one_plain_sentence(
+    add_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    error: Exception,
+) -> None:
+    async def refused(*args: Any, **kwargs: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(add_rig.client, "get_dialogs", refused)
+    add_rig.answers.append("")
+
+    assert cli_main.main(add_rig.argv()) == exit_codes.EXIT_FAILED
+
+    err = capsys.readouterr().err
+    assert f"Telegram could not do this just now (Telegram error {error.code})" in err
+    assert "Nothing was added." in err and "Traceback" not in err
+    assert "RPC" not in err
+    assert add_rig.lock.released == 1
+
+
+def test_add_while_an_administrator_window_holds_the_session_says_so(
+    add_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Group-2 review leftover G2L-1: the real lock's hint -- probably an
+    administrator window -- reaches the user, not only the fixed text."""
+    import pywintypes
+    import winerror
+
+    import xaucopier.ingest.client as client_module
+
+    def denied(*args: object) -> object:
+        raise pywintypes.error(winerror.ERROR_ACCESS_DENIED, "CreateMutex", "Access is denied.")
+
+    monkeypatch.setattr(client_module.win32event, "CreateMutex", denied)
+    monkeypatch.setattr(channels_module, "acquire_single_instance_lock",
+                        client_module.acquire_single_instance_lock)
+
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes")) == 6
+
+    err = capsys.readouterr().err
+    assert "Stop watch first" in err
+    assert "administrator" in err
+    assert add_rig.client.calls == []

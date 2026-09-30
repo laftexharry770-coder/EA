@@ -52,10 +52,15 @@ from xaucopier.cli import exit_codes, paths
 from xaucopier.cli.ack import cmd_ack
 from xaucopier.cli.channels import cmd_channels
 from xaucopier.cli.fixtures import cmd_export_fixtures
-from xaucopier.cli.resolve import cmd_resolve_channels
+from xaucopier.cli.resolve import cmd_resolve_channels, connect_one_shot
 from xaucopier.cli.status import cmd_status
 from xaucopier.cli.watch import cmd_watch
-from xaucopier.ingest.client import API_CREDENTIAL_ERRORS, TERMINAL_AUTH_ERRORS, build_client
+from xaucopier.ingest.client import (
+    API_CREDENTIAL_ERRORS,
+    TERMINAL_AUTH_ERRORS,
+    TelegramUnreachableError,
+    build_client,
+)
 from xaucopier.ingest.secrets import DEFAULT_SECRETS_PATH, SecretsBlob, save
 
 #: How the user runs setup-login again, from PowerShell in the project folder.
@@ -181,6 +186,8 @@ def login_failure(exc: BaseException) -> tuple[int, str]:
             f"Telegram says there have been too many login attempts. Wait {wait}, "
             f"then {_AGAIN}."
         )
+    if isinstance(exc, TelegramUnreachableError):  # the bounded connect (F24)
+        return exit_codes.EXIT_FAILED, f"{exc} Then {_AGAIN}."
     if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
         return exit_codes.EXIT_FAILED, (
             f"Could not reach Telegram ({name}). Check the internet connection, then "
@@ -260,6 +267,10 @@ async def _run_setup_login(path: Path) -> int:
     session_string: str | None = None
     try:
         try:
+            # Only the connect is bounded (F24), never the time the user
+            # takes to type the code or the password inside start().
+            if not client.is_connected():
+                await connect_one_shot(client)
             await client.start(
                 phone=phone,
                 code_callback=_prompt_login_code,

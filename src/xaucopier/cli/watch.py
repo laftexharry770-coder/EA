@@ -337,14 +337,17 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     try:
         lock = acquire_single_instance_lock()
-    except AlreadyRunningError:
+    except AlreadyRunningError as exc:
         print(
             "xaucopier watch is already running on this computer (or resolve-channels "
-            "is). Do not start a second one: two programs using the same Telegram "
-            "session at once can get it logged out for good. Find its window; if it "
-            "is stuck, press Ctrl+C there and answer Y, then start watch again.",
+            "or channels add is). Do not start a second one: two programs using the "
+            "same Telegram session at once can get it logged out for good. Find its "
+            "window; if it is stuck, press Ctrl+C there and answer Y, then start watch "
+            "again.",
             file=sys.stderr,
         )
+        if exc.hint:  # where it probably is (G2L-1)
+            print(exc.hint, file=sys.stderr)
         return exit_codes.EXIT_ALREADY_RUNNING
 
     log_path = setup.db_path.parent / paths.LOG_FILE_NAME
