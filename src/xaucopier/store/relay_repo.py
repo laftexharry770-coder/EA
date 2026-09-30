@@ -126,9 +126,11 @@ anyone acts on:
   standing while the call is queued. Nor is one ever raised while it is:
   every alert that would tell the user to trade a call by hand first
   looks for another signal carrying it -- through `live_signal_for`, else
-  a live signal showing the same call -- and then names that signal and
-  says NOT to trade the call by hand as well (`carrier_of`, `by_hand`;
-  ruling R5-5);
+  a live signal showing the same call posted within the relay window of
+  the alert's post (signals stay NEW for ever: a call with the same zone
+  posted days before is another call; ruling R6-1) -- and then names that
+  signal and says NOT to trade the call by hand as well (`carrier_of`,
+  `by_hand`; ruling R5-5);
 - a live match is always preferred to a withdrawn one -- also for a
   forward: a forward of a withdrawn post repeats the live signal of its
   call, or the live signal the poster posted again in its place (the
@@ -232,6 +234,12 @@ logger = logging.getLogger(__name__)
 class _ChannelCfgLike(Protocol):
     channel_id: int
     parser: str
+
+#: The relay window's length when the caller gives none (`ingest()`'s
+#: default): same-trade posts this close together are copies of one call,
+#: and only a signal posted this close to an alert's post is named as
+#: carrying the same call (`carrier_of`).
+RELAY_WINDOW_SECONDS = 900
 
 #: Counts every signal message stored as a copy of a signal we already have.
 RELAY_DUPLICATES_METRIC = "relay_duplicates"
@@ -826,17 +834,30 @@ def _call_key(call: Signal | sqlite3.Row) -> tuple[str, str, str, str]:
 
 
 def live_same_call(
-    conn: sqlite3.Connection, call: Signal | sqlite3.Row, *, besides: Iterable[int] = ()
+    conn: sqlite3.Connection,
+    call: Signal | sqlite3.Row,
+    *,
+    around: Iterable[datetime],
+    window: int,
+    besides: Iterable[int] = (),
 ) -> sqlite3.Row | None:
     """The newest live signal (NEW, not withdrawn) showing `call` -- a
-    parse or a `signals` row: the same side, symbol and entry zone -- other
-    than the signals `besides`; or None."""
+    parse or a `signals` row: the same side, symbol and entry zone -- whose
+    own message was posted within `window` seconds (both ends included) of
+    one of the moments `around`, other than the signals `besides`; or None.
+    Signals stay NEW for ever: a call with the same zone posted days ago is
+    another call, so it is never named (ruling R6-1)."""
     key, skip = _call_key(call), set(besides)
+    moments, limit = tuple(around), timedelta(seconds=window)
     for row in conn.execute(
-        "SELECT * FROM signals WHERE state = 'NEW' AND withdrawn_at_utc IS NULL "
-        "ORDER BY signal_id DESC"
+        "SELECT s.*, m.posted_at_utc AS message_posted_at_utc FROM signals s "
+        "JOIN messages m ON m.channel_id = s.channel_id AND m.message_id = s.message_id "
+        "WHERE s.state = 'NEW' AND s.withdrawn_at_utc IS NULL ORDER BY s.signal_id DESC"
     ).fetchall():
-        if row["signal_id"] not in skip and _call_key(row) == key:
+        if row["signal_id"] in skip or _call_key(row) != key:
+            continue
+        posted = datetime.fromisoformat(row["message_posted_at_utc"])
+        if any(abs(posted - moment) <= limit for moment in moments):
             return row
     return None
 
@@ -844,6 +865,8 @@ def live_same_call(
 def carrier_of(
     conn: sqlite3.Connection,
     *,
+    around: Iterable[datetime],
+    window: int = RELAY_WINDOW_SECONDS,
     signal_id: int | None = None,
     call: Signal | sqlite3.Row | None = None,
 ) -> sqlite3.Row | None:
@@ -851,10 +874,13 @@ def carrier_of(
     (ruling R5-5): the signal that carries that call now, live, queued or
     traded, when it is not signal `signal_id` itself -- first through
     `live_signal_for` (`carried_by`: the call posted again or promoted),
-    else the newest live signal showing the same call outside that chain
-    (`live_same_call`: posted again as a signal of its own, e.g. after the
-    relay window). `call` is the call meant; by default signal
-    `signal_id`'s. None when nothing else carries it."""
+    else the newest live signal showing the same call outside that chain,
+    posted as a signal of its own within the relay window (`window`) of
+    one of the moments `around` -- when the post the alert is about was
+    posted, and when the post of the call it names was (`live_same_call`,
+    ruling R6-1): the same horizon that decides duplicates. `call` is the
+    call meant; by default signal `signal_id`'s. None when nothing else
+    carries it."""
     if signal_id is not None:
         carrier = carried_by(conn, signal_id)
         if carrier is not None:
@@ -864,7 +890,7 @@ def carrier_of(
     if call is None:
         return None
     besides = chain_ids(conn, signal_id) if signal_id is not None else ()
-    return live_same_call(conn, call, besides=besides)
+    return live_same_call(conn, call, around=around, window=window, besides=besides)
 
 
 def by_hand(conn: sqlite3.Connection, *, advice: str, carrier: sqlite3.Row | None) -> str:
@@ -1023,12 +1049,15 @@ def record_signal_copy(
     match: SignalMatch,
     now_utc: datetime,
     signal: Signal | None = None,
+    relay_window_seconds: int = RELAY_WINDOW_SECONDS,
 ) -> tuple[int, ...]:
     """Store that (`channel_id`, `message_id`) -- already on `messages` --
     repeats `match`'s signal: the link, the INFO line, the counter, and
     for a copy of a withdrawn call the CRITICAL alert. `signal` is the
-    copy's own parse: when another signal carries the withdrawn call now,
-    the alert says so (`by_hand`) and, if the copy shows another call than
+    copy's own parse: when another signal carries the withdrawn call now
+    (`carrier_of`: through the call's chain, or posted within
+    `relay_window_seconds` of the copy or of the post it repeats), the
+    alert says so (`by_hand`) and, if the copy shows another call than
     that one, what it shows. Returns the ids of the alerts raised."""
     conn.execute(
         "UPDATE messages SET relay_of_signal_id = ? WHERE channel_id = ? AND message_id = ?",
@@ -1054,7 +1083,15 @@ def record_signal_copy(
         else f" by message {match.closed_by[1]} on channel {match.closed_by[0]}"
     )
     # The call meant is the withdrawn signal's: this copy may show another.
-    carrier = carrier_of(conn, signal_id=match.signal_id)
+    carrier = carrier_of(
+        conn,
+        signal_id=match.signal_id,
+        around=(
+            posted_at(conn, channel_id=channel_id, message_id=message_id),
+            posted_at(conn, channel_id=match.channel_id, message_id=match.message_id),
+        ),
+        window=relay_window_seconds,
+    )
     advice = by_hand(conn, advice="If the call is still meant, trade it by hand.", carrier=carrier)
     if carrier is not None and signal is not None and not shows_call(signal, carrier):
         advice += (
@@ -1441,9 +1478,16 @@ def _same_trade(
 
 def _posted_at(conn: sqlite3.Connection, signal: sqlite3.Row) -> datetime:
     """When `signal`'s own message was posted."""
+    return posted_at(conn, channel_id=signal["channel_id"], message_id=signal["message_id"])
+
+
+def posted_at(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> datetime:
+    """When stored post (`channel_id`, `message_id`) was posted -- for the
+    alerts that name a carrier only within the relay window of their post
+    (`carrier_of`)."""
     (posted,) = conn.execute(
         "SELECT posted_at_utc FROM messages WHERE channel_id = ? AND message_id = ?",
-        (signal["channel_id"], signal["message_id"]),
+        (channel_id, message_id),
     ).fetchone()
     return datetime.fromisoformat(posted)
 

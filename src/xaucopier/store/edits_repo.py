@@ -1646,12 +1646,35 @@ def _old_post_doubt(ctx: _Ctx, row: sqlite3.Row, status: TradeStatus, *, changed
         f" This post may only have been channel {ctx.channel_id} {what} its old copy of the "
         "call: if so, the call is still meant"
     )
-    carrier = relay_repo.carrier_of(ctx.conn, signal_id=row["signal_id"])
+    carrier = relay_repo.carrier_of(
+        ctx.conn, signal_id=row["signal_id"], around=_carrier_moments(ctx, row)
+    )
     if carrier is not None:
         return f"{doubt}. {relay_repo.by_hand(ctx.conn, advice='', carrier=carrier)}"
     if status == "pending":
         return f"{doubt} -- trade it by hand."
     return f"{doubt} -- keep the trade, and trade by hand the entries that were skipped."
+
+
+def _carrier_moments(ctx: _Ctx, row: sqlite3.Row | None = None) -> tuple[datetime, ...]:
+    """The moments near which an alert about `ctx`'s post may name another
+    signal as carrying the same call (`relay_repo.carrier_of`, ruling
+    R6-1): when the post was posted, when this edit made it what it reads
+    now (if known), and -- for an alert about signal `row` -- when that
+    signal's own message was posted. A call with the same zone posted days
+    before is another call."""
+    moments = [
+        relay_repo.posted_at(ctx.conn, channel_id=ctx.channel_id, message_id=ctx.message_id)
+    ]
+    if ctx.edit_date_utc is not None:
+        moments.append(ctx.edit_date_utc)
+    if row is not None:
+        moments.append(
+            relay_repo.posted_at(
+                ctx.conn, channel_id=row["channel_id"], message_id=row["message_id"]
+            )
+        )
+    return tuple(moments)
 
 
 def _log_echo(ctx: _Ctx, row: sqlite3.Row, *, how: str) -> None:
@@ -1906,7 +1929,9 @@ def _created_alert(ctx: _Ctx, route_result: RouteResult) -> int:
         advice = relay_repo.by_hand(
             ctx.conn,
             advice="If it is a real call, trade it by hand.",
-            carrier=relay_repo.carrier_of(ctx.conn, call=route_result.signal),
+            carrier=relay_repo.carrier_of(
+                ctx.conn, call=route_result.signal, around=_carrier_moments(ctx)
+            ),
         )
         return ctx.alert(
             "WARNING",

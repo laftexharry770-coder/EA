@@ -293,7 +293,7 @@ def ingest(
     source: str,
     now_utc: datetime,
     accounts: tuple[_AccountCfgLike, ...],
-    relay_window_seconds: int = 900,
+    relay_window_seconds: int = relay_repo.RELAY_WINDOW_SECONDS,
     sender_kind: SenderKind | None = None,
     sender_id: int | None = None,
     is_post: bool | None = None,
@@ -523,6 +523,7 @@ def _ingest_new(
             match=relay.match,
             now_utc=now_utc,
             signal=signal,
+            relay_window_seconds=relay_window_seconds,
         )
         return IngestResult(
             outcome="relay_duplicate",

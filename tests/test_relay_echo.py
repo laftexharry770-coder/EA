@@ -42,6 +42,7 @@ from test_relay import (
     CLOSE_HALF,
     COPY,
     OTHER,
+    OTHER_CALL,
     POSTED,
     RELAY,
     REPOST,
@@ -1675,14 +1676,15 @@ def test_an_edit_that_makes_a_post_the_live_call_says_not_to_trade_it_by_hand(
 
 def test_a_held_back_copy_names_the_same_call_queued_as_another_signal(conn):  # noqa: F811
     """The VIP withdrew its call (signal 1, VOIDED) and posted the same call
-    again 20 minutes later -- outside the relay window: a new signal 2,
-    queued, not linked to signal 1. A relay's forward of the withdrawn post,
-    read late (after a reconnect), is held back against signal 1 with a
-    CRITICAL. It must not say to trade the call by hand: signal 2 carries
-    it and is queued (ruling R5-5)."""
+    again two minutes later with a moved stop -- another trade: a new
+    signal 2, queued, not linked to signal 1. A relay's forward of the
+    withdrawn post, read late (after a reconnect), is held back against
+    signal 1 with a CRITICAL. It must not say to trade the call by hand:
+    signal 2 shows the same call, posted within the relay window, and is
+    queued (rulings R5-5, R6-1)."""
     _ingest(conn, VIP, CALL)
     _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
-    again = _ingest(conn, VIP, 4020, posted=POSTED + timedelta(minutes=20))
+    again = _ingest(conn, VIP, 4020, OTHER_CALL, posted=POSTED + timedelta(minutes=2))
     assert (again.outcome, _live(conn)) == ("new", [2])
     assert _promoted_from(conn, 2) is None
 
@@ -1696,19 +1698,27 @@ def test_a_held_back_copy_names_the_same_call_queued_as_another_signal(conn):  #
     assert "reads as" not in detail, detail  # the copy shows that very call
 
 
+@pytest.mark.parametrize(
+    ("minutes", "named"),
+    [(10, True), (16, True), (-14, True), (20, False)],
+    ids=["near-both", "near-the-signal", "near-the-removed-post", "outside-the-window"],
+)
 @pytest.mark.parametrize("order", ORDERS)
 def test_an_older_posts_doubt_names_the_same_call_queued_as_another_signal(
-    conn, order  # noqa: F811
+    conn, order, minutes, named  # noqa: F811
 ):
     """R4-1 (c) with the same call queued elsewhere: the VIP deleted its
-    call and posted it again (signal 2), then posted it once more 18
-    minutes later -- outside the relay window, a new signal 3. The relay's
-    old hand copy is removed: an older post, which voids signal 2 with the
-    CRITICAL doubt. That doubt must not end "trade it by hand": signal 3
-    carries the call and is queued (ruling R5-5)."""
+    call and posted it again (signal 2, V/4012 at +2 min), and also posted
+    it with a moved stop -- another trade, a new signal 3, at `minutes`.
+    The relay's old hand copy (R/7001 at +30 s) is removed: an older post,
+    which voids signal 2 with the CRITICAL doubt. When signal 3 was posted
+    within the relay window of the removed post or of signal 2's own post,
+    the doubt must not end "trade it by hand": signal 3 shows the call and
+    is queued (rulings R5-5, R6-1). Posted further off, it is another call,
+    and the doubt says to trade the call by hand."""
     _store_call(conn, order)
     live = _vip_deletes_and_posts_again(conn)
-    later = _ingest(conn, VIP, 4020, posted=POSTED + timedelta(minutes=20))
+    later = _ingest(conn, VIP, 4020, OTHER_CALL, posted=POSTED + timedelta(minutes=minutes))
     assert later.outcome == "new" and _live(conn) == [live, later.signal_id]
 
     _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=21))
@@ -1716,9 +1726,13 @@ def test_an_older_posts_doubt_names_the_same_call_queued_as_another_signal(
     assert _live(conn) == [later.signal_id]
     detail = _detail(conn, edits_repo.OLD_POST_WITHDREW_CALL)
     assert "old copy" in detail, detail
-    assert f"signal {later.signal_id}" in detail and "message 4020" in detail, detail
-    assert _DO_NOT in detail, detail
-    assert "trade it by hand." not in detail.replace(_DO_NOT, ""), detail
+    if named:
+        assert f"signal {later.signal_id}" in detail and "message 4020" in detail, detail
+        assert _DO_NOT in detail, detail
+        assert "trade it by hand." not in detail.replace(_DO_NOT, ""), detail
+    else:
+        assert detail.split(" [found by")[0].endswith("-- trade it by hand."), detail
+        assert _DO_NOT not in detail and "message 4020" not in detail, detail
 
 
 def test_a_held_back_copy_of_a_call_withdrawn_twice_still_says_trade_it_by_hand(
@@ -1864,3 +1878,186 @@ def test_a_forward_of_a_repeat_removed_is_no_echo_once_its_channel_re_aimed_its_
     assert (again.outcome, _live(conn)) == ("new", [again.signal_id])
 
     _removed_forward_withdraws_the_call_posted_again(conn, forward=9001, again=again.signal_id)
+
+
+# == Round 6 (ruling R6-1): "the same call" only within the relay window =======
+#
+# Signals stay NEW for ever, so a call with the same side and entry zone
+# traded days ago is not "the same call" as a new one: an alert names another
+# signal as carrying the call (and says NOT to trade it by hand) only when
+# that signal came through the call's own chain, or was posted within the
+# relay window -- the horizon that decides duplicates -- of the post the alert
+# is about.
+
+LATER = POSTED + timedelta(days=2)
+#: The fixture's BUY with another entry zone: another call.
+OTHER_ZONE = SIGNAL_TEXT.replace("4480-4485", "4476-4479")
+assert OTHER_ZONE != SIGNAL_TEXT
+
+
+@pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
+def test_an_edit_into_a_call_posted_days_ago_still_says_trade_it_by_hand(
+    conn, executed  # noqa: F811
+):
+    """r5_stale_carrier (a), one channel: the VIP's BUY 4480-4485 two days
+    ago is signal 1 (taken by acct-1, or not). Today the VIP edits a
+    chatter post into the same BUY 4480-4485. Edits never open trades; the
+    alert must not call two-day-old signal 1 "the same call" and forbid
+    trading today's call by hand."""
+    _ingest(conn, VIP, CALL)
+    if executed:
+        _take_entry(conn, 1)
+    _ingest(conn, VIP, 5001, CHATTER_TEXT, posted=LATER)
+    _edit(conn, VIP, 5001, SIGNAL_TEXT, LATER + timedelta(minutes=1))
+    conn.commit()
+
+    detail = _detail(conn, edits_repo.EDIT_CREATED_SIGNAL)
+    assert detail.split(" [found by")[0].endswith("If it is a real call, trade it by hand."), detail
+    assert _DO_NOT not in detail and "signal 1" not in detail, detail
+
+
+@pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
+def test_a_held_back_copy_of_a_call_posted_again_days_later_still_says_trade_it_by_hand(
+    conn, executed  # noqa: F811
+):
+    """r5_stale_carrier (c), two channels: the VIP's BUY 4480-4485 two days
+    ago is signal 1. Today the VIP posts the same call (signal 2) and
+    deletes it; a relay's copy two minutes later is held back against
+    signal 2. Nothing posted near it carries the call: the alert says to
+    trade it by hand if it is still meant, never naming signal 1."""
+    _ingest(conn, VIP, CALL)
+    if executed:
+        _take_entry(conn, 1)
+    today = _ingest(conn, VIP, 5001, posted=LATER)
+    assert today.outcome == "new" and _promoted_from(conn, today.signal_id) is None
+    _delete(conn, VIP, 5001, LATER + timedelta(minutes=1))
+    held = _ingest(conn, RELAY, COPY, posted=LATER + timedelta(minutes=2))
+
+    assert (held.outcome, held.relay_of_signal_id) == ("relay_duplicate", today.signal_id)
+    detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert detail.endswith("If the call is still meant, trade it by hand."), detail
+    assert _DO_NOT not in detail and "signal 1 " not in detail, detail
+
+
+@pytest.mark.parametrize(
+    ("window", "gap", "named"),
+    [(900, 900, True), (900, 901, False), (300, 300, True), (300, 301, False)],
+)
+def test_the_same_call_is_named_only_within_the_relay_window(
+    conn, window, gap, named  # noqa: F811
+):
+    """The VIP withdrew its call (signal 1) and posts it again with a moved
+    stop -- another trade, a signal of its own (signal 2, queued) -- `gap`
+    seconds after a relay forwarded the first post (read late: held back
+    against signal 1). Signal 2 shows the same call: within the relay
+    window of the forward (`window`, both ends included) the alert names it
+    and says not to trade the call by hand as well; one second later it is
+    another call, and the alert says to trade it by hand if it is still
+    meant."""
+    forwarded = POSTED + timedelta(seconds=30)
+    _ingest(conn, VIP, CALL, window=window)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    moved = _ingest(
+        conn, VIP, 4020, OTHER_CALL, posted=forwarded + timedelta(seconds=gap), window=window
+    )
+    assert moved.outcome == "new" and _promoted_from(conn, moved.signal_id) is None
+
+    held = _ingest(conn, RELAY, COPY, posted=forwarded, fwd=(V, CALL), window=window)
+
+    assert (held.outcome, held.relay_of_signal_id) == ("relay_duplicate", 1)
+    detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    if named:
+        assert f"The same call is signal {moved.signal_id}" in detail, detail
+        assert _DO_NOT in detail, detail
+    else:
+        assert detail.endswith("If the call is still meant, trade it by hand."), detail
+        assert _DO_NOT not in detail and "message 4020" not in detail, detail
+
+
+def test_a_late_forward_names_the_same_call_posted_near_the_post_it_repeats(
+    conn,  # noqa: F811
+):
+    """The VIP's call V/4001 (signal 1) and, two minutes later, the same
+    call with a moved stop (another trade: signal 2, queued). A relay
+    forwards V/4001 twenty minutes after it was posted, and the VIP deletes
+    V/4001 (signal 1 VOIDED) before that forward is read: it is held back
+    against signal 1. The forward was posted long after signal 2, but the
+    post it repeats was posted two minutes before it: signal 2 shows the
+    same call, so the alert names it and says not to trade it by hand as
+    well."""
+    _ingest(conn, VIP, CALL)
+    moved = _ingest(conn, VIP, 4020, OTHER_CALL, posted=POSTED + timedelta(minutes=2))
+    assert moved.outcome == "new" and _promoted_from(conn, moved.signal_id) is None
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=25))
+    assert _live(conn) == [moved.signal_id]
+
+    held = _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(minutes=20), fwd=(V, CALL))
+
+    assert (held.outcome, held.relay_of_signal_id) == ("relay_duplicate", 1)
+    detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert f"The same call is signal {moved.signal_id}" in detail and _DO_NOT in detail, detail
+
+
+def test_an_old_post_edited_into_the_live_call_names_it(conn):  # noqa: F811
+    """One channel: a chatter post half an hour old, then the VIP's call
+    (signal 1, queued), and a minute later the VIP edits the old chatter
+    post into the same call. The post was posted long before the call, but
+    it became this call a minute after it: the alert names signal 1 and
+    says not to trade the call by hand as well."""
+    _ingest(conn, VIP, 4000, CHATTER_TEXT, posted=POSTED - timedelta(minutes=30))
+    _ingest(conn, VIP, CALL)
+    _edit(conn, VIP, 4000, SIGNAL_TEXT, POSTED + timedelta(minutes=1))
+    conn.commit()
+
+    detail = _detail(conn, edits_repo.EDIT_CREATED_SIGNAL)
+    assert "The same call is signal 1" in detail and _DO_NOT in detail, detail
+    assert _queued_entries(conn) == [(1, "acct-1"), (1, "acct-2")]
+
+
+@pytest.mark.parametrize(
+    ("text", "shown"),
+    [(OTHER_ZONE, "BUY 4476-4479"), (DIRECTION_EDIT, "SELL 4480-4485")],
+    ids=["another-zone", "another-side"],
+)
+def test_a_live_call_in_another_entry_zone_is_not_the_same_call(conn, text, shown):  # noqa: F811
+    """One channel: the VIP's BUY 4480-4485 is queued (signal 1); a minute
+    later the VIP edits a chatter post into a BUY 4476-4479 (another entry
+    zone) or a SELL 4480-4485 (another side) -- another call. Edits never
+    open trades: the alert says to trade it by hand if it is real, and
+    names no signal."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, VIP, 4002, CHATTER_TEXT, posted=POSTED + timedelta(seconds=30))
+    _edit(conn, VIP, 4002, text, POSTED + timedelta(minutes=1))
+    conn.commit()
+
+    detail = _detail(conn, edits_repo.EDIT_CREATED_SIGNAL)
+    assert shown in detail, detail
+    assert detail.split(" [found by")[0].endswith("If it is a real call, trade it by hand."), detail
+    assert _DO_NOT not in detail and "signal 1" not in detail, detail
+
+
+def test_a_held_back_forward_of_a_re_aimed_post_names_the_call_traded_in_its_place(
+    conn,  # noqa: F811
+):
+    """r5_carrier_exec: n4 (c) with the promoted repost traded. The VIP
+    re-aims V/4001 into a SELL while its repost V/4012 keeps the BUY
+    (promoted: signal 2); acct-1 takes signal 2's entry and the VIP then
+    deletes V/4012 (signal 2 flagged: withdrawn, but traded). A relay's
+    forward of the SELL post is held back against signal 1. Signal 2 is no
+    longer live, but the call was traded as signal 2: trading it by hand
+    as well would open it twice, so the alert names signal 2 and says so."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    assert _edit(conn, VIP, CALL, DIRECTION_EDIT, EDIT_1).promoted_signal_id == 2
+    conn.commit()
+    _take_entry(conn, 2)
+    assert _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=6)).outcome == "flagged"
+    assert _live(conn) == []
+
+    _ingest(conn, RELAY, COPY, DIRECTION_EDIT, posted=POSTED + timedelta(minutes=7), fwd=(V, CALL))
+
+    assert _link(conn, RELAY, COPY) == 1
+    detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert "The same call" in detail and "signal 2 (message 4012" in detail, detail
+    assert "trade status executed" in detail and _DO_NOT in detail, detail
+    assert "trade it by hand." not in detail.replace(_DO_NOT, ""), detail
