@@ -122,6 +122,14 @@ message is first stored; a later version of the same message does not
 change them. (``messages.relay_of_signal_id`` is ingest's own finding,
 not an argument.) The forward pair is also what recognises a relay copy
 exactly (see above).
+
+**Deleted before it was stored** (final review F18). The listener passes
+``deleted_by_event_at_utc`` for a message a ``MessageDeleted`` event
+named before any path had stored it (``listener.DeletedBeforeStored``):
+it is stored -- verbatim, a fixture like any -- already marked deleted by
+the event at that time, and nothing else happens: no signals or
+followups row, no outbox row, no counter. For a message already stored
+it is ignored (the deletion found it stored and applied itself).
 """
 from __future__ import annotations
 
@@ -300,6 +308,7 @@ def ingest(
     fwd_from_channel_id: int | None = None,
     fwd_from_post_id: int | None = None,
     fwd_from_date_utc: datetime | None = None,
+    deleted_by_event_at_utc: datetime | None = None,
 ) -> IngestResult:
     channel_id = channel_cfg.channel_id
     provenance = _provenance_columns(
@@ -338,6 +347,7 @@ def ingest(
             accounts=accounts,
             relay_window_seconds=relay_window_seconds,
             provenance=provenance,
+            deleted_by_event_at_utc=deleted_by_event_at_utc,
         )
 
     edit = edits_repo.reconcile(
@@ -378,6 +388,7 @@ def _ingest_new(
     accounts: tuple[_AccountCfgLike, ...],
     relay_window_seconds: int,
     provenance: dict[str, Any],
+    deleted_by_event_at_utc: datetime | None = None,
 ) -> IngestResult:
     kind = route_result.kind
 
@@ -396,6 +407,37 @@ def _ingest_new(
         source=source,
         provenance=provenance,
     )
+
+    if deleted_by_event_at_utc is not None:
+        # A MessageDeleted event named it before it was stored (final
+        # review F18): stored as the fixture it is, already deleted by the
+        # event -- nothing more. No signals or followups row (a relay
+        # match could otherwise count a deleted post as the call), no
+        # fan-out, and the parse-failure counter is left alone.
+        conn.execute(
+            "UPDATE messages SET deleted_at_utc = ?, deleted_detected_by = ? "
+            "WHERE channel_id = ? AND message_id = ?",
+            (
+                deleted_by_event_at_utc.isoformat(),
+                edits_repo.EVENT_DETECTOR,
+                channel_id,
+                message_id,
+            ),
+        )
+        logger.info(
+            "channel %s message %s (%s) stored already deleted: a MessageDeleted event named "
+            "it before it was stored; not traded",
+            channel_id,
+            message_id,
+            kind,
+        )
+        return IngestResult(
+            outcome="new",
+            signal_id=None,
+            followup_id=None,
+            kind=kind,
+            detail="deleted before it was stored; stored as deleted",
+        )
 
     if kind == "parse_failed":
         signals_repo.increment_parse_failures(conn, channel_id=channel_id)

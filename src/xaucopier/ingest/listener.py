@@ -207,6 +207,13 @@ MAX_RECORDED_HANDLER_ERRORS = 256
 #: most three more.
 MAX_HISTORY_ATTEMPTS = 3
 
+#: The most ids `DeletedBeforeStored` keeps per channel: the lowest go
+#: first. Only ids above the pointer are kept at all, and each goes once
+#: the pointer passes it, so this bound is only ever reached by a channel
+#: whose poster deletes hundreds of posts the forward read has not
+#: reached yet.
+MAX_DELETED_BEFORE_STORED = 500
+
 #: `metrics.name` bumped once per history message skipped after
 #: `MAX_HISTORY_ATTEMPTS` failures. Every one is a message -- possibly a
 #: trade -- that was never stored, so `status` must surface it.
@@ -227,6 +234,86 @@ LIVE_SOURCE = "live"
 #: see `_advance_last_processed` for why.
 HISTORY_SOURCES = frozenset({"backfill", "poll"})
 ALL_SOURCES = HISTORY_SOURCES | {LIVE_SOURCE}
+
+
+class DeletedBeforeStored:
+    """Ids a `MessageDeleted` event named while they were not stored yet,
+    per channel, with when the event said so (final review F18).
+
+    The race: the poll's forward read has fetched a message, and the
+    deletion event for it is handled before the read's ingest job runs.
+    The deletion finds nothing stored ("unknown"); the read then stored
+    the message as if it stood -- a signal with claimable entries. With
+    company in the window re-read the absence healed it a round later; as
+    a channel's only message, every window read missed all of it and
+    tripped the circuit breaker, so it never healed. So the deletion job
+    remembers the id here, and the ingest job that stores it later stores
+    it already marked deleted by the event: no signals row, no fan-out
+    (`messages_repo.ingest`'s `deleted_by_event_at_utc`).
+
+    **Touched only inside writer jobs**, which run one at a time on the
+    writer thread: a deletion job adds, an ingest job reads. Each job
+    first drops the ids at or below the channel's *stored* pointer, read
+    inside that job -- the forward read never fetches those again -- so
+    the pruning never depends on a job that later rolled back. An id at
+    or below the pointer when the event names it is never kept (a message
+    deleted from long ago that we never stored). Bounded per channel
+    (`MAX_DELETED_BEFORE_STORED`, lowest ids dropped first). In memory
+    only: a restart forgets it, and the window re-read then finds such a
+    deletion by absence, as before."""
+
+    __slots__ = ("_ids", "_limit")
+
+    def __init__(self, *, limit: int = MAX_DELETED_BEFORE_STORED) -> None:
+        self._ids: dict[int, dict[int, datetime]] = {}
+        self._limit = limit
+
+    def ids(self, channel_id: int) -> frozenset[int]:
+        return frozenset(self._ids.get(channel_id, {}))
+
+    def pending(self, channel_id: int) -> bool:
+        """Whether any id of the channel is remembered (a cheap check
+        before the ingest job reads the pointer)."""
+        return bool(self._ids.get(channel_id))
+
+    def prune(self, channel_id: int, pointer: int) -> None:
+        """Forget the ids the pointer has passed."""
+        ids = self._ids.get(channel_id)
+        if not ids:
+            return
+        for message_id in [m for m in ids if m <= pointer]:
+            del ids[message_id]
+        if not ids:
+            del self._ids[channel_id]
+
+    def record(
+        self, channel_id: int, message_id: int, *, deleted_at_utc: datetime, pointer: int
+    ) -> bool:
+        """Remember that the event deleted `message_id`, not stored yet.
+        False (nothing kept) when the pointer is at or past it."""
+        self.prune(channel_id, pointer)
+        if message_id <= pointer:
+            return False
+        ids = self._ids.setdefault(channel_id, {})
+        ids.setdefault(message_id, deleted_at_utc)
+        while len(ids) > self._limit:
+            del ids[min(ids)]
+        return message_id in ids
+
+    def deleted_at(self, channel_id: int, message_id: int, *, pointer: int) -> datetime | None:
+        """When the event named `message_id` deleted, if it did before
+        the message was stored; None otherwise."""
+        self.prune(channel_id, pointer)
+        return self._ids.get(channel_id, {}).get(message_id)
+
+
+def _stored_pointer(conn: Connection, channel_id: int) -> int:
+    """The channel's pointer as committed, read inside a writer job."""
+    row = conn.execute(
+        "SELECT last_processed_message_id FROM channel_state WHERE channel_id = ?",
+        (channel_id,),
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 class ListenerStopped(RuntimeError):
@@ -558,6 +645,9 @@ class Listener:
         # Failed history-read attempts per (channel_id, message_id); see
         # ingest_history(). Cleared on success or skip.
         self._history_attempts: dict[tuple[int, int], int] = {}
+        # Ids a MessageDeleted event named before they were stored (F18);
+        # touched only inside writer jobs.
+        self._deleted_before_stored = DeletedBeforeStored()
         # One lock per channel, held for a whole read_history() call: at
         # most one history read per channel at a time (see read_history).
         self._history_locks: dict[int, asyncio.Lock] = {}
@@ -667,8 +757,17 @@ class Listener:
         advances_pointer = source in HISTORY_SOURCES
         now_utc = self._now()
         accounts = self.accounts
+        tombstones = self._deleted_before_stored
 
         def job(conn: Connection) -> IngestResult:
+            deleted_at = None
+            if tombstones.pending(incoming.channel_id):
+                # A deletion event named it before it was stored (F18).
+                deleted_at = tombstones.deleted_at(
+                    incoming.channel_id,
+                    incoming.message_id,
+                    pointer=_stored_pointer(conn, incoming.channel_id),
+                )
             result = messages_repo.ingest(
                 conn,
                 channel_cfg=channel_cfg,
@@ -686,6 +785,7 @@ class Listener:
                 fwd_from_channel_id=incoming.fwd_from_channel_id,
                 fwd_from_post_id=incoming.fwd_from_post_id,
                 fwd_from_date_utc=incoming.fwd_from_date_utc,
+                deleted_by_event_at_utc=deleted_at,
             )
             if advances_pointer:
                 _advance_last_processed(
@@ -742,7 +842,9 @@ class Listener:
         """Record that `message_id` is gone from its channel --
         `edits_repo.apply_deletion()`, on the writer thread. Idempotent:
         the second report of the same deletion finds it marked. Never
-        closes anything, never touches the pointer. (A withdrawn call's
+        closes anything, never touches the pointer. An id a
+        `MessageDeleted` event names before it is stored is remembered
+        (`DeletedBeforeStored`, F18): stored later, it is stored deleted. (A withdrawn call's
         standing repost may be promoted in the same job, which is why the
         accounts go along -- unless it is one of `also_deleted`, the
         other ids the same report named deleted.)
@@ -757,9 +859,10 @@ class Listener:
         now_utc = self._now() if reported_at_utc is None else reported_at_utc
         accounts = self.accounts
         others = frozenset(also_deleted)
+        tombstones = self._deleted_before_stored
 
         def job(conn: Connection) -> DeletionResult:
-            return edits_repo.apply_deletion(
+            result = edits_repo.apply_deletion(
                 conn,
                 channel_cfg=channel_cfg,
                 message_id=message_id,
@@ -768,6 +871,23 @@ class Listener:
                 detected_by=detected_by,
                 also_deleted=others,
             )
+            if result.outcome == "unknown" and detected_by == edits_repo.EVENT_DETECTOR:
+                # Not stored yet -- perhaps a history read holds it right now
+                # (F18): remembered, so it is stored already deleted.
+                channel_id = channel_cfg.channel_id
+                if tombstones.record(
+                    channel_id,
+                    message_id,
+                    deleted_at_utc=now_utc,
+                    pointer=_stored_pointer(conn, channel_id),
+                ):
+                    logger.info(
+                        "channel %s message %s was deleted before it was stored; if a history "
+                        "read brings it, it is stored as deleted and not traded",
+                        channel_id,
+                        message_id,
+                    )
+            return result
 
         return await self._run_on_writer(job)
 

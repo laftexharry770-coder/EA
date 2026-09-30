@@ -13,14 +13,17 @@ listener, poll and store against the fake Telegram client.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 import pytest
 
 import test_relay as relay
 
-from fakes.telegram import FakeMessage
+from fakes.telegram import FakeMessage, FakeTelegramClient
 from test_edits import (
+    ACCOUNTS,
+    CHANNEL,
     CHATTER_TEXT,
     EDIT_1,
     POSTED,
@@ -40,7 +43,9 @@ from test_edits import (
     _withdrawn,
 )
 from xaucopier.ingest.edits import SUSPECT_MIN_ABSENT, AbsenceTracker, is_suspect
-from xaucopier.store import edits_repo
+from xaucopier.ingest.listener import DeletedBeforeStored
+from xaucopier.store import db, edits_repo
+from xaucopier.store.messages_repo import ingest
 
 # -- the circuit breaker (ledger 164) --------------------------------------------
 
@@ -311,3 +316,132 @@ def test_a_window_void_with_nothing_promoted_is_still_summarised(tmp_path) -> No
     assert "1 signal(s)" in detail and f"[{other_signal}]" in detail
     assert str(first_signal) not in detail.split("signal(s)")[1].split(".")[0]
     assert _signal(db_path, SIGNAL_ID_MSG + 2)["state"] == "NEW"  # promoted, queued
+
+
+# -- a deletion that arrives before the message is stored (F18) --------------------
+
+
+@dataclass
+class _DeletedDuringForwardRead(FakeTelegramClient):
+    """The race of final review F18: the poll's forward read has fetched
+    `doomed`, and the `MessageDeleted` update for it is handled before the
+    read's ingest job runs -- so when the deletion is applied, the message
+    is not stored yet."""
+
+    doomed: int | None = None
+    #: The by-id reads the window made, for the single-message case.
+    by_id: list[tuple[int, ...]] = field(default_factory=list)
+
+    async def get_messages(self, *args, **kwargs):
+        result = await super().get_messages(*args, **kwargs)
+        if kwargs.get("ids") is not None:
+            self.by_id.append(tuple(kwargs["ids"]))
+            return result
+        doomed = self.doomed
+        if doomed is not None and any(m.id == doomed for m in result):
+            self.doomed = None
+            assert await self.emit_delete(A, doomed)  # delivered, handled now
+        return result
+
+
+@pytest.mark.parametrize("n_chatter", [3, 0], ids=["window-of-four", "only-message"])
+def test_a_deletion_handled_before_the_forward_read_stores_the_message_is_applied(
+    tmp_path, n_chatter: int
+) -> None:
+    """Final review F18. The event found nothing stored ("unknown") and
+    was forgotten; the read then stored the message as a new signal with
+    claimable entries. With company in the window it healed a round later;
+    as a channel's only message (first run, a new channel) every window
+    read missed all of it, tripped the breaker, and the signal stayed
+    claimable for good under a WINDOW_READ_SUSPECT alert saying deletion
+    events still act. Now the event's id is remembered, and the read
+    stores the message already marked deleted by the event: no signals
+    row, no entry, no alert, and the window never asks for it."""
+    db_path = tmp_path / "store.db"
+    client = _DeletedDuringForwardRead()
+
+    async def body(client, listener, time):
+        with client.blackout():  # history only: the poll will fetch them
+            await client.emit(A, FakeMessage(id=SIGNAL_ID_MSG, message=SIGNAL_TEXT, date=POSTED))
+            for n in range(1, n_chatter + 1):
+                await client.emit(
+                    A, FakeMessage(id=SIGNAL_ID_MSG + n, message=f"{CHATTER_TEXT} {n}", date=POSTED)
+                )
+        client.doomed = SIGNAL_ID_MSG
+        client.by_id.clear()
+        for _ in range(3):
+            await _round(listener, time)
+        assert client.doomed is None, "the race never happened"
+        return listener.read_last_processed_message_id(A)
+
+    pointer = _run(db_path, body, client=client)
+
+    assert pointer == SIGNAL_ID_MSG + n_chatter
+    message = _message(db_path)
+    assert message["deleted_at_utc"] is not None and message["detected_by"] == "event"
+    assert message["raw_text"] == SIGNAL_TEXT  # still a fixture
+    assert _rows(db_path, "SELECT COUNT(*) FROM signals") == [(0,)]
+    assert _outbox(db_path, "ENTRY") == []
+    assert _alerts(db_path) == []
+    assert _metric(db_path, edits_repo.DELETE_MISSED_BY_EVENTSTREAM_METRIC) == 0
+    assert all(SIGNAL_ID_MSG not in ids for ids in client.by_id)
+    if n_chatter == 0:
+        assert client.by_id == []  # nothing left to re-read
+
+
+def test_deleted_before_stored_keeps_only_ids_above_the_pointer_and_forgets_them_once_passed():
+    tombstones = DeletedBeforeStored(limit=3)
+    at = POSTED
+    assert not tombstones.record(A, 4000, deleted_at_utc=at, pointer=4000)  # passed already
+    assert not tombstones.pending(A)
+    assert tombstones.record(A, 4002, deleted_at_utc=at, pointer=4000)
+    assert tombstones.deleted_at(A, 4002, pointer=4000) == at
+    assert tombstones.deleted_at(A, 4003, pointer=4000) is None
+    assert tombstones.deleted_at(A + 1, 4002, pointer=0) is None  # per channel
+    # The pointer passes it: forgotten.
+    assert tombstones.deleted_at(A, 4002, pointer=4002) is None
+    assert not tombstones.pending(A)
+    # Bounded: the lowest ids go first.
+    for message_id in (4010, 4011, 4012, 4013):
+        tombstones.record(A, message_id, deleted_at_utc=at, pointer=4000)
+    assert tombstones.ids(A) == frozenset({4011, 4012, 4013})
+    # The first report's time is kept.
+    tombstones.record(A, 4013, deleted_at_utc=at + timedelta(minutes=1), pointer=4000)
+    assert tombstones.deleted_at(A, 4013, pointer=4000) == at
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [(SIGNAL_TEXT, "signal"), ("Close half now", "followup"),
+     (SIGNAL_TEXT.replace("SL: 4470", ""), "parse_failed")],
+    ids=["signal", "followup", "parse_failed"],
+)
+def test_a_message_stored_deleted_by_the_event_creates_nothing(tmp_path, text, kind) -> None:
+    """`ingest(deleted_by_event_at_utc=...)`: the row, marked deleted by
+    the event -- no signals, followups or outbox rows, no counter -- and a
+    second delivery of it is only a duplicate."""
+    conn = db.connect(tmp_path / "store.db", role="writer")
+    try:
+        def store(**extra):
+            result = ingest(
+                conn, channel_cfg=CHANNEL, message_id=SIGNAL_ID_MSG, text=text,
+                posted_at_utc=POSTED, edit_date_utc=None, reply_to_message_id=None,
+                source="poll", now_utc=POSTED + timedelta(seconds=5), accounts=ACCOUNTS, **extra,
+            )
+            conn.commit()
+            return result
+
+        first = store(deleted_by_event_at_utc=POSTED + timedelta(seconds=2))
+        again = store()
+        rows = lambda sql: [tuple(r) for r in conn.execute(sql).fetchall()]  # noqa: E731
+        assert (first.outcome, first.kind, first.signal_id, first.followup_id) == (
+            "new", kind, None, None
+        )
+        assert again.outcome == "duplicate"
+        assert rows("SELECT kind, deleted_at_utc, deleted_detected_by FROM messages") == [
+            (kind, (POSTED + timedelta(seconds=2)).isoformat(), "event")
+        ]
+        for table in ("signals", "followups", "outbox", "alerts", "channel_state"):
+            assert rows(f"SELECT COUNT(*) FROM {table}") == [(0,)], table
+    finally:
+        conn.close()
