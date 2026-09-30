@@ -1521,6 +1521,62 @@ def test_a_post_of_another_signal_deleted_in_the_same_report_withdrew_nothing_of
     ]
 
 
+@pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
+def test_a_channels_bump_is_its_own_post_while_its_double_still_shows_the_call(
+    conn, executed, caplog  # noqa: F811
+):
+    """R5-1 while the call still stands on the channel: the VIP bumps its
+    call (V/4002, a forward of its own V/4001) and posts it again by hand
+    (V/4003). It deletes the original, then the bump. The bump is the
+    VIP's own post, never an echo: pending, deleting it after it was
+    promoted promotes the double in turn (the bump held the call);
+    executed, it is a repeat removal like the original's -- a WARNING
+    each time, and the call stands."""
+    _vip_bumps_its_call(conn, executed=executed)
+    _ingest(conn, VIP, 4003, posted=POSTED + timedelta(minutes=2))
+    first = _delete(conn, VIP, CALL, POSTED + timedelta(minutes=3))
+    with caplog.at_level(logging.INFO, logger="xaucopier.store.edits_repo"):
+        bump = _delete(conn, VIP, BUMP, POSTED + timedelta(minutes=4))
+
+    assert not [r for r in caplog.records if "echo" in r.getMessage()]
+    if executed:
+        assert (first.outcome, bump.outcome) == ("deleted", "deleted")
+        assert _codes(conn) == [("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED)] * 2
+        assert _live(conn) == [1]
+    else:
+        assert first.promoted_signal_id == 2
+        assert (bump.outcome, bump.promoted_signal_id) == ("voided", 3)
+        assert _q(conn, "SELECT message_id FROM signals WHERE signal_id = 3") == [(4003,)]
+        assert _live(conn) == [3]
+        assert _queued_entries(conn) == [(3, "acct-1"), (3, "acct-2")]
+
+
+@pytest.mark.parametrize("first", [COPY, 7002], ids=["forward-first", "double-first"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_relay_deleting_every_post_at_once_withdraws_the_call_though_one_is_an_echo(
+    conn, order, first  # noqa: F811
+):
+    """The relay forwards the VIP's call (R/7001) and posts it again by hand
+    (R/7002); the VIP double-posts (V/4002) and deletes V/4001 -- a repeat
+    removal, or (VIP-first) its holder with V/4002 promoted. Then one report
+    deletes both relay posts: its last. R/7001's removal only echoes the
+    VIP's deletion of the post it forwarded; R/7002's is the relay's own,
+    and withdraws the call (ruling C2) -- in either order: relay-first
+    R/7001 held the signal, so R/7002 must not leave the saying to it."""
+    _store_call(conn, order, forwards=True)
+    _ingest(conn, VIP, 4002, posted=POSTED + timedelta(minutes=1))
+    _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(minutes=1, seconds=30))
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=2))
+    assert len(_live(conn)) == 1
+
+    both = (COPY, 7002)
+    for message_id in (first, 7002 if first == COPY else COPY):
+        _delete(conn, RELAY, message_id, POSTED + timedelta(minutes=3), also=both)
+
+    assert _live(conn) == []
+    assert _entries_claimable(conn) == []
+
+
 # == Round 5 (ruling R5-5): "trade it by hand" never while the call is queued ==
 
 _DO_NOT = "do NOT trade it by hand as well"
