@@ -42,6 +42,7 @@ from test_relay import (
     CHATTER_TEXT,
     CLOSE_HALF,
     COPY,
+    NOW,
     OTHER,
     OTHER_CALL,
     POSTED,
@@ -2129,3 +2130,227 @@ def test_a_copy_on_another_symbol_names_both_symbols(conn):  # noqa: F811
     assert relay_repo._describe_both(silver, row) == (
         "XAGUSD BUY 4480-4485", "XAUUSD BUY 4480-4485"
     )
+
+
+# == Round 6 (ruling R6-3): posts deleted in one report =========================
+#
+# A channel deleting several posts of a call in one report withdraws the call
+# once, and only the lowest id is recorded as the post that withdrew it
+# (edits_repo._closing_post, round 5). Every post of the call that report
+# deleted while it still showed the call withdrew it just as much: a third
+# channel's forward of ANY of them echoes that withdrawal when it is removed
+# later. Which of the posts the third channel happened to forward never
+# decides whether the call posted again is withdrawn.
+
+#: The relay's two posts of the call, deleted in one report.
+_REPORT = (COPY, 7002)
+_REPORT_ORDERS = pytest.mark.parametrize(
+    "report", [_REPORT, _REPORT[::-1]], ids=["lower-first", "higher-first"]
+)
+
+
+def _closer_of(conn, signal_id: int) -> tuple:  # noqa: F811
+    (row,) = _q(
+        conn,
+        "SELECT closed_by_channel_id, closed_by_message_id FROM signals WHERE signal_id = ?",
+        signal_id,
+    )
+    return tuple(row)
+
+
+def _relay_withdraws_in_one_report(  # noqa: F811
+    conn, *, forwarded: int, report: tuple[int, int], by: str = "event", re_aim: bool = False
+) -> int:
+    """The VIP's call V/4001 (signal 1); the relay copies it twice by hand
+    (R/7001, R/7002) and the other channel forwards R/`forwarded` (O/9001).
+    With `re_aim`, the relay then re-aims R/7002 into a SELL -- a repeat
+    removal: R/7001 still shows the call. One report deletes both relay
+    posts, named in the order `report`: the relay's last posts, so the call
+    is withdrawn -- recorded as through R/7001. The VIP deletes its post and
+    posts the call again. Returns that signal's id."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30))
+    _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(seconds=40))
+    forward = _ingest(
+        conn, OTHER, 9001, posted=POSTED + timedelta(seconds=50), fwd=(R, forwarded)
+    )
+    assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", 1)
+    if re_aim:
+        assert _edit(conn, RELAY, 7002, DIRECTION_EDIT, POSTED + timedelta(minutes=1)).outcome == (
+            "recorded"
+        )
+        conn.commit()
+    for message_id in report:
+        _delete(conn, RELAY, message_id, POSTED + timedelta(minutes=2), by=by, also=_REPORT)
+    assert _live(conn) == []
+    assert _closer_of(conn, 1) == (R, COPY)
+
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=3))
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=4))
+    assert (again.outcome, _live(conn)) == ("new", [again.signal_id])
+    assert _promoted_from(conn, again.signal_id) == 1
+    return again.signal_id
+
+
+@pytest.mark.parametrize("by", ["event", "window"])
+@_REPORT_ORDERS
+@pytest.mark.parametrize("forwarded", _REPORT, ids=["forward-of-7001", "forward-of-7002"])
+def test_a_forward_of_any_post_the_withdrawing_report_deleted_is_an_echo(
+    conn, forwarded, report, by  # noqa: F811
+):
+    """r5_batch_echo, three channels: the relay deletes both of its copies in
+    one report and so withdraws the call (recorded as through R/7001); the
+    VIP deletes its post and posts the call again. The other channel then
+    removes its forward of one of the relay's posts: that only echoes the
+    relay's withdrawal, said when it happened. The VIP's call posted again
+    is still traded -- whichever relay post was forwarded, in whichever
+    order the report named them."""
+    again = _relay_withdraws_in_one_report(conn, forwarded=forwarded, report=report, by=by)
+
+    removed = _delete(conn, OTHER, 9001, POSTED + timedelta(minutes=5))
+
+    assert (removed.outcome, removed.promoted_signal_id) == ("deleted", None)
+    assert _live(conn) == [again]
+    assert _codes(conn) == [("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)]
+    assert _entries_claimable(conn) == [again]
+
+
+@_REPORT_ORDERS
+def test_a_forward_of_a_post_that_left_the_call_before_the_report_is_no_echo(
+    conn, report  # noqa: F811
+):
+    """R6-3's limit: only a post that still showed the call when the report
+    deleted it withdrew the call with it. The other channel forwards R/7002;
+    the relay then re-aims R/7002 into a SELL -- a repeat removal, as R/7001
+    still shows the call -- and deletes both in one report. R/7002 withdrew
+    nothing in that report, and its channel shows the call nowhere now: the
+    forward's removal is a removal like any other (R5-2), and withdraws the
+    call posted again, loudly."""
+    again = _relay_withdraws_in_one_report(conn, forwarded=7002, report=report, re_aim=True)
+
+    _removed_forward_withdraws_the_call_posted_again(conn, forward=9001, again=again)
+
+
+@_REPORT_ORDERS
+def test_a_forward_of_a_post_deleted_with_a_promotions_closer_is_no_echo(
+    conn, report  # noqa: F811
+):
+    """R6-3's limit: a promotion withdrew nothing. The VIP posts its call
+    three times (V/4001-4003) and the other channel forwards V/4002. One
+    report deletes V/4001 and V/4002 while V/4003 stands: V/4003 is
+    promoted (signal 2), and V/4001 recorded as signal 1's closer -- a
+    repeat removal, as the call never stopped. The relay deletes its only
+    copy (the call is withdrawn), the VIP deletes V/4003 and the relay posts
+    the call again (signal 3). The VIP's channel shows the call nowhere: the
+    forward's removal withdraws signal 3."""
+    _ingest(conn, VIP, CALL)
+    for index, message_id in enumerate((4002, 4003)):
+        _ingest(conn, VIP, message_id, posted=POSTED + timedelta(seconds=10 * (index + 1)))
+    _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30))
+    forward = _ingest(conn, OTHER, 9001, posted=POSTED + timedelta(seconds=40), fwd=(V, 4002))
+    assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", 1)
+    ordered = {_REPORT: (CALL, 4002), _REPORT[::-1]: (4002, CALL)}[report]
+    for message_id in ordered:
+        _delete(conn, VIP, message_id, POSTED + timedelta(minutes=1), also=(CALL, 4002))
+    assert _live(conn) == [2] and _closer_of(conn, 1) == (V, CALL)
+    assert relay_repo.closed_by_promotion(conn, 1)
+    assert _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=2)).outcome == "voided"
+    _delete(conn, VIP, 4003, POSTED + timedelta(minutes=3))
+    again = _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(minutes=4))
+    assert (again.outcome, _live(conn)) == ("new", [again.signal_id])
+    assert _promoted_from(conn, again.signal_id) == 2
+
+    _removed_forward_withdraws_the_call_posted_again(conn, forward=9001, again=again.signal_id)
+
+
+def test_a_forward_of_a_repeat_deleted_the_moment_another_channel_withdrew_is_no_echo(
+    conn,  # noqa: F811
+):
+    """R6-3's limit: a report is one channel's. The relay deletes R/7001, a
+    repeat (R/7002 stands), at the very moment the VIP deletes its only post
+    and withdraws the call -- two reports, on two channels. R/7001 withdrew
+    nothing: once the relay's last post is gone too, the other channel's
+    forward of R/7001 removed after the VIP posted the call again withdraws
+    it (R5-2)."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30))
+    _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(seconds=40))
+    _ingest(conn, OTHER, 9001, posted=POSTED + timedelta(seconds=50), fwd=(R, COPY))
+    moment = POSTED + timedelta(minutes=1)
+    assert _delete(conn, RELAY, COPY, moment).outcome == "deleted"  # a repeat
+    assert _delete(conn, VIP, CALL, moment).outcome == "voided"
+    assert _closer_of(conn, 1) == (V, CALL)
+    _delete(conn, RELAY, 7002, POSTED + timedelta(minutes=2))
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=3))
+    assert (again.outcome, _live(conn)) == ("new", [again.signal_id])
+
+    _removed_forward_withdraws_the_call_posted_again(conn, forward=9001, again=again.signal_id)
+
+
+#: The relay channel's bare id, as a forward header names it.
+_R_BARE = -R - 10**12
+
+
+def _ticking_clock():
+    """A clock that moves on by a millisecond at every reading: each job the
+    listener stamps gets its own moment, as with the real clock."""
+    readings = iter(range(1, 10**9))
+    return lambda: NOW + timedelta(milliseconds=next(readings))
+
+
+@pytest.mark.parametrize("via", ["event", "window"])
+def test_posts_deleted_in_one_report_through_the_listener_share_one_moment(tmp_path, via):
+    """R6-3 end to end, with a clock that moves on at every reading: the
+    relay deletes both of its copies in one report -- one MessageDeleted
+    event, or one window re-read -- and each id is its own writer job. The
+    report is one moment: both posts carry the same deletion time, so the
+    other channel's forward of R/7002, the post not recorded as the closer,
+    is an echo too when it is removed after the VIP posted the call again."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        assert await client.emit(V, _post(CALL))
+        assert await client.emit(R, _post(COPY, after=timedelta(seconds=30)))
+        assert await client.emit(R, _post(7002, after=timedelta(seconds=40)))
+        for message_id in (7003, 7004, 7005):  # chatter: a window re-read to believe
+            assert await client.emit(R, _post(message_id, CHATTER_TEXT, after=timedelta(minutes=1)))
+        forward = FakeMessage(
+            id=9001,
+            message=SIGNAL_TEXT,
+            date=POSTED + timedelta(seconds=50),
+            fwd_from=types.MessageFwdHeader(
+                date=POSTED, from_id=types.PeerChannel(channel_id=_R_BARE), channel_post=7002
+            ),
+        )
+        assert await client.emit(O, forward)
+        await _round(listener, time)
+        if via == "event":
+            assert await client.emit_delete(R, COPY, 7002)
+            await _round(listener, time)
+        else:
+            with client.blackout():
+                assert not await client.emit_delete(R, COPY, 7002)
+            for _ in range(3):
+                await _round(listener, time)
+        assert await client.emit_delete(V, CALL)
+        assert await client.emit(V, _post(REPOST, after=timedelta(minutes=3)))
+        await _round(listener, time)
+        assert await client.emit_delete(O, 9001)
+        await _round(listener, time)
+
+    _run(db_path, body, channels=(VIP, RELAY, OTHER), now=_ticking_clock())
+
+    moments = _db_rows(
+        db_path,
+        "SELECT DISTINCT deleted_at_utc FROM messages WHERE channel_id = ? AND message_id IN (?, ?)",
+        (R, COPY, 7002),
+    )
+    assert len(moments) == 1 and moments[0][0] is not None, moments
+    assert _db_rows(db_path, "SELECT deleted_at_utc IS NOT NULL FROM messages WHERE message_id = 9001") == [(1,)]
+    (live,) = _live_rows(db_path)
+    assert _db_rows(
+        db_path, "SELECT closed_by_message_id FROM signals WHERE signal_id = 1"
+    ) == [(COPY,)]
+    codes = [code for (code,) in _db_rows(db_path, "SELECT code FROM alerts")]
+    assert edits_repo.OLD_POST_WITHDREW_CALL not in codes, codes
+    assert _claim(db_path) == ("ENTRY", live)

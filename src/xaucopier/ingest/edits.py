@@ -299,6 +299,7 @@ async def reconcile_window(
                     "window re-read of channel %s (%s) looks normal again", channel_id, channel_cfg.name
                 )
             confirmed = absences.settle(channel_id, absent)
+            reported_at = listener.now_utc()  # one report, one moment (R6-3)
             for message_id in sorted(confirmed):
                 try:
                     deletions.append(
@@ -307,6 +308,7 @@ async def reconcile_window(
                             message_id,
                             detected_by=WINDOW_SOURCE,
                             also_deleted=confirmed,
+                            reported_at_utc=reported_at,
                         )
                     )
                 except db.WriterDeadError:

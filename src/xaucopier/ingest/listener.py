@@ -737,6 +737,7 @@ class Listener:
         *,
         detected_by: str,
         also_deleted: Iterable[int] = (),
+        reported_at_utc: datetime | None = None,
     ) -> DeletionResult:
         """Record that `message_id` is gone from its channel --
         `edits_repo.apply_deletion()`, on the writer thread. Idempotent:
@@ -744,8 +745,16 @@ class Listener:
         closes anything, never touches the pointer. (A withdrawn call's
         standing repost may be promoted in the same job, which is why the
         accounts go along -- unless it is one of `also_deleted`, the
-        other ids the same report named deleted.)"""
-        now_utc = self._now()
+        other ids the same report named deleted.)
+
+        `reported_at_utc`: the moment of the report that named
+        `message_id` and `also_deleted` (`now_utc()` when the report was
+        taken). Every id of one report is its own job, and each must be
+        stamped with that one moment: posts deleted together carry the
+        same deletion time, which is how `relay_repo` tells the posts of
+        one report apart later (ruling R6-3). Without it, the clock is
+        read now."""
+        now_utc = self._now() if reported_at_utc is None else reported_at_utc
         accounts = self.accounts
         others = frozenset(also_deleted)
 
@@ -761,6 +770,12 @@ class Listener:
             )
 
         return await self._run_on_writer(job)
+
+    def now_utc(self) -> datetime:
+        """The listener's clock: what every job it submits is stamped
+        with -- for a caller that submits several jobs as one moment (a
+        deletion report, `ingest_deletion`)."""
+        return self._now()
 
     def history_lock(self, channel_id: int) -> asyncio.Lock:
         """The per-channel lock every history read holds for its whole
@@ -1753,6 +1768,7 @@ class Listener:
         except Exception as exc:  # noqa: BLE001 -- recorded, never fatal
             self._record_handler_error(channel_id, None, exc, source=LIVE_SOURCE)
             return
+        reported_at = self._now()  # one report, one moment (ruling R6-3)
         for message_id in deletion.message_ids:
             try:
                 await self.ingest_deletion(  # 3. submit
@@ -1760,6 +1776,7 @@ class Listener:
                     message_id,
                     detected_by=edits_repo.EVENT_DETECTOR,
                     also_deleted=deletion.message_ids,
+                    reported_at_utc=reported_at,
                 )
             except Exception as exc:  # noqa: BLE001 -- recorded, never fatal
                 self._record_handler_error(channel_id, message_id, exc, source=LIVE_SOURCE)

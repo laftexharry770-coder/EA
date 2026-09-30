@@ -407,10 +407,10 @@ def _db_write(db_path: Path, sql: str, params: tuple = ()) -> None:
         conn.close()
 
 
-def _run(db_path: Path, body, *, channels=(VIP, RELAY), client=None):
+def _run(db_path: Path, body, *, channels=(VIP, RELAY), client=None, now=None):
     """Pointers just below each channel's first test id; start the real
-    listener and poll; run `body(client, listener, time)`; no handler may
-    fail."""
+    listener and poll -- its clock `now`, by default always NOW; run
+    `body(client, listener, time)`; no handler may fail."""
     for channel_id, pointer in ((V, CALL - 1), (R, COPY - 1)):
         _db_write(
             db_path,
@@ -427,7 +427,7 @@ def _run(db_path: Path, body, *, channels=(VIP, RELAY), client=None):
             accounts=LIVE_ACCOUNTS,
             writer=db.Writer(db_path),
             db_path=db_path,
-            now=lambda: NOW,
+            now=now if now is not None else lambda: NOW,
             poll_hook=HistoryPoll(sleep=time.sleep, clock=time.clock),
         )
         await listener.start()

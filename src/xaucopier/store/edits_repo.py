@@ -173,7 +173,11 @@ for both, when it will: not when that message had left the call before,
 or its removal is an echo (`_holder_speaks`; ruling R5-6). Whichever job
 speaks, the post recorded as the one that withdrew the call is the lowest
 id of the report's posts that still showed it (`_closing_post`), so that
-it never depends on which post held the signal.
+it never depends on which post held the signal. Every job of one report
+is stamped with the report's moment (`Listener.ingest_deletion`), so its
+posts carry one deletion time: a forward of any of them that still
+showed the call, removed later, only echoes the withdrawal
+(`relay_repo._deleted_with_closer`, ruling R6-3).
 
 **A deletion inferred from absence can be reversed.** The window re-read
 (`ingest/edits.py`) infers a deletion when a message stops coming back --

@@ -52,7 +52,9 @@ is told apart:
 
 - a forward of *another channel's* post of the call that no longer
   stands (deleted, edited away, re-aimed, or the post that withdrew one of
-  its signals) is an *echo*: its removal only repeats that post's, which
+  its signals -- or any post deleted in the same report as that one while
+  it still showed the call, ruling R6-3) is an *echo*: its removal only
+  repeats that post's, which
   was handled when it happened, and is recorded (INFO) without reaching
   any signal -- also when nothing was posted again, so that which post
   was stored first never matters. A forward of the channel's *own* post
@@ -212,7 +214,15 @@ two watched channels carrying the same calls, unless it says otherwise):
   report, only the lowest id is recorded as the post that withdrew it
   (`edits_repo._closing_post`), so a reply to another of them follows the
   call if it is posted again -- as a reply to any repeat removed before
-  the withdrawal does. The same in either storage order (INV-2).
+  the withdrawal does. The same in either storage order (INV-2). A
+  forward of any of them removed later is an echo all the same
+  (`_deleted_with_closer`, ruling R6-3): only the replies differ.
+- The posts of one report are told apart by their deletion time: the
+  listener stamps every job of one report with the report's moment. A
+  post of the report whose job failed and was marked deleted later, by
+  another report, counts as deleted on its own -- a repeat removal: a
+  forward of it removed once its channel shows the call nowhere
+  withdraws the call posted again, loudly (the safe side).
 """
 from __future__ import annotations
 
@@ -1344,6 +1354,10 @@ def _gone_post(
 
     - the post closed one of its call's signals (it withdrew, broke or
       re-aimed it): its removal was said when it happened -- an echo;
+    - it was deleted in the same report as the post recorded as closing
+      one of them, still showing the call until then
+      (`_deleted_with_closer`, ruling R6-3): it withdrew the call together
+      with that post, which alone is recorded -- an echo too;
     - it no longer stands -- deleted, edited into something that is no
       signal, or (re-read with `channel_cfg`) re-aimed away -- without
       closing anything, or closing a signal only for a promotion
@@ -1396,12 +1410,48 @@ def _gone_post(
     )
     if not gone:
         return None
+    if _deleted_with_closer(conn, row, chain, channel_cfg):
+        return linked  # deleted in the report that withdrew the call: said then
     # A repeat removal: echoed only while its channel still shows the call.
     newest = _signal_row(conn, live_signal_for(conn, linked))
     for other in standing_posts_on(conn, signal_id=linked, channel_id=post[0]):
         if channel_cfg is None or post_shows_call(other, newest, channel_cfg=channel_cfg):
             return linked
     return None
+
+
+def _deleted_with_closer(
+    conn: sqlite3.Connection,
+    post: sqlite3.Row,
+    chain: list[int],
+    channel_cfg: _ChannelCfgLike | None,
+) -> bool:
+    """For `_gone_post` (ruling R6-3): whether stored post `post`, a post of
+    the call whose signals are `chain`, was deleted in the same report as
+    the post recorded as withdrawing one of them -- the same channel and
+    the same deletion time (every job of one report is stamped with the
+    report's moment, `Listener.ingest_deletion`) -- while it still showed
+    that signal's call (still stored as a signal; re-read with
+    `channel_cfg`, when given). Of several posts deleted together only the
+    lowest id is recorded (`edits_repo._closing_post`), yet each withdrew
+    the call as much: a forward of any of them echoes that withdrawal. A
+    promotion's closer withdrew nothing (`closed_by_promotion`), and a post
+    that had left the call before the report withdrew nothing in it."""
+    if post["deleted_at_utc"] is None or post["kind"] != "signal":
+        return False
+    marks = ", ".join("?" for _ in chain)
+    for signal in conn.execute(
+        "SELECT s.* FROM signals s JOIN messages m "
+        "  ON m.channel_id = s.closed_by_channel_id AND m.message_id = s.closed_by_message_id "
+        f"WHERE s.signal_id IN ({marks}) AND s.closed_by_channel_id = ? "
+        "  AND m.deleted_at_utc = ? ORDER BY s.signal_id",
+        (*chain, post["channel_id"], post["deleted_at_utc"]),
+    ).fetchall():
+        if closed_by_promotion(conn, signal["signal_id"]):
+            continue
+        if channel_cfg is None or post_shows_call(post, signal, channel_cfg=channel_cfg):
+            return True
+    return False
 
 
 def _call_stands_elsewhere(
