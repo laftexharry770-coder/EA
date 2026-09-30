@@ -1397,6 +1397,98 @@ def test_a_reply_given_before_its_post_was_re_aimed_follows_the_call_in_either_o
     assert relay_repo.signal_for_followup(conn, followup_id=after) is None
 
 
+@pytest.mark.parametrize("by", ["event", "window"])
+@pytest.mark.parametrize("first", [COPY, 7002], ids=["lower-first", "higher-first"])
+@pytest.mark.parametrize("order", ORDERS)
+def test_posts_deleted_together_withdraw_a_call_through_the_same_post_in_either_order(
+    conn, order, first, by  # noqa: F811
+):
+    """Order seeds 6674 and 8947: the relay double-posts the call (R/7001,
+    R/7002) and deletes both in one report -- its last posts: the call is
+    withdrawn (VOIDED). Then it forwards the VIP's post again, posting the
+    call again (signal 2). Which of the two deleted posts withdrew the call
+    must not depend on which post held the signal (relay-first: R/7001,
+    whose job speaks for both) or on the order the report named them
+    (VIP-first: whichever job ran first): it is the lower id, R/7001. So a
+    reply to R/7001 given before the deletion stays with signal 1 (it is
+    about the call that post withdrew, ruling R4-4), one stored after gets
+    no target, and a reply to R/7002 -- a repeat -- follows the call."""
+    _store_call(conn, order)
+    _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(minutes=1))
+    _ingest(conn, RELAY, 7010, CLOSE_HALF, posted=POSTED + timedelta(minutes=2), reply_to=COPY)
+    both = (COPY, 7002)
+    for message_id in (first, 7002 if first == COPY else COPY):
+        _delete(conn, RELAY, message_id, POSTED + timedelta(minutes=3), by=by, also=both)
+    assert _live(conn) == []
+    assert _q(
+        conn, "SELECT closed_by_channel_id, closed_by_message_id FROM signals WHERE signal_id = 1"
+    ) == [(R, COPY)]
+
+    again = _ingest(conn, RELAY, 7003, posted=POSTED + timedelta(minutes=4), fwd=(V, CALL))
+    assert (again.outcome, _live(conn)) == ("new", [again.signal_id])
+    _ingest(conn, RELAY, 7011, CLOSE_HALF, posted=POSTED + timedelta(minutes=5), reply_to=COPY)
+    _ingest(conn, RELAY, 7012, CLOSE_HALF, posted=POSTED + timedelta(minutes=6), reply_to=7002)
+
+    def acts_on(message_id: int) -> int | None:
+        ((followup_id,),) = _q(
+            conn, "SELECT followup_id FROM followups WHERE message_id = ?", message_id
+        )
+        return relay_repo.signal_for_followup(conn, followup_id=followup_id)
+
+    assert acts_on(7010) == 1  # given before: about the call R/7001 withdrew
+    assert acts_on(7011) is None  # stored after: R/7001 shows no call
+    assert acts_on(7012) == again.signal_id  # R/7002 was a repeat: the call
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_post_that_left_the_call_before_the_report_withdrew_nothing_in_it(
+    conn, order  # noqa: F811
+):
+    """The same rule, with the lower id out of the call already: the relay
+    re-aims R/7001 into a SELL while R/7002 keeps the BUY (VIP-first a
+    repeat removal; relay-first R/7001 held the signal and R/7002 is
+    promoted), a "close half" replies to R/7002, and one report deletes
+    both. R/7001 showed no call any more: R/7002 withdrew it, in either
+    order, so the reply stays with the signal R/7002 withdrew when the
+    relay posts the call again."""
+    _store_call(conn, order)
+    _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(minutes=1))
+    _edit(conn, RELAY, COPY, DIRECTION_EDIT, POSTED + timedelta(minutes=2))
+    conn.commit()
+    _ingest(conn, RELAY, 7010, CLOSE_HALF, posted=POSTED + timedelta(minutes=3), reply_to=7002)
+    for message_id in (COPY, 7002):
+        _delete(conn, RELAY, message_id, POSTED + timedelta(minutes=4), also=(COPY, 7002))
+    assert _live(conn) == []
+    ((withdrawn,),) = _q(
+        conn, "SELECT signal_id FROM signals WHERE closed_by_message_id = 7002"
+    )
+
+    again = _ingest(conn, RELAY, 7003, posted=POSTED + timedelta(minutes=5))
+
+    assert (again.outcome, _live(conn)) == ("new", [again.signal_id])
+    ((followup_id,),) = _q(conn, "SELECT followup_id FROM followups WHERE message_id = 7010")
+    assert relay_repo.signal_for_followup(conn, followup_id=followup_id) == withdrawn
+
+
+def test_a_post_of_another_signal_deleted_in_the_same_report_withdrew_nothing_of_this_one(
+    conn,  # noqa: F811
+):
+    """One channel: the VIP posts a call and, 20 minutes later -- outside
+    the relay window -- the same call again: two signals. One report
+    deletes both posts; each withdrew its own signal, not the other's."""
+    _ingest(conn, VIP, CALL)
+    later = _ingest(conn, VIP, 4020, posted=POSTED + timedelta(minutes=20))
+    assert later.outcome == "new" and _live(conn) == [1, later.signal_id]
+
+    for message_id in (CALL, 4020):
+        _delete(conn, VIP, message_id, POSTED + timedelta(minutes=21), also=(CALL, 4020))
+
+    assert _live(conn) == []
+    assert _q(conn, "SELECT signal_id, closed_by_message_id FROM signals ORDER BY 1") == [
+        (1, CALL), (later.signal_id, 4020)
+    ]
+
+
 # == Round 5 (ruling R5-5): "trade it by hand" never while the call is queued ==
 
 _DO_NOT = "do NOT trade it by hand as well"

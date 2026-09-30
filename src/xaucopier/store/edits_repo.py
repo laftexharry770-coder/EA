@@ -170,7 +170,10 @@ already: it is never promoted (its entries would be claimable until the
 next job voided them), and a repeat deleted together with its signal's
 own message says nothing of its own -- the signal's own deletion speaks
 for both, when it will: not when that message had left the call before,
-or its removal is an echo (`_holder_speaks`; ruling R5-6).
+or its removal is an echo (`_holder_speaks`; ruling R5-6). Whichever job
+speaks, the post recorded as the one that withdrew the call is the lowest
+id of the report's posts that still showed it (`_closing_post`), so that
+it never depends on which post held the signal.
 
 **A deletion inferred from absence can be reversed.** The window re-read
 (`ingest/edits.py`) infers a deletion when a message stops coming back --
@@ -1183,6 +1186,47 @@ def _withdraw_post(
     )
 
 
+def _closing_post(ctx: _Ctx, row: sqlite3.Row) -> int:
+    """The post to record as the one that withdrew signal `row`
+    (`signals.closed_by_*`): `ctx`'s post -- or, when the same report
+    deleted other posts of the call on this channel together with it, the
+    lowest id among them. Which job of the report speaks depends on which
+    post holds the signal (the holder's, `_holder_speaks`) and on the order
+    the report named them; which post withdrew the call must not: a reply
+    to that post stays with the signal it withdrew (ruling R4-4), so it
+    would otherwise depend on which post was stored first (ruling R5-6,
+    INV-2). A post counts when it is a post of the call's chain still
+    stored as a signal, not the post that closed an earlier signal of it,
+    and -- re-read -- still showing the call: one re-aimed or edited away
+    before the report withdrew nothing now."""
+    if not ctx.also_deleted:
+        return ctx.message_id
+    chain = relay_repo.chain_ids(ctx.conn, row["signal_id"])
+    closing = ctx.message_id
+    for message_id in sorted(ctx.also_deleted):
+        if message_id >= closing:
+            break
+        post = _get_message(ctx.conn, channel_id=ctx.channel_id, message_id=message_id)
+        if post is None or post["kind"] != "signal":
+            continue
+        own = signals_repo.get_signal_id(
+            ctx.conn, channel_id=ctx.channel_id, message_id=message_id
+        )
+        if own not in chain and post["relay_of_signal_id"] not in chain:
+            continue
+        closed = ctx.conn.execute(
+            f"SELECT 1 FROM signals WHERE signal_id IN ({', '.join('?' for _ in chain)}) "
+            "  AND closed_by_channel_id = ? AND closed_by_message_id = ?",
+            (*chain, ctx.channel_id, message_id),
+        ).fetchone()
+        if closed is not None:
+            continue
+        if _shows(_reread(ctx, post), row):
+            closing = message_id
+            break
+    return closing
+
+
 def _holder_speaks(ctx: _Ctx, row: sqlite3.Row) -> bool:
     """For a repeat deleted in the same report as signal `row`'s own
     message: whether that message's deletion will withdraw the call, so
@@ -1384,7 +1428,10 @@ def _withdraw_signal(
     signal_id = row["signal_id"]
     signals_repo.mark_withdrawn(ctx.conn, signal_id=signal_id, now_utc=ctx.now_utc)
     signals_repo.record_closed_by(
-        ctx.conn, signal_id=signal_id, channel_id=ctx.channel_id, message_id=ctx.message_id
+        ctx.conn,
+        signal_id=signal_id,
+        channel_id=ctx.channel_id,
+        message_id=_closing_post(ctx, row),
     )
     skipped = outbox.skip_queued(
         ctx.conn, kind="ENTRY", signal_id=signal_id, reason=f"signal withdrawn: {via}"
