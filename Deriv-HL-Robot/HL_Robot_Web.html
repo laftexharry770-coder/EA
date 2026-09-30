@@ -106,6 +106,7 @@ details.adv summary::-webkit-details-marker { display: none; }
 details.adv summary::before { content: "▸ "; }
 details.adv[open] summary::before { content: "▾ "; }
 .check { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-top: 10px; color: var(--muted); }
+.steps { margin: 12px 0 0; padding-left: 20px; font-size: 12.5px; color: var(--muted); display: grid; gap: 4px; }
 .warn { margin-top: 10px; background: var(--red-soft); color: var(--red); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; font-weight: 500; }
 
 /* Blocks, styled like Deriv Bot's builder */
@@ -214,25 +215,34 @@ details.adv[open] summary::before { content: "▾ "; }
       <h2 id="h-conn">Deriv account</h2>
       <div class="body">
         <div class="conn-state"><span class="dot" id="conn-dot"></span><span id="conn-text">Not connected</span></div>
-        <label class="f" for="token">API token</label>
+        <label class="f" for="token">Personal Access Token</label>
         <div class="row">
-          <input class="in" id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Deriv API token">
+          <input class="in" id="token" type="password" autocomplete="off" spellcheck="false" placeholder="pat_…">
           <button class="btn ghost" id="show-token" type="button" aria-label="Show token">Show</button>
         </div>
+        <label class="f" for="app-id">App ID</label>
+        <input class="in num" id="app-id" autocomplete="off" spellcheck="false" placeholder="From your Deriv developer dashboard">
+        <label class="f" for="acct-type">Account</label>
+        <select class="in" id="acct-type">
+          <option value="demo" selected>Demo</option>
+          <option value="real">Real</option>
+        </select>
         <label class="check"><input type="checkbox" id="remember"> Remember the token on this device</label>
         <details class="adv" id="adv">
           <summary>Connection settings</summary>
-          <label class="f" for="app-id">App ID</label>
-          <input class="in num" id="app-id" inputmode="numeric" value="1089">
-          <label class="f" for="server">Server</label>
-          <input class="in num" id="server" value="ws.derivws.com" spellcheck="false">
-          <div class="hint">1089 is Deriv's public app ID. You can register your own for free on Deriv's API site.</div>
+          <label class="f" for="server">API server</label>
+          <input class="in num" id="server" value="api.derivws.com" spellcheck="false">
         </details>
         <div class="row" style="margin-top:12px">
           <button class="btn primary" id="connect" type="button" style="flex:1">Connect</button>
           <button class="btn" id="disconnect" type="button" hidden>Disconnect</button>
         </div>
-        <div class="hint">Create a token with <b>Read</b> and <b>Trade</b> scopes in Deriv under Account settings → API token. It is only ever sent to Deriv.</div>
+        <ol class="steps">
+          <li>Sign in at <b>developers.deriv.com</b> with your Deriv account and open the Dashboard.</li>
+          <li>Register an app. Copy its <b>App ID</b> into the box above.</li>
+          <li>Create a <b>Personal Access Token</b> for that app with the <b>Trade</b> scope. It starts with <span class="num">pat_</span>.</li>
+        </ol>
+        <div class="hint">The token is only ever sent to Deriv. Old tokens from Account settings → API token no longer work: Deriv switched them off.</div>
         <div class="warn" id="real-warn" hidden>This is a real-money account. Try the bot on your Demo account first.</div>
       </div>
     </section>
@@ -344,9 +354,12 @@ details.adv[open] summary::before { content: "▾ "; }
     PUT: { name: 'Lower', icon: 'i-down' },
   };
   const TOKEN_KEY = 'hl_robot_token';
+  const APP_ID_KEY = 'hl_robot_app_id';
+  const ACCT_KEY = 'hl_robot_account';
 
   const state = {
     ws: null,
+    api: 'current', // 'current' (Personal Access Token) or 'legacy'
     reqId: 0,
     pending: new Map(),
     manualClose: false,
@@ -419,19 +432,77 @@ details.adv[open] summary::before { content: "▾ "; }
   // One set of parameters per side. The Higher's barrier sits below the
   // price and the Lower's above it, as the video's variable names say.
   function contractParams(s) {
-    const base = { amount: +s.stake.toFixed(state.decimals), basis: 'stake', currency: state.currency, duration_unit: 't', symbol: s.symbol };
+    const base = { amount: +s.stake.toFixed(state.decimals), basis: 'stake', currency: state.currency, duration_unit: 't' };
+    base[state.api === 'legacy' ? 'symbol' : 'underlying_symbol'] = s.symbol;
     return {
       CALL: { ...base, contract_type: 'CALL', duration: s.hDur, barrier: `-${s.hBar}` },
       PUT: { ...base, contract_type: 'PUT', duration: s.lDur, barrier: `+${s.lBar}` },
     };
   }
 
-  /* ---------- websocket ---------- */
-  function socketUrl() {
-    const host = $('server').value.trim().replace(/^wss?:\/\//, '').replace(/\/.*$/, '');
-    const appId = $('app-id').value.trim().replace(/\D/g, '') || '1089';
-    const scheme = /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host) ? 'ws' : 'wss';
-    return `${scheme}://${host}/websockets/v3?app_id=${appId}&l=EN&brand=deriv`;
+  /* ---------- connecting to Deriv ---------- */
+  // Deriv's current API: the Personal Access Token and App ID go to the REST
+  // API, which lists the account's Options accounts and hands out a one-time
+  // (single-use, 120-second) WebSocket URL that is already logged in.
+  // Tokens that don't start with "pat_" are old-style API tokens, tried on
+  // the old WebSocket API with an "authorize" message.
+  const LEGACY_WS = 'ws.derivws.com';
+  const OLD_TOKEN_HELP = 'Deriv no longer accepts old-style API tokens. Create a Personal Access Token (it starts with pat_) on developers.deriv.com, for the App ID you registered there.';
+
+  const isLocal = host => /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host);
+  const cleanHost = v => v.trim().replace(/^[a-z]+:\/\//i, '').replace(/\/.*$/, '');
+
+  function apiBase() {
+    const host = cleanHost($('server').value) || 'api.derivws.com';
+    return `${isLocal(host) ? 'http' : 'https'}://${host}`;
+  }
+
+  function legacyUrl(appId) {
+    const host = cleanHost(new URLSearchParams(location.search).get('legacy_server') || LEGACY_WS);
+    return `${isLocal(host) ? 'ws' : 'wss'}://${host}/websockets/v3?app_id=${encodeURIComponent(appId || '1089')}&l=EN&brand=deriv`;
+  }
+
+  async function rest(method, path, token, appId) {
+    let res;
+    try {
+      res = await fetch(apiBase() + path, {
+        method,
+        headers: { Authorization: `Bearer ${token}`, 'Deriv-App-ID': appId, Accept: 'application/json', 'Content-Type': 'application/json' },
+      });
+    } catch (e) {
+      throw new Error(`Couldn't reach Deriv at ${cleanHost($('server').value) || 'api.derivws.com'}. Check your internet connection, and that no VPN, ad blocker or network filter is blocking Deriv.`);
+    }
+    const text = await res.text();
+    let body = null;
+    try { body = JSON.parse(text); } catch (e) { /* not JSON */ }
+    if (res.ok) return body || {};
+    const err = (body && ((body.errors && body.errors[0]) || body.error)) || {};
+    const detail = err.message || (body && body.message) || text.slice(0, 160) || res.statusText;
+    if (res.status === 401) throw new Error(`Deriv rejected the token (401: ${detail}). Use a Personal Access Token created for this App ID, with the Trade scope, that hasn't expired or been revoked.`);
+    if (res.status === 403) throw new Error(`Deriv accepted the token but refused access (403: ${detail}). Give the token the Trade scope, and check it was created for this App ID.`);
+    throw new Error(`Deriv error ${res.status}: ${detail}`);
+  }
+
+  async function currentApiSession(token, appId, type) {
+    const listed = await rest('GET', '/trading/v1/options/accounts', token, appId);
+    let accounts = listed.data || [];
+    if (!Array.isArray(accounts)) accounts = [accounts];
+    const typeOf = a => String(a.account_type || a.type || '').toLowerCase();
+    const isDemo = a => /demo|virtual/.test(typeOf(a)) || a.is_virtual === 1 || a.is_virtual === true;
+    const account = accounts.find(a => (type === 'demo' ? isDemo(a) : !isDemo(a)));
+    if (!account) {
+      const have = accounts.map(a => typeOf(a) || 'unknown').join(', ') || 'none';
+      throw new Error(`Deriv has no ${type} Options account for this token (accounts found: ${have}). Pick the other account type, or check the token's account.`);
+    }
+    const id = account.account_id || account.id || account.loginid;
+    const otp = await rest('POST', `/trading/v1/options/accounts/${encodeURIComponent(id)}/otp`, token, appId);
+    const url = otp.data && otp.data.url;
+    if (!url) throw new Error('Deriv did not return a trading connection address. Press Connect again.');
+    return {
+      api: 'current',
+      url,
+      account: { id: String(id), demo: isDemo(account), currency: account.currency, balance: account.balance },
+    };
   }
 
   function send(req) {
@@ -446,53 +517,82 @@ details.adv[open] summary::before { content: "▾ "; }
     });
   }
 
-  function connect() {
-    const token = $('token').value.trim();
+  async function connect(auto = false) {
+    const token = $('token').value.replace(/\s+/g, '');
+    const appId = $('app-id').value.trim();
+    const type = $('acct-type').value;
+    const isPat = /^pat_/i.test(token);
     if (!token) {
       $('token').focus();
-      setConn('off', 'Paste your API token first');
+      setConn('off', 'Paste your Personal Access Token first.');
+      return;
+    }
+    if (isPat && !appId) {
+      $('app-id').focus();
+      setConn('off', 'Enter the App ID the token was created for. Personal Access Tokens only work with their own App ID.');
       return;
     }
     try {
       if ($('remember').checked) localStorage.setItem(TOKEN_KEY, token);
       else localStorage.removeItem(TOKEN_KEY);
+      localStorage.setItem(APP_ID_KEY, appId);
+      localStorage.setItem(ACCT_KEY, type);
     } catch (e) { /* storage unavailable */ }
 
     closeSocket();
     state.manualClose = false;
-    setConn('busy', 'Connecting…');
+    setConn('busy', auto ? 'Connection lost, reconnecting…' : 'Connecting…');
     $('connect').disabled = true;
 
-    const ws = new WebSocket(socketUrl());
+    let session;
+    try {
+      session = isPat ? await currentApiSession(token, appId, type) : { api: 'legacy', url: legacyUrl(appId) };
+    } catch (e) {
+      if (auto && /Couldn't reach/.test(e.message)) {
+        state.reconnectTimer = setTimeout(() => connect(true), 5000);
+        setConn('busy', 'Connection lost, reconnecting…');
+        return;
+      }
+      loginFailed(e.message);
+      return;
+    }
+    openSocket(session, token, type);
+  }
+
+  function loginFailed(message) {
+    log(`Login failed: ${message}`, 'e');
+    setConn('off', message);
+    state.account = null;
+    $('connect').hidden = false;
+    $('disconnect').hidden = true;
+    $('connect').disabled = false;
+    $('run').disabled = true;
+  }
+
+  function openSocket(session, token, type) {
+    let ws;
+    try {
+      ws = new WebSocket(session.url);
+    } catch (e) {
+      loginFailed(`Couldn't open Deriv's trading connection: ${e.message}`);
+      return;
+    }
     state.ws = ws;
+    state.api = session.api;
+    let opened = false;
 
     ws.onopen = async () => {
+      opened = true;
       try {
-        const { authorize } = await send({ authorize: token });
-        state.account = authorize;
-        state.currency = authorize.currency || 'USD';
-        state.decimals = state.currency === 'BTC' || state.currency === 'ETH' ? 8 : 2;
-        const demo = !!authorize.is_virtual || /^VR/.test(authorize.loginid);
-        $('who').innerHTML = `<span class="lid">${esc(authorize.loginid)}</span><span class="badge ${demo ? 'demo' : 'real'}">${demo ? 'Demo' : 'Real'}</span>`;
-        $('real-warn').hidden = demo;
-        $('balance').textContent = `${fmt(authorize.balance)} ${state.currency}`;
-        setConn('on', `Connected as ${authorize.loginid}`);
-        $('connect').hidden = true;
-        $('disconnect').hidden = false;
-        $('connect').disabled = false;
-        log(`Connected to ${authorize.loginid} (${demo ? 'Demo' : 'Real'}).`, 'ok');
-
-        send({ balance: 1, subscribe: 1 }).catch(e => log(`Balance: ${e.message}`, 'e'));
-        await subscribeTicks();
-        resubscribeOpenContracts();
-        refreshQuote();
-        clearInterval(state.pingTimer);
-        state.pingTimer = setInterval(() => send({ ping: 1 }).catch(() => {}), 30000);
-        $('run').disabled = false;
-        if (!state.running) setStatus('Bot is not running', 'Press Run to start trading', 0);
+        let acct = session.account;
+        if (session.api === 'legacy') {
+          const { authorize } = await send({ authorize: token });
+          acct = { id: authorize.loginid, demo: !!authorize.is_virtual || /^VR/.test(authorize.loginid), currency: authorize.currency, balance: authorize.balance };
+        }
+        await loggedIn(acct);
       } catch (e) {
-        log(`Login failed: ${e.message || e.code}`, 'e');
-        state.closeReason = e.message || 'Could not log in';
+        const msg = e.message || e.code || 'Could not log in';
+        state.closeReason = session.api === 'legacy' ? `${msg} ${OLD_TOKEN_HELP}` : msg;
         state.manualClose = true;
         ws.close();
       }
@@ -515,7 +615,7 @@ details.adv[open] summary::before { content: "▾ "; }
       else if (msg.msg_type === 'proposal_open_contract') onContract(msg.proposal_open_contract, msg.subscription);
     };
 
-    ws.onclose = () => {
+    ws.onclose = ev => {
       if (state.ws !== ws) return; // an older socket we already replaced
       clearInterval(state.pingTimer);
       state.pending.forEach(p => p.reject({ code: 'Disconnected', message: 'Connection to Deriv closed.' }));
@@ -527,18 +627,51 @@ details.adv[open] summary::before { content: "▾ "; }
         log('Connection dropped while buying. Check your Deriv statement for any trade not listed here.', 'e');
         state.phase = state.pair && state.pair.contracts.length ? 'open' : 'idle';
       }
-      if (state.manualClose) {
-        setConn(state.closeReason ? 'off' : '', state.closeReason || 'Not connected');
-        state.closeReason = null;
-        $('connect').hidden = false;
-        $('disconnect').hidden = true;
-        $('connect').disabled = false;
+      if (!opened && !state.manualClose) {
+        loginFailed(session.api === 'legacy'
+          ? `Deriv's old connection refused this token. ${OLD_TOKEN_HELP}`
+          : `Deriv closed the trading connection before it opened (code ${ev.code}). Press Connect to try again.`);
         return;
       }
+      if (state.manualClose) {
+        if (state.closeReason) loginFailed(state.closeReason);
+        else {
+          setConn('', 'Not connected');
+          $('connect').hidden = false;
+          $('disconnect').hidden = true;
+          $('connect').disabled = false;
+        }
+        state.closeReason = null;
+        return;
+      }
+      // Each login URL works once, so reconnecting starts a fresh login.
       setConn('busy', 'Connection lost, reconnecting…');
       clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = setTimeout(connect, 3000);
+      state.reconnectTimer = setTimeout(() => connect(true), 3000);
     };
+  }
+
+  async function loggedIn(acct) {
+    state.account = acct;
+    state.currency = acct.currency || 'USD';
+    state.decimals = state.currency === 'BTC' || state.currency === 'ETH' ? 8 : 2;
+    $('who').innerHTML = `<span class="lid">${esc(acct.id)}</span><span class="badge ${acct.demo ? 'demo' : 'real'}">${acct.demo ? 'Demo' : 'Real'}</span>`;
+    $('real-warn').hidden = acct.demo;
+    if (acct.balance !== undefined && acct.balance !== null) $('balance').textContent = `${fmt(acct.balance)} ${state.currency}`;
+    setConn('on', `Connected as ${acct.id}`);
+    $('connect').hidden = true;
+    $('disconnect').hidden = false;
+    $('connect').disabled = false;
+    log(`Connected to ${acct.id} (${acct.demo ? 'Demo' : 'Real'}).`, 'ok');
+
+    send({ balance: 1, subscribe: 1 }).catch(e => log(`Balance: ${e.message}`, 'e'));
+    await subscribeTicks();
+    resubscribeOpenContracts();
+    refreshQuote();
+    clearInterval(state.pingTimer);
+    state.pingTimer = setInterval(() => send({ ping: 1 }).catch(() => {}), 30000);
+    $('run').disabled = false;
+    if (!state.running) setStatus('Bot is not running', 'Press Run to start trading', 0);
   }
 
   function closeSocket() {
@@ -553,7 +686,7 @@ details.adv[open] summary::before { content: "▾ "; }
   async function subscribeTicks() {
     const symbol = $('symbol').value;
     if (state.tickSub) {
-      send({ forget: state.tickSub }).catch(() => {});
+      await send({ forget_all: 'ticks' }).catch(() => {});
       state.tickSub = null;
     }
     state.symbol = symbol;
@@ -609,7 +742,8 @@ details.adv[open] summary::before { content: "▾ "; }
 
   /* ---------- trading ---------- */
   function onTick(tick) {
-    if (tick.symbol && tick.symbol !== state.symbol) return;
+    const sym = tick.symbol || tick.underlying_symbol;
+    if (sym && sym !== state.symbol) return;
     state.lastTick = tick;
     $('spot').textContent = tick.pip_size !== undefined ? (+tick.quote).toFixed(tick.pip_size) : tick.quote;
     if (state.running && state.phase === 'idle') buyPair(tick);
@@ -699,9 +833,14 @@ details.adv[open] summary::before { content: "▾ "; }
     const c = state.contracts.get(poc.contract_id);
     if (!c) return;
     if (subscription && !c.sub) c.sub = subscription.id;
-    if (poc.entry_tick_display_value || poc.entry_tick) c.entry = poc.entry_tick_display_value || String(poc.entry_tick);
-    if (poc.entry_tick_time) c.entry_time = poc.entry_tick_time;
-    if (poc.exit_tick_display_value || poc.exit_tick) c.exit = poc.exit_tick_display_value || String(poc.exit_tick);
+    // The current API reports entry_spot / exit_spot; the old one entry_tick / exit_tick.
+    const first = (...v) => v.find(x => x !== undefined && x !== null && x !== '');
+    const entry = first(poc.entry_tick_display_value, poc.entry_spot_display_value, poc.entry_spot, poc.entry_tick);
+    const exit = first(poc.exit_tick_display_value, poc.exit_spot_display_value, poc.exit_spot, poc.exit_tick);
+    const entryTime = first(poc.entry_tick_time, poc.entry_spot_time);
+    if (entry !== undefined) c.entry = String(entry);
+    if (entryTime !== undefined) c.entry_time = entryTime;
+    if (exit !== undefined) c.exit = String(exit);
     if (poc.buy_price !== undefined) c.buy_price = +poc.buy_price;
     if (poc.payout !== undefined) c.payout = +poc.payout;
 
@@ -805,8 +944,9 @@ details.adv[open] summary::before { content: "▾ "; }
 
   function sameTick(pair) {
     const cs = pair.contracts.map(id => state.contracts.get(id));
-    if (cs.length !== 2 || cs.some(c => !c.entry_time)) return false;
-    return cs[0].entry_time === cs[1].entry_time;
+    if (cs.length !== 2 || cs.some(c => !c.entry)) return false;
+    if (cs.every(c => c.entry_time)) return cs[0].entry_time === cs[1].entry_time;
+    return cs[0].entry === cs[1].entry;
   }
 
   function renderTransactions() {
@@ -819,7 +959,7 @@ details.adv[open] summary::before { content: "▾ "; }
       const pair = state.pairs[i];
       const cs = pair.contracts.map(id => state.contracts.get(id));
       let tag = '';
-      if (cs.length === 2 && cs.every(c => c.entry_time)) {
+      if (cs.length === 2 && cs.every(c => c.entry)) {
         tag = sameTick(pair) ? '<span class="same">Same entry tick</span>' : '<span class="diff">Different entry ticks</span>';
       } else if (pair.failed.length) {
         tag = `<span class="diff">${pair.failed.map(t => SIDES[t].name).join(', ')} not bought</span>`;
@@ -839,7 +979,7 @@ details.adv[open] summary::before { content: "▾ "; }
   }
 
   /* ---------- wiring ---------- */
-  $('connect').addEventListener('click', connect);
+  $('connect').addEventListener('click', () => connect());
   $('disconnect').addEventListener('click', () => {
     if (state.running) stopBot('Stopped');
     closeSocket();
@@ -876,8 +1016,10 @@ details.adv[open] summary::before { content: "▾ "; }
 
   const params = new URLSearchParams(location.search);
   if (params.get('server')) $('server').value = params.get('server');
-  if (params.get('app_id')) $('app-id').value = params.get('app_id');
   try {
+    $('app-id').value = localStorage.getItem(APP_ID_KEY) || '';
+    const acct = localStorage.getItem(ACCT_KEY);
+    if (acct === 'demo' || acct === 'real') $('acct-type').value = acct;
     const saved = localStorage.getItem(TOKEN_KEY);
     if (saved) {
       $('token').value = saved;

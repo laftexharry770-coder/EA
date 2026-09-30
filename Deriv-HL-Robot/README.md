@@ -14,13 +14,21 @@ A rebuild of the "HL robot" in the @bbfxtraders video "Making $2000 for iPhone D
 
 ### What you need
 
-- A Deriv **API token** with the **Read** and **Trade** scopes. Create it in Deriv under **Account settings → API token**. Don't give it the Payments or Admin scopes; the app doesn't need them.
-- Chrome, Edge or Firefox on a computer. Open `HL_Robot_Web.html` by double-clicking it.
+Deriv has moved to a new API. The old tokens from **Account settings → API token** and the old public App ID 1089 no longer connect, so you need two things from Deriv's developer site:
+
+1. Sign in at **developers.deriv.com** with your Deriv account and open the **Dashboard**.
+2. Register an app. Its **App ID** is shown in the dashboard.
+3. Create a **Personal Access Token** for that app with the **Trade** scope. It starts with `pat_`. Copy it when it's shown.
+
+### Opening the app
+
+- **On a phone or any browser:** https://laftexharry770-coder.github.io/EA/Deriv-HL-Robot/HL_Robot_Web.html. If that page doesn't load, turn on GitHub Pages for this repository: **Settings → Pages → Build and deployment → Deploy from a branch → `main`, `/ (root)` → Save**, then wait a minute.
+- **On a computer:** download `HL_Robot_Web.html` and double-click it.
 
 ### Running it
 
-1. In Deriv, switch to your **Demo** account, then create the token.
-2. Paste the token into **API token** and press **Connect**. The top right shows your account, balance, and a **Demo** or **Real** badge.
+1. Paste the token into **Personal Access Token** and the App ID into **App ID**. Leave **Account** on **Demo** to start with.
+2. Press **Connect**. The app asks Deriv for your Options accounts, picks the Demo or Real one, gets a one-time login, and opens the trading connection. The top right shows your account, balance, and a **Demo** or **Real** badge. If something is wrong, the line under **Deriv account** says exactly what, for example a wrong App ID or a token without the Trade scope.
 3. The settings come filled in with the video's values. The two boxes under them show Deriv's live payout for each side. If Deriv refuses a setting, its reason shows there.
 4. Press **Run**. On the next tick the app sends both buy orders to Deriv in the same instant, so both contracts start on the same entry tick.
 5. Open **Transactions**. Each pair shows Lower above Higher, as in the video, with **Same entry tick** once Deriv reports both entry spots.
@@ -42,11 +50,10 @@ Each side here uses its own variables, as the names in the video say. The Deriv 
 
 ### Good to know
 
-- The token is only sent to Deriv. If you tick **Remember the token on this device**, it is saved in this browser's storage; otherwise it's gone when you close the page.
-- The app uses Deriv's public app ID, 1089. If Deriv ever refuses it, register your own free app ID on Deriv's API site and enter it under **Connection settings**.
-- If the connection drops, the bot stops, reconnects by itself, and follows any open contracts to the end. Press **Run** again to carry on.
+- The token is only sent to Deriv. If you tick **Remember the token on this device**, it is saved in this browser's storage; otherwise it's gone when you close the page. The App ID and account choice are always remembered.
+- If the connection drops, the bot stops, logs in again with a fresh one-time login, and follows any open contracts to the end. Press **Run** again to carry on.
 - If Deriv refuses three pairs in a row, the bot stops. The **Journal** tab shows Deriv's exact message for every refused order.
-- I tested the app in Chrome against a stand-in for Deriv's API that uses the same messages, since Deriv's servers couldn't be reached from where it was built. Run it on Demo first.
+- I tested the app in Chrome against a stand-in for Deriv's new API, built from the published login flow (accounts → one-time login → trading connection) and the field names working apps use (`underlying_symbol`, `entry_spot`, `exit_spot`). Deriv's servers couldn't be reached from where it was built, so run it on Demo first.
 
 ## Deriv Bot files (bot.deriv.com)
 
