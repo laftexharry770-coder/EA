@@ -43,7 +43,11 @@ CRITICAL `TEMPLATE_CHANGED_SUSPECTED` naming the channel -- once per
 streak: not again at 4, 5 and on, and a signal read cleanly resets the
 count. The router classifies entry-shaped text in another layout as
 parse_failed too (`parsing/router.py`), so the most likely template
-change -- a new header -- counts.
+change -- a new header -- counts. Such text is never a follow-up; when it
+also reads as an instruction ("Close all GOLD BUY now, SL 4470 hit"), a
+WARNING `ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED` says so the moment it is
+stored, naming the instruction that was NOT acted on -- a single one is
+loud too, not only a third in a row.
 
 Cross-channel relay dedup (spec G7): before a *signal* is inserted,
 `relay_repo.relay_of_signal` asks whether it repeats a call we already
@@ -148,6 +152,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
+from xaucopier.domain.signal import FollowUp
 from xaucopier.parsing.router import RouteResult, route
 from xaucopier.store import alerts, edits_repo, outbox, relay_repo, signals_repo
 
@@ -160,6 +165,20 @@ logger = logging.getLogger(__name__)
 TEMPLATE_CHANGED_SUSPECTED = "TEMPLATE_CHANGED_SUSPECTED"
 #: Unreadable signals in a row that raise it: spec 6.2's PAUSE_NEW count.
 TEMPLATE_CHANGE_STREAK = 3
+#: WARNING: an unreadable trade entry that also reads as an instruction for
+#: an open trade. Entry-shaped text is never a follow-up (ruling F07), so
+#: the instruction was NOT queued; the user is told which one it was.
+ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED = "ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED"
+
+#: An instruction in plain words, by its op (`FollowUpOp.value`).
+_INSTRUCTION_WORDS = {
+    "sl_to_be": "move the stop loss to the entry price",
+    "close_half": "close half of the trade",
+    "close_all": "close the whole trade",
+    "cancel_pending": "cancel the orders not filled yet",
+    "amend_sl": "move the stop loss",
+    "amend_tp": "move a take profit",
+}
 
 IngestOutcome = Literal["new", "duplicate", "edited", "relay_duplicate"]
 SenderKind = Literal["user", "channel", "chat"]
@@ -400,8 +419,7 @@ def _template_changed(
     """The CRITICAL TEMPLATE_CHANGED_SUSPECTED alert for a channel whose
     `TEMPLATE_CHANGE_STREAK`th unreadable signal in a row is `message_id`."""
     channel_id = channel_cfg.channel_id
-    name = getattr(channel_cfg, "name", None)
-    named = f"channel {channel_id}" + (f" ({name})" if name else "")
+    named = _named(channel_cfg)
     return alerts.record(
         conn,
         now_utc=now_utc,
@@ -415,6 +433,49 @@ def _template_changed(
             "The channel has probably changed how it writes its signals: signals written the "
             "new way are NOT traded until this program is updated to read them. Look at the "
             "channel. This alert is raised once; a signal read normally again ends it."
+        ),
+    )
+
+
+def _named(channel_cfg: _ChannelCfgLike) -> str:
+    name = getattr(channel_cfg, "name", None)
+    return f"channel {channel_cfg.channel_id}" + (f" ({name})" if name else "")
+
+
+def _instruction_words(followup: FollowUp) -> str:
+    words = _INSTRUCTION_WORDS.get(followup.op.value, followup.op.value)
+    if followup.op.value == "amend_tp" and followup.tp_index_hint is not None:
+        words = f"move take profit {followup.tp_index_hint}"
+    if followup.op.value in ("amend_sl", "amend_tp") and followup.price_hint is not None:
+        words = f"{words} to {followup.price_hint:g}"
+    return words
+
+
+def _instruction_not_queued(
+    conn: sqlite3.Connection,
+    channel_cfg: _ChannelCfgLike,
+    message_id: int,
+    route_result: RouteResult,
+    *,
+    now_utc: datetime,
+) -> int:
+    """The WARNING ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED for an unreadable
+    trade entry that also reads as an instruction for an open trade: not
+    traded, and the instruction not acted on either (ruling F07's cost,
+    made loud at once)."""
+    instruction = _instruction_words(route_result.unqueued_followup)
+    return alerts.record(
+        conn,
+        now_utc=now_utc,
+        level="WARNING",
+        code=ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED,
+        channel_id=channel_cfg.channel_id,
+        message_id=message_id,
+        detail=(
+            f"Message {message_id} on {_named(channel_cfg)} looks like a trade signal written "
+            "in a way this program cannot read, so nothing was traded from it. It could also "
+            f"be an instruction for a trade already open -- '{instruction}' -- and that was NOT "
+            "done either. Look at the message: if it is an instruction, carry it out by hand."
         ),
     )
 
@@ -487,6 +548,8 @@ def _ingest_new(
         )
 
     if kind == "parse_failed":
+        if route_result.unqueued_followup is not None:
+            _instruction_not_queued(conn, channel_cfg, message_id, route_result, now_utc=now_utc)
         failures = signals_repo.increment_parse_failures(conn, channel_id=channel_id)
         if failures == TEMPLATE_CHANGE_STREAK:
             # Once per streak: exactly at three, never at four, five, ...;

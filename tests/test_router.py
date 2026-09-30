@@ -140,6 +140,11 @@ OTHER_LAYOUTS = [
     "BUY 4480\nSL 4470\nTP 4490",
     "SELL NOW 4502\nsl: 4510\ntp1: 4495",
     "SELL 4502\nStop Loss 4510\nTake Profit 4490",
+    # No target: a gold alias, a side word and a stop are enough -- read
+    # as a follow-up, "SL: 4470" would move a live trade's stop.
+    "XAUUSD BUY NOW 4480\nSL: 4470",
+    "GOLD SELL 4502 SL 4510",
+    "XAU BUY 4480\nSL 4470",
 ]
 
 #: The most likely template change: only the header differs.
@@ -149,6 +154,13 @@ CHANGED_HEADERS = [
     "XAUUSD BUY NOW",
     "GOLD | BUY LIMIT",
     "XAUUSD - BUY SIGNAL",
+    "XAU/USD | BUY SIGNAL",
+    # Not an instrument's name: the channel's own header, reworded. The
+    # body carries no gold alias, so only the header can tell -- and a
+    # word that names no instrument is no reason to call it "not gold".
+    "VIP | BUY SIGNAL",
+    "SCALP | BUY SIGNAL",
+    "GC | BUY SIGNAL",
 ]
 
 
@@ -211,6 +223,17 @@ def test_text_missing_a_side_or_a_stop_value_is_not_entry_shaped(text):
         ("US30 | BUY SIGNAL\n44800-44850\nSL: 44700\nTP1: 44900", "skip"),
         ("NAS100 | SELL\nSL: 19900\nTP: 19700", "skip"),
         ("NAS100 | SELL\nSL: 19900", "skip"),  # never a gold follow-up either
+        # An instrument's name: a symbol with a digit, a currency, metal or
+        # coin pair, or a well-known market's name.
+        ("EURUSD | BUY SIGNAL\n1.1650-1.1655\nSL: 1.1620\nTP1: 1.1700", "skip"),
+        ("XAGUSD | SELL SIGNAL\n52.10-52.20\nSL: 52.60\nTP1: 51.50", "skip"),
+        ("BTCUSDT | BUY SIGNAL\n98000-98200\nSL: 97000\nTP1: 99500", "skip"),
+        ("SILVER | BUY SIGNAL\n52.10-52.20\nSL: 51.60\nTP1: 52.80", "skip"),
+        ("USOIL | SELL SIGNAL\n66.10-66.20\nSL: 66.90\nTP1: 65.20", "skip"),
+        ("GER40 | BUY SIGNAL\n24100-24120\nSL: 24000\nTP1: 24300", "skip"),
+        # ...but a word that names no instrument is the header reworded.
+        ("VIP | BUY SIGNAL\n4480-4485\nSL: 4470\nTP1: 4490", "parse_failed"),
+        ("SIGNAL | SELL\nSL: 4510\nTP: 4490", "parse_failed"),
         # ...but a symbol containing a gold alias is gold,
         ("GOLDUSD | BUY\n4480-4485\nSL: 4470\nTP1: 4490", "parse_failed"),
         ("XAUEUR | SELL\nSL: 4110\nTP1: 4090", "parse_failed"),

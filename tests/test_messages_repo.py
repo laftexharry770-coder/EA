@@ -316,6 +316,55 @@ def test_an_entry_in_another_layout_is_never_queued_as_a_follow_up(conn):
     assert failures == 1
 
 
+def _instruction_alerts(conn) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT level, code, channel_id, message_id, detail FROM alerts WHERE code = ? "
+            "ORDER BY alert_id",
+            (messages_repo.ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED,),
+        ).fetchall()
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "words"),
+    [
+        ("Close all GOLD BUY now, SL 4470 hit", "close the whole trade"),
+        ("XAUUSD BUY TP1 hit ✅ move SL 4480", "move the stop loss to 4480"),
+        # A new entry in another layout reads as "move the stop" too: the
+        # user is told both readings, and that neither was acted on.
+        ("BUY GOLD 4480\nSL: 4470\nTP: 4490", "move the stop loss to 4470"),
+    ],
+    ids=["close-all", "amend-sl", "entry-in-another-layout"],
+)
+def test_an_entry_shaped_instruction_is_reported_the_moment_it_is_not_queued(conn, text, words):
+    """Ruling F07's cost: an oddly worded genuine follow-up that carries a
+    side word and a stop price is recorded as unreadable instead of queued
+    -- LOUDLY. The counter alone is not loud until a third one: each such
+    message raises a WARNING naming the instruction it seemed to give."""
+    _ingest(conn, message_id=4001, text=SIGNAL_TEXT)
+    result = _ingest(conn, message_id=4010, text=text)
+    assert (result.outcome, result.kind, result.followup_id) == ("new", "parse_failed", None)
+    assert _count(conn, "followups") == 0
+    assert conn.execute("SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP'").fetchone()[0] == 0
+    ((level, code, channel_id, message_id, detail),) = _instruction_alerts(conn)
+    assert (level, channel_id, message_id) == ("WARNING", CHANNEL_A.channel_id, 4010)
+    assert words in detail and "4010" in detail and CHANNEL_A.name in detail
+    assert "by hand" in detail
+    for word in ("client", "listener", "RPC", "flood"):
+        assert word not in detail
+
+
+@pytest.mark.parametrize(
+    "text", [NO_PIPE_TEXT, BROKEN_TEXT, CHATTER_TEXT, SIGNAL_TEXT, "close all"],
+    ids=["changed-header", "broken-zone", "chatter", "signal", "followup"],
+)
+def test_nothing_that_reads_as_no_instruction_raises_the_instruction_warning(conn, text):
+    _ingest(conn, message_id=4010, text=text)
+    assert _instruction_alerts(conn) == []
+
+
 def test_the_template_alert_is_per_channel(conn):
     for n in (1, 2):
         _ingest(conn, message_id=9000 + n, text=BROKEN_TEXT)

@@ -29,8 +29,16 @@ The rule that prevents it, in order:
    (XAUUSD, GOLD, XAU) or a target value ("TP: 4490", "TP1 4490", "Take
    Profit 4490"). One exception: a signal naming another instrument in
    the channel's own "SYMBOL | SIDE" header, with no gold alias anywhere
-   ("US30 | BUY SIGNAL ...") is not gold and not a changed template: it
-   stays a skip, so a channel's index calls never raise a false alarm.
+   ("US30 | BUY SIGNAL ...", "EURUSD | SELL ...", "SILVER | BUY ...") is
+   not gold and not a changed template: it stays a skip, so a channel's
+   index calls never raise a false alarm. The symbol must look like an
+   instrument (a digit in it, a currency / metal / coin pair, or a
+   market's name): "VIP | BUY SIGNAL" or "GC | BUY SIGNAL" over the
+   channel's own body is the header reworded, and is parse_failed.
+   When entry-shaped text ALSO reads as an instruction ("Close all GOLD
+   BUY now, SL 4470 hit"), that follow-up rides along as
+   `RouteResult.unqueued_followup` -- never queued, only reported, so a
+   genuine instruction dropped by this rule is dropped loudly.
 4. Anything else NOT_A_SIGNAL: only then is it worth asking whether it is
    a follow-up instruction: a hit is kind="followup", a miss is
    kind="skip".
@@ -74,6 +82,24 @@ _STOP_VALUE = re.compile(rf"\b(?:SL|STOP\s*LOSS)\b\s*[:=@-]?\s*{_NUM}", re.I)
 _TARGET_VALUE = re.compile(rf"\b(?:TP\s*\d*|TAKE\s*PROFIT)\b\s*[:=@-]?\s*{_NUM}", re.I)
 #: The channel's own "SYMBOL | SIDE" header shape, with its symbol.
 _PIPE_HEADER = re.compile(r"\b([A-Z][A-Z0-9]{1,9})\s*\|\s*(?:BUY|SELL)\b", re.I)
+#: The codes a traded pair is made of -- currencies, metals other than gold,
+#: coins and stablecoins: "EURUSD", "XAGUSD", "BTCUSDT" are two of them.
+_PAIR_CODES = frozenset(
+    {
+        "USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD", "SGD", "HKD", "NOK", "SEK",
+        "DKK", "ZAR", "MXN", "TRY", "PLN", "CNH", "CNY", "HUF", "CZK", "INR",
+        "XAG", "XPT", "XPD",
+        "BTC", "ETH", "LTC", "XRP", "SOL", "BNB", "ADA", "DOGE", "DOT", "USDT", "USDC",
+    }
+)
+#: Other markets known by a name rather than a pair or a number.
+_MARKET_NAMES = frozenset(
+    {
+        "SILVER", "PLATINUM", "COPPER", "OIL", "USOIL", "UKOIL", "WTI", "BRENT", "CRUDE",
+        "NGAS", "NATGAS", "NASDAQ", "NAS", "NDX", "DOW", "DJI", "SPX", "DAX", "FTSE",
+        "NIKKEI", "DXY", "VIX", "BITCOIN", "ETHEREUM",
+    }
+)
 
 
 EntryShape = Literal["gold", "other_instrument"]
@@ -98,13 +124,31 @@ def entry_shape(text: str) -> EntryShape | None:
 
 
 def _names_another_instrument(clean: str) -> bool:
-    """A "SYMBOL | SIDE" header whose symbol is no gold alias (and does
-    not contain one: "XAUEUR", "GOLDUSD" are gold)."""
+    """A "SYMBOL | SIDE" header whose symbol is another instrument's name
+    (`_is_instrument`) and no gold alias (nor contains one: "XAUEUR",
+    "GOLDUSD" are gold). "VIP | BUY", "SCALP | BUY", "GC | BUY" name no
+    other instrument: the channel's header reworded, which is exactly the
+    template change rule 3 must not let pass silently."""
     for match in _PIPE_HEADER.finditer(clean):
         symbol = match.group(1).upper()
-        if "XAU" not in symbol and "GOLD" not in symbol:
+        if "XAU" not in symbol and "GOLD" not in symbol and _is_instrument(symbol):
             return True
     return False
+
+
+def _is_instrument(symbol: str) -> bool:
+    """Whether a header's upper-cased `symbol` names a market: it carries a
+    digit ("US30", "NAS100", "GER40"), is a pair of two `_PAIR_CODES`
+    ("EURUSD", "XAGUSD", "BTCUSDT") or one of them alone ("BTC"), or is a
+    market's name (`_MARKET_NAMES`: "SILVER", "USOIL")."""
+    if any(ch.isdigit() for ch in symbol):
+        return True
+    if symbol in _PAIR_CODES or symbol in _MARKET_NAMES:
+        return True
+    return any(
+        symbol[:cut] in _PAIR_CODES and symbol[cut:] in _PAIR_CODES
+        for cut in range(3, len(symbol) - 2)
+    )
 
 
 class _ChannelCfgLike(Protocol):
@@ -123,6 +167,11 @@ class RouteResult:
     signal: Signal | None = None
     followup: FollowUp | None = None
     detail: str = ""
+    #: Only for an entry-shaped parse_failed (rule 3): the instruction
+    #: `parse_followup` reads in it ("Close all GOLD BUY now, SL 4470 hit").
+    #: NEVER queued -- entry-shaped text is no follow-up -- only reported,
+    #: so an oddly worded genuine instruction is dropped loudly (ruling F07).
+    unqueued_followup: FollowUp | None = None
 
 
 def route(
@@ -152,15 +201,11 @@ def route(
     # NOT_A_SIGNAL: never claimed to be this template -- but an entry in
     # another layout is a changed template, never a follow-up (rule 3).
     shape = entry_shape(text)
-    if shape == "gold":
-        return RouteResult(
-            kind="parse_failed",
-            detail=f"reads as a trade entry, but not in this channel's format ({result.detail})",
-        )
     if shape == "other_instrument":
         return RouteResult(kind="skip", detail="another instrument's signal, not gold")
 
-    # Worth asking parse_followup, which carries its own guard too.
+    # Worth asking parse_followup, which carries its own guard too -- and
+    # for entry-shaped text, only so the caller can say what was not done.
     followup = parse_followup(
         text,
         channel_id=channel_cfg.channel_id,
@@ -168,6 +213,12 @@ def route(
         posted_at_utc=posted_at_utc,
         reply_to_message_id=reply_to_message_id,
     )
+    if shape == "gold":
+        return RouteResult(
+            kind="parse_failed",
+            detail=f"reads as a trade entry, but not in this channel's format ({result.detail})",
+            unqueued_followup=followup,
+        )
     if followup is not None:
         return RouteResult(kind="followup", followup=followup, detail=result.detail)
 
