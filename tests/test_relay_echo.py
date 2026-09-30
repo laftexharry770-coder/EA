@@ -1429,6 +1429,33 @@ def test_a_reply_given_before_its_post_was_re_aimed_follows_the_call_in_either_o
     assert relay_repo.signal_for_followup(conn, followup_id=after) is None
 
 
+@pytest.mark.parametrize("order", ORDERS)
+def test_a_post_re_aimed_away_is_no_standing_post_for_the_last_ones_removal(
+    conn, order  # noqa: F811
+):
+    """Order seed 8592 (found at 5000 seeds): the relay forwards the VIP's
+    call; the VIP deletes it (signal 1 VOIDED); the relay posts the call
+    by hand (R/7002) and the VIP forwards that -- the VIP posting the call
+    again (signal 2). The relay re-aims R/7002 into a SELL; the VIP deletes
+    its forward of it (an echo: the relay's forward R/7001 still shows the
+    call). Then the relay deletes R/7001, which forwarded the post that
+    withdrew signal 1. R/7002 still reads as a signal, but no longer as
+    this call: R/7001 was the call's last standing post, and its removal
+    withdraws signal 2."""
+    _store_call(conn, order, forwards=True)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(minutes=2))
+    again = _ingest(conn, VIP, 4002, posted=POSTED + timedelta(minutes=3), fwd=(R, 7002))
+    assert again.outcome == "new" and _live(conn) == [again.signal_id]
+    _edit(conn, RELAY, 7002, DIRECTION_EDIT, POSTED + timedelta(minutes=4))
+    conn.commit()
+    _delete(conn, VIP, 4002, POSTED + timedelta(minutes=5))
+
+    _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=6))
+
+    _withdrawn_everywhere(conn, executed=False, signal_id=again.signal_id)
+
+
 @pytest.mark.parametrize("by", ["event", "window"])
 @pytest.mark.parametrize("first", [COPY, 7002], ids=["lower-first", "higher-first"])
 @pytest.mark.parametrize("order", ORDERS)
