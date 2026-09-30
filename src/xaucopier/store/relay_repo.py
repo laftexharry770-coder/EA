@@ -60,7 +60,11 @@ is told apart:
   forwarded post removed as a repeat -- it withdrew nothing, as its
   channel still showed the call -- is echoed only while that channel
   still shows the call; once its last post is gone too, the forward's
-  removal is a removal like any other (R5-2);
+  removal is a removal like any other (R5-2). With two channels the
+  last-standing-post rule below already decides what is traded; these
+  clauses decide it when a third channel forwards another's posts: the
+  call posted again still stands on its channel while the forward goes
+  (ruling R6-2);
 - the post a withdrawing forward copied is the *original*: its removal is
   the original poster retracting, and reaches the newest signal as any
   removal does;
@@ -1279,6 +1283,13 @@ def _gone_post(
       posts can never echo each other's repeats into keeping a call nobody
       shows;
     - it still stands: None.
+
+    These clauses decide what is traded when three or more channels carry
+    the call (ruling R6-2): a third channel's forward goes while the call,
+    posted again, still stands on another channel, so the last-standing-
+    post rule (`old_post`) does not apply, and only these tell an echo
+    from a removal that must withdraw the call. With two channels that
+    rule already withdraws any call no post shows.
 
     The call it belongs to need not be the one its forward was matched to:
     a late forward of a withdrawn post may repeat another call of the same

@@ -1766,3 +1766,101 @@ def test_a_held_back_forward_of_a_re_aimed_post_names_no_withdrawn_signal(
     detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
     assert detail.endswith("If the call is still meant, trade it by hand."), detail
     assert _DO_NOT not in detail and "signal 2" not in detail, detail
+
+
+# == Round 6 (ruling R6-2): R5-2's clauses with three channels =================
+#
+# With two channels, the last-standing-post rule alone withdraws a call whose
+# every post is gone. With a third channel forwarding the relay's posts, the
+# VIP's call posted again stands on the VIP's channel while the forward is
+# removed: then only R5-2's clauses in relay_repo._gone_post tell an echo
+# (nothing to do) from a removal that must withdraw the call posted again.
+
+
+def _removed_forward_withdraws_the_call_posted_again(  # noqa: F811
+    conn, *, forward: int, again: int
+) -> None:
+    """The third channel removes its forward O/`forward` of a post whose
+    channel no longer shows the call: no echo. The removal of an older post
+    of the call reaches signal `again` -- VOIDED with the CRITICAL doubt --
+    and nothing of the call is claimable."""
+    removed = _delete(conn, OTHER, forward, POSTED + timedelta(minutes=10))
+
+    assert (removed.outcome, removed.signal_id) == ("voided", again)
+    assert _live(conn) == []
+    assert ("CRITICAL", edits_repo.OLD_POST_WITHDREW_CALL) in _codes(conn)
+    assert _entries_claimable(conn) == []
+
+
+def test_a_forward_of_a_repeat_removed_is_no_echo_once_its_channel_withdrew_the_call(
+    conn,  # noqa: F811
+):
+    """r5_three_repeat: a third channel forwards the relay's R/7001. The
+    relay deletes R/7001 while R/7002 still shows the call (a repeat
+    removal), then R/7002, its last post: the relay withdrew the call. The
+    VIP deletes its post and posts the call again (signal 2). The forward's
+    removal cannot echo R/7001's repeat removal: the relay shows the call
+    nowhere any more, so it withdraws signal 2 like any older post."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30))
+    _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(seconds=60))
+    forward = _ingest(conn, OTHER, 9001, posted=POSTED + timedelta(seconds=90), fwd=(R, COPY))
+    assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", 1)
+    assert _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=2)).outcome == "deleted"
+    assert _delete(conn, RELAY, 7002, POSTED + timedelta(minutes=3)).outcome == "voided"
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=4))
+    again = _ingest(conn, VIP, 4002, posted=POSTED + timedelta(minutes=5))
+    assert (again.outcome, _live(conn)) == ("new", [again.signal_id])
+
+    _removed_forward_withdraws_the_call_posted_again(conn, forward=9001, again=again.signal_id)
+
+
+def test_a_forward_of_a_post_a_promotion_replaced_is_no_echo_once_its_channel_withdrew_the_call(
+    conn,  # noqa: F811
+):
+    """r5_three_promo: a third channel forwards the VIP's V/4001. The VIP
+    deletes V/4001 while its double V/4002 stands (promoted: signal 2 --
+    the call never stopped, so V/4001 withdrew nothing). The relay deletes
+    its only copy (the call is withdrawn), the VIP deletes V/4002, and the
+    relay posts the call again (signal 3). The forward's removal cannot
+    echo V/4001's: the VIP shows the call nowhere, so it withdraws
+    signal 3."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, VIP, 4002, posted=POSTED + timedelta(seconds=20))
+    _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30))
+    forward = _ingest(conn, OTHER, 9001, posted=POSTED + timedelta(seconds=40), fwd=(V, CALL))
+    assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", 1)
+    assert _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1)).promoted_signal_id == 2
+    assert _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=2)).outcome == "voided"
+    _delete(conn, VIP, 4002, POSTED + timedelta(minutes=3))
+    again = _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(minutes=4))
+    assert (again.outcome, _live(conn)) == ("new", [again.signal_id])
+    assert _promoted_from(conn, again.signal_id) == 2
+
+    _removed_forward_withdraws_the_call_posted_again(conn, forward=9001, again=again.signal_id)
+
+
+def test_a_forward_of_a_repeat_removed_is_no_echo_once_its_channel_re_aimed_its_last_post(
+    conn,  # noqa: F811
+):
+    """r5_three_reread: a third channel forwards the relay's R/7001. The
+    relay deletes R/7001 (a repeat: R/7002 and R/7003 stand), re-aims
+    R/7002 into a SELL (a repeat: R/7003 stands) and deletes R/7003, its
+    last post of the call. The VIP deletes its post and posts the call again
+    (signal 2). R/7002 is still stored as a signal, but re-read it shows
+    another call: the relay shows this one nowhere, so the forward's removal
+    withdraws signal 2."""
+    _ingest(conn, VIP, CALL)
+    for index, message_id in enumerate((COPY, 7002, 7003)):
+        _ingest(conn, RELAY, message_id, posted=POSTED + timedelta(seconds=30 + 10 * index))
+    forward = _ingest(conn, OTHER, 9001, posted=POSTED + timedelta(seconds=70), fwd=(R, COPY))
+    assert (forward.outcome, forward.relay_of_signal_id) == ("relay_duplicate", 1)
+    assert _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=2)).outcome == "deleted"
+    assert _edit(conn, RELAY, 7002, DIRECTION_EDIT, EDIT_1).outcome == "recorded"
+    conn.commit()
+    assert _delete(conn, RELAY, 7003, POSTED + timedelta(minutes=6)).outcome == "voided"
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=7))
+    again = _ingest(conn, VIP, 4002, posted=POSTED + timedelta(minutes=8))
+    assert (again.outcome, _live(conn)) == ("new", [again.signal_id])
+
+    _removed_forward_withdraws_the_call_posted_again(conn, forward=9001, again=again.signal_id)
