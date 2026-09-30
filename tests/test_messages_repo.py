@@ -19,7 +19,7 @@ import pytest
 
 from xaucopier.config.channels import ChannelCfg
 from xaucopier.domain.signal import FollowUpOp
-from xaucopier.store import db
+from xaucopier.store import db, messages_repo
 from xaucopier.store.messages_repo import ingest
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json"
@@ -249,6 +249,80 @@ def test_parse_failed_increments_skip_leaves_unchanged_signal_resets(conn):
     r3 = _ingest(conn, message_id=9003, text=SIGNAL_TEXT)
     assert r3.outcome == "new" and r3.kind == "signal"
     assert failures() == 0
+
+
+#: The fixture under another header: the most likely template change,
+#: now parse_failed (final review F07), so it feeds the counter too.
+NO_PIPE_TEXT = SIGNAL_TEXT.replace("XAUUSD | BUY SIGNAL", "XAUUSD BUY SIGNAL")
+
+
+def _template_alerts(conn) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT level, code, channel_id, message_id FROM alerts WHERE code = ? "
+            "ORDER BY alert_id",
+            (messages_repo.TEMPLATE_CHANGED_SUSPECTED,),
+        ).fetchall()
+    ]
+
+
+def test_three_unreadable_signals_in_a_row_raise_one_critical_alert_per_streak(conn):
+    """Final review F07 / ruling: when consecutive_parse_failures reaches 3,
+    ONE CRITICAL TEMPLATE_CHANGED_SUSPECTED names the channel -- not again
+    at 4, 5 and on; a signal read cleanly ends the streak, and the next
+    streak of three raises it again."""
+    for n, text in enumerate([NO_PIPE_TEXT, BROKEN_TEXT], start=1):
+        _ingest(conn, message_id=9000 + n, text=text)
+        conn.commit()
+    assert _template_alerts(conn) == []
+    _ingest(conn, message_id=9003, text=CHATTER_TEXT)  # chatter neither counts nor resets
+    _ingest(conn, message_id=9004, text=NO_PIPE_TEXT)
+    conn.commit()
+    assert _template_alerts(conn) == [
+        ("CRITICAL", messages_repo.TEMPLATE_CHANGED_SUSPECTED, CHANNEL_A.channel_id, 9004)
+    ]
+    (detail,) = conn.execute(
+        "SELECT detail FROM alerts WHERE code = ?", (messages_repo.TEMPLATE_CHANGED_SUSPECTED,)
+    ).fetchone()
+    assert str(CHANNEL_A.channel_id) in detail and CHANNEL_A.name in detail
+    for word in ("client", "listener", "RPC", "flood"):
+        assert word not in detail
+    for n in (9005, 9006):  # 4 and 5 in a row: no more
+        _ingest(conn, message_id=n, text=BROKEN_TEXT)
+    assert len(_template_alerts(conn)) == 1
+    _ingest(conn, message_id=9007, text=SIGNAL_TEXT)  # read cleanly: the streak ends
+    for n in (9008, 9009):
+        _ingest(conn, message_id=n, text=BROKEN_TEXT)
+    assert len(_template_alerts(conn)) == 1
+    _ingest(conn, message_id=9010, text=NO_PIPE_TEXT)
+    assert [row[3] for row in _template_alerts(conn)] == [9004, 9010]
+
+
+def test_an_entry_in_another_layout_is_never_queued_as_a_follow_up(conn):
+    """Final review F07's end-to-end case: with a signal live on the
+    channel, an entry in another layout used to be stored as an AMEND_SL
+    follow-up of its own stop, and queued. Now it is an unreadable signal:
+    no followups row, no outbox row, and the counter moves."""
+    _ingest(conn, message_id=4001, text=SIGNAL_TEXT)
+    result = _ingest(conn, message_id=4010, text="BUY GOLD 4480\nSL: 4470\nTP: 4490")
+    assert (result.outcome, result.kind, result.followup_id) == ("new", "parse_failed", None)
+    assert _count(conn, "followups") == 0
+    assert conn.execute("SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP'").fetchone()[0] == 0
+    (failures,) = conn.execute(
+        "SELECT consecutive_parse_failures FROM channel_state WHERE channel_id = ?",
+        (CHANNEL_A.channel_id,),
+    ).fetchone()
+    assert failures == 1
+
+
+def test_the_template_alert_is_per_channel(conn):
+    for n in (1, 2):
+        _ingest(conn, message_id=9000 + n, text=BROKEN_TEXT)
+        _ingest(conn, channel_cfg=CHANNEL_B, message_id=7000 + n, text=BROKEN_TEXT)
+    assert _template_alerts(conn) == []
+    _ingest(conn, channel_cfg=CHANNEL_B, message_id=7003, text=BROKEN_TEXT)
+    assert [row[2] for row in _template_alerts(conn)] == [CHANNEL_B.channel_id]
 
 
 # -- raw_text is a verbatim fixture for every outcome ------------------------

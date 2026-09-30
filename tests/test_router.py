@@ -110,3 +110,115 @@ def test_reply_to_message_id_is_carried_through_to_followup():
     r = _route("close all", reply_to=9)
     assert r.followup is not None
     assert r.followup.reply_to_message_id == 9
+
+
+# -- entry-shaped text that failed the channel parser (final review F07) ---------
+
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import pytest  # noqa: E402
+
+_FIXTURE = json.loads(
+    (Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json").read_text(
+        encoding="utf-8"
+    )
+)
+FIXTURE_TEXT: str = _FIXTURE["text"]
+FIXTURE_HEADER = "XAUUSD | BUY SIGNAL"
+assert FIXTURE_TEXT.count(FIXTURE_HEADER) == 1
+
+#: Common gold entry layouts that are not this channel's template. Before
+#: F07, the first five read as AMEND_SL follow-ups of the entry's own stop.
+OTHER_LAYOUTS = [
+    "BUY GOLD 4480\nSL: 4470\nTP: 4490",
+    "Gold Sell Now @4502\nSL:4510\nTP:4495",
+    "XAUUSD SELL\nEntry 4502\nStop Loss 4510\nTake Profit 4490",
+    "GOLD BUY LIMIT 4480\nSL = 4470\nTP = 4495",
+    "XAUUSD BUY @ 4480\nStoploss: 4470\nTakeprofit: 4490",
+    # No gold alias: a side word, a stop and a target are enough.
+    "BUY 4480\nSL 4470\nTP 4490",
+    "SELL NOW 4502\nsl: 4510\ntp1: 4495",
+    "SELL 4502\nStop Loss 4510\nTake Profit 4490",
+]
+
+#: The most likely template change: only the header differs.
+CHANGED_HEADERS = [
+    "XAUUSD BUY SIGNAL",
+    "XAUUSD | BUY",
+    "XAUUSD BUY NOW",
+    "GOLD | BUY LIMIT",
+    "XAUUSD - BUY SIGNAL",
+]
+
+
+@pytest.mark.parametrize("text", OTHER_LAYOUTS)
+def test_an_entry_in_another_layout_is_parse_failed_never_a_followup(text):
+    r = _route(text)
+    assert r.kind == "parse_failed", r
+    assert r.followup is None and r.signal is None
+
+
+@pytest.mark.parametrize("header", CHANGED_HEADERS)
+def test_the_fixture_under_a_changed_header_is_parse_failed(header):
+    r = _route(FIXTURE_TEXT.replace(FIXTURE_HEADER, header))
+    assert r.kind == "parse_failed", r
+    assert r.followup is None and r.signal is None
+
+
+def test_the_real_fixture_still_routes_to_signal():
+    assert _route(FIXTURE_TEXT).kind == "signal"
+    assert _route(FIXTURE_TEXT.replace(FIXTURE_HEADER, "XAUUSD | BUY SIGNAL NOW")).kind == "signal"
+
+
+#: Every follow-up phrase the tests use: each still routes to a follow-up.
+FOLLOWUP_PHRASES = [
+    "Move SL to BE", "Close half now", "SL to 4460", "TP2 to 4550", "cancel the order",
+    "SL to BE", "sl to breakeven", "Move SL to entry", "BREAKEVEN NOW",
+    "close half", "Close 50%", "take half off", "close half now",
+    "close all", "CLOSE ALL NOW", "close everything", "Close all now",
+    "cancel the pending order", "SL to 4461", "TP2: 4550", "move TP1 to 4500",
+    "tp to 4500",
+    # A side word and a gold alias, but "SL to" is an instruction, not a value.
+    "XAUUSD BUY running: move SL to 4475",
+]
+
+
+@pytest.mark.parametrize("text", FOLLOWUP_PHRASES)
+def test_every_follow_up_phrase_still_routes_to_a_followup(text):
+    assert _route(text).kind == "followup"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Good morning traders",
+        "BUY now, don't miss it",  # a side word, no stop value
+        "SL 4470 was hit, next one soon",  # a stop value, no side word
+        "we BUY the dip\nTP: 4490",  # side and target, no stop value
+        "SL: 4470\nTP: 4490",  # stop and target, no side word
+    ],
+)
+def test_text_missing_a_side_or_a_stop_value_is_not_entry_shaped(text):
+    assert _route(text).kind in ("skip", "followup")
+    assert _route(text).kind != "parse_failed"
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        # Another instrument in the channel's own header shape: not gold, no alarm.
+        ("US30 | BUY SIGNAL\n44800-44850\nSL: 44700\nTP1: 44900", "skip"),
+        ("NAS100 | SELL\nSL: 19900\nTP: 19700", "skip"),
+        ("NAS100 | SELL\nSL: 19900", "skip"),  # never a gold follow-up either
+        # ...but a symbol containing a gold alias is gold,
+        ("GOLDUSD | BUY\n4480-4485\nSL: 4470\nTP1: 4490", "parse_failed"),
+        ("XAUEUR | SELL\nSL: 4110\nTP1: 4090", "parse_failed"),
+        # ...a gold alias anywhere makes it gold,
+        ("US30 | BUY GOLD now\nSL: 4470\nTP: 4490", "parse_failed"),
+        # ...and another layout naming no symbol is a gold entry.
+        ("US30 BUY 44800\nSL: 44700\nTP: 44900", "parse_failed"),
+    ],
+)
+def test_another_instruments_signal_in_the_channels_header_shape_stays_a_skip(text, kind):
+    assert _route(text).kind == kind

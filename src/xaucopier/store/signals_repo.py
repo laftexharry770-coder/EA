@@ -328,10 +328,11 @@ def get_followup_id(conn: sqlite3.Connection, *, channel_id: int, message_id: in
     return row["followup_id"] if row is not None else None
 
 
-def increment_parse_failures(conn: sqlite3.Connection, *, channel_id: int) -> None:
+def increment_parse_failures(conn: sqlite3.Connection, *, channel_id: int) -> int:
     """A parse_failed message: the channel's template may have changed.
     Three in a row trips PAUSE_NEW (spec 6.2) -- Plan 3 reads this
-    counter and acts on it; this only records it.
+    counter and acts on it; this records it and returns the new count
+    (`messages_repo` raises TEMPLATE_CHANGED_SUSPECTED at three).
     """
     conn.execute(
         "INSERT INTO channel_state (channel_id, consecutive_parse_failures) VALUES (?, 1) "
@@ -339,6 +340,11 @@ def increment_parse_failures(conn: sqlite3.Connection, *, channel_id: int) -> No
         "consecutive_parse_failures = consecutive_parse_failures + 1",
         (channel_id,),
     )
+    (count,) = conn.execute(
+        "SELECT consecutive_parse_failures FROM channel_state WHERE channel_id = ?",
+        (channel_id,),
+    ).fetchone()
+    return int(count)
 
 
 def reset_parse_failures(conn: sqlite3.Connection, *, channel_id: int) -> None:

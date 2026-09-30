@@ -36,6 +36,15 @@ parse*, never the raw text: for a routed signal it is `Signal.content_hash`
 as a correction), and for anything else (followup, skip, parse_failed) it
 is a hash of the normalised text, for the same reason.
 
+**A changed template is loud** (spec 6.2; final review F07). A
+parse_failed message bumps its channel's `consecutive_parse_failures`;
+the one that makes it `TEMPLATE_CHANGE_STREAK` (3) also raises one
+CRITICAL `TEMPLATE_CHANGED_SUSPECTED` naming the channel -- once per
+streak: not again at 4, 5 and on, and a signal read cleanly resets the
+count. The router classifies entry-shaped text in another layout as
+parse_failed too (`parsing/router.py`), so the most likely template
+change -- a new header -- counts.
+
 Cross-channel relay dedup (spec G7): before a *signal* is inserted,
 `relay_repo.relay_of_signal` asks whether it repeats a call we already
 have -- a forward of a stored post (or of another stored copy of it),
@@ -140,9 +149,17 @@ from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
 from xaucopier.parsing.router import RouteResult, route
-from xaucopier.store import edits_repo, outbox, relay_repo, signals_repo
+from xaucopier.store import alerts, edits_repo, outbox, relay_repo, signals_repo
 
 logger = logging.getLogger(__name__)
+
+#: CRITICAL: a channel's third unreadable signal in a row -- its signal
+#: layout has probably changed, and until one is read again its new
+#: signals are missed (spec 6.2; final review F07). Raised once per
+#: streak, when the count reaches `TEMPLATE_CHANGE_STREAK`.
+TEMPLATE_CHANGED_SUSPECTED = "TEMPLATE_CHANGED_SUSPECTED"
+#: Unreadable signals in a row that raise it: spec 6.2's PAUSE_NEW count.
+TEMPLATE_CHANGE_STREAK = 3
 
 IngestOutcome = Literal["new", "duplicate", "edited", "relay_duplicate"]
 SenderKind = Literal["user", "channel", "chat"]
@@ -372,6 +389,36 @@ def ingest(
     )
 
 
+def _template_changed(
+    conn: sqlite3.Connection,
+    channel_cfg: _ChannelCfgLike,
+    message_id: int,
+    route_result: RouteResult,
+    *,
+    now_utc: datetime,
+) -> int:
+    """The CRITICAL TEMPLATE_CHANGED_SUSPECTED alert for a channel whose
+    `TEMPLATE_CHANGE_STREAK`th unreadable signal in a row is `message_id`."""
+    channel_id = channel_cfg.channel_id
+    name = getattr(channel_cfg, "name", None)
+    named = f"channel {channel_id}" + (f" ({name})" if name else "")
+    return alerts.record(
+        conn,
+        now_utc=now_utc,
+        level="CRITICAL",
+        code=TEMPLATE_CHANGED_SUSPECTED,
+        channel_id=channel_id,
+        message_id=message_id,
+        detail=(
+            f"{TEMPLATE_CHANGE_STREAK} messages in a row on {named} looked like trade signals "
+            f"but could not be read (the latest, message {message_id}: {route_result.detail}). "
+            "The channel has probably changed how it writes its signals: signals written the "
+            "new way are NOT traded until this program is updated to read them. Look at the "
+            "channel. This alert is raised once; a signal read normally again ends it."
+        ),
+    )
+
+
 def _ingest_new(
     conn: sqlite3.Connection,
     *,
@@ -440,7 +487,12 @@ def _ingest_new(
         )
 
     if kind == "parse_failed":
-        signals_repo.increment_parse_failures(conn, channel_id=channel_id)
+        failures = signals_repo.increment_parse_failures(conn, channel_id=channel_id)
+        if failures == TEMPLATE_CHANGE_STREAK:
+            # Once per streak: exactly at three, never at four, five, ...;
+            # a signal read cleanly resets the count, and a new streak
+            # raises it again.
+            _template_changed(conn, channel_cfg, message_id, route_result, now_utc=now_utc)
         return IngestResult(
             outcome="new", signal_id=None, followup_id=None, kind=kind, detail=route_result.detail
         )
