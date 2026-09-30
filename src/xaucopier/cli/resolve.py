@@ -81,10 +81,12 @@ from xaucopier.ingest.client import (
     API_CREDENTIAL_ERRORS,
     PERMANENT_TELEGRAM_ERRORS,
     AlreadyRunningError,
+    SourceKind,
     TelegramUnreachableError,
     acquire_single_instance_lock,
     build_client,
     connect_within,
+    source_kind,
 )
 
 #: `channel_id` of a channel whose id has not been looked up yet.
@@ -208,6 +210,12 @@ def save_failure_code(exc: BaseException) -> int:
 class Resolved:
     channel_id: int
     title: str
+    #: What Telegram says it is (`client.source_kind`): "channel" (only its
+    #: admins post), "group" (anyone in it posts) or "unknown" (final
+    #: review F05).
+    kind: SourceKind = "unknown"
+    #: This account has not joined it (a public channel found by link).
+    left: bool = False
 
 
 # -- the file edit --------------------------------------------------------------
@@ -535,7 +543,65 @@ def _as_channel(entity: object, *, asked: str) -> Resolved:
             f"{asked!r} is not a channel (it is a {type(entity).__name__}); paste the "
             "channel's own link"
         )
-    return Resolved(channel_id=utils.get_peer_id(entity), title=entity.title)
+    return _resolved(entity)
+
+
+def _resolved(entity: types.Channel) -> Resolved:
+    return Resolved(
+        channel_id=utils.get_peer_id(entity),
+        title=entity.title,
+        kind=source_kind(entity),
+        left=bool(getattr(entity, "left", False)),
+    )
+
+
+#: What each kind is called in the picker and in "Found: ...".
+KIND_WORDS: dict[str, str] = {"channel": "channel", "group": "group", "unknown": "kind unknown"}
+
+#: Said, and asked about, before a group is used (final review F05, ruling
+#: C10): nothing filters who posted, so every member's message is read.
+GROUP_WARNING = (
+    "This is a group: anyone in it can post, and their messages will be read as trading "
+    "instructions."
+)
+#: The same, for a source Telegram describes as neither.
+UNKNOWN_KIND_WARNING = (
+    "Telegram does not say whether this is a channel or a group. If it is a group, anyone "
+    "in it can post, and their messages will be read as trading instructions."
+)
+#: The one answer that uses a group anyway.
+GROUP_QUESTION = "Type yes to use it anyway: "
+
+
+def found_line(resolved: Resolved) -> str:
+    """"Found: <title> -- a channel, Telegram id -100..." (F05, F27)."""
+    kind = resolved.kind if resolved.kind in ("channel", "group") else "source of unknown kind"
+    return (
+        f"Found: {_safe_comment(resolved.title)} -- a {kind}, Telegram id "
+        f"{resolved.channel_id}"
+    )
+
+
+async def accept_source(resolved: Resolved, *, allow_group: bool) -> bool:
+    """Warn about what `resolved` is, and for anything but a channel ask
+    once more -- apart from, and before, the ordinary confirmation, which
+    `--yes` skips: only the answer `yes`, or `--allow-group` on the
+    command line, uses a group (final review F05). A closed input is
+    EOFError, which the command reports: nothing is saved. Also warns when
+    this account has not joined it. False if the user said no."""
+    if resolved.left:
+        print(
+            f"NOTE: This Telegram account has not joined {_safe_comment(resolved.title)}. Join "
+            "it in the Telegram app first: until then, watch sees its posts only through "
+            "the 5-second check, not the moment they are posted."
+        )
+    if resolved.kind == "channel":
+        return True
+    print("", f"WARNING: {GROUP_WARNING if resolved.kind == 'group' else UNKNOWN_KIND_WARNING}")
+    if allow_group:
+        print("--allow-group was given, so it is used anyway.")
+        return True
+    return (await _ask(GROUP_QUESTION)).lower() == "yes"
 
 
 def normalise_link(text: str) -> str:
@@ -582,7 +648,7 @@ async def joined_channels(client: Any) -> tuple[Resolved, ...]:
     Telegram lists them."""
     dialogs = await client.get_dialogs()
     return tuple(
-        Resolved(channel_id=utils.get_peer_id(d.entity), title=d.entity.title)
+        _resolved(d.entity)
         for d in dialogs
         if isinstance(getattr(d, "entity", None), types.Channel)
     )
@@ -608,9 +674,9 @@ async def _choose(
     channels = await joined_channels(client)
     if not channels:
         raise ResolveError("this Telegram account has not joined any channel")
-    print("The channels this account has joined:")
+    print("The channels and groups this account has joined:")
     for number, channel in enumerate(channels, start=1):
-        print(f"  {number:>3}. {channel.title}")
+        print(f"  {number:>3}. {channel.title} ({KIND_WORDS[channel.kind]})")
     choice = await _ask(f"Type the number of {wanted}, or press Enter to cancel: ")
     if not choice:
         return None
@@ -720,7 +786,7 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
         if not await client.is_user_authorized():
             return report_not_logged_in()
         for index, cfg in pending:
-            print(f"\nChannel {cfg.name!r} does not have its numeric id yet.")
+            print(f"\nChannel {cfg.name!r} does not have its Telegram id yet.")
             try:
                 resolved = await _choose(client, repr(cfg.name), args.link)
             except ResolveError as exc:
@@ -739,7 +805,10 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
                     file=sys.stderr,
                 )
                 return exit_codes.EXIT_FAILED
-            print(f"Found: {resolved.title!r} -- numeric id {resolved.channel_id}")
+            print(found_line(resolved))
+            if not await accept_source(resolved, allow_group=args.allow_group):
+                print("Not saved. Nothing was changed.")
+                return exit_codes.EXIT_FAILED
             if not args.yes:
                 confirm = await _ask(
                     f"Save this id for {cfg.name!r} and switch the channel on? Type yes to confirm: "
@@ -773,7 +842,12 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
                 )
                 return code
             saved += 1
-            print(f"Saved: {cfg.name!r} is now channel {resolved.channel_id}, switched on.")
+            # "Channel N" is only ever the number `channels` shows (F27).
+            print(
+                f"Saved: {cfg.name!r} -- its Telegram id {resolved.channel_id} -- and "
+                f"switched it on. It is channel {cfg.ordinal} in "
+                f"`{paths.USER_COMMAND} channels`."
+            )
     except PERMANENT_TELEGRAM_ERRORS as exc:
         return report_permanent_error(exc)
     except TELEGRAM_TROUBLE as exc:
@@ -792,7 +866,7 @@ def cmd_resolve_channels(args: argparse.Namespace) -> int:
         print(f"resolve-channels cannot start: {exc}", file=sys.stderr)
         return exit_codes.EXIT_CONFIG_ERROR
     if not any(cfg.channel_id == PLACEHOLDER_ID for cfg in channels):
-        print("Nothing to do: every channel in channels.toml already has its numeric id.")
+        print("Nothing to do: every channel in channels.toml already has its Telegram id.")
         return exit_codes.EXIT_OK
     try:
         blob = load_session(args.secrets)

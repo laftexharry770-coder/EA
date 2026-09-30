@@ -59,7 +59,9 @@ from xaucopier.cli.resolve import (
     ResolveError,
     _ask,
     _choose,
+    accept_source,
     connect_one_shot,
+    found_line,
     report_already_running,
     report_not_logged_in,
     report_permanent_error,
@@ -202,7 +204,7 @@ def render_list(
             also = (
                 f" -- the same channel as number {', '.join(map(str, same))}" if same else ""
             )
-            lines.append(f"     id: {channel.channel_id} (looked up){also}")
+            lines.append(f"     Telegram id: {channel.channel_id} (looked up){also}")
         lines.append(f"     parser: {_parser_text(channel.parser)}")
         item = totals.get(channel.channel_id) if channel.channel_id != PLACEHOLDER_ID else None
         if item is None or item.last_posted_at_utc is None:
@@ -352,7 +354,7 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
         return exit_codes.EXIT_OK
     if enabled and cfg.channel_id == PLACEHOLDER_ID:
         complain(
-            f"Channel {number} ({name}) was NOT switched on: its numeric id has not been "
+            f"Channel {number} ({name}) was NOT switched on: its Telegram id has not been "
             "looked up yet (channel_id is still 0). Nothing was changed.",
             f"Run `{_CMD} resolve-channels` to look it up (that also switches it on), or "
             f"add the channel with `{_CMD} channels add`.",
@@ -451,7 +453,7 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
         say("Cancelled. Nothing was added.")
         return exit_codes.EXIT_FAILED
     title = _printable(resolved.title)
-    say(f"Found: {title} -- numeric id {resolved.channel_id}")
+    say(found_line(resolved))
 
     # Read the file now, not before the lookup: the user may have taken a
     # while to choose. The writer also refuses if it changes after this.
@@ -493,6 +495,9 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
         )
         return exit_codes.EXIT_FAILED
 
+    if not await accept_source(resolved, allow_group=args.allow_group):
+        say("Not added. Nothing was changed.")
+        return exit_codes.EXIT_FAILED
     number = _next_number(channels)
     say("", f"PLEASE NOTE: {FORMAT_CAVEAT}", "")
     if not args.yes:
@@ -566,6 +571,8 @@ def cmd_add(args: argparse.Namespace) -> int:
         lock.release()
 
 
+_ADD_ONLY = f"--link, --yes and --allow-group only go with `{_CMD} channels add`."
+
 _ON_OFF_USAGE = (
     "Say which channel, by the number `{cmd} channels` shows: "
     "`{cmd} channels on NUMBER` or `{cmd} channels off NUMBER`."
@@ -578,8 +585,8 @@ def cmd_channels(args: argparse.Namespace) -> int:
         if args.number is None:
             complain(_ON_OFF_USAGE)
             return exit_codes.EXIT_USAGE
-        if args.link is not None or args.yes:
-            complain(f"--link and --yes only go with `{_CMD} channels add`.")
+        if args.link is not None or args.yes or args.allow_group:
+            complain(_ADD_ONLY)
             return exit_codes.EXIT_USAGE
         return cmd_switch(args, enabled=args.action == "on")
     if args.number is not None:
@@ -590,7 +597,7 @@ def cmd_channels(args: argparse.Namespace) -> int:
         return exit_codes.EXIT_USAGE
     if args.action == "add":
         return cmd_add(args)
-    if args.link is not None or args.yes:
-        complain(f"--link and --yes only go with `{_CMD} channels add`.")
+    if args.link is not None or args.yes or args.allow_group:
+        complain(_ADD_ONLY)
         return exit_codes.EXIT_USAGE
     return cmd_list(args)

@@ -398,10 +398,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     resolve = subparsers.add_parser(
         "resolve-channels",
-        help="One-time: look up each channel's numeric id and switch it on in channels.toml.",
+        help="One-time: look up each channel's Telegram id and switch it on in channels.toml.",
         description=(
             "For every channel in channels.toml whose channel_id is still 0, look "
-            "up its numeric id -- from a t.me link or @username you paste, or by "
+            "up its Telegram id -- from a t.me link or @username you paste, or by "
             "choosing it from the channels you have joined -- and write it into "
             "channels.toml, switching the channel on. Connects to Telegram once; "
             "watch never looks channels up by name."
@@ -420,7 +420,14 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument(
         "--yes",
         action="store_true",
-        help="Save what was found without asking for confirmation.",
+        help="Save what was found without asking for confirmation (a group is still "
+        "asked about).",
+    )
+    resolve.add_argument(
+        "--allow-group",
+        action="store_true",
+        help="Use a group without asking. In a group anyone can post, and their "
+        "messages are read as trading instructions.",
     )
     resolve.set_defaults(func=cmd_resolve_channels)
 
@@ -467,7 +474,14 @@ def build_parser() -> argparse.ArgumentParser:
     channels.add_argument(
         "--yes",
         action="store_true",
-        help="For add: add what was found without asking for confirmation.",
+        help="For add: add what was found without asking for confirmation (a group is "
+        "still asked about).",
+    )
+    channels.add_argument(
+        "--allow-group",
+        action="store_true",
+        help="For add: add a group without asking. In a group anyone can post, and their "
+        "messages are read as trading instructions.",
     )
     channels.set_defaults(func=cmd_channels)
 

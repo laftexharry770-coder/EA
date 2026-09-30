@@ -603,3 +603,100 @@ def test_a_failure_after_one_channel_was_saved_keeps_it_and_says_so(
     assert "Telegram asks to wait about 10 minutes" in err
     assert "The 1 channel(s) saved above are kept; nothing else was changed." in err
     assert "Nothing was changed." not in err
+
+
+# -- F05: a group is not a channel ------------------------------------------------------------
+
+COMMUNITY_GROUP = types.Channel(
+    id=7777777777, title="MARKET MASTERY HUB / COMMUNITY", photo=types.ChatPhotoEmpty(),
+    date=None, megagroup=True,
+)
+COMMUNITY_GROUP_ID = -1007777777777
+
+
+@pytest.fixture
+def group_rig(rig: Rig) -> Rig:
+    rig.client.dialogs = (SimpleNamespace(entity=MMH), SimpleNamespace(entity=COMMUNITY_GROUP))
+    rig.client.entities["https://t.me/mmhchat"] = COMMUNITY_GROUP
+    return rig
+
+
+def test_the_picker_says_which_entry_is_a_channel_and_which_a_group(
+    group_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final review F05 (A3): the user's own first setup path offered a
+    group titled like the channel with nothing to tell them apart."""
+    group_rig.answers.extend(["", ""])
+
+    assert cli_main.main(group_rig.argv()) == exit_codes.EXIT_FAILED
+
+    out = capsys.readouterr().out
+    assert "  1. MARKET MASTERY HUB / COMMUNITY (channel)" in out
+    assert "  2. MARKET MASTERY HUB / COMMUNITY (group)" in out
+
+
+def test_a_group_needs_its_own_yes_and_no_saves_nothing(
+    group_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = group_rig.channels_path.read_bytes()
+    group_rig.answers.extend(["", "2", "no"])
+
+    assert cli_main.main(group_rig.argv()) == exit_codes.EXIT_FAILED
+
+    assert group_rig.channels_path.read_bytes() == before
+    out = capsys.readouterr().out
+    assert (
+        "This is a group: anyone in it can post, and their messages will be read as trading "
+        "instructions."
+    ) in out
+    assert "Not saved. Nothing was changed." in out
+    assert group_rig.answers == []
+
+
+def test_a_group_confirmed_twice_is_saved(group_rig: Rig) -> None:
+    group_rig.answers.extend(["", "2", "yes", "yes"])
+
+    assert cli_main.main(group_rig.argv()) == exit_codes.EXIT_OK
+
+    loaded = load_channels(group_rig.channels_path)
+    assert (loaded[0].channel_id, loaded[0].enabled) == (COMMUNITY_GROUP_ID, True)
+    assert group_rig.answers == []  # both questions were asked
+
+
+def test_yes_on_the_command_line_does_not_answer_the_group_question(
+    group_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = group_rig.channels_path.read_bytes()
+    group_rig.answers.append("no")
+
+    assert cli_main.main(group_rig.argv("--link", "https://t.me/mmhchat", "--yes")) == 1
+
+    assert group_rig.channels_path.read_bytes() == before
+    assert group_rig.answers == []
+
+
+def test_allow_group_saves_a_group_without_asking(
+    group_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = cli_main.main(group_rig.argv("--link", "https://t.me/mmhchat", "--yes", "--allow-group"))
+
+    assert code == exit_codes.EXIT_OK
+    assert load_channels(group_rig.channels_path)[0].channel_id == COMMUNITY_GROUP_ID
+    assert "anyone in it can post" in capsys.readouterr().out
+
+
+def test_saved_names_the_telegram_id_and_the_channel_number_apart(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final review F27: "is now channel -1001234567890" used "channel
+    number" for the Telegram id, while `channels on N` means the number the
+    list shows."""
+    assert cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes")) == 0
+
+    out = capsys.readouterr().out
+    assert (
+        "Saved: 'MARKET MASTERY HUB / COMMUNITY' -- its Telegram id -1001234567890 -- and "
+        "switched it on. It is channel 1 in `.\\xaucopier channels`."
+    ) in out
+    assert "is now channel -100" not in out
+    assert "does not have its Telegram id yet" in out

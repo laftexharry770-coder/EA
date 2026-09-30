@@ -1204,3 +1204,176 @@ def test_add_while_an_administrator_window_holds_the_session_says_so(
     assert "Stop watch first" in err
     assert "administrator" in err
     assert add_rig.client.calls == []
+
+
+# -- F05: a group is not a channel ------------------------------------------------------------
+
+VIP_CHANNEL = types.Channel(
+    id=5555555555, title="Gold Signals VIP", photo=types.ChatPhotoEmpty(), date=None, broadcast=True
+)
+VIP_GROUP = types.Channel(
+    id=6666666666, title="Gold Signals VIP", photo=types.ChatPhotoEmpty(), date=None, megagroup=True
+)
+VIP_GROUP_ID = -1006666666666
+GROUP_WARNING = (
+    "This is a group: anyone in it can post, and their messages will be read as trading "
+    "instructions."
+)
+
+
+@pytest.fixture
+def group_rig(add_rig: AddRig) -> AddRig:
+    add_rig.client.dialogs = (SimpleNamespace(entity=VIP_CHANNEL), SimpleNamespace(entity=VIP_GROUP))
+    add_rig.client.entities["https://t.me/goldchat"] = VIP_GROUP
+    return add_rig
+
+
+def test_the_picker_says_which_entry_is_a_channel_and_which_a_group(
+    group_rig: AddRig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final review F05: a channel and its discussion group often share a
+    title; the list showed '1. Gold Signals VIP' twice."""
+    group_rig.answers.extend(["", ""])  # Enter for the list, then Enter to cancel
+
+    assert cli_main.main(group_rig.argv()) == exit_codes.EXIT_FAILED
+
+    out = capsys.readouterr().out
+    assert "  1. Gold Signals VIP (channel)" in out
+    assert "  2. Gold Signals VIP (group)" in out
+
+
+def test_a_group_picked_from_the_list_needs_its_own_yes(
+    group_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prompts: list[str] = []
+    answers = ["", "2", "yes", "yes"]
+
+    def typed(prompt: str = "") -> str:
+        prompts.append(prompt)
+        return answers.pop(0)
+
+    monkeypatch.setattr("builtins.input", typed)
+
+    assert cli_main.main(group_rig.argv()) == exit_codes.EXIT_OK
+
+    added = load_channels(group_rig.rig.channels_path)[-1]
+    assert (added.channel_id, added.enabled) == (VIP_GROUP_ID, True)
+    out = capsys.readouterr().out
+    assert GROUP_WARNING in out
+    assert "Found: Gold Signals VIP -- a group" in out
+    # The group question comes before, and apart from, the ordinary one.
+    assert prompts[2] == "Type yes to use it anyway: "
+    assert prompts[3].startswith("Add Gold Signals VIP as channel 8")
+
+
+@pytest.mark.parametrize("answer", ["no", "y", ""])
+def test_a_group_not_confirmed_with_yes_is_not_added(
+    group_rig: AddRig, capsys: pytest.CaptureFixture[str], answer: str
+) -> None:
+    before = group_rig.rig.channels_path.read_bytes()
+    group_rig.answers.extend(["", "2", answer])
+
+    assert cli_main.main(group_rig.argv()) == exit_codes.EXIT_FAILED
+
+    assert group_rig.rig.channels_path.read_bytes() == before
+    assert "Not added. Nothing was changed." in capsys.readouterr().out
+    assert group_rig.answers == []  # the ordinary question was never asked
+
+
+def test_yes_on_the_command_line_does_not_answer_the_group_question(
+    group_rig: AddRig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = group_rig.rig.channels_path.read_bytes()
+    group_rig.answers.append("no")
+
+    code = cli_main.main(group_rig.argv("--link", "https://t.me/goldchat", "--yes"))
+
+    assert code == exit_codes.EXIT_FAILED
+    assert group_rig.rig.channels_path.read_bytes() == before
+    assert GROUP_WARNING in capsys.readouterr().out
+    assert group_rig.answers == []
+
+
+def test_with_no_one_to_answer_a_group_is_refused(
+    group_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def closed(prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", closed)
+    before = group_rig.rig.channels_path.read_bytes()
+
+    code = cli_main.main(group_rig.argv("--link", "https://t.me/goldchat", "--yes"))
+
+    assert code == exit_codes.EXIT_FAILED
+    assert group_rig.rig.channels_path.read_bytes() == before
+    assert "No answer could be read" in capsys.readouterr().err
+
+
+def test_allow_group_is_the_explicit_way_to_add_a_group_without_asking(
+    group_rig: AddRig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = cli_main.main(
+        group_rig.argv("--link", "https://t.me/goldchat", "--yes", "--allow-group")
+    )
+
+    assert code == exit_codes.EXIT_OK
+    assert load_channels(group_rig.rig.channels_path)[-1].channel_id == VIP_GROUP_ID
+    out = capsys.readouterr().out
+    assert GROUP_WARNING in out and "--allow-group" in out
+    assert group_rig.answers == []
+
+
+def test_a_channel_needs_no_second_yes(
+    group_rig: AddRig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    group_rig.answers.extend(["", "1", "yes"])
+
+    assert cli_main.main(group_rig.argv()) == exit_codes.EXIT_OK
+
+    assert load_channels(group_rig.rig.channels_path)[-1].channel_id == -1005555555555
+    out = capsys.readouterr().out
+    assert "Found: Gold Signals VIP -- a channel" in out
+    assert "anyone in it can post" not in out
+
+
+def test_a_source_telegram_does_not_describe_is_treated_as_a_possible_group(
+    add_rig: AddRig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    neither = types.Channel(id=7777777777, title="Mystery", photo=types.ChatPhotoEmpty(), date=None)
+    add_rig.client.entities["https://t.me/mystery"] = neither
+    add_rig.answers.append("no")
+
+    code = cli_main.main(add_rig.argv("--link", "https://t.me/mystery", "--yes"))
+
+    assert code == exit_codes.EXIT_FAILED
+    out = capsys.readouterr().out
+    assert "does not say whether this is a channel or a group" in out
+
+
+def test_a_channel_this_account_has_not_joined_is_added_with_a_warning(
+    add_rig: AddRig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    not_joined = types.Channel(
+        id=8888888888, title="Public Gold", photo=types.ChatPhotoEmpty(), date=None,
+        broadcast=True, left=True,
+    )
+    add_rig.client.entities["https://t.me/publicgold"] = not_joined
+
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/publicgold", "--yes")) == 0
+
+    out = capsys.readouterr().out
+    assert "This Telegram account has not joined Public Gold" in out
+    assert "Join it in the Telegram app" in out
+
+
+@pytest.mark.parametrize("action", [("on", "3"), ("off", "7"), ()])
+def test_allow_group_only_goes_with_add(
+    rig: Rig, capsys: pytest.CaptureFixture[str], action: tuple[str, ...]
+) -> None:
+    before = rig.channels_path.read_bytes()
+
+    assert cli_main.main(rig.argv(*action, "--allow-group")) == exit_codes.EXIT_USAGE
+
+    assert rig.channels_path.read_bytes() == before
+    assert "only go with `.\\xaucopier channels add`" in capsys.readouterr().err
