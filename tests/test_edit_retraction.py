@@ -12,6 +12,12 @@ touched. The post is recorded as no signal any more (`messages.kind`
 it still shows the call (`relay_repo.post_shows_call`, the one helper)
 sees a cancelled post as not showing it -- which is what makes a double
 post cancelled one post at a time end with nothing claimable.
+
+Whatever the stored version was -- chatter, the call without its stop,
+a call already withdrawn -- an edit straight into the call WITH an added
+retraction word is read as no signal: never completed within the 120 s
+grace, never a post that stands again, never 'trade it by hand' (group 4
+review, round 1).
 """
 from __future__ import annotations
 
@@ -371,3 +377,116 @@ def test_a_cancelled_holder_deleted_with_its_repeat_is_not_the_post_that_withdre
         ("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, 4001),
         ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED, 4002),
     ]
+
+
+# -- a post that was no signal, edited straight into a cancelled call ------------
+
+#: A first version that is no signal: chatter announcing the call, and the
+#: call without its stop (parse_failed).
+ANNOUNCED = "XAUUSD BUY coming soon, get ready"
+NO_STOP = SIGNAL_TEXT.replace("\U0001f534 SL: 4470\n", "")
+
+
+def _no_signal_then(conn, first: str, edit_to: str, after: timedelta):  # noqa: F811
+    ingest(
+        conn, channel_cfg=VIP, message_id=4001, text=first, posted_at_utc=POSTED,
+        edit_date_utc=None, reply_to_message_id=None, source="live",
+        now_utc=POSTED + timedelta(seconds=1), accounts=ACCOUNTS,
+    )
+    conn.commit()
+    result = edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=4001, text=edit_to, posted_at_utc=POSTED,
+        edit_date_utc=POSTED + after, reply_to_message_id=None,
+        now_utc=POSTED + after, accounts=ACCOUNTS, detected_by="event",
+    )
+    conn.commit()
+    return result
+
+
+@pytest.mark.parametrize(
+    "after", [timedelta(seconds=60), timedelta(minutes=10)], ids=["within-the-grace", "after-it"]
+)
+@pytest.mark.parametrize("first", [ANNOUNCED, NO_STOP], ids=["chatter", "parse_failed"])
+def test_a_post_that_was_no_signal_edited_straight_into_a_cancelled_call_is_never_traded(
+    conn, first: str, after: timedelta  # noqa: F811
+) -> None:
+    """Ledger 161 read as the ruling says: an edit that ADDS a retraction
+    word absent from the stored text is a withdrawal -- whatever the stored
+    version was. The announcement (or the call without its stop) edited
+    into the call with CANCELLED appended says the call is off: within the
+    120 s grace it is not completed into a new signal, and after it the
+    user is never told to trade it by hand."""
+    assert route_kind(first) in ("skip", "parse_failed")
+    result = _no_signal_then(conn, first, CANCELLED, after)
+    assert result.signal_id is None
+    assert _q(conn, "SELECT COUNT(*) FROM signals") == [(0,)]
+    assert _q(conn, "SELECT COUNT(*) FROM outbox") == [(0,)]
+    assert _q(conn, "SELECT kind, raw_text FROM messages") == [("skip", CANCELLED)]
+    codes = [code for (code,) in _q(conn, "SELECT code FROM alerts")]
+    assert edits_repo.EDIT_COMPLETED_SIGNAL not in codes
+    assert edits_repo.EDIT_CREATED_SIGNAL not in codes
+    assert all("by hand" not in detail for (detail,) in _q(conn, "SELECT detail FROM alerts"))
+
+
+def test_the_same_edit_without_the_word_is_still_completed(conn) -> None:  # noqa: F811
+    """The control: the announcement edited into the plain call within the
+    grace is a new signal (ruling C5) -- only the added word withdraws it."""
+    result = _no_signal_then(conn, ANNOUNCED, SIGNAL_TEXT, timedelta(seconds=60))
+    assert result.signal_id is not None
+    assert len(_claimable(conn)) == 2
+
+
+def test_a_signal_edited_into_chatter_then_into_a_cancelled_call_stays_withdrawn(
+    conn,  # noqa: F811
+) -> None:
+    """The call, withdrawn by an edit into chatter, then edited into the
+    call with CANCELLED: still withdrawn, no second signals row, and no
+    advice to trade it by hand."""
+    _one(conn, SIGNAL_TEXT, edit_to="Wait for confirmation")
+    _edit_to(conn, 4001, CANCELLED, POSTED + timedelta(minutes=6))
+    assert _q(conn, "SELECT signal_id, state, withdrawn_at_utc IS NOT NULL FROM signals") == [
+        (1, "VOIDED", 1)
+    ]
+    assert _claimable(conn) == []
+    codes = [code for (code,) in _q(conn, "SELECT code FROM alerts")]
+    assert edits_repo.EDIT_CREATED_SIGNAL not in codes
+    assert all("by hand" not in detail for (detail,) in _q(conn, "SELECT detail FROM alerts"))
+
+
+def test_a_post_edited_away_and_back_as_a_cancelled_call_never_keeps_a_promoted_repost(
+    conn,  # noqa: F811
+) -> None:
+    """The VIP double-posts. The original is edited into chatter (its call
+    withdrawn, the repost promoted), then into the call with CANCELLED --
+    a post that says the call is off, never a post that stands again. So
+    when the repost is deleted too, no post carries the call: the promoted
+    signal is voided and nothing is claimable."""
+    for message_id, after in ((4001, 0), (4002, 30)):
+        ingest(
+            conn, channel_cfg=VIP, message_id=message_id, text=SIGNAL_TEXT,
+            posted_at_utc=POSTED + timedelta(seconds=after), edit_date_utc=None,
+            reply_to_message_id=None, source="live",
+            now_utc=POSTED + timedelta(seconds=after + 1), accounts=ACCOUNTS,
+        )
+        conn.commit()
+    _edit_to(conn, 4001, "Good morning traders", POSTED + timedelta(minutes=3))
+    assert _q(conn, "SELECT signal_id, message_id, state FROM signals ORDER BY 1") == [
+        (1, 4001, "VOIDED"), (2, 4002, "NEW")
+    ]
+    _edit_to(conn, 4001, CANCELLED, POSTED + timedelta(minutes=4))
+    assert _q(conn, "SELECT kind FROM messages WHERE message_id = 4001") == [("skip",)]
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4002, now_utc=POSTED + timedelta(minutes=5),
+        accounts=ACCOUNTS, detected_by="event",
+    )
+    conn.commit()
+    assert _claimable(conn) == []
+    assert _q(conn, "SELECT signal_id, state, withdrawn_at_utc IS NOT NULL FROM signals "
+                    "ORDER BY 1") == [(1, "VOIDED", 1), (2, "VOIDED", 1)]
+    assert outbox.claim(conn, account_id="acct-2", pid=1, now_utc=POSTED + timedelta(hours=1)) is None
+
+
+def route_kind(text: str) -> str:
+    from xaucopier.parsing.router import route
+
+    return route(text, channel_cfg=VIP, message_id=4001, posted_at_utc=POSTED).kind

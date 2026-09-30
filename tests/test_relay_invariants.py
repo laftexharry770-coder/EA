@@ -37,9 +37,11 @@ Seeds: the retraction families use 1000 * channels + n, the order
 family 5000 + n, for n in range(XAUCOPIER_FUZZ_SEEDS).
 
 **Retraction by an added "CANCELLED"** (ledger 161, group-3 leftover
-G3L-3). The cancel families add one more event -- a post by hand edited
+G3L-3). The cancel families add two more events -- a post by hand edited
 to append "CANCELLED", which withdraws it though its levels are the
-same -- and let the final withdrawal cancel a post too. They are families
+same, and a post by hand that shows no call edited straight into the
+call with "CANCELLED" (which never shows it) -- and let the final
+withdrawal cancel a post too. They are families
 of their own (seeds 20000 + 1000 * channels + n and 26000 + n), so the
 scenarios the families above generate are exactly what they were.
 """
@@ -199,7 +201,12 @@ class _World:
     def edit(self, key: tuple[int, int], label: str, *, by: str = "event") -> None:
         post = self.posts[key]
         at = self.tick()
-        text = post.text + CANCEL_SUFFIX if label == "CANCEL" else EDITS[label]
+        if label == "CANCEL":
+            text = post.text + CANCEL_SUFFIX
+        elif label == "CALL+CANCEL":
+            text = SIGNAL_TEXT + CANCEL_SUFFIX
+        else:
+            text = EDITS[label]
         edits_repo.apply_edit(
             self.conn, channel_cfg=CHANNELS[key[0]], message_id=key[1], text=text,
             posted_at_utc=post.posted, edit_date_utc=at, reply_to_message_id=None,
@@ -309,6 +316,19 @@ def _cancel(world: _World, rng: random.Random) -> None:
     ]
     if hands:
         world.edit(rng.choice(hands), "CANCEL", by=rng.choice(["event", "event", "window"]))
+
+
+def _cancelled_call(world: _World, rng: random.Random) -> None:
+    """A post by hand that shows NO call (chatter, a broken call, another
+    call) is edited straight into the call with "CANCELLED" appended: it
+    adds the word, so it never shows the call (group 4 review, round 1)."""
+    hands = [
+        k for k in world.standing()
+        if world.posts[k].forwarded is None and world.posts[k].text not in SHOWS_CALL
+        and CANCEL_SUFFIX not in world.posts[k].text
+    ]
+    if hands:
+        world.edit(rng.choice(hands), "CALL+CANCEL", by=rng.choice(["event", "event", "window"]))
 
 
 def _withdraw_everything(world: _World, rng: random.Random, *, cancel: bool = False) -> None:
@@ -453,6 +473,8 @@ def _retraction_run(
                 _read_back(world, rng)
             elif op == "cancel":
                 _cancel(world, rng)
+            elif op == "cancelled call":
+                _cancelled_call(world, rng)
             if problems := _no_double_trade(world.conn):
                 return problems, world.log
         _withdraw_everything(world, random.Random(seed), cancel=cancel)
@@ -465,7 +487,7 @@ def _retraction_run(
 
 def _retraction_events(rng: random.Random, *, cancel: bool = False) -> list[tuple]:
     ops = ["post", "post", "forward", "forward", "forward", "delete", "delete", "edit",
-           "execute", "read back"] + (["cancel", "cancel"] if cancel else [])
+           "execute", "read back"] + (["cancel", "cancel", "cancelled call"] if cancel else [])
     return [(rng.choice(ops), rng.randrange(2**32)) for _ in range(rng.randint(2, 9))]
 
 
@@ -506,6 +528,8 @@ def _order_run(
                 _read_back(world, rng)
             elif op == "cancel":
                 _cancel(world, rng)
+            elif op == "cancelled call":
+                _cancelled_call(world, rng)
             if problems := _no_double_trade(world.conn):
                 return [problems], world.log
             outcomes.append(_outcome(world))
@@ -522,7 +546,7 @@ def _order_run(
 
 def _order_events(rng: random.Random, *, cancel: bool = False) -> tuple[bool, list[tuple]]:
     ops = ["post", "forward", "delete", "delete", "delete", "edit", "edit", "execute", "reply",
-           "reply", "read back"] + (["cancel", "cancel"] if cancel else [])
+           "reply", "read back"] + (["cancel", "cancel", "cancelled call"] if cancel else [])
     return rng.random() < 0.5, [
         (rng.choice(ops), rng.randrange(2**32)) for _ in range(rng.randint(2, 8))
     ]

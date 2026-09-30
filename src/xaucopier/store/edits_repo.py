@@ -49,7 +49,11 @@ which now follows the latest classification -- and then:
   whether a stored post still shows the call (`relay_repo.read_post`,
   the one helper) sees it as showing none, though its text still parses
   as the call. A later version that still carries the word stays a
-  retraction. (A retraction posted as a *reply* -- "signal cancelled" --
+  retraction. A post that was NO signal (chatter, the call without its
+  stop, a call withdrawn by an edit into chatter) edited straight into
+  the call with an added word is read the same way: never completed by
+  the 120 s grace, never a post that stands again, never "trade it by
+  hand". (A retraction posted as a *reply* -- "signal cancelled" --
   needs a follow-up op of its own: Plan 3.)
 - **Follow-up -> follow-up** -- updated in place (a worker reads it when it
   claims); WARNING if it had already been dispatched.
@@ -647,7 +651,14 @@ def _as_retraction(
     that always says "setup invalid below 4460" is no retraction -- and a
     post retracted so before (stored as no signal, its text still the
     call) stays retracted while its text still carries one of those
-    words: a typo fixed afterwards is not the call posted again."""
+    words: a typo fixed afterwards is not the call posted again.
+
+    Whatever the stored version was: chatter, the call without its stop,
+    or a call withdrawn by an edit into chatter, edited straight into the
+    call WITH an added "CANCELLED" says the call is off. Read as no
+    signal, it is never completed into a new one (the C5 grace), never
+    stands again as a post of the call, and never has the user told to
+    trade it by hand (group 4 review, round 1)."""
     if route_result.kind != "signal":
         return None
     words = retraction_words(text)
@@ -663,7 +674,9 @@ def _as_retraction(
             message_id=existing["message_id"],
             posted_at_utc=datetime.fromisoformat(existing["posted_at_utc"]),
         )
-        added = words & before if stored.kind == "signal" else frozenset()
+        # Retracted before (its text still the call): sticky while a word
+        # it carried stays. Anything else: the words this version adds.
+        added = words & before if stored.kind == "signal" else words - before
     if not added:
         return None
     return RouteResult(
