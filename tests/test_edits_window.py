@@ -13,6 +13,7 @@ listener, poll and store against the fake Telegram client.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -575,3 +576,70 @@ def test_the_race_on_a_relayed_call_withdraws_it_whichever_post_was_stored_first
         assert edits_repo.SIGNAL_VOIDED_BY_DELETION in codes
     finally:
         conn.close()
+
+
+def test_a_report_naming_a_post_not_stored_yet_is_applied_as_that_report(tmp_path) -> None:
+    """The VIP double-posts the call (4001, 4002) and deletes both in one
+    report. 4002 is stored; the report's deletion of 4001 is handled
+    before the forward read stores it, and that read's ingest job lands
+    before the report's job for 4002. Remembered with the report's other
+    ids, 4001's deletion is applied as part of that report -- 4002 already
+    counts as gone -- so everything ends exactly as the same report
+    handled after both were stored: the call withdrawn once, nothing
+    claimable."""
+    from test_listener import CHANNEL as L_CHANNEL
+    from test_listener import POSTED as L_POSTED
+    from test_listener import SIGNAL_TEXT as L_SIGNAL_TEXT
+    from test_listener import _started
+
+    from xaucopier.ingest.listener import IncomingMessage
+
+    report = (4001, 4002)
+    reported_at = L_POSTED + timedelta(seconds=40)
+
+    def incoming(message_id: int) -> IncomingMessage:
+        return IncomingMessage(
+            channel_id=L_CHANNEL.channel_id, message_id=message_id, text=L_SIGNAL_TEXT,
+            posted_at_utc=L_POSTED + timedelta(seconds=message_id - 4000),
+            edit_date_utc=None, reply_to_message_id=None,
+        )
+
+    async def delete(listener, message_id: int):
+        return await listener.ingest_deletion(
+            L_CHANNEL, message_id, detected_by=edits_repo.EVENT_DETECTOR,
+            also_deleted=report, reported_at_utc=reported_at,
+        )
+
+    async def raced(listener) -> None:
+        await listener.ingest_message(incoming(4002), channel_cfg=L_CHANNEL, source="live")
+        assert (await delete(listener, 4001)).outcome == "unknown"
+        await listener.ingest_message(incoming(4001), channel_cfg=L_CHANNEL, source="poll")
+        await delete(listener, 4002)
+
+    async def reference(listener) -> None:
+        await listener.ingest_message(incoming(4002), channel_cfg=L_CHANNEL, source="live")
+        await listener.ingest_message(incoming(4001), channel_cfg=L_CHANNEL, source="poll")
+        await delete(listener, 4001)
+        await delete(listener, 4002)
+
+    states = []
+    for name, steps in (("raced", raced), ("reference", reference)):
+        db_path = tmp_path / f"{name}.db"
+
+        async def scenario(steps=steps, db_path=db_path) -> None:
+            async with _started(db_path, FakeTelegramClient()) as listener:
+                await steps(listener)
+
+        asyncio.run(scenario())
+        conn = db.connect(db_path, role="reader")
+        try:
+            states.append(_without_times(conn))
+            claimable = conn.execute(
+                "SELECT COUNT(*) FROM outbox WHERE kind = 'ENTRY' AND state = 'QUEUED'"
+            ).fetchone()[0]
+            assert claimable == 0
+        finally:
+            conn.close()
+    raced_state, reference_state = states
+    assert raced_state == reference_state
+    assert [(row[2], row[5]) for row in raced_state["signals"]] == [(4002, "VOIDED")]
