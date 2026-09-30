@@ -11,6 +11,16 @@
   looked up (`channel_id = 0`) and one whose parser xaucopier does not
   have; `off` of the last channel still on is allowed, with a warning that
   `watch` will then refuse to start.
+- **OFF means not read at all** (ruling F15): not its new posts, and not
+  the edits, deletions and follow-ups of the signals it already posted.
+  `off` says how many of its signals are still waiting or already traded
+  (`report.signals_in_play`); `watch` cancels the waiting entries at its
+  next start. **And posts made while it was off are never read** (ruling
+  M12, F28): `on` of a channel read before writes a seed cutoff of now
+  (`reseed_from_now`), so the next `watch` starts reading it from there
+  instead of catching up on everything posted meanwhile. `channels add`
+  does the same for a channel read before, removed and added back
+  (G2L-3).
 - `channels add` adds a NEW channel: the only command here that contacts
   Telegram, once, to look the channel up -- by the same paste-a-link or
   pick-from-the-channels-you-joined flow `resolve-channels` uses. It takes
@@ -81,7 +91,7 @@ from xaucopier.ingest.client import (
     session_in_use,
 )
 from xaucopier.parsing.registry import parser_for
-from xaucopier.store import db, report
+from xaucopier.store import channel_state, db, report
 
 _CMD = paths.USER_COMMAND
 #: What each registered parser reads, in the user's words.
@@ -203,15 +213,9 @@ def render_list(
                 f"`{_CMD} resolve-channels`"
             )
         else:
-            same = [
-                other.ordinal
-                for other in channels
-                if other.channel_id == channel.channel_id and other is not channel
-            ]
-            also = (
-                f" -- the same channel as number {', '.join(map(str, same))}" if same else ""
-            )
-            lines.append(f"     Telegram id: {channel.channel_id} (looked up){also}")
+            # One Telegram id is never listed twice: the loader refuses such a
+            # file (final review F40), so there is no "same channel as" here.
+            lines.append(f"     Telegram id: {channel.channel_id} (looked up)")
         lines.append(f"     parser: {_parser_text(channel.parser)}")
         item = totals.get(channel.channel_id) if channel.channel_id != PLACEHOLDER_ID else None
         if item is None or item.last_posted_at_utc is None:
@@ -308,6 +312,72 @@ def _raw_channel(text: str, number: int) -> dict[str, Any] | None:
     return None
 
 
+def reseed_from_now(db_path: Path, channel_id: int, now: datetime) -> bool:
+    """Ask the next `watch` to read channel `channel_id` again from `now`
+    -- whole seconds, UTC -- instead of from where it stopped, if it was
+    read before (a `channel_state` row with a pointer or the seeded
+    marker): `channel_state.request_reseed`, in one short transaction.
+    For `channels on` (F28, ruling M12) and `channels add` of a channel
+    read before (G2L-3): posts made while it was off, or not in the list,
+    are never read. Returns whether a cutoff was written.
+
+    No database yet, or a channel never read: nothing to write, since its
+    first read seeds it at that watch's start anyway. A database another
+    program holds past SQLite's wait (10 s), one from a newer version, or
+    a file that is not a database raises `sqlite3.DatabaseError`, and
+    nothing is written -- the caller then changes nothing either."""
+    if not db_path.is_file():
+        return False
+    conn = db.connect(db_path, role="writer")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            state = channel_state.read(conn, channel_id)
+            if not (state.seeded or state.pointer > 0):
+                conn.rollback()
+                return False
+            channel_state.request_reseed(conn, channel_id=channel_id, cutoff_utc=now)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return True
+    finally:
+        conn.close()
+
+
+def _off_lines(db_path: Path, cfg: ChannelCfg) -> list[str]:
+    """What `channels off` does to the channel and to the signals it
+    already posted, in plain words (final review F15)."""
+    lines = [
+        "While it is off, this program does not read it at all: what it posts then is "
+        "not recorded, and not read later either, even after you switch it back on."
+    ]
+    try:
+        if db_path.is_file():
+            conn = db.connect_readonly(db_path)
+            try:
+                waiting, traded = report.signals_in_play(conn, cfg.channel_id)
+            finally:
+                conn.close()
+        else:
+            waiting = traded = 0
+    except sqlite3.DatabaseError as exc:
+        lines.append(f"Its signals could not be counted. {database_problem(db_path, exc)}")
+        return lines
+    if not waiting and not traded:
+        lines.append("None of its signals is waiting to be traded or already traded.")
+        return lines
+    lines.append(
+        f"{waiting} of its signals {'is' if waiting == 1 else 'are'} still waiting to be "
+        f"traded, and {traded} {'has' if traded == 1 else 'have'} already been traded. "
+        "Their edits, deletions and follow-ups (like 'close all') are no longer read. "
+        f"The waiting ones are cancelled the next time `{_CMD} watch` starts; a trade "
+        "already open keeps its stop loss and take profit."
+    )
+    return lines
+
+
 def _takes_effect() -> str:
     if session_in_use():
         return WATCH_RUNNING_NOTE
@@ -367,20 +437,21 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
             f"add the channel with `{_CMD} channels add`.",
         )
         return exit_codes.EXIT_FAILED
+    # No second block with this Telegram id can be ON already: the loader
+    # refuses a file that lists one id twice (final review F40).
+    reseeded = False
     if enabled:
-        twin = next(
-            (
-                other
-                for other in channels
-                if other.enabled and other.channel_id == cfg.channel_id and other is not cfg
-            ),
-            None,
-        )
-        if twin is not None:
+        # The cutoff first, then the switch: if the save below fails, the
+        # channel stays OFF -- never read -- so the cutoff does nothing and
+        # the next `channels on` writes its own. The other order could
+        # leave it ON with no cutoff, and the next watch would read
+        # everything posted while it was off as new (F28).
+        try:
+            reseeded = reseed_from_now(args.db, cfg.channel_id, _utcnow())
+        except sqlite3.DatabaseError as exc:
             complain(
-                f"Channel {number} ({name}) was NOT switched on: it is the same Telegram "
-                f"channel (id {cfg.channel_id}) as channel {twin.ordinal} "
-                f"({_printable(twin.name)}), which is already ON. Nothing was changed."
+                database_problem(args.db, exc),
+                f"Nothing was changed: channel {number} is still OFF.",
             )
             return exit_codes.EXIT_FAILED
 
@@ -410,6 +481,13 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
         return code
 
     say(f"Channel {number} ({name}) is now {word}.")
+    if reseeded:
+        say(
+            "Messages posted while it was off are not read: the next watch reads it "
+            "from now on."
+        )
+    if not enabled:
+        say(*_off_lines(args.db, cfg))
     if not enabled and not any(other.enabled for other in channels if other is not cfg):
         say(
             "WARNING: that was the last channel switched on. With no channel ON, "
@@ -514,6 +592,13 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
         if answer.lower() not in ("y", "yes"):
             say("Not added. Nothing was changed.")
             return exit_codes.EXIT_FAILED
+    # A channel read before, removed and now added back, is read from now
+    # on -- as `channels on` does it, and in the same order (G2L-3).
+    try:
+        reseed_from_now(args.db, resolved.channel_id, _utcnow())
+    except sqlite3.DatabaseError as exc:
+        complain(database_problem(args.db, exc), "Nothing was added.")
+        return exit_codes.EXIT_FAILED
     try:
         save_added(
             path,

@@ -1387,3 +1387,289 @@ def test_allow_group_only_goes_with_add(
 
     assert rig.channels_path.read_bytes() == before
     assert "only go with `.\\xaucopier channels add`" in capsys.readouterr().err
+
+
+# -- F28 / G2L-3: a channel switched back on is read again from now ---------------------------
+
+#: `_utcnow()` during these tests: with a fraction, which the cutoff drops.
+SWITCHED_AT = NOW + timedelta(microseconds=654321)
+
+
+def _state_row(db_path: Path, channel_id: int) -> tuple | None:
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT last_processed_message_id, seeded_at_utc, seed_cutoff_utc FROM channel_state "
+            "WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def _set_state(db_path: Path, channel_id: int, pointer: int, seeded: str | None) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO channel_state (channel_id, last_processed_message_id, seeded_at_utc) "
+            "VALUES (?, ?, ?) ON CONFLICT(channel_id) DO UPDATE SET "
+            "last_processed_message_id = excluded.last_processed_message_id, "
+            "seeded_at_utc = excluded.seeded_at_utc",
+            (channel_id, pointer, seeded),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def on_rig(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> Rig:
+    monkeypatch.setattr(channels_module, "_utcnow", lambda: SWITCHED_AT)
+    return rig
+
+
+@pytest.mark.parametrize(
+    ("pointer", "seeded"),
+    [(5, "2026-09-01T00:00:00+00:00"), (0, "2026-09-01T00:00:00+00:00"), (5, None)],
+    ids=["seeded", "seeded at 0: every post was newer", "a pointer from before the marker"],
+)
+def test_on_of_a_channel_read_before_asks_the_next_watch_to_start_reading_it_from_now(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str], pointer: int, seeded: str | None
+) -> None:
+    """Ruling M12 (F28): OFF means posts made while it was off are ignored,
+    not paused. Before, `channels on` only flipped the switch, and the next
+    watch read everything posted while it was off as new -- signals and
+    'close all's included."""
+    _set_state(on_rig.db_path, QUIET, pointer, seeded)
+
+    assert cli_main.main(on_rig.argv("on", "3")) == exit_codes.EXIT_OK
+
+    assert _switches(on_rig.channels_path)[3] is True
+    # Whole seconds, UTC; the pointer is kept (a re-seed never moves it back).
+    assert _state_row(on_rig.db_path, QUIET) == (pointer, seeded, "2026-09-23T12:00:00+00:00")
+    out = capsys.readouterr().out
+    assert "Channel 3 (Quiet Signals) is now ON." in out
+    assert "posted while it was off are not read" in out
+
+
+@pytest.mark.parametrize(
+    "state",
+    [None, (0, None)],
+    ids=["never read: no row", "never seeded: a counter's row at 0"],
+)
+def test_on_of_a_channel_never_read_writes_no_cutoff(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str], state: tuple | None
+) -> None:
+    """Its first read seeds it anyway, at that watch's start."""
+    if state is not None:
+        _set_state(on_rig.db_path, QUIET, *state)
+    before = _state_row(on_rig.db_path, QUIET)
+
+    assert cli_main.main(on_rig.argv("on", "3")) == exit_codes.EXIT_OK
+
+    assert _switches(on_rig.channels_path)[3] is True
+    assert _state_row(on_rig.db_path, QUIET) == before
+    assert "posted while it was off" not in capsys.readouterr().out
+
+
+def test_on_with_no_database_yet_creates_none(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = on_rig.db_path.with_name("not-yet.db")
+    argv = [a if a != str(on_rig.db_path) else str(missing) for a in on_rig.argv("on", "3")]
+
+    assert cli_main.main(argv) == exit_codes.EXIT_OK
+
+    assert not missing.exists()
+    assert _switches(on_rig.channels_path)[3] is True
+
+
+def test_on_while_the_database_is_held_changes_nothing_and_says_so(
+    on_rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The cutoff and the switch go together: with the database held past
+    its wait (10 s; shortened here), neither is written."""
+    _set_state(on_rig.db_path, QUIET, 5, "2026-09-01T00:00:00+00:00")
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 50)
+    before = on_rig.channels_path.read_bytes()
+    holder = sqlite3.connect(on_rig.db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        assert cli_main.main(on_rig.argv("on", "3")) == exit_codes.EXIT_FAILED
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert on_rig.channels_path.read_bytes() == before
+    assert _state_row(on_rig.db_path, QUIET)[2] is None
+    err = capsys.readouterr().err
+    assert "The database is busy" in err
+    assert "Nothing was changed: channel 3 is still OFF" in err and "Traceback" not in err
+
+
+def test_on_with_a_database_it_cannot_use_changes_nothing(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw = sqlite3.connect(on_rig.db_path)
+    raw.execute("PRAGMA user_version = 99")
+    raw.commit()
+    raw.close()
+    before = on_rig.channels_path.read_bytes()
+
+    assert cli_main.main(on_rig.argv("on", "3")) == exit_codes.EXIT_FAILED
+
+    assert on_rig.channels_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert "newer version of xaucopier; use that version" in err
+    assert "Nothing was changed: channel 3 is still OFF" in err
+
+
+def test_the_cutoff_is_written_before_the_switch_so_a_failed_save_leaves_it_off(
+    on_rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The order, and why: cutoff first, then channels.toml. A save that
+    fails after the cutoff leaves the channel OFF -- never read, so the
+    cutoff does nothing, and the next `channels on` writes its own. The
+    other order could leave it ON with no cutoff: everything posted while
+    it was off read as new."""
+    _set_state(on_rig.db_path, QUIET, 5, "2026-09-01T00:00:00+00:00")
+    _inject("replace", monkeypatch, on_rig)
+
+    assert cli_main.main(on_rig.argv("on", "3")) == exit_codes.EXIT_FAILED
+
+    assert _switches(on_rig.channels_path)[3] is False
+    assert _state_row(on_rig.db_path, QUIET)[2] == "2026-09-23T12:00:00+00:00"
+
+
+def test_off_writes_nothing_to_the_database(on_rig: Rig) -> None:
+    _set_state(on_rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    before = _sha(on_rig.db_path)
+
+    assert cli_main.main(on_rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    assert _sha(on_rig.db_path) == before
+
+
+# -- F15: what OFF does to the signals already recorded ---------------------------------------
+
+
+def test_off_says_how_many_signals_are_in_play_and_what_off_does_to_them(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final review F15: OFF also stops reading the edits, deletions and
+    follow-ups of the channel's signals already recorded. Gold Room has 3
+    signals queued; one of them is marked traded here."""
+    conn = sqlite3.connect(on_rig.db_path)
+    conn.execute(
+        "UPDATE outbox SET state = 'DONE' WHERE outbox_id = (SELECT MIN(outbox_id) FROM outbox)"
+    )
+    conn.commit()
+    conn.close()
+
+    assert cli_main.main(on_rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "Channel 7 (Gold Room) is now OFF." in out
+    assert "2 of its signals are still waiting to be traded, and 1 has already been traded." in out
+    assert "edits, deletions and follow-ups (like 'close all') are no longer read" in out
+    assert "cancelled the next time `.\\xaucopier watch` starts" in out
+    assert "keeps its stop loss and take profit" in out
+    assert "not read later either" in out  # M12: posts made while off stay unread
+
+
+def test_a_signal_one_account_has_taken_counts_as_traded_and_a_skipped_one_not_at_all(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Gold Room's first signal is taken (CLAIMED) by one account and still
+    waiting for a second: it is traded, not waiting. Its second signal's
+    entry was skipped: neither. Its third is waiting."""
+    conn = sqlite3.connect(on_rig.db_path)
+    first, second, _ = [
+        row[0] for row in conn.execute("SELECT signal_id FROM signals ORDER BY signal_id")
+    ]
+    conn.execute("UPDATE outbox SET state = 'CLAIMED' WHERE signal_id = ?", (first,))
+    conn.execute(
+        "INSERT INTO outbox (account_id, kind, signal_id, state) "
+        "VALUES ('second-account', 'ENTRY', ?, 'QUEUED')",
+        (first,),
+    )
+    conn.execute("UPDATE outbox SET state = 'SKIPPED' WHERE signal_id = ?", (second,))
+    conn.commit()
+    conn.close()
+
+    assert cli_main.main(on_rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "1 of its signals is still waiting to be traded, and 1 has already been traded." in out
+
+
+def test_off_of_a_channel_with_nothing_in_play_says_so(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    on_rig.channels_path.write_bytes(
+        SEEDED_TOML.replace("enabled    = false    # off for now", "enabled    = true").encode("utf-8")
+    )
+
+    assert cli_main.main(on_rig.argv("off", "3")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "None of its signals is waiting to be traded or already traded." in out
+
+
+def test_off_with_no_database_still_switches_off(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = on_rig.db_path.with_name("not-yet.db")
+    argv = [a if a != str(on_rig.db_path) else str(missing) for a in on_rig.argv("off", "7")]
+
+    assert cli_main.main(argv) == exit_codes.EXIT_OK
+
+    assert not missing.exists()
+    assert _switches(on_rig.channels_path)[7] is False
+    assert "None of its signals is waiting" in capsys.readouterr().out
+
+
+# -- G2L-3: a channel removed and added back is read again from now --------------------------
+
+
+def test_add_of_a_channel_read_before_asks_the_next_watch_to_start_reading_it_from_now(
+    add_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Group-2 review leftover G2L-3: a channel removed from channels.toml
+    and added back kept its old pointer, so everything posted while it was
+    gone was read as new -- `channels add` now does what `channels on` does."""
+    monkeypatch.setattr(channels_module, "_utcnow", lambda: SWITCHED_AT)
+    _set_state(add_rig.rig.db_path, SILVER_ID, 40, "2026-09-01T00:00:00+00:00")
+
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes")) == 0
+
+    assert load_channels(add_rig.rig.channels_path)[-1].channel_id == SILVER_ID
+    assert _state_row(add_rig.rig.db_path, SILVER_ID) == (
+        40, "2026-09-01T00:00:00+00:00", "2026-09-23T12:00:00+00:00"
+    )
+
+
+def test_add_of_a_channel_never_read_writes_no_cutoff(add_rig: AddRig) -> None:
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes")) == 0
+
+    assert _state_row(add_rig.rig.db_path, SILVER_ID) is None
+
+
+def test_add_while_the_database_is_held_adds_nothing(
+    add_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_state(add_rig.rig.db_path, SILVER_ID, 40, "2026-09-01T00:00:00+00:00")
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 50)
+    before = add_rig.rig.channels_path.read_bytes()
+    holder = sqlite3.connect(add_rig.rig.db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        code = cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes"))
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert code == exit_codes.EXIT_FAILED
+    assert add_rig.rig.channels_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert "The database is busy" in err and "Nothing was added." in err

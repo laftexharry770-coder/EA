@@ -196,6 +196,22 @@ def collect(conn: sqlite3.Connection, *, today: str) -> StatusReport:
     )
 
 
+def signals_in_play(conn: sqlite3.Connection, channel_id: int) -> tuple[int, int]:
+    """(waiting, traded) for `channel_id`'s signals: how many still have a
+    trade entry waiting (QUEUED) and none taken, and how many have one
+    taken by a trading account (CLAIMED or DONE) -- what `channels off`
+    tells the user OFF stops following (final review F15)."""
+    rows = conn.execute(
+        "SELECT MAX(o.state IN ('CLAIMED', 'DONE')), MAX(o.state = 'QUEUED') "
+        "FROM signals s JOIN outbox o ON o.signal_id = s.signal_id AND o.kind = 'ENTRY' "
+        "WHERE s.channel_id = ? GROUP BY s.signal_id",
+        (channel_id,),
+    ).fetchall()
+    traded = sum(1 for taken, _ in rows if taken)
+    waiting = sum(1 for taken, queued in rows if not taken and queued)
+    return waiting, traded
+
+
 def signals_per_channel(conn: sqlite3.Connection) -> tuple[tuple[int, int], ...]:
     """(channel id, signals recorded as trades) for every channel that has
     produced one -- `xaucopier channels` shows it beside each channel."""
