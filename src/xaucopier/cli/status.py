@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -89,6 +90,37 @@ _RESTART_ADVICE = (
     "If the watch window is still open, click in it, press Ctrl+C and answer Y; "
     f"then start it again with `{_CMD} watch`."
 )
+
+
+def database_problem(path: Path, exc: sqlite3.DatabaseError) -> str:
+    """What is wrong with the database file at `path`, in plain words, for
+    every command that reads it (`status`, `ack`, `channels`,
+    `export-fixtures`): one written by a newer version of xaucopier
+    (G1L-5: running `watch` cannot bring *that* up to date), one from an
+    older version, one that is busy, or a file that is not xaucopier's
+    database at all (final review F25). The caller says what was, or was
+    not, done."""
+    if isinstance(exc, db.SchemaVersionError):
+        if exc.newer:
+            return (
+                f"The database at {path} was written by a newer version of xaucopier; "
+                "use that version. This version does not read or change it."
+            )
+        return (
+            f"The database at {path} is from an older version of xaucopier. Run "
+            f"`{_CMD} watch` once to bring it up to date, then try again."
+        )
+    if db.is_lock_error(exc):
+        return (
+            f"The database is busy -- watch is probably writing to it ({path}). Try "
+            "again in a moment."
+        )
+    if isinstance(exc, sqlite3.OperationalError):
+        return f"The database at {path} could not be used ({exc})."
+    return (
+        f"The file at {path} is not xaucopier's database, or it is damaged ({exc}). "
+        "Check that --db names the right file."
+    )
 
 
 def round_counts(detail: str | None) -> tuple[int, int] | None:
@@ -419,8 +451,13 @@ def render(
 
 def cmd_status(args: argparse.Namespace) -> int:
     db_path: Path = args.db
+    now = _utcnow()
     try:
         conn = db.connect_readonly(db_path)
+        try:
+            rep = report.collect(conn, today=metrics.day_key_for(now))
+        finally:
+            conn.close()
     except FileNotFoundError:
         print(
             f"No recordings yet: there is no database at {db_path}. "
@@ -428,17 +465,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return exit_codes.EXIT_FAILED
-    except db.SchemaVersionError as exc:
-        print(
-            f"{exc}. Run `{_CMD} watch` once to bring it up to date, then try again.",
-            file=sys.stderr,
-        )
+    except sqlite3.DatabaseError as exc:
+        print(database_problem(db_path, exc), file=sys.stderr)
         return exit_codes.EXIT_FAILED
-    now = _utcnow()
-    try:
-        rep = report.collect(conn, today=metrics.day_key_for(now))
-    finally:
-        conn.close()
 
     configured: tuple[ChannelCfg, ...] | None
     config_problem: str | None = None

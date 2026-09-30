@@ -62,7 +62,7 @@ from xaucopier.cli.resolve import (
     save_added,
     save_switch,
 )
-from xaucopier.cli.status import ago, when
+from xaucopier.cli.status import ago, database_problem, when
 from xaucopier.cli.watch import SetupError, load_channels_config, load_session
 from xaucopier.config.channels import ChannelCfg
 from xaucopier.ingest.client import (
@@ -140,22 +140,17 @@ def read_totals(db_path: Path) -> tuple[dict[int, ChannelTotals], str | None]:
     connection that cannot write -- and, if it could not be read, why."""
     try:
         conn = db.connect_readonly(db_path)
+        try:
+            activity = report.channel_activity(conn)
+            signals = dict(report.signals_per_channel(conn))
+        finally:
+            conn.close()
     except FileNotFoundError:
         return {}, f"Nothing has been recorded yet (there is no database at {db_path})."
-    except db.SchemaVersionError as exc:
-        return {}, (
-            f"Recorded messages are not shown: {exc}. Run `{_CMD} watch` once to bring "
-            "it up to date."
-        )
+    except sqlite3.DatabaseError as exc:
+        return {}, f"Recorded messages are not shown. {database_problem(db_path, exc)}"
     except sqlite3.Error as exc:
         return {}, f"Recorded messages are not shown: {db_path} could not be read ({exc})."
-    try:
-        activity = report.channel_activity(conn)
-        signals = dict(report.signals_per_channel(conn))
-    except sqlite3.Error as exc:
-        return {}, f"Recorded messages are not shown: {db_path} could not be read ({exc})."
-    finally:
-        conn.close()
     return {
         item.channel_id: ChannelTotals(
             messages=item.messages,

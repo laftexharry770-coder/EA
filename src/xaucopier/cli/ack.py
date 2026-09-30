@@ -22,7 +22,7 @@ import sqlite3
 import sys
 
 from xaucopier.cli import exit_codes, paths
-from xaucopier.cli.status import alert_lines, critical_first
+from xaucopier.cli.status import alert_lines, critical_first, database_problem
 from xaucopier.store import alerts, db
 
 _CMD = paths.USER_COMMAND
@@ -38,11 +38,7 @@ def _reminder(cleared: list[alerts.Alert]) -> None:
 
 
 def _list(args: argparse.Namespace) -> int:
-    try:
-        conn = db.connect_readonly(args.db)
-    except db.SchemaVersionError as exc:
-        print(f"{exc}. Run `{_CMD} watch` once to bring it up to date.", file=sys.stderr)
-        return exit_codes.EXIT_FAILED
+    conn = db.connect_readonly(args.db)
     try:
         uncleared = critical_first(alerts.unacked(conn))
     finally:
@@ -62,25 +58,17 @@ def cmd_ack(args: argparse.Namespace) -> int:
     if not args.db.is_file():
         print(f"No recordings yet: there is no database at {args.db}.", file=sys.stderr)
         return exit_codes.EXIT_FAILED
-    if args.alert_id is None and not args.all:
-        return _list(args)
-
     try:
+        if args.alert_id is None and not args.all:
+            return _list(args)
         return _clear(args)
-    except sqlite3.OperationalError as exc:
-        # SQLite waited out its 10 s busy timeout (or could not write at
-        # all): whatever this call did was rolled back with the connection.
-        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
-            print(
-                "The database is busy -- watch is probably writing to it. Nothing was "
-                "cleared; try again in a moment.",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"The database could not be changed ({exc}). Nothing was cleared.",
-                file=sys.stderr,
-            )
+    except sqlite3.DatabaseError as exc:
+        # SQLite waited out its 10 s busy timeout, could not write at all,
+        # or the file is not a database xaucopier can use (F25, G1L-5):
+        # whatever this call did was rolled back with the connection.
+        print(database_problem(args.db, exc), file=sys.stderr)
+        if args.alert_id is not None or args.all:
+            print("Nothing was cleared.", file=sys.stderr)
         return exit_codes.EXIT_FAILED
 
 
