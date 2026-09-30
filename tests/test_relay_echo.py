@@ -1281,6 +1281,38 @@ def test_a_channel_whose_only_post_was_held_back_cannot_repost_a_withdrawn_call(
     assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED not in [c for _, c in _codes(conn)]
 
 
+def test_a_held_back_copy_that_came_to_repeat_the_call_is_a_post_of_it(conn):  # noqa: F811
+    """R5-4's limit: a copy held back against a withdrawn call is no post
+    of the call its channel had -- until the call is posted again, when it
+    repeats the new signal (COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED) and its
+    channel shows the call like any other. The VIP deletes its call
+    (VOIDED); channel C copies it (held back); the VIP posts it again
+    (signal 2: C's copy now repeats it) and deletes that too, its last
+    post (VOIDED). C then deletes its copy -- its last post of the call --
+    and posts the call again: like every channel whose last post of the
+    call was withdrawn (ruling R4-2), C posting it again is a new signal,
+    traded."""
+    _ingest(conn, VIP, CALL)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    held = _ingest(conn, OTHER, 8001, posted=POSTED + timedelta(minutes=2))
+    assert (held.outcome, held.relay_of_signal_id) == ("relay_duplicate", 1)
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=3))
+    assert again.outcome == "new" and _link(conn, OTHER, 8001) == again.signal_id
+    assert _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=4)).outcome == "voided"
+    _delete(conn, OTHER, 8001, POSTED + timedelta(minutes=5))
+
+    third = _ingest(conn, OTHER, 8002, posted=POSTED + timedelta(minutes=6))
+
+    assert third.outcome == "new", third
+    assert _promoted_from(conn, third.signal_id) == again.signal_id
+    assert _live(conn) == [third.signal_id]
+    assert _queued_entries(conn) == [(third.signal_id, "acct-1"), (third.signal_id, "acct-2")]
+    assert _q(
+        conn, "SELECT message_id FROM alerts WHERE code = ? AND acked = 0",
+        relay_repo.COPY_OF_WITHDRAWN_SIGNAL,
+    ) == []
+
+
 # == Round 5 (ruling R5-6): what the invariant tests found =====================
 #
 # tests/test_relay_invariants.py checks, on generated scenarios, that a call

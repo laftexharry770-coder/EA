@@ -109,8 +109,9 @@ anyone acts on:
   not a copy of it: that channel withdrew the call and posted it again,
   and the new post is a new signal *replacing* the withdrawn one
   (`SignalRelay.replaces`; `record_replacement`). A copy held back (below)
-  is no post of the call its channel had: a channel that only copied a
-  call after it was withdrawn never withdrew it (ruling R5-4);
+  is no post of the call its channel had while it is held back: a channel
+  that only copied a call after it was withdrawn never withdrew it
+  (ruling R5-4);
 - a copy of it from any other channel, or a forward of it, is held back
   -- one source withdrew the call -- with a CRITICAL alert naming both
   messages and the post that withdrew it (`COPY_OF_WITHDRAWN_SIGNAL`),
@@ -497,10 +498,12 @@ def withdrew_call(
     either. Every such channel, not only the one whose post withdrew the
     call first, may post the call again as a new signal. A copy *held
     back* -- stored after the call was withdrawn, with its own
-    `COPY_OF_WITHDRAWN_SIGNAL` alert -- is no post of the call it had:
-    a channel that only ever copied a withdrawn call never withdrew it,
-    so deleting that copy and posting the call again is held back again
-    (ruling R5-4). (A signal closed before migration 4 recorded no
+    `COPY_OF_WITHDRAWN_SIGNAL` alert naming the signal it is still linked
+    to -- is no post of the call it had: a channel that only ever copied a
+    withdrawn call never withdrew it, so deleting that copy and posting the
+    call again is held back again (ruling R5-4). Once the call was posted
+    again, that copy repeats the new signal (`record_replacement`): a post
+    of the call like any other. (A signal closed before migration 4 recorded no
     closer: then its own channel withdrew it, as only a signal's own
     message could close it.)"""
     signal = _signal_row(conn, signal_id)
@@ -514,7 +517,8 @@ def withdrew_call(
         "    SELECT 1 FROM signals s WHERE s.channel_id = m.channel_id "
         f"     AND s.message_id = m.message_id AND s.signal_id IN ({marks}))) "
         "  AND NOT EXISTS (SELECT 1 FROM alerts a WHERE a.code = ? "
-        "    AND a.channel_id = m.channel_id AND a.message_id = m.message_id) LIMIT 1",
+        "    AND a.channel_id = m.channel_id AND a.message_id = m.message_id "
+        "    AND a.signal_id = m.relay_of_signal_id) LIMIT 1",
         (channel_id, *chain, *chain, COPY_OF_WITHDRAWN_SIGNAL),
     ).fetchone()
     if had is None:
