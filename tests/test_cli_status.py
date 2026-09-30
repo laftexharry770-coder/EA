@@ -505,3 +505,89 @@ def test_stuck_advice_says_to_stop_the_old_window_first(tmp_path: Path) -> None:
 )
 def test_round_counts_reads_the_polls_own_wording(detail, expected) -> None:
     assert status_module.round_counts(detail) == expected
+
+
+# -- the counters and alerts the final fix wave added (STATUS-NEW-METRICS) ------------------
+
+
+def test_the_new_counters_are_information_in_their_own_section_and_never_flagged(
+    tmp_path: Path,
+) -> None:
+    """backlog_recovered (posts made while watch was stopped, caught up once
+    it runs again -- not dropped by the live feed) and the two relay-copy
+    counters are information, not trouble: their own section, in words,
+    with no '<-- look into this' -- and not under OTHER COUNTERS by their
+    raw names, as before."""
+    import dataclasses
+
+    from xaucopier.ingest.poll import BACKLOG_RECOVERED_METRIC
+    from xaucopier.store.relay_repo import (
+        RELAY_DUPLICATE_FOLLOWUPS_METRIC,
+        RELAY_DUPLICATES_METRIC,
+    )
+
+    rep = dataclasses.replace(
+        _report(),
+        metrics=(
+            report.MetricTotal(name=BACKLOG_RECOVERED_METRIC, today=4, all_time=9),
+            report.MetricTotal(name=RELAY_DUPLICATES_METRIC, today=1, all_time=3),
+            report.MetricTotal(name=RELAY_DUPLICATE_FOLLOWUPS_METRIC, today=0, all_time=2),
+        ),
+    )
+    text = _render(rep, tmp_path)
+
+    info = next(section for section in text.split("\n\n") if f"({BACKLOG_RECOVERED_METRIC})" in section)
+    header, *rows = info.splitlines()
+    assert header.startswith("FOR INFORMATION -- NOTHING TO DO")
+
+    def row(name: str) -> str:
+        (line,) = [line for line in rows if f"({name})" in line]
+        return line
+
+    assert row(BACKLOG_RECOVERED_METRIC).split()[-2:] == ["4", "9"]
+    assert "while watch was stopped" in row(BACKLOG_RECOVERED_METRIC)
+    assert row(RELAY_DUPLICATES_METRIC).split()[-2:] == ["1", "3"]
+    assert "not traded twice" in row(RELAY_DUPLICATES_METRIC)
+    assert row(RELAY_DUPLICATE_FOLLOWUPS_METRIC).split()[-2:] == ["0", "2"]
+    assert "not acted on twice" in row(RELAY_DUPLICATE_FOLLOWUPS_METRIC)
+    assert "look into this" not in text
+    assert "OTHER COUNTERS" not in text
+    # The should-be-zero table stays about trouble only.
+    zero = next(section for section in text.split("\n\n") if section.startswith("SHOULD STAY AT ZERO"))
+    assert BACKLOG_RECOVERED_METRIC not in zero and RELAY_DUPLICATES_METRIC not in zero
+
+
+def test_the_information_rows_show_zero_before_anything_was_counted(tmp_path: Path) -> None:
+    text = _render(_report(), tmp_path)
+
+    info = next(section for section in text.split("\n\n") if section.startswith("FOR INFORMATION"))
+    assert [line.split()[-2:] for line in info.splitlines()[1:]] == [["0", "0"]] * 3
+
+
+def _new_alert_codes() -> list[str]:
+    from xaucopier.store import edits_repo as edits
+    from xaucopier.store import messages_repo as messages
+
+    return [
+        messages.TEMPLATE_CHANGED_SUSPECTED,
+        messages.ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED,
+        edits.EDIT_COMPLETED_SIGNAL,
+        edits.SIGNAL_REPOST_PROMOTED,
+        alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
+    ]
+
+
+@pytest.mark.parametrize("code", _new_alert_codes())
+def test_each_alert_the_fix_wave_added_is_listed_with_its_words(tmp_path: Path, code: str) -> None:
+    """They go through the ordinary alert listing, with their own words."""
+    import dataclasses
+
+    alert = alerts.Alert(
+        alert_id=5, created_at_utc=NOW, level="WARNING", code=code, channel_id=A,
+        message_id=7, signal_id=None, detail="what happened, in words", acked=False,
+    )
+    text = _render(dataclasses.replace(_report(), alerts=(alert,)), tmp_path)
+
+    assert "ALERTS: 1 unacknowledged (0 CRITICAL, 1 WARNING)" in text
+    assert f"[WARNING] #5" in text and code in text
+    assert "what happened, in words" in text

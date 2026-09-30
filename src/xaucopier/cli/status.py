@@ -31,7 +31,7 @@ from xaucopier.cli.watch import SetupError, load_channels_config
 from xaucopier.config.channels import ChannelCfg
 from xaucopier.ingest.client import EXIT_CONFIG_ERROR, EXIT_TERMINAL_AUTH
 from xaucopier.ingest.listener import HISTORY_SKIPPED_METRIC
-from xaucopier.ingest.poll import MISSED_BY_EVENTSTREAM_METRIC
+from xaucopier.ingest.poll import BACKLOG_RECOVERED_METRIC, MISSED_BY_EVENTSTREAM_METRIC
 from xaucopier.store import alerts, db, heartbeats, metrics, report
 from xaucopier.store.edits_repo import (
     DELETE_MISSED_BY_EVENTSTREAM_METRIC,
@@ -41,6 +41,10 @@ from xaucopier.store.outbox import (
     DEAD_ENTRY_SKIPPED_METRIC,
     LEASE_RECLAIMED_METRIC,
     NO_ACCOUNTS_METRIC,
+)
+from xaucopier.store.relay_repo import (
+    RELAY_DUPLICATE_FOLLOWUPS_METRIC,
+    RELAY_DUPLICATES_METRIC,
 )
 
 #: A poll round finishes every ~5 s; one whose channel reads all time out
@@ -59,6 +63,19 @@ ZERO_METRICS: tuple[tuple[str, str], ...] = (
     (NO_ACCOUNTS_METRIC, "signals recorded with no trading account switched on"),
     (LEASE_RECLAIMED_METRIC, "queue items taken back from a trading worker that died"),
     (DEAD_ENTRY_SKIPPED_METRIC, "queued entries dropped because their signal was withdrawn"),
+)
+#: Counters that are information only: nothing went wrong, nothing to do
+#: (final fix wave). Posts made while watch was stopped are caught up when
+#: it runs again -- not dropped by the live feed (F17) -- and a copy of a
+#: call already recorded (a relay, a forward, a double post) is stored but
+#: never traded or acted on twice (F02, F08, F09).
+INFO_METRICS: tuple[tuple[str, str], ...] = (
+    (BACKLOG_RECOVERED_METRIC, "posts made while watch was stopped, caught up after it started"),
+    (RELAY_DUPLICATES_METRIC, "copies of a signal already recorded -- not traded twice"),
+    (
+        RELAY_DUPLICATE_FOLLOWUPS_METRIC,
+        "copies of an instruction already recorded -- not acted on twice",
+    ),
 )
 
 _KINDS: tuple[tuple[str, str], ...] = (
@@ -429,8 +446,9 @@ def render(
             rep, "MISSED BY TELEGRAM'S LIVE FEED, RECOVERED BY THE 5-SECOND CHECK", MISSED_METRICS
         ),
         _metric_table(rep, "SHOULD STAY AT ZERO", ZERO_METRICS),
+        _metric_table(rep, "FOR INFORMATION -- NOTHING TO DO", INFO_METRICS),
     ]
-    known = {name for name, _ in MISSED_METRICS + ZERO_METRICS}
+    known = {name for name, _ in MISSED_METRICS + ZERO_METRICS + INFO_METRICS}
     others = [total for total in rep.metrics if total.name not in known]
     if others:
         sections.append(
