@@ -423,20 +423,25 @@ trade_status = signals_repo.trade_status
 
 
 def window_versions(
-    conn: sqlite3.Connection, *, channel_id: int, at_or_below: int, limit: int
+    conn: sqlite3.Connection, *, channel_id: int, limit: int
 ) -> tuple[StoredVersion, ...]:
-    """The `limit` newest stored messages of a channel with ids at or
-    below `at_or_below` (the poll pointer), oldest first. A message a
-    `MessageDeleted` event deleted is not asked for again -- Telegram named
-    it. One the window itself inferred deleted *is*: that inference may be
-    wrong, and reading the message back is how it is reversed. Read-only:
-    the listener calls this on its reader connection."""
+    """The `limit` newest stored messages of a channel, oldest first --
+    whatever the poll pointer says (final review F03): a message stored
+    live sits above the pointer until the next forward read passes it, and
+    a forward read never passes one that was deleted, so leaving those out
+    left the deletion of a channel's newest signal unseen until the channel
+    posted again. Every one of them is stored, so its absence from a read
+    means as much as any other's. A message a `MessageDeleted` event
+    deleted is not asked for again -- Telegram named it. One the window
+    itself inferred deleted *is*: that inference may be wrong, and reading
+    the message back is how it is reversed. Read-only: the listener calls
+    this on its reader connection."""
     rows = conn.execute(
         "SELECT message_id, edit_date_utc, raw_text, deleted_detected_by FROM messages "
-        "WHERE channel_id = ? AND message_id <= ? "
+        "WHERE channel_id = ? "
         "  AND (deleted_at_utc IS NULL OR deleted_detected_by = ?) "
         "ORDER BY message_id DESC LIMIT ?",
-        (channel_id, at_or_below, WINDOW_DETECTOR, limit),
+        (channel_id, WINDOW_DETECTOR, limit),
     ).fetchall()
     return tuple(
         StoredVersion(

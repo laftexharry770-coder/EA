@@ -8,8 +8,8 @@ see is a trade the poster retracted, still held. So:
 - `MessageEdited` / `MessageDeleted` are *hints*, handled like
   `NewMessage`: route, normalise, submit, return.
 - The poll's **window re-read** is the source of truth: after each
-  channel's forward read it fetches the stored messages at or below the
-  pointer by id (`get_messages(ids=[...])`), finds edits the stream
+  channel's forward read it fetches the newest stored messages -- above
+  the pointer too (F03) -- by id (`get_messages(ids=[...])`), finds edits the stream
   dropped, and finds deletions by *absence* -- a `None` where a message
   used to be.
 - Everything is decided inside one writer job against the stored row, so
@@ -1202,10 +1202,11 @@ def test_the_deletion_handler_makes_no_rpc_and_ignores_what_it_cannot_route(
 
 def test_the_window_re_read_never_moves_the_pointer(tmp_path: Path) -> None:
     """The D1 shape again. 4002 is hidden by a blackout; 4003 arrives
-    live and is stored *above* the pointer. A window re-read that read
-    or advanced past the pointer would carry it over 4002, which no
-    later read could then see. The window reads only at or below the
-    pointer, and writes nothing to it."""
+    live and is stored *above* the pointer. A window re-read that
+    advanced the pointer would carry it over 4002, which no later read
+    could then see. The window re-reads 4003 too -- the newest stored
+    messages, whatever the pointer (final review F03) -- but writes
+    nothing to the pointer."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
@@ -1225,8 +1226,9 @@ def test_the_window_re_read_never_moves_the_pointer(tmp_path: Path) -> None:
     result, pointer_after_window, requested = _run(db_path, body)
 
     assert pointer_after_window == SIGNAL_ID_MSG
-    assert requested == [(SIGNAL_ID_MSG,)]
-    assert result.requested == (SIGNAL_ID_MSG,)
+    assert requested == [(SIGNAL_ID_MSG, SIGNAL_ID_MSG + 2)]
+    assert result.requested == (SIGNAL_ID_MSG, SIGNAL_ID_MSG + 2)
+    assert result.pointer == SIGNAL_ID_MSG
     # ...so the next forward read still recovers the blacked-out message.
     assert _rows(db_path, "SELECT message_id, source FROM messages ORDER BY message_id") == [
         (SIGNAL_ID_MSG, "live"),
@@ -1265,7 +1267,7 @@ def test_the_window_leaves_a_pointer_on_an_unstored_id_where_it_is(tmp_path: Pat
     assert _pointer(db_path) == SIGNAL_ID_MSG - 1
 
 
-def test_the_window_is_the_newest_n_stored_messages_at_or_below_the_pointer(
+def test_the_window_is_the_newest_n_stored_messages(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "store.db"

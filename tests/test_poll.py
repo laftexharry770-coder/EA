@@ -331,8 +331,8 @@ def test_d1_blackout_then_live_then_one_round_recovers_the_whole_gap(tmp_path: P
     # not Telethon's default of ONE message...
     history_calls = [c for c in poll_calls if c.ids is None]
     assert [(c.min_id, c.limit, c.reverse) for c in history_calls] == [(9, DEFAULT_POLL_LIMIT, True)]
-    # ...then (Task 10) one by-id re-read of what is now at or below the
-    # pointer, in which edits and deletions would show.
+    # ...then (Task 10) one by-id re-read of the newest stored messages,
+    # in which edits and deletions would show.
     assert [c.ids for c in poll_calls if c.ids is not None] == [(10, 11, 12, 13)]
     assert _stored(db_path) == [(10, "poll"), (11, "poll"), (12, "poll"), (13, "live")]
     assert _pointer(db_path) == 13

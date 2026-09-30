@@ -39,10 +39,11 @@ Every `interval` (5 s) the poll runs one *round*:
    of drops a day.
 4. **Re-read that channel's recent window by id** (Task 10,
    `ingest/edits.py`'s `reconcile_window`), right after its forward
-   read: the `edit_window` (50) newest stored messages at or below the
-   pointer, fetched with `get_messages(ids=...)`. The forward read only
-   ever sees ids above the pointer, so this is the only history read
-   that can find an edit, or -- by a message's absence -- a deletion,
+   read: the `edit_window` (50) newest stored messages, above the
+   pointer too (final review F03), fetched with `get_messages(ids=...)`.
+   The forward read only ever sees ids above the pointer, and never one
+   that was deleted, so this is the only history read that can find an
+   edit below it, or -- by a message's absence -- a deletion anywhere,
    that the `MessageEdited`/`MessageDeleted` stream dropped. It runs in
    the same per-channel step, only once that channel's forward read has
    succeeded this round, under the same `rpc_timeout` and the same error

@@ -12,12 +12,16 @@ which:
 
 1. takes that channel's history lock (`Listener.history_lock`), so it
    never interleaves with a history read of the same channel;
-2. reads the pointer and picks the **window**: the `window` newest stored
-   messages at or below it (`edits_repo.window_versions`, one indexed
-   read on the reader connection) -- leaving out those a `MessageDeleted`
-   event deleted, keeping those an earlier window re-read only *inferred*
-   deleted. Messages above the pointer belong to the forward read, which
-   meets their current version anyway when it passes them;
+2. picks the **window**: the `window` newest stored messages of the
+   channel (`edits_repo.window_versions`, one indexed read on the reader
+   connection) -- leaving out those a `MessageDeleted` event deleted,
+   keeping those an earlier window re-read only *inferred* deleted. That
+   includes messages stored live *above* the pointer (final review F03):
+   the forward read meets an edited one's current version anyway when it
+   passes it, but it never passes a *deleted* one, so without them the
+   deletion of a channel's newest signal went unseen until the channel
+   posted again. Every message in the window is stored, so an absence
+   means as much above the pointer as below it;
 3. fetches them by id in one bounded RPC -- `get_messages(channel,
    ids=[...])` under `asyncio.wait_for(..., rpc_timeout)` -- which
    returns each message's *current* version, or `None` for one that is
@@ -65,13 +69,17 @@ deletion voided every unexecuted signal in the window at once. So:
   (`AbsenceTracker`, one per poll run); a restart simply starts over.
 - A window re-read that voids any signal raises one CRITICAL
   `WINDOW_VOIDED_SIGNALS` alert with the count and the signal ids, on top
-  of each signal's own WARNING -- a mass void must not read as noise.
+  of each signal's own WARNING -- a mass void must not read as noise. A
+  void that promoted a standing repost of the call in its place is left
+  out: that call is still queued (G3L-2).
 
 **It never moves the pointer.** It writes only through `ingest_edit`,
 `ingest_deletion` and `record_alert`, none of which touches
-`channel_state`, and it only reads ids at or below the pointer. The
-pointer is `read_history`'s alone: a read that advanced it past an id it
-had not ingested would lose that message for good (the reviewer's D1).
+`channel_state`; it reads the pointer only to report it. The pointer is
+`read_history`'s alone: a read that advanced it past an id it had not
+ingested would lose that message for good (the reviewer's D1) -- and a
+stored message above the pointer, re-read here, is still met again by
+the forward read, which finds it stored.
 
 **Matched by id, never by position.** Because Telegram may leave an id
 out of its answer (telethon/client/messages.py:324-327), the list need not
@@ -177,7 +185,8 @@ class WindowResult:
     """What one window re-read of one channel found."""
 
     channel_id: int
-    #: The pointer the window was taken below (read, never written).
+    #: The channel's pointer when the window was taken (read, never
+    #: written; the window is not bounded by it).
     pointer: int
     #: The ids asked for, oldest first; empty if there was nothing to ask.
     requested: tuple[int, ...]
@@ -245,7 +254,7 @@ async def reconcile_window(
     async with listener.history_lock(channel_id):
         pointer = listener.read_last_processed_message_id(channel_id)
         stored = edits_repo.window_versions(
-            listener.reader, channel_id=channel_id, at_or_below=pointer, limit=window
+            listener.reader, channel_id=channel_id, limit=window
         )
         requested = tuple(version.message_id for version in stored)
         if not requested:
@@ -340,7 +349,7 @@ async def reconcile_window(
     )
     if result.changed:
         logger.info(
-            "window re-read of channel %s (%s) at or below %s: %d edit(s), %d deletion(s) "
+            "window re-read of channel %s (%s), pointer %s: %d edit(s), %d deletion(s) "
             "applied",
             channel_id,
             channel_cfg.name,
@@ -394,10 +403,30 @@ async def _suspect_read(
 async def _report_voids(
     listener: Listener, channel_cfg: ChannelCfg, deletions: list[DeletionResult]
 ) -> None:
-    voided = [d.signal_id for d in deletions if d.outcome == "voided"]
+    """The CRITICAL summary of one window read's voids (module docstring).
+    A void that promoted the channel's standing repost of the call in its
+    place is left out (group-3 leftover G3L-2): the call never stopped --
+    it is queued as the promoted signal, and its own WARNINGs say so --
+    and whether such a void happens at all depends only on which post of
+    a relayed call was stored first (a copy's deletion is a repeat
+    removal), so "check they really were deleted" would be noise that
+    comes and goes with storage order."""
+    channel_id = channel_cfg.channel_id
+    for d in deletions:
+        if d.outcome == "voided" and d.promoted_signal_id is not None:
+            logger.info(
+                "window re-read of channel %s (%s): signal %s voided, its call still queued "
+                "as signal %s (a repost promoted in its place); not in the void summary",
+                channel_id,
+                channel_cfg.name,
+                d.signal_id,
+                d.promoted_signal_id,
+            )
+    voided = [
+        d.signal_id for d in deletions if d.outcome == "voided" and d.promoted_signal_id is None
+    ]
     if not voided:
         return
-    channel_id = channel_cfg.channel_id
     try:
         await listener.record_alert(
             "CRITICAL",

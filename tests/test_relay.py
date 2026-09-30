@@ -608,8 +608,9 @@ def test_repost_then_delete_promotes_the_standing_repost(tmp_path, found_by):
     assert state["links"] == []  # the promoted repost is no copy any more
     assert ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION) in _codes(state)
     assert ("WARNING", edits_repo.SIGNAL_REPOST_PROMOTED, V, REPOST, 2) in state["alerts"]
-    if found_by == "window":
-        assert ("CRITICAL", edits_repo.WINDOW_VOIDED_SIGNALS) in _codes(state)
+    # The call is still queued, as the promoted repost: no CRITICAL "check
+    # they really were deleted" summary for it (G3L-2).
+    assert ("CRITICAL", edits_repo.WINDOW_VOIDED_SIGNALS) not in _codes(state)
     detail = _alert_detail(db_path, edits_repo.SIGNAL_REPOST_PROMOTED)
     assert f"message {REPOST}" in detail and f"message {CALL}" in detail
 
@@ -1052,7 +1053,8 @@ def test_a_copy_re_aimed_after_execution_is_loud_and_skips_the_rest(tmp_path):
 def test_a_copys_edit_the_update_stream_dropped_reaches_the_signal(tmp_path, found_by):
     """Every arrival path: the window re-read (the copy is at or below the
     pointer) and the poll's forward read (the copy was stored live, above
-    it)."""
+    it; the window re-reads it too, and whichever comes first applies the
+    edit, once)."""
     db_path = tmp_path / "store.db"
 
     async def body(client, listener, time):
