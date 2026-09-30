@@ -174,8 +174,8 @@ store the link on the copy's `messages` row, log it at INFO with both
 messages, and bump the durable counters `relay_duplicates` /
 `relay_duplicate_followups`.
 
-**Known limitations** (accepted, ruling G3 round 4; each needs two
-watched channels carrying the same calls):
+**Known limitations** (accepted, rulings G3 rounds 4 and 5; each needs
+two watched channels carrying the same calls, unless it says otherwise):
 
 - A copy held back and then re-linked to a call posted again is re-linked
   again, with a second `COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED` warning, if
@@ -197,6 +197,16 @@ watched channels carrying the same calls):
   another channel -- whose ingest does not have the first channel's
   parser -- it stays the post that withdrew its signal: its later removal
   changes nothing, and a forward of it removed is an echo.
+- Whether another channel's posts still show the call (`_gone_post`,
+  `_call_stands_elsewhere`) is read with the changed post's own channel
+  config, as the other channel's parser is not at hand. With channels on
+  different parsers, a post that does not read as the call that way
+  counts as not standing -- the safe side: the removal withdraws the call.
+- One channel suffices: of several posts of the call deleted in one
+  report, only the lowest id is recorded as the post that withdrew it
+  (`edits_repo._closing_post`), so a reply to another of them follows the
+  call if it is posted again -- as a reply to any repeat removed before
+  the withdrawal does. The same in either storage order (INV-2).
 """
 from __future__ import annotations
 
