@@ -53,9 +53,9 @@ from xaucopier.store import edits_repo, relay_repo
 from xaucopier.store.migrations import migrate
 from xaucopier.store.messages_repo import ingest
 
-#: Seeds per family in the normal suite (a few seconds in all);
+#: Seeds per family in the normal suite (about 20 s in all);
 #: `XAUCOPIER_FUZZ_SEEDS` overrides, e.g. 5000 for a thorough run.
-DEFAULT_SEEDS = 300
+DEFAULT_SEEDS = 1000
 SEEDS = int(os.environ.get("XAUCOPIER_FUZZ_SEEDS", DEFAULT_SEEDS))
 #: Seeds per test item (a failing block names its seeds).
 BLOCK = 50
