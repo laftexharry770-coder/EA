@@ -618,10 +618,17 @@ def _replace_what_cannot_be_shown() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run one command. A command that does not finish normally ends with
+    "(exit code N)" -- the number the runbook's table explains (final
+    review F26) -- except `watch`, which says its code itself on every way
+    it stops ("watch stopped (exit code 4: ...)"), so it is said once."""
     _replace_what_cannot_be_shown()
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    code = args.func(args)
+    if code != exit_codes.EXIT_OK and args.func is not cmd_watch:
+        print(f"(exit code {code})", file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":

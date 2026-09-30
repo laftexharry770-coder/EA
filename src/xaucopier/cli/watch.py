@@ -348,6 +348,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         )
         if exc.hint:  # where it probably is (G2L-1)
             print(exc.hint, file=sys.stderr)
+        # watch says its own code on every way it stops (F26; main() does not).
+        print(f"(exit code {exit_codes.EXIT_ALREADY_RUNNING})", file=sys.stderr)
         return exit_codes.EXIT_ALREADY_RUNNING
 
     log_path = setup.db_path.parent / paths.LOG_FILE_NAME
@@ -360,7 +362,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
             _print_setup_error(exc)
             return exit_codes.EXIT_CONFIG_ERROR
         except sqlite3.Error as exc:
-            print(f"The database is busy ({exc}); try again in a minute.", file=sys.stderr)
+            print(
+                f"The database is busy ({exc}); try again in a minute. "
+                f"(exit code {exit_codes.EXIT_LISTENER_STOPPED})",
+                file=sys.stderr,
+            )
             return exit_codes.EXIT_LISTENER_STOPPED
 
         _print_banner(setup, log_path)

@@ -836,7 +836,8 @@ def test_add_stops_on_a_permanent_telegram_error_with_its_exit_code(
     assert add_rig.rig.channels_path.read_bytes() == before
     err = capsys.readouterr().err
     assert words in err and "Traceback" not in err
-    assert len([line for line in err.splitlines() if line.strip()]) == 1  # one plain sentence
+    # One plain sentence, then the exit code (F26).
+    assert [line for line in err.splitlines() if line.strip()][1:] == [f"(exit code {code})"]
     assert "disconnect" in add_rig.client.calls
     assert add_rig.lock.released == 1
 
@@ -1163,7 +1164,7 @@ def test_add_told_to_wait_by_telegram_says_how_long_in_minutes(
     assert "Telegram asks to wait about 5 minutes, then run it again" in err
     assert "`.\\xaucopier channels add`" in err and "Nothing was added." in err
     assert "Traceback" not in err and "flood" not in err.lower()
-    assert len([line for line in err.splitlines() if line.strip()]) == 1
+    assert [line for line in err.splitlines() if line.strip()][1:] == ["(exit code 1)"]
     assert "disconnect" in add_rig.client.calls and add_rig.lock.released == 1
 
 
