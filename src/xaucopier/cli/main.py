@@ -42,7 +42,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import getpass
+import io
 import sys
 from pathlib import Path
 
@@ -69,6 +71,16 @@ _SUPPORT = "No program can fix this; only Telegram support can (https://telegram
 #: Telethon's own words when the login code was wrong `max_attempts` (3)
 #: times in a row (telethon/client/auth.py, `_start`).
 _THREE_WRONG_CODES = "consecutive sign-in attempts failed"
+#: Said whenever Telegram accepted the login but no session was saved (the
+#: save failed, or something failed right after the acceptance -- final
+#: review F34): Telegram made a XAUCOPIER-TRADEBOX session this program has
+#: no copy of, and running setup-login again makes a second one.
+_END_EXTRA_SESSION = (
+    "IMPORTANT: Telegram had already accepted this login, so a 'XAUCOPIER-TRADEBOX' "
+    "session now exists on your Telegram account, and this program has no copy of it. "
+    "Open Telegram -> Settings -> Devices and end that extra XAUCOPIER-TRADEBOX "
+    f"session by hand, then {_AGAIN}."
+)
 
 
 def _prompt_login_code() -> str:
@@ -208,11 +220,46 @@ def login_failure(exc: BaseException) -> tuple[int, str]:
     )
 
 
-def _print_failure(exc: BaseException) -> int:
+def _print_failure(exc: BaseException, *, accepted: bool = False) -> int:
+    """`login_failure()`'s sentence, then -- when Telegram had already
+    accepted the login (`accepted`) -- the session to end by hand."""
     code, message = login_failure(exc)
     print(message, file=sys.stderr)
+    if accepted:
+        print(_END_EXTRA_SESSION, file=sys.stderr)
     print("Nothing was saved.", file=sys.stderr)
     return code
+
+
+def _login_accepted(client: object) -> bool:
+    """Whether Telegram accepted the code (or the 2FA password) before the
+    failure (final review F34). Telethon marks its client authorized
+    (`_authorized = True`, in `_on_login`) the moment Telegram answers the
+    sign-in, before its own next requests -- which can still fail, for
+    example with Telegram's own trouble. Read without asking Telegram
+    anything: the connection may be what failed."""
+    return getattr(client, "_authorized", None) is True
+
+
+async def _start_quietly(client: object, *, phone: str) -> None:
+    """`client.start()` with what Telethon itself prints to stdout kept off
+    the screen -- "Signed in successfully as ...; remember to not break the
+    ToS or you will risk an account ban!" (final review F29) -- so only
+    xaucopier's own sentences show. The login code's prompt still shows:
+    its callback puts the real stdout back while it asks (input() writes
+    its prompt there). The 2FA password's needs nothing: getpass writes
+    its prompt to the console itself, or to stderr, never to stdout.
+    Telethon's "Invalid code. Please try again." goes to stderr and stays."""
+    shown = sys.stdout
+
+    def code() -> str:
+        with contextlib.redirect_stdout(shown):
+            return _prompt_login_code()
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        await client.start(  # type: ignore[attr-defined]
+            phone=phone, code_callback=code, password=_prompt_2fa_password
+        )
 
 
 async def _disconnect_quietly(client: object) -> None:
@@ -227,8 +274,8 @@ async def _run_setup_login(path: Path) -> int:
     print(
         "Get api_id/api_hash from https://my.telegram.org (API development "
         "tools) -- these are specific to your phone number. Do not reuse a "
-        "sample value from a tutorial; it will get the client permanently "
-        "flood-blocked."
+        "sample value from a tutorial: Telegram blocks those for good, and this "
+        "program with them."
     )
 
     api_id_raw = input("api_id: ").strip()
@@ -271,17 +318,13 @@ async def _run_setup_login(path: Path) -> int:
             # takes to type the code or the password inside start().
             if not client.is_connected():
                 await connect_one_shot(client)
-            await client.start(
-                phone=phone,
-                code_callback=_prompt_login_code,
-                password=_prompt_2fa_password,
-            )
+            await _start_quietly(client, phone=phone)
             # Defence in depth: `start()` returning is not proof of a login
             # (a blank 2FA password made it return without one). Never save
             # a session Telegram does not recognise as logged in.
             authorized = await client.is_user_authorized()
         except Exception as exc:  # noqa: BLE001 -- every failure is explained, none escapes
-            return _print_failure(exc)
+            return _print_failure(exc, accepted=_login_accepted(client))
         if not authorized:
             print(
                 "Telegram did not log this program in, although no error was reported. "
@@ -310,11 +353,7 @@ async def _run_setup_login(path: Path) -> int:
         # references the file path, never the secret values.
         print(
             f"Login to Telegram succeeded, but saving the encrypted session "
-            f"to {path} failed: {exc}\n"
-            "IMPORTANT: a live 'XAUCOPIER-TRADEBOX' session now exists on "
-            "your Telegram account with no local copy of its credential. "
-            "Go to Telegram -> Settings -> Devices and terminate that "
-            f"session by hand, then {_AGAIN}.",
+            f"to {path} failed: {exc}\n{_END_EXTRA_SESSION}",
             file=sys.stderr,
         )
         return exit_codes.EXIT_FAILED
@@ -322,8 +361,9 @@ async def _run_setup_login(path: Path) -> int:
     print(f"Login succeeded. Session saved (DPAPI-encrypted, this user only) to: {path}")
     print(
         "On your phone, check Telegram -> Settings -> Devices: you should "
-        "see a session named 'XAUCOPIER-TRADEBOX'. If you don't see it, "
-        "something is wrong -- do not proceed to run the listener."
+        "see a session named 'XAUCOPIER-TRADEBOX'. If you do not see it, "
+        f"something went wrong: do not start `{paths.USER_COMMAND} watch`, and tell "
+        "whoever looks after xaucopier."
     )
     print(f"Next: run `{paths.USER_COMMAND} resolve-channels`.")
     return exit_codes.EXIT_OK

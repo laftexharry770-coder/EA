@@ -620,3 +620,135 @@ def test_the_time_taken_to_type_the_login_code_is_never_cut_short(
 
     assert cli_main.main(["setup-login", "--path", str(target)]) == 0
     assert load(target).session_string == _FAKE_SESSION_AFTER_LOGIN
+
+
+# -- F29: only xaucopier's own words, in plain language -------------------------------------
+
+
+def test_telethons_own_login_line_is_not_shown_but_the_prompts_are(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final review F29: a successful login printed Telethon's own "Signed in
+    successfully as ...; remember to not break the ToS or you will risk an
+    account ban!" before "Login succeeded". Telethon's real start() runs
+    here (offline) with the real input(), so every prompt is what the user
+    would see -- none of them may be swallowed with Telethon's line."""
+    import io
+    import sys
+
+    _real_client_offline(monkeypatch, sign_in=_two_step)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(f"{_FAKE_API_ID}\n{_FAKE_PHONE}\n12345\n"))
+    _answers(monkeypatch, "getpass.getpass", [_FAKE_API_HASH, "right"])
+    target = tmp_path / "session.dpapi"
+
+    assert cli_main.main(["setup-login", "--path", str(target)]) == 0
+
+    out = capsys.readouterr().out
+    assert "api_id: " in out
+    assert "Phone number, with country code" in out
+    assert "Enter the login code Telegram just sent you" in out
+    assert "Signed in successfully" not in out and "ToS" not in out
+    assert "Login succeeded" in out
+    assert load(target).session_string == _FAKE_SESSION_AFTER_LOGIN
+
+
+def test_setup_login_speaks_plainly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No 'client', 'flood-blocked' or 'listener': the user knows only
+    this program and `.\\xaucopier watch`."""
+    monkeypatch.setattr(cli_main, "build_client", lambda blob: _FakeClientSuccess())
+    _answers(monkeypatch, "builtins.input", [_FAKE_API_ID, _FAKE_PHONE])
+    _answers(monkeypatch, "getpass.getpass", [_FAKE_API_HASH])
+
+    assert cli_main.main(["setup-login", "--path", str(tmp_path / "s.dpapi")]) == 0
+
+    captured = capsys.readouterr()
+    said = (captured.out + captured.err).lower()
+    for jargon in ("client", "flood", "listener", "rpc"):
+        assert jargon not in said, jargon
+    assert "`.\\xaucopier watch`" in captured.out
+
+
+# -- F34: a login Telegram accepted before the failure leaves a session to end by hand -------
+
+
+def _accepted_then_failing(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """The real TelegramClient and Telethon's real start() -> sign_in() ->
+    _on_login(), offline: Telegram accepts the code (a login now exists on
+    the account), then its own next request fails -- Telegram's trouble
+    (500) -- before start() returns (the reviewer's S10)."""
+    from telethon import TelegramClient, functions, utils
+
+    from xaucopier.ingest.client import build_client
+
+    seen: dict[str, Any] = {"requests": []}
+
+    async def call(self: Any, request: Any, ordered: bool = False, flood_sleep_threshold: Any = None) -> Any:
+        seen["requests"].append(type(request).__name__)
+        if isinstance(request, functions.auth.SignInRequest):
+            return types.auth.Authorization(user=_USER)
+        if isinstance(request, functions.updates.GetStateRequest):
+            raise errors.RpcCallFailError(request=request)
+        raise AssertionError(f"tried to send {type(request).__name__} to Telegram")
+
+    monkeypatch.setattr(TelegramClient, "__call__", call)
+
+    def build(blob: Any) -> Any:
+        client = build_client(blob)
+
+        async def nothing(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        async def send_code_request(phone: str, *args: Any, **kwargs: Any) -> None:
+            client._phone_code_hash[utils.parse_phone(phone)] = "not-a-real-hash"
+
+        monkeypatch.setattr(client, "connect", nothing)
+        monkeypatch.setattr(client, "is_connected", lambda: True)
+        monkeypatch.setattr(client, "get_me", nothing)
+        monkeypatch.setattr(client, "send_code_request", send_code_request)
+        monkeypatch.setattr(client, "disconnect", nothing)
+        seen["client"] = client
+        return client
+
+    monkeypatch.setattr(cli_main, "build_client", build)
+    return seen
+
+
+def test_a_failure_after_telegram_accepted_the_login_says_to_end_the_extra_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final review F34: this said only "The login failed ... Nothing was
+    saved", although a XAUCOPIER-TRADEBOX device now exists on the account
+    that this program has no copy of -- and the retry makes a second one."""
+    seen = _accepted_then_failing(monkeypatch)
+    _answers(monkeypatch, "builtins.input", [_FAKE_API_ID, _FAKE_PHONE, "12345"])
+    _answers(monkeypatch, "getpass.getpass", [_FAKE_API_HASH])
+    target = tmp_path / "session.dpapi"
+
+    assert cli_main.main(["setup-login", "--path", str(target)]) == 1
+
+    assert seen["requests"] == ["SignInRequest", "GetStateRequest"]
+    assert not target.exists()
+    err = capsys.readouterr().err
+    assert "The login failed" in err and "Traceback" not in err
+    assert "Telegram had already accepted this login" in err
+    assert "Settings -> Devices" in err and "XAUCOPIER-TRADEBOX" in err
+    assert "Nothing was saved." in err
+
+
+def test_a_failure_before_telegram_accepted_the_login_does_not_mention_devices(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    made = _real_client_offline(
+        monkeypatch, sign_in=lambda kwargs: errors.PhoneCodeInvalidError(request=None)
+    )
+    _answers(monkeypatch, "builtins.input", [_FAKE_API_ID, _FAKE_PHONE, "1", "2", "3"])
+    _answers(monkeypatch, "getpass.getpass", [_FAKE_API_HASH])
+
+    assert cli_main.main(["setup-login", "--path", str(tmp_path / "s.dpapi")]) == 1
+
+    assert len(made["sign_ins"]) == 3
+    err = capsys.readouterr().err
+    assert "The login code was wrong 3 times" in err
+    assert "already accepted" not in err and "Devices" not in err
