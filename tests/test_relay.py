@@ -54,6 +54,7 @@ from xaucopier.config.channels import ChannelCfg
 from xaucopier.domain.signal import FollowUp, FollowUpOp
 from xaucopier.ingest.listener import HistoryIngest, Listener
 from xaucopier.ingest.poll import HistoryPoll, split_new
+from xaucopier.parsing.router import route
 from xaucopier.store import db, edits_repo, outbox, relay_repo, signals_repo
 from xaucopier.store.messages_repo import IngestResult, ingest
 
@@ -1694,6 +1695,46 @@ def test_a_follow_ups_target_and_its_path_go_together(conn):
                 conn, channel_id=VIP.channel_id, message_id=1, followup=followup,
                 target_signal_id=target, resolution_path=path,
             )
+
+
+@pytest.mark.parametrize(
+    ("promoted_from", "kind", "ok"),
+    [
+        (None, None, True),
+        (1, "promoted", True),
+        (1, "posted_again", True),
+        (1, None, False),
+        (None, "promoted", False),
+        (None, "posted_again", False),
+    ],
+)
+def test_a_replacing_signals_link_and_its_kind_go_together(conn, promoted_from, kind, ok):
+    """Ruling R5-3 (review round 5): a signal that replaces a withdrawn one
+    records both the signal it replaces and how (promoted, or posted
+    again); neither alone is ever stored."""
+    _ingest(conn, VIP, 4001)
+    _ingest(conn, VIP, 4101, CHATTER_TEXT, posted=POSTED + timedelta(minutes=1))
+    signal = route(
+        SIGNAL_TEXT, channel_cfg=VIP, message_id=4101, posted_at_utc=POSTED
+    ).signal
+
+    def insert() -> int:
+        return signals_repo.insert_signal(
+            conn, channel_id=VIP.channel_id, message_id=4101, signal=signal,
+            promoted_from_signal_id=promoted_from, replacement_kind=kind,
+        )
+
+    if ok:
+        signal_id = insert()
+        assert _q(
+            conn,
+            "SELECT promoted_from_signal_id, replacement_kind FROM signals WHERE signal_id = ?",
+            signal_id,
+        ) == [(promoted_from, kind)]
+    else:
+        with pytest.raises(ValueError, match="go together"):
+            insert()
+        assert _q(conn, "SELECT COUNT(*) FROM signals WHERE message_id = 4101") == [(0,)]
 
 
 def test_an_executed_call_deleted_post_by_post_is_flagged_when_the_last_goes(tmp_path):
