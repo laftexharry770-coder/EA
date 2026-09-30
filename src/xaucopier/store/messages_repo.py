@@ -137,12 +137,18 @@ not an argument.) The forward pair is also what recognises a relay copy
 exactly (see above).
 
 **Deleted before it was stored** (final review F18). The listener passes
-``deleted_by_event_at_utc`` for a message a ``MessageDeleted`` event
-named before any path had stored it (``listener.DeletedBeforeStored``):
-it is stored -- verbatim, a fixture like any -- already marked deleted by
-the event at that time, and nothing else happens: no signals or
-followups row, no outbox row, no counter. For a message already stored
-it is ignored (the deletion found it stored and applied itself).
+``deleted_by_event_at_utc`` (and ``deleted_by_event_with``, the other ids
+the same report named) for a message a ``MessageDeleted`` event named
+before any path had stored it (``listener.DeletedBeforeStored``). The
+race must change nothing, so the message is ingested exactly as any
+other -- routed, admitted or linked as a copy, fanned out -- and then,
+in the SAME transaction, ``edits_repo.apply_deletion`` applies that
+event, stamped with the event's own time: the result is what the event
+arriving a moment later gives. A signal is VOIDED and its entries
+SKIPPED before any worker could claim them; a relay copy stored before
+or after sees a post of the call that was deleted (ruling C2), whichever
+was stored first. For a message already stored it is ignored (the
+deletion found it stored and applied itself).
 """
 from __future__ import annotations
 
@@ -150,6 +156,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from collections.abc import Collection
 from typing import Any, Literal, Protocol
 
 from xaucopier.domain.signal import FollowUp
@@ -345,6 +352,7 @@ def ingest(
     fwd_from_post_id: int | None = None,
     fwd_from_date_utc: datetime | None = None,
     deleted_by_event_at_utc: datetime | None = None,
+    deleted_by_event_with: Collection[int] = (),
 ) -> IngestResult:
     channel_id = channel_cfg.channel_id
     provenance = _provenance_columns(
@@ -368,7 +376,7 @@ def ingest(
     existing = _get_message(conn, channel_id=channel_id, message_id=message_id)
 
     if existing is None:
-        return _ingest_new(
+        result = _ingest_new(
             conn,
             channel_cfg=channel_cfg,
             channel_id=channel_id,
@@ -383,8 +391,29 @@ def ingest(
             accounts=accounts,
             relay_window_seconds=relay_window_seconds,
             provenance=provenance,
-            deleted_by_event_at_utc=deleted_by_event_at_utc,
         )
+        if deleted_by_event_at_utc is not None:
+            # A MessageDeleted event named it before it was stored (final
+            # review F18): that event, applied now in this same transaction
+            # with its own time -- as if it had come a moment later.
+            deletion = edits_repo.apply_deletion(
+                conn,
+                channel_cfg=channel_cfg,
+                message_id=message_id,
+                now_utc=deleted_by_event_at_utc,
+                accounts=accounts,
+                detected_by=edits_repo.EVENT_DETECTOR,
+                also_deleted=deleted_by_event_with,
+            )
+            logger.info(
+                "channel %s message %s (%s) was deleted before it was stored: stored, and the "
+                "deletion applied at once (%s)",
+                channel_id,
+                message_id,
+                route_result.kind,
+                deletion.outcome,
+            )
+        return result
 
     edit = edits_repo.reconcile(
         conn,
@@ -496,7 +525,6 @@ def _ingest_new(
     accounts: tuple[_AccountCfgLike, ...],
     relay_window_seconds: int,
     provenance: dict[str, Any],
-    deleted_by_event_at_utc: datetime | None = None,
 ) -> IngestResult:
     kind = route_result.kind
 
@@ -515,37 +543,6 @@ def _ingest_new(
         source=source,
         provenance=provenance,
     )
-
-    if deleted_by_event_at_utc is not None:
-        # A MessageDeleted event named it before it was stored (final
-        # review F18): stored as the fixture it is, already deleted by the
-        # event -- nothing more. No signals or followups row (a relay
-        # match could otherwise count a deleted post as the call), no
-        # fan-out, and the parse-failure counter is left alone.
-        conn.execute(
-            "UPDATE messages SET deleted_at_utc = ?, deleted_detected_by = ? "
-            "WHERE channel_id = ? AND message_id = ?",
-            (
-                deleted_by_event_at_utc.isoformat(),
-                edits_repo.EVENT_DETECTOR,
-                channel_id,
-                message_id,
-            ),
-        )
-        logger.info(
-            "channel %s message %s (%s) stored already deleted: a MessageDeleted event named "
-            "it before it was stored; not traded",
-            channel_id,
-            message_id,
-            kind,
-        )
-        return IngestResult(
-            outcome="new",
-            signal_id=None,
-            followup_id=None,
-            kind=kind,
-            detail="deleted before it was stored; stored as deleted",
-        )
 
     if kind == "parse_failed":
         if route_result.unqueued_followup is not None:

@@ -354,9 +354,11 @@ def test_a_deletion_handled_before_the_forward_read_stores_the_message_is_applie
     as a channel's only message (first run, a new channel) every window
     read missed all of it, tripped the breaker, and the signal stayed
     claimable for good under a WINDOW_READ_SUSPECT alert saying deletion
-    events still act. Now the event's id is remembered, and the read
-    stores the message already marked deleted by the event: no signals
-    row, no entry, no alert, and the window never asks for it."""
+    events still act. Now the event's id is remembered, and the job that
+    stores the message applies the deletion in the same transaction --
+    exactly as if the event had come a moment later: the signal VOIDED,
+    its entries skipped before anyone could claim them, a WARNING, and the
+    window never asks for it."""
     db_path = tmp_path / "store.db"
     client = _DeletedDuringForwardRead()
 
@@ -380,9 +382,9 @@ def test_a_deletion_handled_before_the_forward_read_stores_the_message_is_applie
     message = _message(db_path)
     assert message["deleted_at_utc"] is not None and message["detected_by"] == "event"
     assert message["raw_text"] == SIGNAL_TEXT  # still a fixture
-    assert _rows(db_path, "SELECT COUNT(*) FROM signals") == [(0,)]
-    assert _outbox(db_path, "ENTRY") == []
-    assert _alerts(db_path) == []
+    assert _signal(db_path)["state"] == "VOIDED" and _withdrawn(db_path)
+    assert _outbox(db_path, "ENTRY") == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+    assert _alerts(db_path) == [("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)]
     assert _metric(db_path, edits_repo.DELETE_MISSED_BY_EVENTSTREAM_METRIC) == 0
     assert all(SIGNAL_ID_MSG not in ids for ids in client.by_id)
     if n_chatter == 0:
@@ -394,9 +396,14 @@ def test_deleted_before_stored_keeps_only_ids_above_the_pointer_and_forgets_them
     at = POSTED
     assert not tombstones.record(A, 4000, deleted_at_utc=at, pointer=4000)  # passed already
     assert not tombstones.pending(A)
-    assert tombstones.record(A, 4002, deleted_at_utc=at, pointer=4000)
+    assert tombstones.record(
+        A, 4002, deleted_at_utc=at, pointer=4000, also_deleted=frozenset({4002, 4003})
+    )
     assert tombstones.deleted_at(A, 4002, pointer=4000) == at
+    # The report's other ids go along: the deletion is applied as that report.
+    assert tombstones.deletion(A, 4002, pointer=4000) == (at, frozenset({4002, 4003}))
     assert tombstones.deleted_at(A, 4003, pointer=4000) is None
+    assert tombstones.deletion(A, 4003, pointer=4000) is None
     assert tombstones.deleted_at(A + 1, 4002, pointer=0) is None  # per channel
     # The pointer passes it: forgotten.
     assert tombstones.deleted_at(A, 4002, pointer=4002) is None
@@ -410,38 +417,161 @@ def test_deleted_before_stored_keeps_only_ids_above_the_pointer_and_forgets_them
     assert tombstones.deleted_at(A, 4013, pointer=4000) == at
 
 
+def _without_times(conn) -> dict[str, list[tuple]]:
+    """Every row of every table, minus the columns that hold a time."""
+    state = {}
+    for (table,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+        "AND name NOT IN ('heartbeats', 'schema_version') ORDER BY 1"
+    ).fetchall():
+        columns = [
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            if not row[1].endswith("_utc")
+        ]
+        state[table] = [
+            tuple(row) for row in conn.execute(
+                f"SELECT {', '.join(columns)} FROM {table} ORDER BY {', '.join(columns)}"
+            ).fetchall()
+        ]
+    return state
+
+
+#: The live signal on the channel when the race is run: another call than
+#: SIGNAL_TEXT (its own stop).
+OTHER_CALL = SIGNAL_TEXT.replace("4470", "4465")
+
+#: What the race is run on: a signal, a repeat of the live one, a
+#: follow-up replying to it, an unreadable signal, and chatter -- with the
+#: states the raced message's own signals rows end in.
+RACED = [
+    (SIGNAL_TEXT, "signal", None, ["VOIDED"]),
+    (OTHER_CALL, "signal", None, []),  # a copy: linked, no row of its own
+    ("Close half now", "followup", 3001, []),
+    (SIGNAL_TEXT.replace("SL: 4470", ""), "parse_failed", None, []),
+    (CHATTER_TEXT, "skip", None, []),
+]
+
+
 @pytest.mark.parametrize(
-    ("text", "kind"),
-    [(SIGNAL_TEXT, "signal"), ("Close half now", "followup"),
-     (SIGNAL_TEXT.replace("SL: 4470", ""), "parse_failed")],
-    ids=["signal", "followup", "parse_failed"],
+    ("text", "kind", "reply_to", "own_states"),
+    RACED,
+    ids=["signal", "repeat", "followup", "parse_failed", "skip"],
 )
-def test_a_message_stored_deleted_by_the_event_creates_nothing(tmp_path, text, kind) -> None:
-    """`ingest(deleted_by_event_at_utc=...)`: the row, marked deleted by
-    the event -- no signals, followups or outbox rows, no counter -- and a
-    second delivery of it is only a duplicate."""
+def test_a_message_stored_after_its_deletion_event_ends_as_if_the_event_came_after(
+    tmp_path, text, kind, reply_to, own_states
+) -> None:
+    """`ingest(deleted_by_event_at_utc=...)` -- the deletion event handled
+    before the message was stored (F18) -- ends exactly as the same event
+    handled a moment after it was stored: every row the same but for the
+    times. So the race changes nothing: a signal is VOIDED with its
+    entries skipped in the same transaction (never claimable), a relay
+    rule still sees the post it matched, and the event, not the window,
+    is what found it. A second delivery of the message is a duplicate."""
+    stored_at = POSTED + timedelta(seconds=5)
+    event_at = POSTED + timedelta(seconds=2)
+
+    def store(conn, message_id, text, reply_to=None, **extra):
+        result = ingest(
+            conn, channel_cfg=CHANNEL, message_id=message_id, text=text,
+            posted_at_utc=POSTED, edit_date_utc=None, reply_to_message_id=reply_to,
+            source="poll", now_utc=stored_at, accounts=ACCOUNTS, **extra,
+        )
+        conn.commit()
+        return result
+
+    states, results = [], []
+    for raced in (True, False):
+        conn = db.connect(tmp_path / f"{raced}.db", role="writer")
+        try:
+            store(conn, 3001, OTHER_CALL)  # a live signal on the channel
+            if raced:
+                result = store(
+                    conn, SIGNAL_ID_MSG, text, reply_to,
+                    deleted_by_event_at_utc=event_at,
+                    deleted_by_event_with=frozenset({SIGNAL_ID_MSG}),
+                )
+            else:
+                result = store(conn, SIGNAL_ID_MSG, text, reply_to)
+                edits_repo.apply_deletion(
+                    conn, channel_cfg=CHANNEL, message_id=SIGNAL_ID_MSG,
+                    now_utc=stored_at + timedelta(seconds=1), accounts=ACCOUNTS,
+                    detected_by="event", also_deleted=frozenset({SIGNAL_ID_MSG}),
+                )
+                conn.commit()
+            again = store(conn, SIGNAL_ID_MSG, text, reply_to)
+            assert again.outcome == "duplicate"
+            states.append(_without_times(conn))
+            results.append((result.outcome, result.kind))
+            if raced:
+                row = conn.execute(
+                    "SELECT deleted_at_utc, deleted_detected_by FROM messages "
+                    "WHERE message_id = ?", (SIGNAL_ID_MSG,),
+                ).fetchone()
+                assert tuple(row) == (event_at.isoformat(), "event")  # the event's own time
+                claimable = conn.execute(
+                    "SELECT COUNT(*) FROM outbox o JOIN signals s ON s.signal_id = o.signal_id "
+                    "WHERE s.message_id = ? AND o.state = 'QUEUED'", (SIGNAL_ID_MSG,),
+                ).fetchone()[0]
+                assert claimable == 0
+        finally:
+            conn.close()
+    raced_state, reference = states
+    assert raced_state == reference
+    assert results[0] == results[1] and results[0][1] == kind
+    assert [row[5] for row in raced_state["signals"] if row[2] == SIGNAL_ID_MSG] == own_states
+
+
+@pytest.mark.parametrize("order", ["relay-first", "vip-first"])
+def test_the_race_on_a_relayed_call_withdraws_it_whichever_post_was_stored_first(
+    tmp_path, order: str
+) -> None:
+    """Group 4 review, round 1. The relay forwards the VIP's call; the
+    VIP deletes it, and the event is handled before the forward read
+    stores the VIP's post. Stored with no signals row and no relay link,
+    the deleted post was invisible to the relay rules: the relay's copy
+    stayed queued, silently, in both storage orders. Applied as the event
+    it is, the deletion withdraws the call (ruling C2) -- nothing is
+    claimable, and it is said."""
     conn = db.connect(tmp_path / "store.db", role="writer")
     try:
-        def store(**extra):
+        def store(channel_cfg, message_id, at, **extra):
             result = ingest(
-                conn, channel_cfg=CHANNEL, message_id=SIGNAL_ID_MSG, text=text,
-                posted_at_utc=POSTED, edit_date_utc=None, reply_to_message_id=None,
-                source="poll", now_utc=POSTED + timedelta(seconds=5), accounts=ACCOUNTS, **extra,
+                conn, channel_cfg=channel_cfg, message_id=message_id, text=SIGNAL_TEXT,
+                posted_at_utc=at, edit_date_utc=None, reply_to_message_id=None,
+                source="poll", now_utc=at + timedelta(seconds=5), accounts=ACCOUNTS, **extra,
             )
             conn.commit()
             return result
 
-        first = store(deleted_by_event_at_utc=POSTED + timedelta(seconds=2))
-        again = store()
-        rows = lambda sql: [tuple(r) for r in conn.execute(sql).fetchall()]  # noqa: E731
-        assert (first.outcome, first.kind, first.signal_id, first.followup_id) == (
-            "new", kind, None, None
-        )
-        assert again.outcome == "duplicate"
-        assert rows("SELECT kind, deleted_at_utc, deleted_detected_by FROM messages") == [
-            (kind, (POSTED + timedelta(seconds=2)).isoformat(), "event")
-        ]
-        for table in ("signals", "followups", "outbox", "alerts", "channel_state"):
-            assert rows(f"SELECT COUNT(*) FROM {table}") == [(0,)], table
+        def relay_copy():
+            store(
+                relay.RELAY, 7001, POSTED + timedelta(seconds=30),
+                fwd_from_channel_id=relay.VIP.channel_id, fwd_from_post_id=SIGNAL_ID_MSG,
+                fwd_from_date_utc=POSTED,
+            )
+
+        def vip_post_raced():
+            deleted_at = POSTED + timedelta(seconds=40)
+            unknown = edits_repo.apply_deletion(
+                conn, channel_cfg=relay.VIP, message_id=SIGNAL_ID_MSG, now_utc=deleted_at,
+                accounts=ACCOUNTS, detected_by="event",
+            )
+            assert unknown.outcome == "unknown"
+            store(relay.VIP, SIGNAL_ID_MSG, POSTED, deleted_by_event_at_utc=deleted_at)
+
+        for step in ((relay_copy, vip_post_raced) if order == "relay-first"
+                     else (vip_post_raced, relay_copy)):
+            step()
+        claimable = conn.execute(
+            "SELECT COUNT(*) FROM outbox o JOIN signals s ON s.signal_id = o.signal_id "
+            "WHERE o.kind = 'ENTRY' AND o.state = 'QUEUED' AND s.state = 'NEW' "
+            "AND s.withdrawn_at_utc IS NULL"
+        ).fetchone()[0]
+        assert claimable == 0
+        assert [tuple(r) for r in conn.execute(
+            "SELECT state, withdrawn_at_utc IS NOT NULL FROM signals"
+        ).fetchall()] == [("VOIDED", 1)]
+        codes = [c for (c,) in conn.execute("SELECT code FROM alerts").fetchall()]
+        assert edits_repo.SIGNAL_VOIDED_BY_DELETION in codes
     finally:
         conn.close()
