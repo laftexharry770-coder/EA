@@ -1,0 +1,893 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HL Robot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f2f3f4;
+  --card: #ffffff;
+  --ink: #333333;
+  --muted: #6e6e6e;
+  --faint: #999999;
+  --line: #e5e5e5;
+  --field: #f7f7f7;
+  --red: #ff444f;
+  --red-soft: #ffe9ea;
+  --teal: #4bb4b3;
+  --teal-strong: #008079;
+  --teal-soft: #e3f4f4;
+  --loss: #ec3f3f;
+  --blue: #2c5b8f;
+  --shadow: 0 1px 2px rgba(0,0,0,.06), 0 4px 16px rgba(0,0,0,.05);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e0e0e; --card: #1b1b1b; --ink: #eaeaea; --muted: #a8a8a8; --faint: #7a7a7a;
+    --line: #2c2c2c; --field: #242424; --red-soft: #3a1c1e; --teal-soft: #15302f;
+    --teal-strong: #6fd1cf; --blue: #7fa9d9;
+    --shadow: 0 1px 2px rgba(0,0,0,.5); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e0e0e; --card: #1b1b1b; --ink: #eaeaea; --muted: #a8a8a8; --faint: #7a7a7a;
+  --line: #2c2c2c; --field: #242424; --red-soft: #3a1c1e; --teal-soft: #15302f;
+  --teal-strong: #6fd1cf; --blue: #7fa9d9;
+  --shadow: 0 1px 2px rgba(0,0,0,.5); color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--ink);
+  font: 14px/1.45 "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.num { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+
+/* Top bar */
+.topbar {
+  position: sticky; top: 0; z-index: 5; background: var(--card); border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+}
+.logo { width: 32px; height: 32px; border-radius: 8px; background: var(--red); color: #fff; font-weight: 700;
+  display: grid; place-items: center; font-size: 13px; letter-spacing: .5px; flex: none; }
+.brand { font-weight: 700; font-size: 16px; }
+.brand small { display: block; font-weight: 500; font-size: 12px; color: var(--muted); }
+.acct { margin-left: auto; text-align: right; min-width: 0; }
+.acct .bal { font-weight: 700; font-size: 15px; }
+.acct .who { font-size: 12px; color: var(--muted); display: flex; justify-content: flex-end; align-items: center; min-width: 0; }
+.acct .lid { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.acct .badge { flex: none; }
+@media (max-width: 480px) { .brand small { display: none; } }
+.badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px; margin-left: 6px; vertical-align: 1px; }
+.badge.demo { background: var(--teal-soft); color: var(--teal-strong); }
+.badge.real { background: var(--red-soft); color: var(--red); }
+
+/* Layout */
+.wrap { max-width: 1120px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 900px) { .wrap { grid-template-columns: minmax(0, 420px) minmax(0, 1fr); align-items: start; } .col-right { position: sticky; top: 70px; } }
+.col { display: grid; gap: 16px; min-width: 0; }
+.card { background: var(--card); border-radius: 12px; box-shadow: var(--shadow); min-width: 0; }
+.card > h2 { margin: 0; padding: 14px 16px 0; font-size: 15px; font-weight: 700; }
+.card .body { padding: 12px 16px 16px; }
+
+/* Connect */
+.conn-state { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
+.dot.on { background: var(--teal); box-shadow: 0 0 0 3px var(--teal-soft); }
+.dot.busy { background: #f0ad4e; }
+.dot.off { background: var(--red); }
+label.f { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 10px 0 4px; }
+.in {
+  width: 100%; height: 40px; border: 1px solid var(--line); border-radius: 8px; background: var(--field);
+  color: var(--ink); padding: 0 12px; font: inherit; outline: none;
+}
+.in:focus { border-color: var(--ink); background: var(--card); }
+.in.num { font-size: 14px; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row > .in { flex: 1; min-width: 0; }
+.btn {
+  height: 40px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--ink);
+  font: 600 14px/1 inherit; font-family: inherit; padding: 0 14px; cursor: pointer; white-space: nowrap;
+}
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.primary { background: var(--red); border-color: var(--red); color: #fff; }
+.btn.ghost { border-color: transparent; background: transparent; color: var(--muted); padding: 0 8px; }
+.hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.hint a { color: var(--blue); }
+details.adv { margin-top: 10px; }
+details.adv summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--muted); list-style: none; }
+details.adv summary::-webkit-details-marker { display: none; }
+details.adv summary::before { content: "▸ "; }
+details.adv[open] summary::before { content: "▾ "; }
+.check { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-top: 10px; color: var(--muted); }
+.warn { margin-top: 10px; background: var(--red-soft); color: var(--red); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; font-weight: 500; }
+
+/* Blocks, styled like Deriv Bot's builder */
+.block { border-radius: 10px; overflow: hidden; border: 1px solid var(--line); margin-top: 12px; }
+.block:first-child { margin-top: 0; }
+.block .bh { background: #064e72; color: #fff; font-weight: 600; font-size: 13px; padding: 7px 12px; display: flex; align-items: center; gap: 8px; }
+.block .bb { padding: 10px 12px; display: grid; gap: 8px; background: var(--field); }
+.kv { display: grid; grid-template-columns: minmax(0, 1fr) 118px; gap: 8px; align-items: center; font-size: 13px; }
+.kv > span { min-width: 0; }
+.kv.wide { grid-template-columns: 76px minmax(0, 1fr); }
+.kv .in { height: 34px; background: var(--card); }
+.kv select.in { padding: 0 8px; }
+.pill { display: inline-block; background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; font-size: 12.5px; }
+.sign { display: inline-block; width: 22px; text-align: center; font-weight: 700; }
+
+/* Quote */
+.quote { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+.q { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.q .t { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; }
+.q .p { font-size: 18px; font-weight: 700; margin-top: 4px; }
+.q .s { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.q.err .s { color: var(--red); }
+
+/* Run bar */
+.runbar { display: flex; align-items: center; gap: 12px; padding: 14px 16px; }
+.run {
+  height: 48px; min-width: 120px; border: 0; border-radius: 8px; color: #fff; font: 700 16px/1 inherit; font-family: inherit;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px; cursor: pointer; background: var(--teal);
+}
+.run.stop { background: var(--red); }
+.run:disabled { opacity: .45; cursor: not-allowed; }
+.status { flex: 1; min-width: 0; }
+.status b { display: block; font-size: 14px; }
+.status span { font-size: 12px; color: var(--muted); }
+.progress { height: 4px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 6px; }
+.progress i { display: block; height: 100%; width: 0; background: var(--teal); transition: width .25s; }
+.ticker { text-align: right; }
+.ticker .num { font-size: 18px; font-weight: 600; }
+.ticker small { display: block; font-size: 11px; color: var(--muted); }
+
+@media (max-width: 899px) {
+  body { padding-bottom: calc(92px + env(safe-area-inset-bottom)); }
+  .runcard { position: fixed; left: 0; right: 0; bottom: 0; z-index: 6; border-radius: 14px 14px 0 0;
+    box-shadow: 0 -4px 20px rgba(0,0,0,.12); padding-bottom: env(safe-area-inset-bottom); }
+  .runbar { padding: 12px 16px; }
+}
+
+/* Tabs */
+.tabs { display: flex; border-bottom: 1px solid var(--line); padding: 0 8px; }
+.tab { flex: 1; background: none; border: 0; padding: 12px 4px; font: 600 14px/1 inherit; font-family: inherit; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; }
+.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--red); }
+.pane { display: none; }
+.pane.on { display: block; }
+
+/* Summary */
+.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--line); border-top: 1px solid var(--line); }
+.stat { background: var(--card); padding: 12px 10px; text-align: center; min-width: 0; }
+.stat .l { font-size: 12px; color: var(--muted); }
+.stat .v { font-weight: 700; font-size: 15px; margin-top: 2px; overflow-wrap: anywhere; }
+.pos { color: var(--teal-strong); }
+.neg { color: var(--loss); }
+
+/* Transactions */
+.tx-head, .tx { display: grid; grid-template-columns: 58px minmax(0, 1fr) minmax(0, 1fr); gap: 8px; align-items: center; padding: 10px 16px; }
+.tx-head { font-size: 12px; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--line); }
+.tx-head div:last-child, .tx .pl { text-align: right; }
+.tx { border-bottom: 1px solid var(--line); font-size: 13px; }
+.tx .ty { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 12px; }
+.spot { display: grid; gap: 2px; }
+.spot div { display: flex; align-items: center; gap: 6px; }
+.ring { width: 9px; height: 9px; border-radius: 50%; border: 2px solid var(--red); flex: none; }
+.ring.exit { border-color: var(--faint); }
+.pl div + div { font-weight: 600; }
+.pair-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 16px; background: var(--field); font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); }
+.pair-head .same { color: var(--teal-strong); font-weight: 600; }
+.pair-head .diff { color: var(--red); font-weight: 600; }
+.empty { padding: 28px 16px; text-align: center; color: var(--muted); font-size: 13px; }
+.scroll { max-height: 520px; overflow: auto; }
+
+/* Journal */
+.log { font-size: 12.5px; }
+.log div { padding: 7px 16px; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; }
+.log time { color: var(--faint); }
+.log .e { color: var(--red); }
+.log .ok { color: var(--teal-strong); }
+.log span { overflow-wrap: anywhere; }
+
+.foot { font-size: 12px; color: var(--muted); padding: 0 16px 16px; }
+.foot button { margin-top: 8px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="logo">HL</div>
+  <div class="brand">HL Robot<small>Higher + Lower on the same tick</small></div>
+  <div class="acct" id="acct">
+    <div class="bal num" id="balance">—</div>
+    <div class="who" id="who">Not connected</div>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="col">
+    <section class="card" aria-labelledby="h-conn">
+      <h2 id="h-conn">Deriv account</h2>
+      <div class="body">
+        <div class="conn-state"><span class="dot" id="conn-dot"></span><span id="conn-text">Not connected</span></div>
+        <label class="f" for="token">API token</label>
+        <div class="row">
+          <input class="in" id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Deriv API token">
+          <button class="btn ghost" id="show-token" type="button" aria-label="Show token">Show</button>
+        </div>
+        <label class="check"><input type="checkbox" id="remember"> Remember the token on this device</label>
+        <details class="adv" id="adv">
+          <summary>Connection settings</summary>
+          <label class="f" for="app-id">App ID</label>
+          <input class="in num" id="app-id" inputmode="numeric" value="1089">
+          <label class="f" for="server">Server</label>
+          <input class="in num" id="server" value="ws.derivws.com" spellcheck="false">
+          <div class="hint">1089 is Deriv's public app ID. You can register your own for free on Deriv's API site.</div>
+        </details>
+        <div class="row" style="margin-top:12px">
+          <button class="btn primary" id="connect" type="button" style="flex:1">Connect</button>
+          <button class="btn" id="disconnect" type="button" hidden>Disconnect</button>
+        </div>
+        <div class="hint">Create a token with <b>Read</b> and <b>Trade</b> scopes in Deriv under Account settings → API token. It is only ever sent to Deriv.</div>
+        <div class="warn" id="real-warn" hidden>This is a real-money account. Try the bot on your Demo account first.</div>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="h-set">
+      <h2 id="h-set">Bot settings</h2>
+      <div class="body">
+        <div class="block">
+          <div class="bh">1. Trade parameters</div>
+          <div class="bb">
+            <div class="kv wide"><label for="symbol">Market</label>
+              <select class="in" id="symbol">
+                <option value="R_10">Volatility 10 Index</option>
+                <option value="R_25">Volatility 25 Index</option>
+                <option value="R_50">Volatility 50 Index</option>
+                <option value="R_75">Volatility 75 Index</option>
+                <option value="R_100" selected>Volatility 100 Index</option>
+                <option value="1HZ10V">Volatility 10 (1s) Index</option>
+                <option value="1HZ25V">Volatility 25 (1s) Index</option>
+                <option value="1HZ50V">Volatility 50 (1s) Index</option>
+                <option value="1HZ75V">Volatility 75 (1s) Index</option>
+                <option value="1HZ100V">Volatility 100 (1s) Index</option>
+              </select>
+            </div>
+            <div class="kv wide"><span>Trade type</span><span><span class="pill">Up/Down › Higher/Lower</span> <span class="pill">Both</span></span></div>
+          </div>
+        </div>
+        <div class="block">
+          <div class="bh">Run once at start</div>
+          <div class="bb">
+            <div class="kv"><label for="stake">Stake per trade</label><input class="in num" id="stake" inputmode="decimal" value="5"></div>
+            <div class="kv"><label for="h-dur">Higher duration (ticks)</label><input class="in num" id="h-dur" inputmode="numeric" value="5"></div>
+            <div class="kv"><label for="h-bar">Higher barrier below (offset)</label><input class="in num" id="h-bar" inputmode="decimal" value="1"></div>
+            <div class="kv"><label for="l-dur">Lower duration (ticks)</label><input class="in num" id="l-dur" inputmode="numeric" value="5"></div>
+            <div class="kv"><label for="l-bar">Lower barrier above (offset)</label><input class="in num" id="l-bar" inputmode="decimal" value="1"></div>
+          </div>
+        </div>
+        <div class="block">
+          <div class="bh">Stop the bot (optional)</div>
+          <div class="bb">
+            <div class="kv"><label for="tp">When profit reaches</label><input class="in num" id="tp" inputmode="decimal" placeholder="Off"></div>
+            <div class="kv"><label for="sl">When loss reaches</label><input class="in num" id="sl" inputmode="decimal" placeholder="Off"></div>
+          </div>
+        </div>
+        <div class="quote" id="quote" aria-live="polite">
+          <div class="q" id="q-call"><div class="t"><span class="ico-up"></span>Higher <span class="num" id="q-call-bar"></span></div><div class="p num" id="q-call-pay">—</div><div class="s" id="q-call-s">Connect to see Deriv's payout</div></div>
+          <div class="q" id="q-put"><div class="t"><span class="ico-down"></span>Lower <span class="num" id="q-put-bar"></span></div><div class="p num" id="q-put-pay">—</div><div class="s" id="q-put-s">Connect to see Deriv's payout</div></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="col col-right">
+    <section class="card runcard">
+      <div class="runbar">
+        <button class="run" id="run" type="button" disabled>▶ Run</button>
+        <div class="status">
+          <b id="status">Bot is not running</b>
+          <span id="substatus">Connect your account to start</span>
+          <div class="progress"><i id="bar"></i></div>
+        </div>
+        <div class="ticker"><div class="num" id="spot">—</div><small id="spot-sym">Volatility 100 Index</small></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" aria-selected="true" data-pane="p-sum">Summary</button>
+        <button class="tab" role="tab" aria-selected="false" data-pane="p-tx">Transactions</button>
+        <button class="tab" role="tab" aria-selected="false" data-pane="p-log">Journal</button>
+      </div>
+      <div class="pane on" id="p-sum">
+        <div class="stats" id="stats">
+          <div class="stat"><div class="l">Total stake</div><div class="v num" id="s-stake">0.00</div></div>
+          <div class="stat"><div class="l">Total payout</div><div class="v num" id="s-payout">0.00</div></div>
+          <div class="stat"><div class="l">No. of runs</div><div class="v num" id="s-runs">0</div></div>
+          <div class="stat"><div class="l">Contracts lost</div><div class="v num" id="s-lost">0</div></div>
+          <div class="stat"><div class="l">Contracts won</div><div class="v num" id="s-won">0</div></div>
+          <div class="stat"><div class="l">Total profit/loss</div><div class="v num" id="s-pl">0.00</div></div>
+        </div>
+        <div class="foot">
+          <div id="s-pairs">No pairs yet.</div>
+          <button class="btn" id="reset" type="button">Reset</button>
+        </div>
+      </div>
+      <div class="pane" id="p-tx">
+        <div class="tx-head"><div>Type</div><div>Entry/Exit spot</div><div>Buy price and P/L</div></div>
+        <div class="scroll" id="tx"><div class="empty">Trades appear here, newest first.</div></div>
+      </div>
+      <div class="pane" id="p-log">
+        <div class="scroll log" id="log"></div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-up" viewBox="0 0 16 16"><path d="M2 12 L7 7 L9 9 L14 3" fill="none" stroke="#2a9d9b" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 3h4v4" fill="none" stroke="#2a9d9b" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-down" viewBox="0 0 16 16"><path d="M2 4 L7 9 L9 7 L14 13" fill="none" stroke="#ff444f" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 13h4V9" fill="none" stroke="#ff444f" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+</svg>
+
+<script>
+(() => {
+  'use strict';
+
+  const $ = id => document.getElementById(id);
+  const SIDES = {
+    CALL: { name: 'Higher', icon: 'i-up' },
+    PUT: { name: 'Lower', icon: 'i-down' },
+  };
+  const TOKEN_KEY = 'hl_robot_token';
+
+  const state = {
+    ws: null,
+    reqId: 0,
+    pending: new Map(),
+    manualClose: false,
+    closeReason: null,
+    reconnectTimer: null,
+    pingTimer: null,
+    account: null,
+    currency: 'USD',
+    decimals: 2,
+    symbol: 'R_100',
+    tickSub: null,
+    lastTick: null,
+    running: false,
+    phase: 'idle', // idle | buying | open
+    pair: null,
+    pairs: [],
+    contracts: new Map(),
+    failedPairs: 0,
+  };
+
+  /* ---------- small helpers ---------- */
+  const fmt = (n, d = state.decimals) => (Number.isFinite(+n) ? (+n).toFixed(d) : '—');
+  const signed = n => (n > 0 ? '+' : '') + fmt(n);
+  const now = () => new Date().toLocaleTimeString([], { hour12: false });
+  const icon = type => `<svg width="16" height="16" aria-hidden="true"><use href="#${SIDES[type].icon}"/></svg>`;
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const symbolName = () => $('symbol').selectedOptions[0].textContent;
+
+  function log(msg, kind = '') {
+    const el = document.createElement('div');
+    el.innerHTML = `<time>${now()}</time><span class="${kind}">${esc(msg)}</span>`;
+    $('log').prepend(el);
+  }
+
+  function setStatus(title, sub = '', progress = null) {
+    $('status').textContent = title;
+    $('substatus').textContent = sub;
+    if (progress !== null) $('bar').style.width = `${Math.round(progress * 100)}%`;
+  }
+
+  function setConn(kind, text) {
+    $('conn-dot').className = `dot ${kind}`;
+    $('conn-text').textContent = text;
+  }
+
+  /* ---------- settings ---------- */
+  function readSettings() {
+    const num = id => Number(String($(id).value).trim().replace(',', '.'));
+    const s = {
+      symbol: $('symbol').value,
+      stake: num('stake'),
+      hDur: num('h-dur'),
+      hBar: String($('h-bar').value).trim().replace(',', '.'),
+      lDur: num('l-dur'),
+      lBar: String($('l-bar').value).trim().replace(',', '.'),
+      tp: $('tp').value.trim() === '' ? null : num('tp'),
+      sl: $('sl').value.trim() === '' ? null : num('sl'),
+    };
+    const errors = [];
+    if (!(s.stake > 0)) errors.push('Stake per trade must be above 0.');
+    if (!Number.isInteger(s.hDur) || s.hDur < 1) errors.push('Higher duration must be a whole number of ticks.');
+    if (!Number.isInteger(s.lDur) || s.lDur < 1) errors.push('Lower duration must be a whole number of ticks.');
+    if (!/^\d+(\.\d+)?$/.test(s.hBar)) errors.push('Higher barrier must be a number like 1 or 0.5.');
+    if (!/^\d+(\.\d+)?$/.test(s.lBar)) errors.push('Lower barrier must be a number like 1 or 0.5.');
+    if (s.tp !== null && !(s.tp > 0)) errors.push('Profit limit must be above 0, or empty.');
+    if (s.sl !== null && !(s.sl > 0)) errors.push('Loss limit must be above 0, or empty.');
+    return { s, errors };
+  }
+
+  // One set of parameters per side. The Higher's barrier sits below the
+  // price and the Lower's above it, as the video's variable names say.
+  function contractParams(s) {
+    const base = { amount: +s.stake.toFixed(state.decimals), basis: 'stake', currency: state.currency, duration_unit: 't', symbol: s.symbol };
+    return {
+      CALL: { ...base, contract_type: 'CALL', duration: s.hDur, barrier: `-${s.hBar}` },
+      PUT: { ...base, contract_type: 'PUT', duration: s.lDur, barrier: `+${s.lBar}` },
+    };
+  }
+
+  /* ---------- websocket ---------- */
+  function socketUrl() {
+    const host = $('server').value.trim().replace(/^wss?:\/\//, '').replace(/\/.*$/, '');
+    const appId = $('app-id').value.trim().replace(/\D/g, '') || '1089';
+    const scheme = /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host) ? 'ws' : 'wss';
+    return `${scheme}://${host}/websockets/v3?app_id=${appId}&l=EN&brand=deriv`;
+  }
+
+  function send(req) {
+    return new Promise((resolve, reject) => {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+        reject({ code: 'NotConnected', message: 'Not connected to Deriv.' });
+        return;
+      }
+      const req_id = ++state.reqId;
+      state.pending.set(req_id, { resolve, reject });
+      state.ws.send(JSON.stringify({ ...req, req_id }));
+    });
+  }
+
+  function connect() {
+    const token = $('token').value.trim();
+    if (!token) {
+      $('token').focus();
+      setConn('off', 'Paste your API token first');
+      return;
+    }
+    try {
+      if ($('remember').checked) localStorage.setItem(TOKEN_KEY, token);
+      else localStorage.removeItem(TOKEN_KEY);
+    } catch (e) { /* storage unavailable */ }
+
+    closeSocket();
+    state.manualClose = false;
+    setConn('busy', 'Connecting…');
+    $('connect').disabled = true;
+
+    const ws = new WebSocket(socketUrl());
+    state.ws = ws;
+
+    ws.onopen = async () => {
+      try {
+        const { authorize } = await send({ authorize: token });
+        state.account = authorize;
+        state.currency = authorize.currency || 'USD';
+        state.decimals = state.currency === 'BTC' || state.currency === 'ETH' ? 8 : 2;
+        const demo = !!authorize.is_virtual || /^VR/.test(authorize.loginid);
+        $('who').innerHTML = `<span class="lid">${esc(authorize.loginid)}</span><span class="badge ${demo ? 'demo' : 'real'}">${demo ? 'Demo' : 'Real'}</span>`;
+        $('real-warn').hidden = demo;
+        $('balance').textContent = `${fmt(authorize.balance)} ${state.currency}`;
+        setConn('on', `Connected as ${authorize.loginid}`);
+        $('connect').hidden = true;
+        $('disconnect').hidden = false;
+        $('connect').disabled = false;
+        log(`Connected to ${authorize.loginid} (${demo ? 'Demo' : 'Real'}).`, 'ok');
+
+        send({ balance: 1, subscribe: 1 }).catch(e => log(`Balance: ${e.message}`, 'e'));
+        await subscribeTicks();
+        resubscribeOpenContracts();
+        refreshQuote();
+        clearInterval(state.pingTimer);
+        state.pingTimer = setInterval(() => send({ ping: 1 }).catch(() => {}), 30000);
+        $('run').disabled = false;
+        if (!state.running) setStatus('Bot is not running', 'Press Run to start trading', 0);
+      } catch (e) {
+        log(`Login failed: ${e.message || e.code}`, 'e');
+        state.closeReason = e.message || 'Could not log in';
+        state.manualClose = true;
+        ws.close();
+      }
+    };
+
+    ws.onmessage = ev => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      // A subscription's first message answers the request; the same
+      // req_id then keeps coming on every stream update.
+      const entry = msg.req_id && state.pending.get(msg.req_id);
+      if (entry) {
+        state.pending.delete(msg.req_id);
+        if (msg.error) entry.reject(msg.error);
+        else entry.resolve(msg);
+      }
+      if (msg.error) return;
+      if (msg.msg_type === 'tick') onTick(msg.tick);
+      else if (msg.msg_type === 'balance') $('balance').textContent = `${fmt(msg.balance.balance)} ${state.currency}`;
+      else if (msg.msg_type === 'proposal_open_contract') onContract(msg.proposal_open_contract, msg.subscription);
+    };
+
+    ws.onclose = () => {
+      if (state.ws !== ws) return; // an older socket we already replaced
+      clearInterval(state.pingTimer);
+      state.pending.forEach(p => p.reject({ code: 'Disconnected', message: 'Connection to Deriv closed.' }));
+      state.pending.clear();
+      state.tickSub = null;
+      $('run').disabled = true;
+      if (state.running) stopBot('Connection lost');
+      if (state.phase === 'buying') {
+        log('Connection dropped while buying. Check your Deriv statement for any trade not listed here.', 'e');
+        state.phase = state.pair && state.pair.contracts.length ? 'open' : 'idle';
+      }
+      if (state.manualClose) {
+        setConn(state.closeReason ? 'off' : '', state.closeReason || 'Not connected');
+        state.closeReason = null;
+        $('connect').hidden = false;
+        $('disconnect').hidden = true;
+        $('connect').disabled = false;
+        return;
+      }
+      setConn('busy', 'Connection lost, reconnecting…');
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = setTimeout(connect, 3000);
+    };
+  }
+
+  function closeSocket() {
+    clearTimeout(state.reconnectTimer);
+    clearInterval(state.pingTimer);
+    if (state.ws) {
+      state.manualClose = true;
+      try { state.ws.close(); } catch (e) { /* already closed */ }
+    }
+  }
+
+  async function subscribeTicks() {
+    const symbol = $('symbol').value;
+    if (state.tickSub) {
+      send({ forget: state.tickSub }).catch(() => {});
+      state.tickSub = null;
+    }
+    state.symbol = symbol;
+    state.lastTick = null;
+    $('spot').textContent = '—';
+    $('spot-sym').textContent = symbolName();
+    try {
+      const res = await send({ ticks: symbol, subscribe: 1 });
+      state.tickSub = res.subscription && res.subscription.id;
+    } catch (e) {
+      log(`Price feed for ${symbolName()}: ${e.message}`, 'e');
+    }
+  }
+
+  /* ---------- live payout quote ---------- */
+  let quoteTimer = null;
+  function refreshQuote() {
+    clearTimeout(quoteTimer);
+    quoteTimer = setTimeout(async () => {
+      const { s, errors } = readSettings();
+      $('q-call-bar').textContent = /^\d/.test(s.hBar) ? `−${s.hBar}` : '';
+      $('q-put-bar').textContent = /^\d/.test(s.lBar) ? `+${s.lBar}` : '';
+      if (!state.account) return;
+      if (errors.length) {
+        ['call', 'put'].forEach(k => showQuote(k, null, errors[0]));
+        return;
+      }
+      const params = contractParams(s);
+      await Promise.all(['CALL', 'PUT'].map(async type => {
+        const k = type.toLowerCase();
+        try {
+          const { proposal } = await send({ proposal: 1, ...params[type] });
+          showQuote(k, proposal);
+        } catch (e) {
+          showQuote(k, null, e.message || e.code);
+        }
+      }));
+    }, 250);
+  }
+
+  function showQuote(k, proposal, error) {
+    const box = $(`q-${k}`);
+    box.classList.toggle('err', !!error);
+    if (error) {
+      $(`q-${k}-pay`).textContent = '—';
+      $(`q-${k}-s`).textContent = error;
+      return;
+    }
+    const profit = proposal.payout - proposal.ask_price;
+    $(`q-${k}-pay`).textContent = `${fmt(proposal.payout)} ${state.currency}`;
+    $(`q-${k}-s`).textContent = `Payout if it wins, profit ${signed(profit)}`;
+  }
+
+  /* ---------- trading ---------- */
+  function onTick(tick) {
+    if (tick.symbol && tick.symbol !== state.symbol) return;
+    state.lastTick = tick;
+    $('spot').textContent = tick.pip_size !== undefined ? (+tick.quote).toFixed(tick.pip_size) : tick.quote;
+    if (state.running && state.phase === 'idle') buyPair(tick);
+  }
+
+  // Both buy requests leave in the same instant, straight after a tick
+  // arrives, so Deriv starts both contracts on the same entry tick.
+  async function buyPair(tick) {
+    const { s, errors } = readSettings();
+    if (errors.length) {
+      stopBot(errors[0]);
+      return;
+    }
+    state.phase = 'buying';
+    const pair = { n: state.pairs.length + 1, tick_epoch: tick.epoch, contracts: [], failed: [] };
+    state.pair = pair;
+    const params = contractParams(s);
+    setStatus('Buying Higher and Lower…', `Pair ${pair.n}, sent on tick ${tick.quote}`, 0.15);
+
+    const requests = ['CALL', 'PUT'].map(type =>
+      send({ buy: '1', price: params[type].amount, parameters: params[type] })
+        .then(res => ({ type, buy: res.buy }))
+        .catch(error => ({ type, error }))
+    );
+    const results = await Promise.all(requests);
+
+    results.forEach(r => {
+      if (r.error) {
+        pair.failed.push(r.type);
+        log(`${SIDES[r.type].name} not bought: ${r.error.message || r.error.code}`, 'e');
+        return;
+      }
+      const c = {
+        id: r.buy.contract_id,
+        type: r.type,
+        pair: pair.n,
+        buy_price: +r.buy.buy_price,
+        payout: +r.buy.payout,
+        entry: null,
+        entry_time: null,
+        exit: null,
+        profit: null,
+        settled: false,
+        sub: null,
+      };
+      state.contracts.set(c.id, c);
+      pair.contracts.push(c.id);
+      log(`${SIDES[r.type].name} bought for ${fmt(c.buy_price)} ${state.currency} (payout ${fmt(c.payout)}).`, 'ok');
+      watchContract(c);
+    });
+
+    if (!pair.contracts.length) {
+      state.phase = 'idle';
+      state.pair = null;
+      state.failedPairs += 1;
+      const first = results[0].error;
+      if (first && ['InvalidToken', 'AuthorizationRequired', 'InsufficientBalance', 'PermissionDenied'].includes(first.code)) {
+        stopBot(first.message);
+      } else if (state.failedPairs >= 3) {
+        stopBot('Deriv refused 3 pairs in a row. Check the Journal.');
+      }
+      return;
+    }
+    state.failedPairs = 0;
+    state.pairs.push(pair);
+    state.phase = 'open';
+    setStatus('Contracts running', `Pair ${pair.n}: waiting for the ticks to finish`, 0.4);
+    renderTransactions();
+    renderSummary();
+  }
+
+  function watchContract(c) {
+    send({ proposal_open_contract: 1, contract_id: c.id, subscribe: 1 })
+      .then(res => {
+        if (res.subscription) c.sub = res.subscription.id;
+      })
+      .catch(e => log(`Could not follow contract ${c.id}: ${e.message}`, 'e'));
+  }
+
+  function resubscribeOpenContracts() {
+    state.contracts.forEach(c => {
+      if (!c.settled) watchContract(c);
+    });
+  }
+
+  function onContract(poc, subscription) {
+    const c = state.contracts.get(poc.contract_id);
+    if (!c) return;
+    if (subscription && !c.sub) c.sub = subscription.id;
+    if (poc.entry_tick_display_value || poc.entry_tick) c.entry = poc.entry_tick_display_value || String(poc.entry_tick);
+    if (poc.entry_tick_time) c.entry_time = poc.entry_tick_time;
+    if (poc.exit_tick_display_value || poc.exit_tick) c.exit = poc.exit_tick_display_value || String(poc.exit_tick);
+    if (poc.buy_price !== undefined) c.buy_price = +poc.buy_price;
+    if (poc.payout !== undefined) c.payout = +poc.payout;
+
+    const ended = poc.is_sold || (poc.status && poc.status !== 'open');
+    if (ended && !c.settled) {
+      c.settled = true;
+      c.profit = +poc.profit;
+      c.won = c.profit > 0;
+      if (poc.sell_price !== undefined) c.sell_price = +poc.sell_price;
+      if (c.sub) send({ forget: c.sub }).catch(() => {});
+      log(`${SIDES[c.type].name} ${c.won ? 'won' : 'lost'} ${signed(c.profit)} ${state.currency}.`, c.won ? 'ok' : 'e');
+    }
+    renderTransactions();
+    renderSummary();
+    maybeFinishPair();
+  }
+
+  function maybeFinishPair() {
+    const pair = state.pair;
+    if (state.phase !== 'open' || !pair) return;
+    const cs = pair.contracts.map(id => state.contracts.get(id));
+    const done = cs.filter(c => c.settled).length;
+    setStatus('Contracts running', `Pair ${pair.n}: ${done} of ${cs.length} settled`, 0.4 + 0.6 * (done / cs.length));
+    if (done < cs.length) return;
+
+    state.phase = 'idle';
+    state.pair = null;
+    const pl = totals().profit;
+    const { s } = readSettings();
+    if (state.running && s.tp !== null && pl >= s.tp) stopBot(`Profit limit reached (${signed(pl)} ${state.currency})`);
+    else if (state.running && s.sl !== null && pl <= -s.sl) stopBot(`Loss limit reached (${signed(pl)} ${state.currency})`);
+    else if (state.running) setStatus('Waiting for the next tick', 'Trading again', 1);
+    else setStatus('Bot is not running', 'Press Run to start trading', 0);
+  }
+
+  function startBot() {
+    const { errors } = readSettings();
+    if (errors.length) {
+      setStatus('Check the settings', errors[0], 0);
+      return;
+    }
+    state.running = true;
+    state.failedPairs = 0;
+    $('run').classList.add('stop');
+    $('run').textContent = '■ Stop';
+    toggleInputs(false);
+    log('Bot started.', 'ok');
+    if (state.phase === 'idle') setStatus('Waiting for the next tick', 'Both sides are bought together on the next tick', 0.05);
+  }
+
+  function stopBot(reason) {
+    const wasRunning = state.running;
+    state.running = false;
+    $('run').classList.remove('stop');
+    $('run').textContent = '▶ Run';
+    toggleInputs(true);
+    if (wasRunning) log(`Bot stopped${reason ? `: ${reason}` : ''}.`, reason && reason !== 'Stopped' ? 'e' : '');
+    if (state.phase === 'open') setStatus('Stopping', 'Letting the open contracts finish', null);
+    else setStatus('Bot is not running', reason || 'Press Run to start trading', 0);
+  }
+
+  function toggleInputs(enabled) {
+    ['symbol', 'stake', 'h-dur', 'h-bar', 'l-dur', 'l-bar'].forEach(id => ($(id).disabled = !enabled));
+  }
+
+  /* ---------- rendering ---------- */
+  function totals() {
+    const t = { stake: 0, payout: 0, runs: 0, won: 0, lost: 0, profit: 0 };
+    state.contracts.forEach(c => {
+      if (!c.settled) return;
+      t.runs += 1;
+      t.stake += c.buy_price;
+      t.profit += c.profit;
+      if (c.won) {
+        t.won += 1;
+        t.payout += c.sell_price !== undefined ? c.sell_price : c.payout;
+      } else {
+        t.lost += 1;
+      }
+    });
+    return t;
+  }
+
+  function renderSummary() {
+    const t = totals();
+    $('s-stake').textContent = `${fmt(t.stake)} ${state.currency}`;
+    $('s-payout').textContent = `${fmt(t.payout)} ${state.currency}`;
+    $('s-runs').textContent = t.runs;
+    $('s-lost').textContent = t.lost;
+    $('s-won').textContent = t.won;
+    const pl = $('s-pl');
+    pl.textContent = `${signed(t.profit)} ${state.currency}`;
+    pl.className = `v num ${t.profit > 0 ? 'pos' : t.profit < 0 ? 'neg' : ''}`;
+
+    const both = state.pairs.filter(p => p.contracts.length === 2);
+    const same = both.filter(sameTick).length;
+    $('s-pairs').textContent = state.pairs.length
+      ? `${state.pairs.length} pair${state.pairs.length === 1 ? '' : 's'} placed. ${same} of ${both.length} with both sides on the same entry tick.`
+      : 'No pairs yet.';
+  }
+
+  function sameTick(pair) {
+    const cs = pair.contracts.map(id => state.contracts.get(id));
+    if (cs.length !== 2 || cs.some(c => !c.entry_time)) return false;
+    return cs[0].entry_time === cs[1].entry_time;
+  }
+
+  function renderTransactions() {
+    if (!state.pairs.length) {
+      $('tx').innerHTML = '<div class="empty">Trades appear here, newest first.</div>';
+      return;
+    }
+    const html = [];
+    for (let i = state.pairs.length - 1; i >= 0; i--) {
+      const pair = state.pairs[i];
+      const cs = pair.contracts.map(id => state.contracts.get(id));
+      let tag = '';
+      if (cs.length === 2 && cs.every(c => c.entry_time)) {
+        tag = sameTick(pair) ? '<span class="same">Same entry tick</span>' : '<span class="diff">Different entry ticks</span>';
+      } else if (pair.failed.length) {
+        tag = `<span class="diff">${pair.failed.map(t => SIDES[t].name).join(', ')} not bought</span>`;
+      }
+      html.push(`<div class="pair-head"><span>Pair ${pair.n}</span>${tag}</div>`);
+      // Lower above Higher, newest first, as in Deriv Bot's list.
+      cs.slice().reverse().forEach(c => {
+        const plCls = c.settled ? (c.profit > 0 ? 'pos' : 'neg') : '';
+        html.push(`<div class="tx" data-type="${c.type}">
+          <div class="ty">${icon(c.type)}${SIDES[c.type].name}</div>
+          <div class="spot num"><div><span class="ring"></span>${esc(c.entry || '…')}</div><div><span class="ring exit"></span>${esc(c.exit || '')}</div></div>
+          <div class="pl num"><div>${fmt(c.buy_price)} ${state.currency}</div><div class="${plCls}">${c.settled ? `${signed(c.profit)} ${state.currency}` : ''}</div></div>
+        </div>`);
+      });
+    }
+    $('tx').innerHTML = html.join('');
+  }
+
+  /* ---------- wiring ---------- */
+  $('connect').addEventListener('click', connect);
+  $('disconnect').addEventListener('click', () => {
+    if (state.running) stopBot('Stopped');
+    closeSocket();
+  });
+  $('token').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+  $('show-token').addEventListener('click', () => {
+    const t = $('token');
+    t.type = t.type === 'password' ? 'text' : 'password';
+    $('show-token').textContent = t.type === 'password' ? 'Show' : 'Hide';
+  });
+  $('run').addEventListener('click', () => (state.running ? stopBot('Stopped') : startBot()));
+  $('reset').addEventListener('click', () => {
+    if (state.phase !== 'idle') return;
+    state.pairs = [];
+    state.contracts.clear();
+    renderTransactions();
+    renderSummary();
+    log('Summary reset.');
+  });
+  $('symbol').addEventListener('change', () => {
+    if (state.account) subscribeTicks();
+    else $('spot-sym').textContent = symbolName();
+    refreshQuote();
+  });
+  ['stake', 'h-dur', 'h-bar', 'l-dur', 'l-bar'].forEach(id => $(id).addEventListener('input', refreshQuote));
+  document.querySelectorAll('.tab').forEach(tab =>
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', String(t === tab)));
+      document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.id === tab.dataset.pane));
+    })
+  );
+  document.querySelector('.ico-up').outerHTML = icon('CALL');
+  document.querySelector('.ico-down').outerHTML = icon('PUT');
+
+  const params = new URLSearchParams(location.search);
+  if (params.get('server')) $('server').value = params.get('server');
+  if (params.get('app_id')) $('app-id').value = params.get('app_id');
+  try {
+    const saved = localStorage.getItem(TOKEN_KEY);
+    if (saved) {
+      $('token').value = saved;
+      $('remember').checked = true;
+    }
+  } catch (e) { /* storage unavailable */ }
+  refreshQuote();
+  renderSummary();
+  log('Ready. Connect your Deriv account to start.');
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,165 @@
+<xml xmlns="http://www.w3.org/1999/xhtml" is_dbot="true" collection="false">
+  <variables>
+    <variable id="Mww9aFwH05BKLkkhBvxK">Stake per trade</variable>
+    <variable id="iOp3g53MGXG6XdSess4O">Higher duration (ticks)</variable>
+    <variable id="Je9GrKwbeZZfNnZ0yt6X">Higher barrier below (offset)</variable>
+    <variable id="WZ03cL0l9dUECdN5rRmR">Lower duration (ticks)</variable>
+    <variable id="53PR4zpPAm0rjYHuDBpx">Lower barrier above (offset)</variable>
+  </variables>
+  <block type="trade_definition" id="EGhLi6PIch5qTJQBeleR" deletable="false" x="0" y="0">
+    <statement name="TRADE_OPTIONS">
+      <block type="trade_definition_market" id="WLQOzjWYf0brRBPnMdqK" deletable="false" movable="false">
+        <field name="MARKET_LIST">synthetic_index</field>
+        <field name="SUBMARKET_LIST">random_index</field>
+        <field name="SYMBOL_LIST">R_100</field>
+        <next>
+          <block type="trade_definition_tradetype" id="xhGMe7x0bl6m73wHkJxM" deletable="false" movable="false">
+            <field name="TRADETYPECAT_LIST">callput</field>
+            <field name="TRADETYPE_LIST">higherlower</field>
+            <next>
+              <block type="trade_definition_contracttype" id="KZzRfEF4G1ybsTmlCaJf" deletable="false" movable="false">
+                <field name="TYPE_LIST">both</field>
+                <next>
+                  <block type="trade_definition_candleinterval" id="mjch5dFXDt2xIz3Czv0H" deletable="false" movable="false">
+                    <field name="CANDLEINTERVAL_LIST">60</field>
+                    <next>
+                      <block type="trade_definition_restartbuysell" id="4KysQGOj8nDv8vtiGnSs" deletable="false" movable="false">
+                        <field name="TIME_MACHINE_ENABLED">FALSE</field>
+                        <next>
+                          <block type="trade_definition_restartonerror" id="LVhQa8m1lYYw0QmWZ63T" deletable="false" movable="false">
+                            <field name="RESTARTONERROR">FALSE</field>
+                          </block>
+                        </next>
+                      </block>
+                    </next>
+                  </block>
+                </next>
+              </block>
+            </next>
+          </block>
+        </next>
+      </block>
+    </statement>
+    <statement name="INITIALIZATION">
+      <block type="variables_set" id="PqK3vVN5qmw6RLpO61uv">
+        <field name="VAR" id="Mww9aFwH05BKLkkhBvxK">Stake per trade</field>
+        <value name="VALUE">
+          <block type="math_number" id="g8MZrqAtJvm1mmRm6WfN">
+            <field name="NUM">5</field>
+          </block>
+        </value>
+        <next>
+          <block type="variables_set" id="gbhjgzdhNgGnr1xtAfvd">
+            <field name="VAR" id="iOp3g53MGXG6XdSess4O">Higher duration (ticks)</field>
+            <value name="VALUE">
+              <block type="math_number" id="W3gAxvDvhTBgmwSUg4mj">
+                <field name="NUM">5</field>
+              </block>
+            </value>
+            <next>
+              <block type="variables_set" id="imeALpnQ1BFlbZvW0YA6">
+                <field name="VAR" id="Je9GrKwbeZZfNnZ0yt6X">Higher barrier below (offset)</field>
+                <value name="VALUE">
+                  <block type="math_number" id="mjGhEiaSN40gqfWGrriz">
+                    <field name="NUM">1</field>
+                  </block>
+                </value>
+                <next>
+                  <block type="variables_set" id="RA99DpnVwmJuEMcd85Rd">
+                    <field name="VAR" id="WZ03cL0l9dUECdN5rRmR">Lower duration (ticks)</field>
+                    <value name="VALUE">
+                      <block type="math_number" id="K98cO2ffvromc6fU91AF">
+                        <field name="NUM">5</field>
+                      </block>
+                    </value>
+                    <next>
+                      <block type="variables_set" id="FeYyZN63WkzIMOgJ8k1S">
+                        <field name="VAR" id="53PR4zpPAm0rjYHuDBpx">Lower barrier above (offset)</field>
+                        <value name="VALUE">
+                          <block type="math_number" id="oCMLouzjOmtQEE74lXP2">
+                            <field name="NUM">1</field>
+                          </block>
+                        </value>
+                      </block>
+                    </next>
+                  </block>
+                </next>
+              </block>
+            </next>
+          </block>
+        </next>
+      </block>
+    </statement>
+    <statement name="SUBMARKET">
+      <block type="trade_definition_tradeoptions" id="RrDLLMg8ZcbVPBIZEaLx">
+        <mutation has_first_barrier="true" has_second_barrier="false" has_prediction="false"/>
+        <field name="DURATIONTYPE_LIST">t</field>
+        <field name="CURRENCY_LIST">USD</field>
+        <field name="BARRIEROFFSETTYPE_LIST">+</field>
+        <value name="DURATION">
+          <shadow type="math_number" id="YaBiSBvP60Nd3Hv64kDF">
+            <field name="NUM">5</field>
+          </shadow>
+          <block type="variables_get" id="9XZOhJEIzgp9tudOnjd4">
+            <field name="VAR" id="WZ03cL0l9dUECdN5rRmR">Lower duration (ticks)</field>
+          </block>
+        </value>
+        <value name="AMOUNT">
+          <shadow type="math_number" id="RUTsdtS1ZAAjDCaN8a7O">
+            <field name="NUM">5</field>
+          </shadow>
+          <block type="variables_get" id="EkaIYzZkqaZFAtzZIWxR">
+            <field name="VAR" id="Mww9aFwH05BKLkkhBvxK">Stake per trade</field>
+          </block>
+        </value>
+        <value name="BARRIEROFFSET">
+          <shadow type="math_number_positive" id="Fo8qYXuAeSWdbQJvMc8m">
+            <field name="NUM">1</field>
+          </shadow>
+          <block type="variables_get" id="TeYfIvCUDu9cbUSZmfB0">
+            <field name="VAR" id="53PR4zpPAm0rjYHuDBpx">Lower barrier above (offset)</field>
+          </block>
+        </value>
+      </block>
+    </statement>
+  </block>
+  <block type="before_purchase" id="RNyx2IlyEv7usho0Sb8H" deletable="false" x="0" y="820">
+    <statement name="BEFOREPURCHASE_STACK">
+      <block type="controls_if" id="YdIZzFczUIOYUTrQHh25">
+        <value name="IF0">
+          <block type="logic_compare" id="eUpKQlCJsWrEQOoqzta9">
+            <field name="OP">LT</field>
+            <value name="A">
+              <block type="math_modulo" id="5zmUTYqaurOBmpJW4m5c">
+                <value name="DIVIDEND">
+                  <block type="epoch" id="gi1b0JqKipZUWgav8SMU"/>
+                </value>
+                <value name="DIVISOR">
+                  <block type="math_number" id="ps403z9YdOAwt7yt5X5C">
+                    <field name="NUM">20</field>
+                  </block>
+                </value>
+              </block>
+            </value>
+            <value name="B">
+              <block type="math_number" id="Xcw6yCjINxpPAREr6yhN">
+                <field name="NUM">2</field>
+              </block>
+            </value>
+          </block>
+        </value>
+        <statement name="DO0">
+          <block type="purchase" id="nD0FpovJVGLkoaiBbmdm">
+            <field name="PURCHASE_LIST">PUT</field>
+          </block>
+        </statement>
+      </block>
+    </statement>
+  </block>
+  <block type="during_purchase" id="TWEXIb5T9rJUaZuSKNrB" deletable="false" x="720" y="0"/>
+  <block type="after_purchase" id="1OmsszCk4nccz7thuUUF" deletable="false" x="720" y="260">
+    <statement name="AFTERPURCHASE_STACK">
+      <block type="trade_again" id="mVLC8XwbdOJzsJVu7VzC"/>
+    </statement>
+  </block>
+</xml>
