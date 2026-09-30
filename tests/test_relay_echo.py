@@ -1917,7 +1917,9 @@ def test_an_edit_into_a_call_posted_days_ago_still_says_trade_it_by_hand(
     if executed:
         _take_entry(conn, 1)
     _ingest(conn, VIP, 5001, CHATTER_TEXT, posted=LATER)
-    _edit(conn, VIP, 5001, SIGNAL_TEXT, LATER + timedelta(minutes=1))
+    # Three minutes on: past the 120 s in which an edit completing a post
+    # makes it a signal (ruling C5), so the edit opens no trade.
+    _edit(conn, VIP, 5001, SIGNAL_TEXT, LATER + timedelta(minutes=3))
     conn.commit()
 
     detail = _detail(conn, edits_repo.EDIT_CREATED_SIGNAL)
@@ -2036,7 +2038,8 @@ def test_a_live_call_in_another_entry_zone_is_not_the_same_call(conn, text, show
     names no signal."""
     _ingest(conn, VIP, CALL)
     _ingest(conn, VIP, 4002, CHATTER_TEXT, posted=POSTED + timedelta(seconds=30))
-    _edit(conn, VIP, 4002, text, POSTED + timedelta(minutes=1))
+    # Past the 120 s grace (ruling C5): the edit opens no trade.
+    _edit(conn, VIP, 4002, text, POSTED + timedelta(minutes=3))
     conn.commit()
 
     detail = _detail(conn, edits_repo.EDIT_CREATED_SIGNAL)

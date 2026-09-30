@@ -236,7 +236,7 @@ from typing import Literal, Protocol
 
 from xaucopier.domain.signal import Signal
 from xaucopier.parsing.router import RouteResult, route
-from xaucopier.store import alerts, metrics, signals_repo
+from xaucopier.store import alerts, metrics, outbox, signals_repo
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +308,23 @@ class SignalRelay:
     #: one -- a channel that withdrew the call posted it again. Insert it
     #: with `promoted_from_signal_id` set to this, then `record_replacement`.
     replaces: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Admission:
+    """What `admit_signal` made of a message read as a signal."""
+
+    #: The signal it repeats: it was stored as a copy of it
+    #: (`record_signal_copy`), and nothing was queued. None otherwise.
+    match: SignalMatch | None
+    #: Else the new signal, fanned out.
+    signal_id: int | None
+    #: The withdrawn signal the new one replaces (the call posted again).
+    replaces: int | None
+    #: The ENTRY rows queued for the new signal.
+    queued: int
+    #: The alerts raised on the way (a held-back copy's, a replacement's).
+    alert_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1043,6 +1060,86 @@ def relay_of_signal(
     return SignalRelay(None, replaces)
 
 
+def admit_signal(
+    conn: sqlite3.Connection,
+    *,
+    channel_cfg: _ChannelCfgLike,
+    message_id: int,
+    signal: Signal,
+    posted_at_utc: datetime,
+    relay_window_seconds: int,
+    fwd_from_channel_id: int | None,
+    fwd_from_post_id: int | None,
+    accounts: tuple,
+    now_utc: datetime,
+) -> Admission:
+    """A message of `channel_cfg`'s channel -- already on `messages` --
+    read as signal `signal` for the first time, admitted by the relay
+    rules (`relay_of_signal`): a copy of a call we have is stored as such
+    (`record_signal_copy`; a copy of a withdrawn call is held back
+    loudly) and nothing is queued; else it is a new signal -- replacing a
+    withdrawn call its channel posts again (`record_replacement`) -- with
+    its ENTRY rows fanned out, in the caller's writer job. The one door
+    for a new signal: `messages_repo.ingest` for a message stored for the
+    first time, and `edits_repo` for a post an edit completed within the
+    grace (final review F11), so both follow the same rules -- the same
+    call already live or queued is never a second signal (G3L-1)."""
+    channel_id = channel_cfg.channel_id
+    relay = relay_of_signal(
+        conn,
+        channel_id=channel_id,
+        message_id=message_id,
+        trade_hash=signal.content_hash,
+        posted_at_utc=posted_at_utc,
+        relay_window_seconds=relay_window_seconds,
+        fwd_from_channel_id=fwd_from_channel_id,
+        fwd_from_post_id=fwd_from_post_id,
+        channel_cfg=channel_cfg,
+        signal=signal,
+    )
+    if relay.match is not None:
+        raised = record_signal_copy(
+            conn,
+            channel_id=channel_id,
+            message_id=message_id,
+            match=relay.match,
+            now_utc=now_utc,
+            signal=signal,
+            relay_window_seconds=relay_window_seconds,
+        )
+        return Admission(relay.match, None, None, 0, raised)
+    signal_id = signals_repo.insert_signal(
+        conn,
+        channel_id=channel_id,
+        message_id=message_id,
+        signal=signal,
+        promoted_from_signal_id=relay.replaces,
+        replacement_kind=None if relay.replaces is None else "posted_again",
+    )
+    # Same transaction as the signal insert above -- see messages_repo's
+    # module docstring and tests/test_outbox.py's atomicity tests.
+    queued = outbox.fan_out_checked(
+        conn,
+        kind="ENTRY",
+        signal_id=signal_id,
+        followup_id=None,
+        accounts=accounts,
+        now_utc=now_utc,
+    )
+    raised: tuple[int, ...] = ()
+    if relay.replaces is not None:
+        # The channel that withdrew the call posted it again: this signal
+        # carries the call now.
+        raised = record_replacement(
+            conn,
+            new_signal_id=signal_id,
+            replaced_signal_id=relay.replaces,
+            now_utc=now_utc,
+            channel_cfg=channel_cfg,
+        )
+    return Admission(None, signal_id, relay.replaces, queued, raised)
+
+
 def find_signal_relay(
     conn: sqlite3.Connection,
     *,
@@ -1621,6 +1718,12 @@ def _live_same_trade(
             if not is_withdrawn_unexecuted(conn, signal):
                 return signal
     return None
+
+
+def match_of(conn: sqlite3.Connection, signal: sqlite3.Row) -> SignalMatch:
+    """Signal `signal` (a `signals` row) as the call a post repeats -- the
+    same trade -- for `record_signal_copy`."""
+    return _signal_match(conn, signal, via="hash")
 
 
 def _signal_match(conn: sqlite3.Connection, signal: sqlite3.Row, *, via: MatchVia) -> SignalMatch:

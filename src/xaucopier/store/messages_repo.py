@@ -595,67 +595,34 @@ def _ingest_new(
 
     # kind == "signal"
     signals_repo.reset_parse_failures(conn, channel_id=channel_id)
-    signal = route_result.signal
-
-    relay = relay_repo.relay_of_signal(
+    # A copy of a call we have, a withdrawn call posted again, or a new
+    # signal -- insert and fan-out in this same transaction
+    # (relay_repo.admit_signal; tests/test_outbox.py's atomicity tests).
+    admission = relay_repo.admit_signal(
         conn,
-        channel_id=channel_id,
+        channel_cfg=channel_cfg,
         message_id=message_id,
-        trade_hash=signal.content_hash,
+        signal=route_result.signal,
         posted_at_utc=posted_at_utc,
         relay_window_seconds=relay_window_seconds,
         fwd_from_channel_id=provenance["fwd_from_channel_id"],
         fwd_from_post_id=provenance["fwd_from_post_id"],
-        channel_cfg=channel_cfg,
-        signal=signal,
+        accounts=accounts,
+        now_utc=now_utc,
     )
-    if relay.match is not None:
-        relay_repo.record_signal_copy(
-            conn,
-            channel_id=channel_id,
-            message_id=message_id,
-            match=relay.match,
-            now_utc=now_utc,
-            signal=signal,
-            relay_window_seconds=relay_window_seconds,
-        )
+    if admission.match is not None:
         return IngestResult(
             outcome="relay_duplicate",
             signal_id=None,
             followup_id=None,
             kind=kind,
             detail=route_result.detail,
-            relay_of_signal_id=relay.match.signal_id,
-        )
-
-    signal_id = signals_repo.insert_signal(
-        conn,
-        channel_id=channel_id,
-        message_id=message_id,
-        signal=signal,
-        promoted_from_signal_id=relay.replaces,
-        replacement_kind=None if relay.replaces is None else "posted_again",
-    )
-    # Same transaction as the signal insert above -- see the module
-    # docstring and tests/test_outbox.py's atomicity tests.
-    outbox.fan_out_checked(
-        conn,
-        kind="ENTRY",
-        signal_id=signal_id,
-        followup_id=None,
-        accounts=accounts,
-        now_utc=now_utc,
-    )
-    if relay.replaces is not None:
-        # The channel that withdrew the call posted it again: this signal
-        # carries the call now (relay_repo.record_replacement).
-        relay_repo.record_replacement(
-            conn,
-            new_signal_id=signal_id,
-            replaced_signal_id=relay.replaces,
-            now_utc=now_utc,
-            channel_cfg=channel_cfg,
+            relay_of_signal_id=admission.match.signal_id,
         )
     return IngestResult(
-        outcome="new", signal_id=signal_id, followup_id=None, kind=kind, detail=route_result.detail
+        outcome="new",
+        signal_id=admission.signal_id,
+        followup_id=None,
+        kind=kind,
+        detail=route_result.detail,
     )

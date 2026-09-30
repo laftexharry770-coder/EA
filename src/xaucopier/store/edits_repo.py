@@ -58,11 +58,25 @@ which now follows the latest classification -- and then:
   `relay_repo`) edited or deleted -- a WARNING naming both posts; the
   follow-up acted on is the other post's and is not changed by guess.
   Nothing is said when that post already reads the same, or was withdrawn.
-- **Anything -> signal or follow-up, from something else** -- recorded and
-  alerted (WARNING), never traded. An edit never fans out an ENTRY, nor
-  an instruction: one that creates a trade is too easy to trigger by
-  accident. No `signals` row is created either -- it would make a genuine
-  repost of the same call a relay duplicate, and so never traded.
+- **A post completed by a quick edit** (final review F11, ruling C5) --
+  a message stored as parse_failed or skip, never a post of any call
+  (no signals row of its own, no copy link), that an edit turns into a
+  valid signal within `EDIT_GRACE_SECONDS` (120 s) of its posted_at, by
+  the edit's own date: admitted exactly as a new post of it would be
+  (`relay_repo.admit_signal`) -- a new signal, fanned out; the call
+  posted again; a copy of the same call already queued (G3L-1); or held
+  back as a copy of a withdrawn call -- with a WARNING
+  `EDIT_COMPLETED_SIGNAL`. So the same channel history trades the same
+  whether or not the update stream delivered the first version.
+- **Anything else -> signal or follow-up** -- recorded and alerted, never
+  traded: an edit never fans out an ENTRY, nor an instruction, beyond
+  the grace; one that creates a trade is too easy to trigger by accident.
+  No `signals` row is created either -- it would make a genuine repost of
+  the same call a relay duplicate, and so never traded. But the same
+  call already live or queued comes first (G3L-1): the message is stored
+  as a copy of it and the WARNING says the call is queued -- never "trade
+  it by hand". Otherwise `EDIT_CREATED_SIGNAL` asks the user to trade it
+  by hand, and is CRITICAL for it.
 - A signal already `INVALID` or `VOIDED` stays so; an edit of it is
   recorded with a WARNING.
 
@@ -230,7 +244,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from collections.abc import Collection
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
 from xaucopier.domain.signal import FollowUp, FollowUpOp, Signal
@@ -253,8 +267,16 @@ LIVE_SIGNAL_RETRACTED_BY_EDIT = "LIVE_SIGNAL_RETRACTED_BY_EDIT"
 SIGNAL_VOIDED_BY_DELETION = "SIGNAL_VOIDED_BY_DELETION"
 #: CRITICAL: a signal that is executed or in flight was deleted.
 LIVE_SIGNAL_DELETED = "LIVE_SIGNAL_DELETED"
-#: WARNING: an edit turned a non-signal into a signal. Not traded.
+#: An edit turned a non-signal into a signal, and it is not traded (a
+#: follow-up edited into one, a post completed after the grace, a post of
+#: a call edited back into it). CRITICAL when it asks the user to trade
+#: it by hand (ruling C5); WARNING when the same call is queued already.
 EDIT_CREATED_SIGNAL = "EDIT_CREATED_SIGNAL"
+#: WARNING: a message stored as parse_failed or skip was completed into a
+#: signal by an edit within `EDIT_GRACE_SECONDS` of being posted: a new
+#: signal, fanned out -- or a copy of the same call already queued
+#: (final review F11, ruling C5).
+EDIT_COMPLETED_SIGNAL = "EDIT_COMPLETED_SIGNAL"
 #: WARNING: an edit turned chatter (or a broken signal) into a follow-up. Not dispatched.
 EDIT_CREATED_FOLLOWUP = "EDIT_CREATED_FOLLOWUP"
 #: WARNING: a material edit of a signal that is already INVALID or VOIDED.
@@ -297,6 +319,13 @@ WINDOW_READ_SUSPECT = "WINDOW_READ_SUSPECT"
 #: Raised by ingest/edits.py.
 WINDOW_VOIDED_SIGNALS = "WINDOW_VOIDED_SIGNALS"
 
+# -- a post completed by a quick edit (final review F11, ruling C5) -------------
+#: A message stored as parse_failed or skip that an edit turns into a
+#: valid signal at most this long after it was posted (by the edit's own
+#: `edit_date`) is a new signal. A module constant, not a domain Policy
+#: field (the pure core is not touched).
+EDIT_GRACE_SECONDS = 120
+
 # -- retraction by edit (ledger 161) ------------------------------------------
 #: Words that, ADDED to a signal by an edit, withdraw it: whole words, any
 #: case ("CANCELLATION" and "INVALIDATED" are other words).
@@ -337,6 +366,7 @@ EditOutcome = Literal[
     "followup_edited",  # a follow-up's instruction changed: updated in place
     "withdrawn",  # a follow-up edited into no instruction: its queued rows skipped
     "reclassified",  # became a signal or follow-up by an edit: alerted, never traded
+    "completed",  # parse_failed/skip completed into a signal within the grace: admitted as new
     "recorded",  # any other newer version: recorded, nothing to do
 ]
 #: Outcomes that recorded a newer, materially different version.
@@ -349,6 +379,7 @@ CHANGED_OUTCOMES = frozenset(
         "followup_edited",
         "withdrawn",
         "reclassified",
+        "completed",
         "recorded",
     }
 )
@@ -1889,12 +1920,11 @@ def _edit_of_followup(ctx: _Ctx, route_result: RouteResult, new_hash: str) -> Ed
             alert_ids=partial.alert_ids,
             skipped=partial.skipped,
         )
-    created = _created_alert(ctx, route_result)
-    return ctx.result(
-        "reclassified",
-        new_kind,
-        "follow-up edited into a signal; not traded",
-        alert_ids=(*partial.alert_ids, created),
+    created = _edited_into_signal(ctx, "followup", route_result)
+    return dataclasses.replace(
+        created,
+        detail=f"follow-up edited into a signal; {created.detail}",
+        alert_ids=(*partial.alert_ids, *created.alert_ids),
         skipped=partial.skipped,
     )
 
@@ -1959,7 +1989,9 @@ def _withdraw_followup(ctx: _Ctx, followup_id: int, *, code: str, via: str) -> _
 
 def _edit_of_other(ctx: _Ctx, stored_kind: str, route_result: RouteResult) -> EditResult:
     new_kind = route_result.kind
-    if new_kind in ("signal", "followup"):
+    if new_kind == "signal":
+        return _edited_into_signal(ctx, stored_kind, route_result)
+    if new_kind == "followup":
         alert = _created_alert(ctx, route_result)
         return ctx.result(
             "reclassified", new_kind, f"{stored_kind} edited into {new_kind}", alert_ids=(alert,)
@@ -1972,6 +2004,180 @@ def _edit_of_other(ctx: _Ctx, stored_kind: str, route_result: RouteResult) -> Ed
         new_kind,
     )
     return ctx.result("recorded", new_kind, f"{stored_kind} edited into {new_kind}")
+
+
+def _edited_into_signal(ctx: _Ctx, stored_kind: str, route_result: RouteResult) -> EditResult:
+    """An edit turned a message that was no signal into one. A message
+    never a post of any call -- no signals row of its own (a VOIDED one
+    included: one message, one signal), no link to one -- stored as
+    parse_failed or skip and completed within `EDIT_GRACE_SECONDS` of
+    being posted is admitted as if it had been posted complete (ruling
+    C5, `_complete`). Otherwise an edit opens no trade; but first, the
+    same call already live or queued makes it a copy of that call, never
+    a "trade it by hand" (G3L-1, `_copy_of_live_call`)."""
+    fresh = ctx.signal_id is None and ctx.relay_of_signal_id is None
+    if fresh and stored_kind in ("parse_failed", "skip") and _within_grace(ctx):
+        return _complete(ctx, route_result)
+    if fresh:
+        copy = _copy_of_live_call(ctx, route_result)
+        if copy is not None:
+            return copy
+    alert = _created_alert(ctx, route_result)
+    return ctx.result(
+        "reclassified", "signal", f"{stored_kind} edited into signal", alert_ids=(alert,)
+    )
+
+
+def _posted_at(ctx: _Ctx) -> datetime:
+    return relay_repo.posted_at(ctx.conn, channel_id=ctx.channel_id, message_id=ctx.message_id)
+
+
+def _within_grace(ctx: _Ctx) -> bool:
+    """Whether this edit was made at most `EDIT_GRACE_SECONDS` after the
+    message was posted (both by Telegram's own dates)."""
+    return ctx.edit_date_utc - _posted_at(ctx) <= timedelta(seconds=EDIT_GRACE_SECONDS)
+
+
+def _complete(ctx: _Ctx, route_result: RouteResult) -> EditResult:
+    """Ruling C5 (final review F11): a post stored as parse_failed or skip,
+    completed into a signal by an edit within the grace, is admitted as a
+    new post of it would be (`relay_repo.admit_signal`) -- a new signal,
+    fanned out, or a copy of the same call already live or queued (G3L-1),
+    or held back as a copy of a withdrawn one -- with a WARNING
+    EDIT_COMPLETED_SIGNAL. A clean read ends the channel's run of
+    unreadable signals, as it does for a new post."""
+    message = _get_message(ctx.conn, channel_id=ctx.channel_id, message_id=ctx.message_id)
+    posted = datetime.fromisoformat(message["posted_at_utc"])
+    admission = relay_repo.admit_signal(
+        ctx.conn,
+        channel_cfg=ctx.channel_cfg,
+        message_id=ctx.message_id,
+        signal=route_result.signal,
+        posted_at_utc=posted,
+        relay_window_seconds=relay_repo.RELAY_WINDOW_SECONDS,
+        fwd_from_channel_id=message["fwd_from_channel_id"],
+        fwd_from_post_id=message["fwd_from_post_id"],
+        accounts=ctx.accounts,
+        now_utc=ctx.now_utc,
+    )
+    signals_repo.reset_parse_failures(ctx.conn, channel_id=ctx.channel_id)
+    seconds = int((ctx.edit_date_utc - posted).total_seconds())
+    what = (
+        f"message {ctx.message_id} on channel {ctx.channel_id} was completed into a signal "
+        f"({_describe(route_result)}) by an edit {seconds} s after it was posted"
+    )
+    if admission.signal_id is not None:
+        again = (
+            ""
+            if admission.replaces is None
+            else f" It is the call of withdrawn signal {admission.replaces}, posted again."
+        )
+        alert = ctx.alert(
+            "WARNING",
+            EDIT_COMPLETED_SIGNAL,
+            f"{what}. It is now signal {admission.signal_id}, and {admission.queued} trade "
+            f"entr{'y is' if admission.queued == 1 else 'ies are'} queued for it, as if it had "
+            f"been posted complete.{again} If the poster did not mean it as a call, check the "
+            "channel.",
+            signal_id=admission.signal_id,
+        )
+        logger.warning(
+            "channel %s message %s completed into signal %s by an edit within the grace",
+            ctx.channel_id,
+            ctx.message_id,
+            admission.signal_id,
+        )
+        return dataclasses.replace(ctx, signal_id=admission.signal_id).result(
+            "completed",
+            "signal",
+            f"completed by an edit within {EDIT_GRACE_SECONDS} s: signal {admission.signal_id}",
+            alert_ids=(*admission.alert_ids, alert),
+        )
+    match = admission.match
+    if match.withdrawn_unexecuted:
+        said = (
+            f"It repeats signal {match.signal_id} (message {match.message_id} on channel "
+            f"{match.channel_id}), which was withdrawn before anything was executed: it is held "
+            "back as a new post of it would be, and nothing was queued (see the alert about "
+            "this copy)."
+        )
+    else:
+        said = f"{_already_queued(ctx, match)} This post is stored as a copy of it."
+    alert = ctx.alert(
+        "WARNING", EDIT_COMPLETED_SIGNAL, f"{what}. {said}", signal_id=match.signal_id
+    )
+    return ctx.result(
+        "completed",
+        "signal",
+        f"completed by an edit within {EDIT_GRACE_SECONDS} s: a copy of signal {match.signal_id}",
+        alert_ids=(*admission.alert_ids, alert),
+    )
+
+
+def _already_queued(ctx: _Ctx, match: relay_repo.SignalMatch) -> str:
+    """For an alert about a post that repeats live signal `match`: the
+    same call is queued (or traded) already -- never "trade it by hand"."""
+    status = trade_status(ctx.conn, signal_id=match.signal_id)
+    where = f"message {match.message_id} on channel {match.channel_id}"
+    state = "already queued" if status == "pending" else f"trade status {status}"
+    return (
+        f"The same call is signal {match.signal_id} ({where}), {state}: do NOT trade it by "
+        "hand as well -- that would open the trade twice. Nothing more was queued."
+    )
+
+
+def _copy_of_live_call(ctx: _Ctx, route_result: RouteResult) -> EditResult | None:
+    """G3L-1: a message edited into a signal it may not be traded as (a
+    follow-up, or completed after the grace) that repeats a call already
+    live or queued -- the same post, or the same trade close together,
+    through the call's chain (`relay_repo.relay_of_signal`) -- is stored as
+    a copy of it (a post of the call from now on) and the WARNING says the
+    call is queued. Failing a relay match, the live signal `carrier_of`
+    names for the call -- posted near this post, or near this edit (ruling
+    R6-1) -- counts too. None when no live signal carries the call."""
+    message = _get_message(ctx.conn, channel_id=ctx.channel_id, message_id=ctx.message_id)
+    relay = relay_repo.relay_of_signal(
+        ctx.conn,
+        channel_id=ctx.channel_id,
+        message_id=ctx.message_id,
+        trade_hash=route_result.signal.content_hash,
+        posted_at_utc=datetime.fromisoformat(message["posted_at_utc"]),
+        relay_window_seconds=relay_repo.RELAY_WINDOW_SECONDS,
+        fwd_from_channel_id=message["fwd_from_channel_id"],
+        fwd_from_post_id=message["fwd_from_post_id"],
+        channel_cfg=ctx.channel_cfg,
+        signal=route_result.signal,
+    )
+    match = relay.match
+    if match is None or match.withdrawn_unexecuted:
+        carrier = relay_repo.carrier_of(
+            ctx.conn, call=route_result.signal, around=_carrier_moments(ctx)
+        )
+        if carrier is None:
+            return None
+        match = relay_repo.match_of(ctx.conn, carrier)
+    relay_repo.record_signal_copy(
+        ctx.conn,
+        channel_id=ctx.channel_id,
+        message_id=ctx.message_id,
+        match=match,
+        now_utc=ctx.now_utc,
+        signal=route_result.signal,
+    )
+    alert = ctx.alert(
+        "WARNING",
+        EDIT_CREATED_SIGNAL,
+        f"an edit turned message {ctx.message_id} on channel {ctx.channel_id} into a signal "
+        f"({_describe(route_result)}). {_already_queued(ctx, match)} This post is stored as a "
+        "copy of it.",
+        signal_id=match.signal_id,
+    )
+    return ctx.result(
+        "reclassified",
+        "signal",
+        f"edited into a copy of signal {match.signal_id}",
+        alert_ids=(alert,),
+    )
 
 
 def _created_alert(ctx: _Ctx, route_result: RouteResult) -> int:
@@ -2014,15 +2220,15 @@ def _created_alert(ctx: _Ctx, route_result: RouteResult) -> int:
             )
     if route_result.kind == "signal":
         # R5-5: never "trade it by hand" while the same call is live.
+        carrier = relay_repo.carrier_of(
+            ctx.conn, call=route_result.signal, around=_carrier_moments(ctx)
+        )
         advice = relay_repo.by_hand(
-            ctx.conn,
-            advice="If it is a real call, trade it by hand.",
-            carrier=relay_repo.carrier_of(
-                ctx.conn, call=route_result.signal, around=_carrier_moments(ctx)
-            ),
+            ctx.conn, advice="If it is a real call, trade it by hand.", carrier=carrier
         )
         return ctx.alert(
-            "WARNING",
+            # Asking the user to act by hand is CRITICAL (ruling C5).
+            "CRITICAL" if carrier is None else "WARNING",
             EDIT_CREATED_SIGNAL,
             f"an edit turned message {ctx.message_id} into a signal "
             f"({_describe(route_result)}). Edits never open trades: nothing was queued. "
