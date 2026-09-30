@@ -32,6 +32,7 @@ import xaucopier.cli.resolve as resolve_module
 from fakes.telegram import FakeTelegramClient
 from xaucopier.cli import exit_codes
 from xaucopier.config.channels import load_channels
+from xaucopier.config.loader import ConfigError
 from xaucopier.ingest.client import AlreadyRunningError
 from xaucopier.ingest.secrets import SecretsBlob
 
@@ -244,11 +245,16 @@ def test_a_failure_at_any_point_of_the_write_leaves_the_file_exactly_as_it_was(
     elif where == "final rename":
         monkeypatch.setattr(os, "replace", _boom)
     else:
-        monkeypatch.setattr(resolve_module, "load_channels", _boom)
+        def rejects(*args: Any, **kwargs: Any) -> None:
+            raise ConfigError("injected: the loader rejects the edited file")
+
+        monkeypatch.setattr(resolve_module, "load_channels", rejects)
 
     code = cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes"))
 
-    assert code == exit_codes.EXIT_CONFIG_ERROR
+    # F30: the disk refusing a write or the rename is worth running again
+    # (exit 1); a file the loader rejects is a setup problem (exit 5).
+    assert code == (exit_codes.EXIT_CONFIG_ERROR if where == "verification" else exit_codes.EXIT_FAILED)
     assert rig.channels_path.read_bytes() == before
     assert _enabled_placeholders(rig.channels_path) == []
     assert _no_temp_files(rig.config_dir)

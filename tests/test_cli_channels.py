@@ -39,6 +39,7 @@ from xaucopier.cli import exit_codes
 from xaucopier.cli.watch import load_session as real_load_session
 from xaucopier.config.accounts import load_accounts
 from xaucopier.config.channels import ChannelCfg, load_channels
+from xaucopier.config.loader import ConfigError
 from xaucopier.ingest.client import AlreadyRunningError
 from xaucopier.ingest.secrets import SecretsBlob
 from xaucopier.store import db, messages_repo
@@ -485,7 +486,11 @@ def _inject(where: str, monkeypatch: pytest.MonkeyPatch, rig: Rig) -> None:
     elif where == "fsync":
         monkeypatch.setattr(os, "fsync", _boom)
     elif where == "reload":
-        monkeypatch.setattr(resolve_module, "load_channels", _boom)
+        # The real loader rejecting what was written.
+        def rejects(*args: Any, **kwargs: Any) -> Any:
+            raise ConfigError("injected: the loader rejects the edited file")
+
+        monkeypatch.setattr(resolve_module, "load_channels", rejects)
     elif where == "compare":
         # A sloppy edit that also renames another channel -- which the
         # loader would accept -- must be caught by the comparison.
@@ -512,6 +517,19 @@ def _inject(where: str, monkeypatch: pytest.MonkeyPatch, rig: Rig) -> None:
 
 
 WRITE_STEPS = ("text edit", "temp write", "fsync", "reload", "compare", "changed meanwhile", "replace")
+#: Final review F30: a failure that running the command again can fix -- the
+#: file changed meanwhile, or the disk refused a write or the final rename
+#: (another program had the file open) -- is exit 1. A file the edit or the
+#: loader cannot accept is a setup problem: exit 5.
+STEP_CODE = {
+    "text edit": 5,
+    "temp write": 1,
+    "fsync": 1,
+    "reload": 5,
+    "compare": 5,
+    "changed meanwhile": 1,
+    "replace": 1,
+}
 
 
 @pytest.mark.parametrize("where", WRITE_STEPS)
@@ -528,14 +546,22 @@ def test_a_failure_at_any_step_of_a_switch_leaves_the_file_exactly_as_it_was(
 
     code = cli_main.main(rig.argv(*argv))
 
-    assert code == exit_codes.EXIT_CONFIG_ERROR
+    assert code == STEP_CODE[where]
     if where == "changed meanwhile":
         assert rig.channels_path.read_bytes() == before + b"# edited by hand\n"
     else:
         assert rig.channels_path.read_bytes() == before
     assert _no_temp_files(rig)
     err = capsys.readouterr().err
-    assert "The file was not changed" in err
+    if where == "changed meanwhile":
+        # Something else changed the file: nothing is claimed about it but
+        # that this command wrote nothing.
+        assert "was changed by something else" in err
+        assert "Nothing was written by this command" in err
+        assert "The file was not changed" not in err
+    else:
+        assert "The file was not changed" in err
+    assert ("run the command again" in err.lower()) is (STEP_CODE[where] == 1)
     if where == "compare":
         assert "differs from the original" in err
 
@@ -869,14 +895,208 @@ def test_a_failure_at_any_step_of_an_add_leaves_the_file_exactly_as_it_was(
 
     code = cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes"))
 
-    assert code == exit_codes.EXIT_CONFIG_ERROR
+    assert code == STEP_CODE[where]
     if where == "changed meanwhile":
         assert rig.channels_path.read_bytes() == before + b"# edited by hand\n"
     else:
         assert rig.channels_path.read_bytes() == before
     assert _no_temp_files(rig)
     err = capsys.readouterr().err
-    assert "The file was not changed: nothing was added." in err
+    if where == "changed meanwhile":
+        assert "Nothing was added by this command" in err
+    else:
+        assert "The file was not changed: nothing was added." in err
+    assert ("`.\\xaucopier channels add` again" in err) is (STEP_CODE[where] == 1)
     if where == "compare":
         assert "differs from the original" in err
     assert add_rig.lock.released == 1
+
+
+# -- F33: two commands writing channels.toml at once ------------------------------------------
+
+
+def _run_in_thread(name: str, argv: list[str], results: dict[str, int]):
+    import threading
+
+    def run() -> None:
+        results[name] = cli_main.main(argv)
+
+    thread = threading.Thread(target=run, name=name)
+    thread.start()
+    return thread
+
+
+def test_two_switches_at_once_both_end_true_the_later_one_changes_nothing(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final review F33: A (`channels on 3`) passes every check and is about
+    to replace the file; B (`channels off 7`) starts meanwhile. Before, B
+    deleted A's temporary file (one fixed name), A's replace then moved
+    B's text into place, and both reported the opposite of what happened.
+    Now the check-and-replace is one step no other xaucopier command can
+    enter: A's change lands, and B -- which read the file before A
+    changed it -- says truthfully that it wrote nothing."""
+    import os
+    import threading
+    import time
+
+    real_replace = os.replace
+    a_inside, b_started = threading.Event(), threading.Event()
+
+    def replace(src: Any, dst: Any) -> None:
+        if threading.current_thread().name == "A":
+            a_inside.set()
+            b_started.wait(5)
+            time.sleep(0.5)  # B has read the file and is trying to write it
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    real_fsync_write = resolve_module._fsync_write
+
+    def fsync_write(path: Path, data: bytes) -> None:
+        # Each writer's own temporary file, never another's.
+        assert path.parent == rig.channels_path.parent
+        assert not path.exists()
+        real_fsync_write(path, data)
+
+    monkeypatch.setattr(resolve_module, "_fsync_write", fsync_write)
+    results: dict[str, int] = {}
+
+    a = _run_in_thread("A", rig.argv("on", "3"), results)
+    assert a_inside.wait(10)  # A passed every check and is about to replace
+    b = _run_in_thread("B", rig.argv("off", "7"), results)
+    b_started.set()
+    a.join(20)
+    b.join(20)
+
+    assert results == {"A": exit_codes.EXIT_OK, "B": exit_codes.EXIT_FAILED}
+    assert _switches(rig.channels_path) == {1: False, 7: True, 3: True}
+    assert _no_temp_files(rig)
+    captured = capsys.readouterr()
+    assert "Channel 3 (Quiet Signals) is now ON." in captured.out
+    assert "Channel 7 (Gold Room) is now OFF." not in captured.out
+    assert "was changed by something else" in captured.err
+    assert "Nothing was written by this command" in captured.err
+
+
+def test_each_write_uses_its_own_temporary_file_beside_channels_toml(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    names: list[str] = []
+    real_fsync_write = resolve_module._fsync_write
+
+    def fsync_write(path: Path, data: bytes) -> None:
+        names.append(path.name)
+        assert path.parent == rig.channels_path.parent
+        real_fsync_write(path, data)
+
+    monkeypatch.setattr(resolve_module, "_fsync_write", fsync_write)
+
+    assert cli_main.main(rig.argv("on", "3")) == exit_codes.EXIT_OK
+    assert cli_main.main(rig.argv("off", "3")) == exit_codes.EXIT_OK
+
+    assert len(names) == 2 and names[0] != names[1]
+    assert all(name.startswith(".channels.toml.") and name.endswith(".tmp") for name in names)
+    assert _no_temp_files(rig)
+
+
+def test_a_write_that_cannot_get_its_turn_changes_nothing_and_says_to_run_again(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Another xaucopier command holds the write for longer than the wait
+    (10 s; 0.2 s here): nothing is written, exit 1, run it again."""
+    import threading
+
+    monkeypatch.setattr(resolve_module, "CONFIG_LOCK_TIMEOUT_SECONDS", 0.2)
+    holding, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with resolve_module.config_write_lock(rig.channels_path):
+            holding.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    try:
+        assert holding.wait(5)
+        before = rig.channels_path.read_bytes()
+
+        assert cli_main.main(rig.argv("on", "3")) == exit_codes.EXIT_FAILED
+
+        assert rig.channels_path.read_bytes() == before
+    finally:
+        release.set()
+        holder.join(10)
+    assert _no_temp_files(rig)
+    err = capsys.readouterr().err
+    assert "another xaucopier command is changing" in err
+    assert "channel 3 is still OFF" in err and "run the command again" in err.lower()
+    # Once it is free, the same command goes through.
+    assert cli_main.main(rig.argv("on", "3")) == exit_codes.EXIT_OK
+
+
+def test_a_lock_held_by_an_administrator_window_is_waited_for_like_any_other(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A command running as administrator holds a lock this window may not
+    open (access denied): that is "busy", waited for, never a traceback."""
+    import pywintypes
+    import winerror
+
+    real_create = resolve_module.win32event.CreateMutex
+    denied = {"left": 3}
+
+    def create(*args: Any) -> Any:
+        if denied["left"]:
+            denied["left"] -= 1
+            raise pywintypes.error(winerror.ERROR_ACCESS_DENIED, "CreateMutex", "Access is denied.")
+        return real_create(*args)
+
+    monkeypatch.setattr(resolve_module.win32event, "CreateMutex", create)
+
+    assert cli_main.main(rig.argv("on", "3")) == exit_codes.EXIT_OK
+    assert denied["left"] == 0
+    assert _switches(rig.channels_path)[3] is True
+
+    denied["left"] = 10_000
+    monkeypatch.setattr(resolve_module, "CONFIG_LOCK_TIMEOUT_SECONDS", 0.2)
+    assert cli_main.main(rig.argv("off", "3")) == exit_codes.EXIT_FAILED
+    assert _switches(rig.channels_path)[3] is True
+    assert "another xaucopier command is changing" in capsys.readouterr().err
+
+
+def test_a_writer_that_died_holding_the_write_does_not_block_the_next_one(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Windows hands a mutex whose holder ended without releasing it to the
+    next waiter as "abandoned": the write is the next one's to make."""
+    import threading
+
+    import win32api
+    import win32event
+
+    handles: list[Any] = []
+
+    def die_holding() -> None:
+        handle = win32event.CreateMutex(None, False, resolve_module.config_lock_name(rig.channels_path))
+        assert win32event.WaitForSingleObject(handle, 0) == win32event.WAIT_OBJECT_0
+        handles.append(handle)  # the thread ends owning it, never releasing it
+
+    holder = threading.Thread(target=die_holding)
+    holder.start()
+    holder.join(10)
+    try:
+        assert cli_main.main(rig.argv("on", "3")) == exit_codes.EXIT_OK
+    finally:
+        win32api.CloseHandle(handles[0])
+    assert _switches(rig.channels_path)[3] is True
+
+
+def test_the_write_lock_is_one_per_file_however_its_path_is_spelled(tmp_path: Path) -> None:
+    path = tmp_path / "config" / "channels.toml"
+    same = tmp_path / "config" / ".." / "CONFIG" / "Channels.TOML"
+    assert resolve_module.config_lock_name(path) == resolve_module.config_lock_name(same)
+    assert resolve_module.config_lock_name(path) != resolve_module.config_lock_name(
+        tmp_path / "other" / "channels.toml"
+    )
+    assert resolve_module.config_lock_name(path).startswith("Local\\xaucopier_config_")

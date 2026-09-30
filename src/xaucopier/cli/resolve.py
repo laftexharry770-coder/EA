@@ -22,6 +22,18 @@ channel's `channel_id` and `enabled` may differ -- and only then
 always either exactly the old one or the fully checked new one; a
 failure at any step leaves it untouched and removes the temporary file.
 
+**Two commands writing at once cannot both think they won** (final review
+F33). Each write has its own temporary file, and the write -- temporary
+file, checks, "is the file still what this command read?", replace -- is
+one step no other xaucopier command can enter (`config_write_lock()`, a
+short-lived named mutex of its own, never the session's). The later of
+two commands therefore finds the file changed and writes nothing, and
+says so (`ChangedMeanwhileError`, exit 1: run it again). A failure that
+running the command again can fix -- that, a write that had to wait too
+long, or the disk refusing the write or the rename -- is exit 1; a file
+the edit or the loader cannot accept is exit 5 (`save_failure_code()`,
+final review F30).
+
 **`channels on` / `channels off` / `channels add` (`cli/channels.py`) write
 through the same path.** Their text edits (`set_enabled()`,
 `append_channel()`) live here beside `set_id_then_enable()`, and every one
@@ -40,16 +52,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import copy
+import hashlib
 import os
 import re
 import sys
+import time
 import tomllib
+import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+import pywintypes
+import win32api
+import win32event
+import winerror
 from telethon import utils
 from telethon.tl import types
 
@@ -88,6 +109,80 @@ _PRIVATE_POST_LINK = re.compile(r"(?:^|/)t(?:elegram)?\.me/c/\d+")
 
 class ResolveError(Exception):
     """This channel could not be resolved or saved; the message says why."""
+
+
+class ChangedMeanwhileError(ResolveError):
+    """`channels.toml` is no longer the text this command read: something
+    else -- another xaucopier command, or a person editing it -- changed it
+    meanwhile. Nothing was written; running the command again is the fix."""
+
+
+class ConfigBusyError(ResolveError):
+    """Another xaucopier command was writing `channels.toml` for longer than
+    `CONFIG_LOCK_TIMEOUT_SECONDS`. Nothing was written."""
+
+
+#: How long a write of `channels.toml` waits for another xaucopier command
+#: that is writing it (each write holds it for milliseconds).
+CONFIG_LOCK_TIMEOUT_SECONDS = 10.0
+_LOCK_RETRY_SECONDS = 0.05
+
+
+def config_lock_name(path: Path) -> str:
+    """The name of the write lock for the file at `path`: one per file,
+    however the path is spelled."""
+    key = hashlib.sha256(os.path.normcase(str(path.resolve())).encode("utf-8")).hexdigest()
+    return f"Local\\xaucopier_config_{key[:40]}"
+
+
+@contextlib.contextmanager
+def config_write_lock(path: Path) -> Iterator[None]:
+    """Hold the write lock for the file at `path` -- a named mutex of its
+    own, never the session's `Global\\xaucopier_listener`, so `channels on`
+    and `off` still run while `watch` does. Waits up to
+    `CONFIG_LOCK_TIMEOUT_SECONDS`, then `ConfigBusyError`. A mutex this
+    window may not open (held by a command in an administrator window) is
+    waited for the same way. Windows releases it if its holder dies."""
+    name = config_lock_name(path)
+    deadline = time.monotonic() + CONFIG_LOCK_TIMEOUT_SECONDS
+    busy = ConfigBusyError(
+        f"another xaucopier command is changing {path.name} right now; nothing was written"
+    )
+    while True:
+        try:
+            handle = win32event.CreateMutex(None, False, name)
+            break
+        except pywintypes.error as exc:
+            if exc.winerror != winerror.ERROR_ACCESS_DENIED:
+                raise
+            if time.monotonic() >= deadline:
+                raise busy from None
+            time.sleep(_LOCK_RETRY_SECONDS)
+    try:
+        wait_ms = max(0, int((deadline - time.monotonic()) * 1000))
+        if win32event.WaitForSingleObject(handle, wait_ms) not in (
+            win32event.WAIT_OBJECT_0,
+            win32event.WAIT_ABANDONED,  # its holder died: the lock is ours
+        ):
+            raise busy
+        try:
+            yield
+        finally:
+            win32event.ReleaseMutex(handle)
+    finally:
+        win32api.CloseHandle(handle)
+
+
+def save_failure_code(exc: BaseException) -> int:
+    """The exit code for a failed save of `channels.toml` (final review
+    F30): 1 when running the command again can fix it -- the file changed
+    meanwhile, another command held the write too long, or the disk refused
+    the write or the rename (another program had the file open) -- and 5
+    for a file the edit or the loader cannot accept, which only a fix to
+    the file can."""
+    if isinstance(exc, (ChangedMeanwhileError, ConfigBusyError, OSError)):
+        return exit_codes.EXIT_FAILED
+    return exit_codes.EXIT_CONFIG_ERROR
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,34 +384,36 @@ def write_config_atomically(
     and is read back: parsed, it must equal that copy exactly, so nothing
     else in the file changed. It is then loaded through the real loader
     (`load_channels`) and `confirm` must accept what loaded. Last, `path`
-    must still hold `original` -- nothing else changed it meanwhile. Only
-    then is the temporary file `os.replace()`d over `path`, which is
-    atomic on NTFS. On any failure the temporary file is removed and
-    `path` is exactly as it was."""
+    must still hold `original` -- nothing else changed it meanwhile
+    (`ChangedMeanwhileError`). Only then is the temporary file
+    `os.replace()`d over `path`, which is atomic on NTFS. The temporary
+    file is this call's own, and everything from writing it to the replace
+    runs under `config_write_lock()`, so no other xaucopier command can
+    pass the same check in between. On any failure the temporary file is
+    removed and `path` is exactly as it was."""
     expected = copy.deepcopy(tomllib.loads(original))
     expect(expected)
 
-    tmp = path.with_name(f".{path.name}.resolve-tmp")
-    tmp.unlink(missing_ok=True)
-    try:
-        _fsync_write(tmp, new_text.encode("utf-8"))
-        written = tomllib.loads(tmp.read_bytes().decode("utf-8"))
-        if written != expected:
-            raise ResolveError(
-                "internal error: the edited channels.toml differs from the original in "
-                f"more than {change}; nothing was written"
-            )
-        loaded = load_channels(tmp)
-        if not confirm(loaded):
-            raise ResolveError("internal error: the edited channel did not load as expected")
-        if path.read_bytes() != original.encode("utf-8"):
-            raise ResolveError(
-                "channels.toml was changed by something else while this command ran; "
-                "nothing was written -- run the command again"
-            )
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    with config_write_lock(path):
+        try:
+            _fsync_write(tmp, new_text.encode("utf-8"))
+            written = tomllib.loads(tmp.read_bytes().decode("utf-8"))
+            if written != expected:
+                raise ResolveError(
+                    "internal error: the edited channels.toml differs from the original in "
+                    f"more than {change}; nothing was written"
+                )
+            loaded = load_channels(tmp)
+            if not confirm(loaded):
+                raise ResolveError("internal error: the edited channel did not load as expected")
+            if path.read_bytes() != original.encode("utf-8"):
+                raise ChangedMeanwhileError(
+                    "channels.toml was changed by something else while this command ran"
+                )
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def save_resolved(path: Path, *, index: int, resolved: Resolved, today: str) -> None:
@@ -579,14 +676,24 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
                     resolved=resolved,
                     today=datetime.now(UTC).date().isoformat(),
                 )
-            except (ResolveError, OSError, tomllib.TOMLDecodeError) as exc:
+            except Exception as exc:  # noqa: BLE001 -- the writer leaves the file untouched on any failure
+                code = save_failure_code(exc)
+                if isinstance(exc, ChangedMeanwhileError):
+                    outcome = "Nothing was written by this command."
+                else:
+                    outcome = "The file was not changed."
+                again = (
+                    f" Run `{paths.USER_COMMAND} resolve-channels` again, or, to"
+                    if code == exit_codes.EXIT_FAILED
+                    else " To"
+                )
                 print(
-                    f"Could not save to {channels_path}: {exc}\nThe file was not changed. To "
-                    f"do it by hand, set channel_id = {resolved.channel_id} and then "
-                    f"enabled = true in the {cfg.name!r} section.",
+                    f"Could not save to {channels_path}: {exc}\n{outcome}{again} do it by "
+                    f"hand, set channel_id = {resolved.channel_id} and then enabled = true "
+                    f"in the {cfg.name!r} section.",
                     file=sys.stderr,
                 )
-                return exit_codes.EXIT_CONFIG_ERROR
+                return code
             saved += 1
             print(f"Saved: {cfg.name!r} is now channel {resolved.channel_id}, switched on.")
     except PERMANENT_TELEGRAM_ERRORS as exc:

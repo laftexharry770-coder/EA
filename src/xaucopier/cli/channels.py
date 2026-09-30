@@ -54,12 +54,14 @@ from typing import Any
 from xaucopier.cli import exit_codes, paths
 from xaucopier.cli.resolve import (
     PLACEHOLDER_ID,
+    ChangedMeanwhileError,
     ResolveError,
     _ask,
     _choose,
     report_not_logged_in,
     report_permanent_error,
     save_added,
+    save_failure_code,
     save_switch,
 )
 from xaucopier.cli.status import ago, database_problem, when
@@ -379,12 +381,20 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
             today=_utcnow().date().isoformat(),
         )
     except Exception as exc:  # noqa: BLE001 -- the writer leaves the file untouched on any failure
-        complain(
-            f"Could not save the change to {path}: {exc}",
-            f"The file was not changed: channel {number} is still "
-            f"{'OFF' if enabled else 'ON'}.",
-        )
-        return exit_codes.EXIT_CONFIG_ERROR
+        code = save_failure_code(exc)
+        if isinstance(exc, ChangedMeanwhileError):
+            outcome = (
+                f"Nothing was written by this command. See the channels as they are now "
+                f"with `{_CMD} channels`, then run the command again."
+            )
+        else:
+            outcome = (
+                f"The file was not changed: channel {number} is still "
+                f"{'OFF' if enabled else 'ON'}."
+                + (" Run the command again." if code == exit_codes.EXIT_FAILED else "")
+            )
+        complain(f"Could not save the change to {path}: {exc}", outcome)
+        return code
 
     say(f"Channel {number} ({name}) is now {word}.")
     if not enabled and not any(other.enabled for other in channels if other is not cfg):
@@ -500,11 +510,16 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
             today=_utcnow().date().isoformat(),
         )
     except Exception as exc:  # noqa: BLE001 -- the writer leaves the file untouched on any failure
-        complain(
-            f"Could not save to {path}: {exc}",
-            "The file was not changed: nothing was added.",
-        )
-        return exit_codes.EXIT_CONFIG_ERROR
+        code = save_failure_code(exc)
+        again = f"run `{_CMD} channels add` again."
+        if isinstance(exc, ChangedMeanwhileError):
+            outcome = f"Nothing was added by this command. Check with `{_CMD} channels`, then {again}"
+        else:
+            outcome = "The file was not changed: nothing was added." + (
+                f" Please {again}" if code == exit_codes.EXIT_FAILED else ""
+            )
+        complain(f"Could not save to {path}: {exc}", outcome)
+        return code
     say(
         f"Added: {title} is now channel {number}, switched ON (parser mmh).",
         f"It takes effect the next time you run `{_CMD} watch`. See every channel with "
