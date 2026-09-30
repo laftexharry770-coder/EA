@@ -411,3 +411,74 @@ def test_watch_that_cannot_reach_telegram_stops_with_exit_4_and_says_so(
     assert "Could not reach Telegram within 0.1 seconds" in err
     assert "add_event_handler" not in client.calls
     assert rig.lock.released == 1
+
+
+# -- F32: a channel name the output cannot show -----------------------------------------------
+
+
+def test_an_emoji_channel_name_never_crashes_the_banner_when_output_is_redirected(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Redirected to a file, Python writes cp1252 on Windows, which has no
+    emoji; `channels add` copies Telegram titles verbatim. Before: the
+    banner raised UnicodeEncodeError -- a traceback, exit 1, watch_stopped
+    never stamped. Now every command's output replaces what it cannot show."""
+    import io
+    import sys
+
+    name = "\U0001F947 GOLD VIP SIGNALS \U0001F4C8"
+    _write_config(rig.config_dir, ENABLED_CHANNEL.replace('"Test Channel"', f'"{name}"'))
+    out_bytes, err_bytes = io.BytesIO(), io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(out_bytes, encoding="cp1252"))
+    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(err_bytes, encoding="cp1252"))
+
+    def run(setup, blob) -> int:
+        # watch's log lines name channels too (a group source, a slow read),
+        # and they go to stderr.
+        logging.getLogger("xaucopier.ingest.listener").warning("%s is a group", name)
+        return exit_codes.EXIT_LISTENER_STOPPED
+
+    monkeypatch.setattr(watch_module, "_run", run)
+
+    exit_code = cli_main.main(rig.argv())
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    assert exit_code == exit_codes.EXIT_LISTENER_STOPPED
+    out = out_bytes.getvalue().decode("cp1252")
+    err = err_bytes.getvalue().decode("cp1252")
+    assert "watching: ? GOLD VIP SIGNALS ?" in out
+    assert "watch stopped (exit code 4" in out
+    assert "? GOLD VIP SIGNALS ? is a group" in err
+    assert "Traceback" not in err and "Logging error" not in err
+    assert _stamps(rig.db_path)[heartbeats.WATCH_STOPPED] == "4"
+    assert rig.lock.released == 1
+
+
+def test_a_stream_that_cannot_be_reconfigured_is_left_as_it_is(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Some stand-ins for stdout have no reconfigure(); main() must still run."""
+    import sys
+
+    class Plain:
+        def __init__(self) -> None:
+            self.text: list[str] = []
+
+        def write(self, text: str) -> int:
+            self.text.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            pass
+
+    class Refusing(Plain):
+        def reconfigure(self, **kwargs: object) -> None:
+            raise ValueError("I/O operation on closed file")
+
+    plain, refusing = Plain(), Refusing()
+    monkeypatch.setattr(sys, "stdout", plain)
+    monkeypatch.setattr(sys, "stderr", refusing)
+    with pytest.raises(SystemExit):
+        cli_main.main(["--help"])
+    assert "exit codes:" in "".join(plain.text)

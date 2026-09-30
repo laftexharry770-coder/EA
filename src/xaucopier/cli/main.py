@@ -535,7 +535,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _replace_what_cannot_be_shown() -> None:
+    """Make stdout and stderr replace a character their encoding cannot
+    show (an emoji in a channel title, written to a file or a pipe, which
+    Python encodes as cp1252 on Windows) with "?", instead of raising
+    UnicodeEncodeError -- a traceback in the middle of `watch`'s banner
+    (final review F32). One guard for every command. A stream that cannot
+    be reconfigured is left as it is."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):  # e.g. a stream already closed
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _replace_what_cannot_be_shown()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
