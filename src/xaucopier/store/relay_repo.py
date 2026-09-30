@@ -235,7 +235,7 @@ from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
 from xaucopier.domain.signal import Signal
-from xaucopier.parsing.router import route
+from xaucopier.parsing.router import RouteResult, route
 from xaucopier.store import alerts, metrics, signals_repo
 
 logger = logging.getLogger(__name__)
@@ -1328,18 +1328,38 @@ def shows_call(signal: Signal, row: sqlite3.Row) -> bool:
     return not reaims(json.loads(row["parsed_json"]), signal)
 
 
-def post_shows_call(
-    post: sqlite3.Row, row: sqlite3.Row, *, channel_cfg: _ChannelCfgLike
-) -> bool:
-    """Whether stored post `post` (a `messages` row of `channel_cfg`'s
-    channel), re-read with the channel's parser, shows the call of signals
-    row `row`."""
+def read_post(post: sqlite3.Row, *, channel_cfg: _ChannelCfgLike) -> RouteResult:
+    """**How every relay rule reads a stored post** (group-3 leftover
+    G3L-3): `post` (a `messages` row of `channel_cfg`'s channel) re-read
+    with the channel's parser -- unless it is no longer stored as a signal
+    (`messages.kind`, which follows the post's latest version). A post
+    retracted by an edit that ADDED a retraction word ("CANCELLED", ledger
+    161; `edits_repo`) still parses as the same call -- the word changes
+    no level -- but is stored as 'skip': read here, it shows no call. So
+    are a post edited into chatter, a follow-up or broken text, and --
+    the safe side -- one whose stored kind another channel's parser would
+    disagree with. Every "does this post still show the call" question,
+    here and in `edits_repo`, goes through this (`post_shows_call`)."""
     routed = route(
         post["raw_text"],
         channel_cfg=channel_cfg,
         message_id=post["message_id"],
         posted_at_utc=datetime.fromisoformat(post["posted_at_utc"]),
     )
+    if routed.kind == "signal" and post["kind"] != "signal":
+        return RouteResult(
+            kind=post["kind"], detail=f"stored as {post['kind']}; it shows no call"
+        )
+    return routed
+
+
+def post_shows_call(
+    post: sqlite3.Row, row: sqlite3.Row, *, channel_cfg: _ChannelCfgLike
+) -> bool:
+    """Whether stored post `post` (a `messages` row of `channel_cfg`'s
+    channel), read as the relay rules read a post (`read_post`: a
+    retracted post shows no call), shows the call of signals row `row`."""
+    routed = read_post(post, channel_cfg=channel_cfg)
     return routed.kind == "signal" and shows_call(routed.signal, row)
 
 

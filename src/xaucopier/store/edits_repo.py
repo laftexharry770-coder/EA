@@ -39,6 +39,18 @@ which now follows the latest classification -- and then:
 - **Signal -> unparseable** (`parse_failed`) -- `INVALID` + CRITICAL alert.
 - **Signal -> chatter or a follow-up** -- the call is withdrawn: handled
   exactly like a deletion (below). The new follow-up is not dispatched.
+- **A retraction word added** (ledger 161) -- an edit that ADDS
+  "CANCELLED", "CANCELED", "CANCEL", "VOID" or "INVALID" (a whole word,
+  any case) that the stored text did not carry. The trade hash does not
+  change -- the levels are the same -- so this used to pass as cosmetic.
+  It is read as no signal ('skip', `_as_retraction`) and handled like an
+  edit into chatter: pending, VOIDED and withdrawn; executed, a CRITICAL
+  flag. The post is recorded as 'skip', so every relay rule that asks
+  whether a stored post still shows the call (`relay_repo.read_post`,
+  the one helper) sees it as showing none, though its text still parses
+  as the call. A later version that still carries the word stays a
+  retraction. (A retraction posted as a *reply* -- "signal cancelled" --
+  needs a follow-up op of its own: Plan 3.)
 - **Follow-up -> follow-up** -- updated in place (a worker reads it when it
   claims); WARNING if it had already been dispatched.
 - **Follow-up -> anything else** -- withdrawn: its queued rows are skipped.
@@ -214,6 +226,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass
 from collections.abc import Collection
@@ -283,6 +296,16 @@ WINDOW_READ_SUSPECT = "WINDOW_READ_SUSPECT"
 #: CRITICAL: one window re-read voided signals; the count and the ids.
 #: Raised by ingest/edits.py.
 WINDOW_VOIDED_SIGNALS = "WINDOW_VOIDED_SIGNALS"
+
+# -- retraction by edit (ledger 161) ------------------------------------------
+#: Words that, ADDED to a signal by an edit, withdraw it: whole words, any
+#: case ("CANCELLATION" and "INVALIDATED" are other words).
+RETRACTION_WORDS = ("CANCELLED", "CANCELED", "CANCEL", "VOID", "INVALID")
+_RETRACTION_WORD = re.compile(
+    r"\b(?:" + "|".join(RETRACTION_WORDS) + r")\b", re.IGNORECASE
+)
+#: `RouteResult.detail` of a version read as a retraction starts with this.
+_RETRACTION_DETAIL = "edited to add "
 
 # -- metrics ------------------------------------------------------------------
 EDIT_MISSED_BY_EVENTSTREAM_METRIC = "edit_missed_by_eventstream"
@@ -534,6 +557,11 @@ def reconcile(
     end here. `channel_cfg` is the message's channel (its parser re-reads
     a withdrawn call's standing repost, which may be promoted)."""
     _check_detector(detected_by)
+    retraction = _as_retraction(existing, text, route_result, channel_cfg=channel_cfg)
+    if retraction is not None:
+        # The poster added "CANCELLED" (or the like) to the signal: the
+        # call is withdrawn, as by an edit into chatter (ledger 161).
+        route_result, new_hash = retraction, content_hash_for(retraction, text)
     stored_kind = existing["kind"]
     channel_id = channel_cfg.channel_id
     ctx = _Ctx(
@@ -568,6 +596,60 @@ def reconcile(
             result, alert_ids=(*reversal, *result.alert_ids), reversed_deletion=True
         )
     return result
+
+
+def retraction_words(text: str) -> frozenset[str]:
+    """The retraction words (`RETRACTION_WORDS`) `text` carries, upper-cased."""
+    return frozenset(match.group(0).upper() for match in _RETRACTION_WORD.finditer(normalize(text)))
+
+
+def _as_retraction(
+    existing: sqlite3.Row,
+    text: str,
+    route_result: RouteResult,
+    *,
+    channel_cfg: _ChannelCfgLike,
+) -> RouteResult | None:
+    """A version that still parses as a signal but withdraws it (ledger
+    161): read as no signal ('skip'), or None. It withdraws it when it
+    ADDS a retraction word the stored text did not carry -- a template
+    that always says "setup invalid below 4460" is no retraction -- and a
+    post retracted so before (stored as no signal, its text still the
+    call) stays retracted while its text still carries one of those
+    words: a typo fixed afterwards is not the call posted again."""
+    if route_result.kind != "signal":
+        return None
+    words = retraction_words(text)
+    if not words:
+        return None
+    before = retraction_words(existing["raw_text"])
+    if existing["kind"] == "signal":
+        added = words - before
+    else:
+        stored = route(
+            existing["raw_text"],
+            channel_cfg=channel_cfg,
+            message_id=existing["message_id"],
+            posted_at_utc=datetime.fromisoformat(existing["posted_at_utc"]),
+        )
+        added = words & before if stored.kind == "signal" else frozenset()
+    if not added:
+        return None
+    return RouteResult(
+        kind="skip",
+        detail=f"{_RETRACTION_DETAIL}{', '.join(sorted(added))} (a retraction)",
+    )
+
+
+def _is_retraction(route_result: RouteResult) -> bool:
+    return route_result.kind == "skip" and route_result.detail.startswith(_RETRACTION_DETAIL)
+
+
+def _edited(route_result: RouteResult) -> str:
+    """How a post was edited, for an alert or a log line."""
+    if _is_retraction(route_result):
+        return route_result.detail
+    return f"edited into {route_result.kind}"
 
 
 def _reconcile_version(
@@ -843,7 +925,7 @@ def _edit_of_signal_row(ctx: _Ctx, row: sqlite3.Row, route_result: RouteResult) 
         return ctx.result("recorded", new_kind, "a post that had left the call")
     if not shows_now and _is_echo(ctx):
         # A forward of a post of the call that no longer stands (R4-1 a).
-        _log_echo(ctx, row, how=f"edited into {new_kind}")
+        _log_echo(ctx, row, how=_edited(route_result))
         return ctx.result("recorded", new_kind, "an echo of another post's removal")
     if new_kind == "signal":
         return _signal_to_signal(ctx, row, status, route_result.signal)
@@ -857,15 +939,19 @@ def _edit_of_signal_row(ctx: _Ctx, row: sqlite3.Row, route_result: RouteResult) 
             how="edited so it no longer reads as a signal",
             new_kind=new_kind,
         )
-    # skip or followup: the post no longer shows the call -- a deletion in
-    # all but name (R3-P1: the call is withdrawn only if it was the
-    # channel's last standing post of it).
+    # skip or followup -- or a retraction word added (ledger 161): the post
+    # no longer shows the call -- a deletion in all but name (R3-P1: the
+    # call is withdrawn only if it was the channel's last standing post).
     return _withdraw_post(
         ctx,
         row,
         status,
-        via=f"edited into {new_kind} ({_describe(route_result)})",
-        how=f"edited into {new_kind}",
+        via=(
+            _edited(route_result)
+            if _is_retraction(route_result)
+            else f"edited into {new_kind} ({_describe(route_result)})"
+        ),
+        how=_edited(route_result),
         pending_code=SIGNAL_RETRACTED_BY_EDIT,
         live_code=LIVE_SIGNAL_RETRACTED_BY_EDIT,
         new_kind=new_kind,
@@ -1289,13 +1375,11 @@ def _break_post(
 
 
 def _reread(ctx: _Ctx, post: sqlite3.Row) -> RouteResult:
-    """A stored post of `ctx`'s channel, re-read with the channel's parser."""
-    return route(
-        post["raw_text"],
-        channel_cfg=ctx.channel_cfg,
-        message_id=post["message_id"],
-        posted_at_utc=datetime.fromisoformat(post["posted_at_utc"]),
-    )
+    """A stored post of `ctx`'s channel, read as every relay rule reads a
+    post (`relay_repo.read_post`, G3L-3): re-read with the channel's
+    parser, and showing no call once it is no longer stored as a signal
+    -- a post retracted by an added "CANCELLED" included."""
+    return relay_repo.read_post(post, channel_cfg=ctx.channel_cfg)
 
 
 def _shows(route_result: RouteResult, row: sqlite3.Row) -> bool:
@@ -1351,12 +1435,7 @@ def post_left_live_call(
         return False
     if signal["state"] != "NEW" or signal["withdrawn_at_utc"] is not None:
         return False
-    routed = route(
-        post["raw_text"],
-        channel_cfg=channel_cfg,
-        message_id=message_id,
-        posted_at_utc=datetime.fromisoformat(post["posted_at_utc"]),
-    )
+    routed = relay_repo.read_post(post, channel_cfg=channel_cfg)
     return routed.kind == "signal" and not _shows(routed, signal)
 
 
@@ -2255,6 +2334,8 @@ def _live_clause(status: TradeStatus) -> str:
 
 
 def _describe(route_result: RouteResult) -> str:
+    if _is_retraction(route_result):
+        return route_result.detail
     if route_result.kind == "signal":
         s = route_result.signal
         tps = "/".join(f"{tp:g}" for tp in s.tps)

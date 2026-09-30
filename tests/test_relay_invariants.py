@@ -35,6 +35,13 @@ found").
 
 Seeds: the retraction families use 1000 * channels + n, the order
 family 5000 + n, for n in range(XAUCOPIER_FUZZ_SEEDS).
+
+**Retraction by an added "CANCELLED"** (ledger 161, group-3 leftover
+G3L-3). The cancel families add one more event -- a post by hand edited
+to append "CANCELLED", which withdraws it though its levels are the
+same -- and let the final withdrawal cancel a post too. They are families
+of their own (seeds 20000 + 1000 * channels + n and 26000 + n), so the
+scenarios the families above generate are exactly what they were.
 """
 from __future__ import annotations
 
@@ -72,6 +79,11 @@ EDITS = {
     "CHAT": CHATTER_TEXT,
     "BROKEN": UNPARSEABLE_EDIT,
 }
+#: What `_edit` draws from (the cancel families add CANCEL on their own).
+EDIT_LABELS = ("BUY", "SL", "SELL", "CHAT", "BROKEN")
+#: Appended by a cancel edit: the post's levels unchanged, the call
+#: withdrawn (ledger 161).
+CANCEL_SUFFIX = "\n\u274c CANCELLED"
 SHOWS_CALL = frozenset({SIGNAL_TEXT, SL_EDIT})
 READS_AS_SIGNAL = frozenset({SIGNAL_TEXT, SL_EDIT, DIRECTION_EDIT})
 
@@ -187,13 +199,14 @@ class _World:
     def edit(self, key: tuple[int, int], label: str, *, by: str = "event") -> None:
         post = self.posts[key]
         at = self.tick()
+        text = post.text + CANCEL_SUFFIX if label == "CANCEL" else EDITS[label]
         edits_repo.apply_edit(
-            self.conn, channel_cfg=CHANNELS[key[0]], message_id=key[1], text=EDITS[label],
+            self.conn, channel_cfg=CHANNELS[key[0]], message_id=key[1], text=text,
             posted_at_utc=post.posted, edit_date_utc=at, reply_to_message_id=None,
             now_utc=at, accounts=ACCOUNTS, detected_by=by,
         )
         self.conn.commit()
-        post.text, post.edited_at = EDITS[label], at
+        post.text, post.edited_at = text, at
         self.log.append(f"edit {self.name(key)} -> {label} ({by})")
 
     def read_back(self, key: tuple[int, int]) -> None:
@@ -264,7 +277,7 @@ def _edit(world: _World, rng: random.Random) -> None:
     if not hands:
         return
     key = rng.choice(hands)
-    label = rng.choice(list(EDITS))
+    label = rng.choice(EDIT_LABELS)
     if EDITS[label] == world.posts[key].text:
         return
     world.edit(key, label, by=rng.choice(["event", "event", "window"]))
@@ -288,10 +301,21 @@ def _reply(world: _World, rng: random.Random) -> None:
     world.log.append(f"reply {world.name((target[0], post.message_id))} -> {world.name(target)}")
 
 
-def _withdraw_everything(world: _World, rng: random.Random) -> None:
+def _cancel(world: _World, rng: random.Random) -> None:
+    """A post by hand that shows the call gets "CANCELLED" appended."""
+    hands = [
+        k for k in world.standing()
+        if world.posts[k].forwarded is None and world.posts[k].text in SHOWS_CALL
+    ]
+    if hands:
+        world.edit(rng.choice(hands), "CANCEL", by=rng.choice(["event", "event", "window"]))
+
+
+def _withdraw_everything(world: _World, rng: random.Random, *, cancel: bool = False) -> None:
     """Every post still showing the call is withdrawn -- deleted, or (a
-    post by hand) edited into chatter or re-aimed -- one at a time, in a
-    random order; the rest are deleted or left as they are."""
+    post by hand) edited into chatter or re-aimed, or with `cancel` given
+    "CANCELLED" -- one at a time, in a random order; the rest are deleted
+    or left as they are."""
     rest = world.standing()
     rng.shuffle(rest)
     for key in rest:
@@ -299,7 +323,7 @@ def _withdraw_everything(world: _World, rng: random.Random) -> None:
         if post.text not in SHOWS_CALL and rng.random() < 0.5:
             continue  # shows no call: may stay
         if post.forwarded is None and post.text in SHOWS_CALL and rng.random() < 0.4:
-            world.edit(key, rng.choice(["CHAT", "SELL"]))
+            world.edit(key, rng.choice(["CHAT", "SELL", "CANCEL"] if cancel else ["CHAT", "SELL"]))
         else:
             world.delete([key], by=rng.choice(["event", "event", "window"]))
 
@@ -404,7 +428,9 @@ def _what(conn, signal_id: int | None, live: set[int]) -> str | None:
 # -- the families ------------------------------------------------------------
 
 
-def _retraction_run(seed: int, events: list[tuple], channels: int) -> tuple[list[str], list[str]]:
+def _retraction_run(
+    seed: int, events: list[tuple], channels: int, *, cancel: bool = False
+) -> tuple[list[str], list[str]]:
     """One retraction scenario: the VIP's call, the events, then every
     post withdrawn. Returns (problems, log)."""
     world = _World(_fresh())
@@ -425,9 +451,11 @@ def _retraction_run(seed: int, events: list[tuple], channels: int) -> tuple[list
                 world.execute()
             elif op == "read back":
                 _read_back(world, rng)
+            elif op == "cancel":
+                _cancel(world, rng)
             if problems := _no_double_trade(world.conn):
                 return problems, world.log
-        _withdraw_everything(world, random.Random(seed))
+        _withdraw_everything(world, random.Random(seed), cancel=cancel)
         return _no_double_trade(world.conn) + _retracted(world.conn), world.log
     except Exception as exc:  # noqa: BLE001 -- reported with the seed and the events
         return [_crash(exc)], world.log
@@ -435,13 +463,15 @@ def _retraction_run(seed: int, events: list[tuple], channels: int) -> tuple[list
         world.conn.close()
 
 
-def _retraction_events(rng: random.Random) -> list[tuple]:
+def _retraction_events(rng: random.Random, *, cancel: bool = False) -> list[tuple]:
     ops = ["post", "post", "forward", "forward", "forward", "delete", "delete", "edit",
-           "execute", "read back"]
+           "execute", "read back"] + (["cancel", "cancel"] if cancel else [])
     return [(rng.choice(ops), rng.randrange(2**32)) for _ in range(rng.randint(2, 9))]
 
 
-def _order_run(order: str, forwards: bool, events: list[tuple], seed: int) -> tuple[list, list]:
+def _order_run(
+    order: str, forwards: bool, events: list[tuple], seed: int, *, cancel: bool = False
+) -> tuple[list, list]:
     """One order scenario: V/4001 and the relay's R/7001 (a forward of
     it, or by hand) stored in `order`, then the events, then every post
     withdrawn. Returns (the outcome after each step, log); an outcome is
@@ -474,10 +504,12 @@ def _order_run(order: str, forwards: bool, events: list[tuple], seed: int) -> tu
                 _reply(world, rng)
             elif op == "read back":
                 _read_back(world, rng)
+            elif op == "cancel":
+                _cancel(world, rng)
             if problems := _no_double_trade(world.conn):
                 return [problems], world.log
             outcomes.append(_outcome(world))
-        _withdraw_everything(world, random.Random(seed))
+        _withdraw_everything(world, random.Random(seed), cancel=cancel)
         if problems := _no_double_trade(world.conn) + _retracted(world.conn):
             return [problems], world.log
         outcomes.append(_outcome(world))
@@ -488,17 +520,19 @@ def _order_run(order: str, forwards: bool, events: list[tuple], seed: int) -> tu
         world.conn.close()
 
 
-def _order_events(rng: random.Random) -> tuple[bool, list[tuple]]:
+def _order_events(rng: random.Random, *, cancel: bool = False) -> tuple[bool, list[tuple]]:
     ops = ["post", "forward", "delete", "delete", "delete", "edit", "edit", "execute", "reply",
-           "reply", "read back"]
+           "reply", "read back"] + (["cancel", "cancel"] if cancel else [])
     return rng.random() < 0.5, [
         (rng.choice(ops), rng.randrange(2**32)) for _ in range(rng.randint(2, 8))
     ]
 
 
-def _order_problems(seed: int, forwards: bool, events: list[tuple]) -> tuple[list[str], list[str]]:
-    first, log = _order_run("vip-first", forwards, events, seed)
-    second, _ = _order_run("relay-first", forwards, events, seed)
+def _order_problems(
+    seed: int, forwards: bool, events: list[tuple], *, cancel: bool = False
+) -> tuple[list[str], list[str]]:
+    first, log = _order_run("vip-first", forwards, events, seed, cancel=cancel)
+    second, _ = _order_run("relay-first", forwards, events, seed, cancel=cancel)
     for order, outcomes in (("vip-first", first), ("relay-first", second)):
         if outcomes and isinstance(outcomes[-1], list):
             return [f"{order}: {problem}" for problem in outcomes[-1]], log
@@ -571,4 +605,41 @@ def test_which_post_is_stored_first_never_changes_what_is_traded(seeds):
             small = _shrink(lambda e: bool(_order_problems(base, forwards, e)[0]), events)
             problems, log = _order_problems(base, forwards, small)
             failures.append(_report("order", base, problems, log))
+    assert not failures, "\n\n".join(failures)
+
+
+@pytest.mark.parametrize("seeds", _blocks(), ids=lambda r: f"seeds{r.start}-{r.stop - 1}")
+@pytest.mark.parametrize("channels", [1, 2], ids=["one-channel", "two-channels"])
+def test_a_call_whose_posts_are_cancelled_or_withdrawn_is_never_traded(channels, seeds):
+    """INV-1 and INV-3 with "CANCELLED" appended to posts by hand, as an
+    event and as a way the final withdrawal takes a post (ledger 161,
+    G3L-3): a cancelled post never keeps a call standing."""
+    failures = []
+    for seed in seeds:
+        base = 20000 + 1000 * channels + seed
+        events = _retraction_events(random.Random(base), cancel=True)
+        problems, log = _retraction_run(base, events, channels, cancel=True)
+        if problems:
+            small = _shrink(
+                lambda e: bool(_retraction_run(base, e, channels, cancel=True)[0]), events
+            )
+            problems, log = _retraction_run(base, small, channels, cancel=True)
+            failures.append(_report(f"cancel ({channels} channel(s))", base, problems, log))
+    assert not failures, "\n\n".join(failures)
+
+
+@pytest.mark.parametrize("seeds", _blocks(), ids=lambda r: f"seeds{r.start}-{r.stop - 1}")
+def test_which_post_is_stored_first_never_changes_what_a_cancel_does(seeds):
+    """INV-2 (and INV-1, INV-3) with cancel edits among the events."""
+    failures = []
+    for seed in seeds:
+        base = 26000 + seed
+        forwards, events = _order_events(random.Random(base), cancel=True)
+        problems, log = _order_problems(base, forwards, events, cancel=True)
+        if problems:
+            small = _shrink(
+                lambda e: bool(_order_problems(base, forwards, e, cancel=True)[0]), events
+            )
+            problems, log = _order_problems(base, forwards, small, cancel=True)
+            failures.append(_report("order with cancels", base, problems, log))
     assert not failures, "\n\n".join(failures)
