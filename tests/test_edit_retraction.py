@@ -329,3 +329,45 @@ def test_chatter_that_mentioned_a_cancel_edited_into_a_signal_is_no_retraction(c
     result = _one(conn, chatter, edit_to=SIGNAL_TEXT + "\n" + chatter)
     assert result.outcome == "reclassified"
     assert _q(conn, "SELECT kind FROM messages") == [("signal",)]
+
+
+@pytest.mark.parametrize("named_first", [4001, 4002], ids=["cancelled-first", "repeat-first"])
+def test_a_cancelled_holder_deleted_with_its_repeat_is_not_the_post_that_withdrew_the_call(
+    conn, named_first: int  # noqa: F811
+) -> None:
+    """G3L-3 where no SQL filter guards the re-read (`_holder_speaks`). The
+    call was executed; its own message 4001 was cancelled while the repeat
+    4002 stood (a repeat removal: the trade continues). Then one report
+    deletes both. The call's last standing post is the repeat, so the
+    repeat's deletion is what withdraws it -- a CRITICAL flag naming 4002,
+    recorded as the post that withdrew it -- whichever post the report
+    names first. Read by its text alone, the cancelled 4001 would still
+    'show the call', and its deletion would be taken as the withdrawal."""
+    for message_id, after in ((4001, 0), (4002, 60)):
+        ingest(
+            conn, channel_cfg=VIP, message_id=message_id, text=SIGNAL_TEXT,
+            posted_at_utc=POSTED + timedelta(seconds=after), edit_date_utc=None,
+            reply_to_message_id=None, source="live",
+            now_utc=POSTED + timedelta(seconds=after + 1), accounts=ACCOUNTS,
+        )
+        conn.commit()
+    conn.execute("UPDATE outbox SET state = 'DONE' WHERE account_id = 'acct-1'")
+    conn.commit()
+    _edit_to(conn, 4001, CANCELLED, POSTED + timedelta(minutes=3))
+    assert [c for (c,) in _q(conn, "SELECT code FROM alerts")] == [
+        edits_repo.SIGNAL_REPEAT_REMOVED
+    ]
+    for message_id in (named_first, 4001 + 4002 - named_first):
+        edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=message_id, now_utc=POSTED + timedelta(minutes=4),
+            accounts=ACCOUNTS, detected_by="event", also_deleted=frozenset({4001, 4002}),
+        )
+        conn.commit()
+    assert _claimable(conn) == []
+    assert _q(
+        conn, "SELECT signal_id, withdrawn_at_utc IS NOT NULL, closed_by_message_id FROM signals"
+    ) == [(1, 1, 4002)]
+    assert _q(conn, "SELECT level, code, message_id FROM alerts ORDER BY alert_id") == [
+        ("WARNING", edits_repo.SIGNAL_REPEAT_REMOVED, 4001),
+        ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED, 4002),
+    ]
