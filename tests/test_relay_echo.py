@@ -26,6 +26,7 @@ orders:
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from datetime import timedelta
@@ -78,6 +79,7 @@ from test_relay_order import (
     _take_entry,
     _the_vip_manages_the_trade,
 )
+from xaucopier.parsing.router import route
 from xaucopier.store import edits_repo, relay_repo
 
 CANCELLED = "CANCELLED - do not take this one"
@@ -1608,6 +1610,10 @@ def test_a_relay_deleting_every_post_at_once_withdraws_the_call_though_one_is_an
 # == Round 5 (ruling R5-5): "trade it by hand" never while the call is queued ==
 
 _DO_NOT = "do NOT trade it by hand as well"
+#: A held-back copy re-aimed into a SELL says so, and which call is meant
+#: (ruling R6-4).
+_READS_SELL = "This copy itself reads as SELL 4480-4485, not signal 1's BUY 4480-4485."
+_TRADE_THE_BUY = "If signal 1's BUY 4480-4485 is still meant, trade it by hand."
 
 
 def test_a_held_back_forward_of_a_re_aimed_post_names_the_call_queued_in_its_place(
@@ -1629,7 +1635,8 @@ def test_a_held_back_forward_of_a_re_aimed_post_names_the_call_queued_in_its_pla
     assert "signal 2" in detail and f"message {REPOST}" in detail, detail
     assert _DO_NOT in detail, detail
     assert "trade it by hand." not in detail.replace(_DO_NOT, ""), detail
-    assert "SELL 4480-4485" in detail, detail
+    assert _READS_SELL in detail, detail
+    assert "The same call, BUY 4480-4485, is signal 2" in detail, detail
 
 
 def test_a_held_back_copy_of_a_call_nobody_posted_again_still_says_trade_it_by_hand(
@@ -1778,7 +1785,8 @@ def test_a_held_back_forward_of_a_re_aimed_post_names_no_withdrawn_signal(
 
     assert _link(conn, RELAY, COPY) == 1
     detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
-    assert detail.endswith("If the call is still meant, trade it by hand."), detail
+    assert _READS_SELL in detail, detail
+    assert detail.endswith(_TRADE_THE_BUY), detail
     assert _DO_NOT not in detail and "signal 2" not in detail, detail
 
 
@@ -2061,3 +2069,63 @@ def test_a_held_back_forward_of_a_re_aimed_post_names_the_call_traded_in_its_pla
     assert "The same call" in detail and "signal 2 (message 4012" in detail, detail
     assert "trade status executed" in detail and _DO_NOT in detail, detail
     assert "trade it by hand." not in detail.replace(_DO_NOT, ""), detail
+
+
+# == Round 6 (ruling R6-4): a held-back copy that shows another call ===========
+
+
+@pytest.mark.parametrize("executed", [False, True], ids=["pending", "executed"])
+def test_a_channels_bump_of_its_re_aimed_post_says_which_call_it_withdrew(
+    conn, executed  # noqa: F811
+):
+    """r5_bump_reaimed, one channel: the VIP re-aims its BUY 4480-4485 into
+    a SELL (signal 1 INVALID, or flagged when it was traded), then forwards
+    its own post -- now a SELL -- as V/4002. The bump repeats signal 1 and
+    is held back with a CRITICAL. Its text reads as SELL: the alert must
+    say so and say that the call it means is signal 1's BUY, so the user
+    does not trade the retracted BUY by mistake for what the bump shows."""
+    _ingest(conn, VIP, CALL)
+    if executed:
+        _take_entry(conn, 1)
+    _edit(conn, VIP, CALL, DIRECTION_EDIT, EDIT_1)
+    conn.commit()
+
+    bump = _ingest(
+        conn, VIP, BUMP, DIRECTION_EDIT, posted=POSTED + timedelta(minutes=6), fwd=(V, CALL)
+    )
+
+    assert (bump.outcome, bump.relay_of_signal_id) == ("relay_duplicate", 1)
+    assert _entries_claimable(conn) == []
+    if not executed:
+        detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+        assert _READS_SELL in detail, detail
+        assert detail.endswith(_TRADE_THE_BUY), detail
+    else:  # a traded call's copy is no copy of a withdrawn call: no alert
+        assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL not in [code for _, code in _codes(conn)]
+
+
+def test_a_held_back_copy_showing_the_call_names_no_other_call(conn):  # noqa: F811
+    """The control: a held-back copy that shows the withdrawn call itself
+    says nothing about what it reads as, and the advice is unchanged."""
+    _ingest(conn, VIP, CALL)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    _ingest(conn, OTHER, 8001, posted=POSTED + timedelta(minutes=2))
+
+    detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert "reads as" not in detail, detail
+    assert detail.endswith("one source withdrew the call. If the call is still meant, trade it by hand.")
+
+
+def test_a_copy_on_another_symbol_names_both_symbols(conn):  # noqa: F811
+    """Side by side, a copy's call and the call meant carry their symbols
+    when these differ (one parser reads XAUUSD only today; another may
+    not): never "BUY 4480-4485, not signal 1's BUY 4480-4485"."""
+    _ingest(conn, VIP, CALL)
+    (row,) = conn.execute("SELECT * FROM signals WHERE signal_id = 1").fetchall()
+    signal = route(SIGNAL_TEXT, channel_cfg=VIP, message_id=CALL, posted_at_utc=POSTED).signal
+
+    assert relay_repo._describe_both(signal, row) == ("BUY 4480-4485", "BUY 4480-4485")
+    silver = dataclasses.replace(signal, symbol_alias="XAGUSD")
+    assert relay_repo._describe_both(silver, row) == (
+        "XAGUSD BUY 4480-4485", "XAUUSD BUY 4480-4485"
+    )

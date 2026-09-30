@@ -893,19 +893,27 @@ def carrier_of(
     return live_same_call(conn, call, around=around, window=window, besides=besides)
 
 
-def by_hand(conn: sqlite3.Connection, *, advice: str, carrier: sqlite3.Row | None) -> str:
+def by_hand(
+    conn: sqlite3.Connection,
+    *,
+    advice: str,
+    carrier: sqlite3.Row | None,
+    described: str | None = None,
+) -> str:
     """The closing advice of an alert that would tell the user to trade a
     call by hand (ruling R5-5): `advice` -- unless the same call is live,
     queued or traded as another signal, `carrier` (`carrier_of`), when
     trading it by hand as well would open it twice: the advice then names
     that signal and says NOT to trade the call by hand as well. Every
-    "trade it by hand" goes through here."""
+    "trade it by hand" goes through here. `described`: the call meant, as
+    `describe_call` says it, when the alert also names another call."""
     if carrier is None:
         return advice
     status = signals_repo.trade_status(conn, signal_id=carrier["signal_id"])
     state = carrier["state"] + (", withdrawn" if carrier["withdrawn_at_utc"] else "")
+    same = "The same call" if described is None else f"The same call, {described},"
     return (
-        f"The same call is signal {carrier['signal_id']} (message {carrier['message_id']} on "
+        f"{same} is signal {carrier['signal_id']} (message {carrier['message_id']} on "
         f"channel {carrier['channel_id']}; it is {state}, trade status {status}): "
         "do NOT trade it by hand as well -- that would open the trade twice."
     )
@@ -914,6 +922,21 @@ def by_hand(conn: sqlite3.Connection, *, advice: str, carrier: sqlite3.Row | Non
 def describe_call(signal: Signal) -> str:
     """A signal's call, for an alert: side and entry zone."""
     return f"{signal.side.value.upper()} {signal.zone.lo:g}-{signal.zone.hi:g}"
+
+
+def _describe_both(signal: Signal, row: sqlite3.Row) -> tuple[str, str]:
+    """A parse's call and a `signals` row's, for an alert that sets them
+    side by side: side and entry zone (`describe_call`), and the symbol
+    too when the two differ."""
+    parsed = json.loads(row["parsed_json"])
+    zone = parsed["zone"]
+    stored = f"{parsed['side'].upper()} {zone['lo']:g}-{zone['hi']:g}"
+    if parsed["symbol_alias"] == signal.symbol_alias:
+        return describe_call(signal), stored
+    return (
+        f"{signal.symbol_alias} {describe_call(signal)}",
+        f"{parsed['symbol_alias']} {stored}",
+    )
 
 
 def is_withdrawn_unexecuted(conn: sqlite3.Connection, signal: sqlite3.Row) -> bool:
@@ -1054,11 +1077,13 @@ def record_signal_copy(
     """Store that (`channel_id`, `message_id`) -- already on `messages` --
     repeats `match`'s signal: the link, the INFO line, the counter, and
     for a copy of a withdrawn call the CRITICAL alert. `signal` is the
-    copy's own parse: when another signal carries the withdrawn call now
+    copy's own parse. When another signal carries the withdrawn call now
     (`carrier_of`: through the call's chain, or posted within
     `relay_window_seconds` of the copy or of the post it repeats), the
-    alert says so (`by_hand`) and, if the copy shows another call than
-    that one, what it shows. Returns the ids of the alerts raised."""
+    alert says so (`by_hand`). When the copy reads as another call than
+    the withdrawn signal's -- a forward of a re-aimed post -- the alert
+    says what it reads as and names the call it means, carrier or not
+    (ruling R6-4). Returns the ids of the alerts raised."""
     conn.execute(
         "UPDATE messages SET relay_of_signal_id = ? WHERE channel_id = ? AND message_id = ?",
         (match.signal_id, channel_id, message_id),
@@ -1092,12 +1117,23 @@ def record_signal_copy(
         ),
         window=relay_window_seconds,
     )
-    advice = by_hand(conn, advice="If the call is still meant, trade it by hand.", carrier=carrier)
-    if carrier is not None and signal is not None and not shows_call(signal, carrier):
-        advice += (
-            f" This copy itself reads as {describe_call(signal)}, which is not the call "
-            f"signal {carrier['signal_id']} carries."
-        )
+    withdrawn = _signal_row(conn, match.signal_id)
+    reads, meant = "", None
+    if signal is not None and not shows_call(signal, withdrawn):
+        # The copy shows another call (a forward of a re-aimed post): say so,
+        # and which call "the call" is -- signal N's (ruling R6-4).
+        shown, meant = _describe_both(signal, withdrawn)
+        reads = f" This copy itself reads as {shown}, not signal {match.signal_id}'s {meant}."
+    advice = by_hand(
+        conn,
+        advice=(
+            "If the call is still meant, trade it by hand."
+            if meant is None
+            else f"If signal {match.signal_id}'s {meant} is still meant, trade it by hand."
+        ),
+        carrier=carrier,
+        described=meant,
+    )
     alert_id = alerts.record(
         conn,
         now_utc=now_utc,
@@ -1110,7 +1146,7 @@ def record_signal_copy(
             f"message {message_id} on channel {channel_id} repeats signal {match.signal_id} "
             f"(message {match.message_id} on channel {match.channel_id}), which was "
             f"withdrawn{by} before anything was executed (it is {match.state}). This copy "
-            f"was not traded either: one source withdrew the call. {advice}"
+            f"was not traded either: one source withdrew the call.{reads} {advice}"
         ),
     )
     return (alert_id,)
