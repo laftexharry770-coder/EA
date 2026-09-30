@@ -86,13 +86,20 @@ from xaucopier.store import db, report
 _CMD = paths.USER_COMMAND
 #: What each registered parser reads, in the user's words.
 PARSER_LAYOUTS: dict[str, str] = {"mmh": "the MARKET MASTERY HUB message layout"}
-#: Told whenever a channel is added or described: a new channel is only
-#: recorded, not traded, unless its posts look like MARKET MASTERY HUB's.
+#: Told whenever a channel is added: what the one parser reads, and what
+#: happens to everything else it posts -- exactly what ingest does (final
+#: review F07, group-4 leftover G4L-1): a signal in another layout is
+#: recorded, never traded; an instruction for an open trade is recorded as
+#: one, whatever the layout; unreadable signals in a row raise an alert.
 FORMAT_CAVEAT = (
-    "The only parser built so far, mmh, understands only the MARKET MASTERY HUB "
-    "message layout. A channel that writes its signals differently will have its "
-    "messages recorded, but nothing will be traded from it until a parser is built "
-    "for it from 5-10 of its real messages."
+    "The only parser built so far, mmh, only reads trade signals written in the MARKET "
+    "MASTERY HUB layout. From this channel, a signal written any other way is recorded "
+    "but NOT traded, until a parser is built for it from 5-10 of its real messages. A "
+    "message that reads like an instruction for a trade already open (for example "
+    "'close all' or 'move SL to entry') is recorded as an instruction, whatever its "
+    f"layout. When 3 messages in a row look like signals but cannot be read, `{_CMD} "
+    "status` shows a TEMPLATE_CHANGED_SUSPECTED alert: the channel changed its layout, or "
+    "it writes some calls in a layout this program does not read."
 )
 #: What to say while `watch` runs: it reads the list only when it starts.
 WATCH_RUNNING_NOTE = (

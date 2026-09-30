@@ -632,3 +632,19 @@ def test_an_edit_keeps_the_signals_original_source(conn):
         conn.execute("SELECT parsed_json FROM signals").fetchone()["parsed_json"]
     )["sl"] == 4460.0
     assert _parsed_source(conn) == "poll"
+
+
+def test_the_template_alert_also_covers_a_channel_that_never_used_the_layout(conn):
+    """Group-4 review leftover G4L-1: "the channel has probably changed how it
+    writes its signals" misleads on a channel that never used the MMH
+    layout, and on a group where members post their own calls."""
+    for n, text in enumerate([NO_PIPE_TEXT, BROKEN_TEXT, NO_PIPE_TEXT], start=1):
+        _ingest(conn, message_id=9100 + n, text=text)
+    conn.commit()
+    (detail,) = conn.execute(
+        "SELECT detail FROM alerts WHERE code = ?", (messages_repo.TEMPLATE_CHANGED_SUSPECTED,)
+    ).fetchone()
+    assert "changed how it writes its signals" in detail
+    assert "or this channel writes some calls in a layout this program does not read" in detail
+    assert "group" in detail
+    assert "NOT traded" in detail

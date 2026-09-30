@@ -459,9 +459,12 @@ def _template_changed(
         detail=(
             f"{TEMPLATE_CHANGE_STREAK} messages in a row on {named} looked like trade signals "
             f"but could not be read (the latest, message {message_id}: {route_result.detail}). "
-            "The channel has probably changed how it writes its signals: signals written the "
-            "new way are NOT traded until this program is updated to read them. Look at the "
-            "channel. This alert is raised once; a signal read normally again ends it."
+            "Either the channel has changed how it writes its signals, or this channel writes "
+            "some calls in a layout this program does not read -- a channel that never used "
+            "the MARKET MASTERY HUB layout, or a group whose members post calls of their own. "
+            "Signals written that way are NOT traded until this program is updated to read "
+            "them. Look at the channel. This alert is raised once; a signal read normally "
+            "again ends it."
         ),
     )
 

@@ -695,9 +695,19 @@ def test_add_appends_the_channel_as_the_next_number_keeping_every_byte(
     assert add_rig.client.calls[0] == "connect" and add_rig.client.calls[-1] == "disconnect"
     assert add_rig.lock.acquired == add_rig.lock.released == 1
     out = capsys.readouterr().out
-    assert "The only parser built so far, mmh, understands only the MARKET MASTERY HUB" in out
-    assert "nothing will be traded from it until a parser is built" in out
-    assert "5-10 of its real messages" in out
+    # Final review F07: what the caveat says must be true of what ingest does.
+    caveat = channels_module.FORMAT_CAVEAT
+    assert f"PLEASE NOTE: {caveat}" in out
+    assert "only reads trade signals written in the MARKET MASTERY HUB layout" in caveat
+    assert "written any other way is recorded but NOT traded" in caveat
+    assert "5-10 of its real messages" in caveat
+    # A message that reads as an instruction is recorded as one (and queued),
+    # whatever the layout -- never "nothing" from this channel.
+    assert "recorded as an instruction" in caveat and "close all" in caveat
+    assert "nothing will be traded from it" not in caveat
+    # A layout it cannot read is loud: the alert, by name, and what it means.
+    assert "TEMPLATE_CHANGED_SUSPECTED" in caveat and "alert" in caveat
+    assert "writes some calls in a layout this program does not read" in caveat
     assert "is now channel 8, switched ON" in out
     assert "`.\\xaucopier channels off 8`" in out
 
