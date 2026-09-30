@@ -100,6 +100,16 @@ T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
+#: The `LogRecord` attribute that marks a log line for the log file only:
+#: technical detail the watch window does not show (group-2 review
+#: leftover G2L-2) -- why watch stopped in a developer's words, a
+#: traceback. `watch`'s window handler drops such lines whenever it also
+#: writes a log file; the log-file handler keeps them. Defined here, the
+#: lowest module the store, ingest and the CLI all use.
+FILE_ONLY_ATTRIBUTE = "xaucopier_file_only"
+#: `extra=` for such a line: `logger.error("...", extra=LOG_FILE_ONLY)`.
+LOG_FILE_ONLY: dict[str, object] = {FILE_ONLY_ATTRIBUTE: True}
+
 
 def connect(path: Path, *, role: Role) -> sqlite3.Connection:
     """Open a connection to the store at `path`, configured for `role`.
@@ -420,6 +430,8 @@ class Writer:
     ) -> None:
         """The thread is ending abnormally. Fail the job it was running,
         every job still queued, and (via `_death`) every later submit()."""
+        # Technical, so the log file only: the watch window says the stop
+        # that follows in plain words (G2L-2).
         logger.critical(
             "xaucopier writer thread for %s died (%s: %s); every pending and "
             "future write will fail with WriterDeadError",
@@ -427,6 +439,7 @@ class Writer:
             type(exc).__name__,
             exc,
             exc_info=exc,
+            extra=LOG_FILE_ONLY,
         )
         orphans: list[concurrent.futures.Future] = []
         with self._lifecycle_lock:

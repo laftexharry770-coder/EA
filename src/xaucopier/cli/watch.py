@@ -262,14 +262,23 @@ async def run_watch(client: object, setup: WatchSetup) -> int:
     return await run_listener(listener)
 
 
+def _for_the_window(record: logging.LogRecord) -> bool:
+    """False for a line meant for the log file only (`LOG_FILE_ONLY`)."""
+    return not getattr(record, db.FILE_ONLY_ATTRIBUTE, False)
+
+
 def start_logging(log_path: Path) -> Callable[[], None]:
     """Log INFO and above to the console and to `log_path` (rotating), in
-    UTC. Returns the function that undoes it."""
+    UTC. Returns the function that undoes it. A line marked
+    `LOG_FILE_ONLY` -- technical detail, such as why watch stopped in a
+    developer's words -- goes to the log file only; with no log file it
+    shows in the window rather than nowhere (G2L-2)."""
     root = logging.getLogger()
     previous_level = root.level
     formatter = logging.Formatter("%(asctime)s UTC %(levelname)-8s %(name)s: %(message)s")
     formatter.converter = time.gmtime
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    window = logging.StreamHandler(sys.stderr)
+    handlers: list[logging.Handler] = [window]
     try:
         handlers.append(
             logging.handlers.RotatingFileHandler(
@@ -279,6 +288,8 @@ def start_logging(log_path: Path) -> Callable[[], None]:
     except OSError as exc:
         print(f"warning: cannot write the log file {log_path} ({exc}); logging to this window only",
               file=sys.stderr)
+    else:
+        window.addFilter(_for_the_window)
     for handler in handlers:
         handler.setFormatter(formatter)
         root.addHandler(handler)
@@ -323,7 +334,13 @@ def _run(setup: WatchSetup, blob: SecretsBlob) -> int:
     except KeyboardInterrupt:
         return exit_codes.EXIT_INTERRUPTED
     except Exception:  # noqa: BLE001 -- anything else is "stopped, restart me"
-        logger.exception("watch stopped on an unexpected error")
+        # One plain line for the window, the traceback for the log file (G2L-2).
+        logger.error(
+            "watch stopped on a problem this program did not expect. The details are in "
+            "%s.",
+            paths.LOG_FILE_NAME,
+        )
+        logger.exception("watch stopped on an unexpected error", extra=db.LOG_FILE_ONLY)
         return exit_codes.EXIT_LISTENER_STOPPED
 
 

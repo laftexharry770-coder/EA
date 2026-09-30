@@ -337,11 +337,35 @@ def _stored_pointer(conn: Connection, channel_id: int) -> int:
     return int(row[0]) if row is not None else 0
 
 
+#: `extra=` for a log line meant for the log file only (G2L-2; defined in
+#: `store.db`, which the store uses too).
+LOG_FILE_ONLY = db.LOG_FILE_ONLY
+
+#: What the window says for a stop no one gave plainer words to.
+UNEXPLAINED_STOP = (
+    "watch stopped on a problem this program did not expect; the details are in "
+    "the log file."
+)
+#: What the window says when the 5-second check stopped.
+_CHECK_STOPPED = (
+    "The 5-second check of the channels stopped, so posts that Telegram's live feed "
+    "drops would have been missed."
+)
+
+
 class ListenerStopped(RuntimeError):
     """The listener is not receiving Telegram updates: it stopped, or it
     never got going. Whether that happened cleanly or not, for a
     supervisor it is never a success -- `run_listener()` turns it into
-    `EXIT_LISTENER_STOPPED` ("restart me")."""
+    `EXIT_LISTENER_STOPPED` ("restart me").
+
+    `plain` is what the watch window says: why watch stopped, in the
+    user's words. The message itself is the technical detail, which goes
+    to the log file only (G2L-2)."""
+
+    def __init__(self, message: str, *, plain: str | None = None) -> None:
+        super().__init__(message)
+        self.plain = plain if plain is not None else UNEXPLAINED_STOP
 
 
 class ListenerStartupError(ListenerStopped):
@@ -960,10 +984,13 @@ class Listener:
     def _writer_died(self, exc: db.WriterDeadError) -> None:
         if self._writer_death is None or self._writer_death.done():
             return
+        # Technical, so the log file only: the stop that follows says it
+        # plainly in the window (G2L-2).
         logger.critical(
             "the writer thread is dead (%s); nothing can be stored, so the "
             "listener is stopping for its supervisor to restart it",
             exc,
+            extra=LOG_FILE_ONLY,
         )
         # A result, not an exception: nothing is lost if no one ever
         # awaits it, and wait_until_stopped() chains it as the cause.
@@ -1575,10 +1602,11 @@ class Listener:
             telegram_clock = await self._read_telegram_clock()
             dialogs = await client_module.telegram_within(self.client.get_dialogs(), timeout)  # 2
         except client_module.TelegramUnreachableError as exc:
-            raise ListenerStartupError(
+            message = (
                 f"{exc} watch stops now (exit code 4); start it again once this "
                 "computer is back online."
-            ) from exc
+            )
+            raise ListenerStartupError(message, plain=message) from exc
         self._name_sources(dialogs)
         self._started_at = self._decide_start(local_start, telegram_clock)
         await self._store_seed_cutoffs()
@@ -1605,12 +1633,20 @@ class Listener:
         except TimeoutError as exc:
             raise ListenerStartupError(
                 f"the writer thread did not connect to {self.db_path} within "
-                f"{self._writer_ready_timeout:g}s; refusing to listen without it"
+                f"{self._writer_ready_timeout:g}s; refusing to listen without it",
+                plain=(
+                    f"Could not open the database {self.db_path} within "
+                    f"{self._writer_ready_timeout:g} seconds, so nothing could be recorded."
+                ),
             ) from exc
         except Exception as exc:  # noqa: BLE001 -- any probe failure means no writer
             raise ListenerStartupError(
                 f"the writer thread could not connect to {self.db_path}: "
-                f"{type(exc).__name__}: {exc}"
+                f"{type(exc).__name__}: {exc}",
+                plain=(
+                    f"Could not open the database {self.db_path} ({type(exc).__name__}), "
+                    "so nothing could be recorded."
+                ),
             ) from exc
 
     async def _skip_entries_of_channels_off(self) -> None:
@@ -1999,14 +2035,16 @@ class Listener:
             raise ListenerStopped(
                 "run_until_disconnected() returned: the listener is no longer "
                 "receiving Telegram updates. A listener that has stopped "
-                "listening is never a successful exit."
+                "listening is never a successful exit.",
+                plain="The connection to Telegram ended, so new posts could no longer arrive.",
             )
 
         if self._writer_death is not None and self._writer_death in done:
             death = self._writer_death.result()
             raise ListenerStopped(
                 f"the writer thread died ({death}): nothing can be stored, so the "
-                "listener is stopping rather than running without a writer"
+                "listener is stopping rather than running without a writer",
+                plain="Saving to the database stopped working, so nothing more could be recorded.",
             ) from death
 
         # Neither of the others, so the poll task finished first.
@@ -2016,7 +2054,8 @@ class Listener:
         if poll_task.cancelled():
             raise ListenerStopped(
                 "the poll task was cancelled: nothing is recovering messages "
-                "the update stream drops"
+                "the update stream drops",
+                plain=_CHECK_STOPPED,
             )
         poll_error = poll_task.exception()
         if poll_error is not None:
@@ -2031,11 +2070,19 @@ class Listener:
                 raise poll_error
             raise ListenerStopped(
                 f"the poll task died ({type(poll_error).__name__}: {poll_error}): "
-                "nothing is recovering messages the update stream drops"
+                "nothing is recovering messages the update stream drops",
+                # An error that says itself plainly (WriterUnresponsiveError)
+                # says it; any other is named by its type.
+                plain=getattr(poll_error, "plain", None)
+                or (
+                    f"The 5-second check of the channels failed ({type(poll_error).__name__}), "
+                    "so posts that Telegram's live feed drops would have been missed."
+                ),
             ) from poll_error
         raise ListenerStopped(
             "the poll task returned: nothing is recovering messages the update "
-            "stream drops"
+            "stream drops",
+            plain=_CHECK_STOPPED,
         )
 
     async def run(self) -> NoReturn:
@@ -2121,7 +2168,11 @@ async def run_listener(listener: Listener) -> int:
     try:
         await listener.run()
     except ListenerStopped as exc:
-        logger.error("%s", exc)
+        # The window reads the plain sentence; the log file keeps the
+        # technical detail too (G2L-2).
+        logger.error("%s", exc.plain)
+        if str(exc) != exc.plain:
+            logger.error("%s", exc, extra=LOG_FILE_ONLY)
         return EXIT_LISTENER_STOPPED
     except TERMINAL_AUTH_ERRORS as exc:
         logger.error(

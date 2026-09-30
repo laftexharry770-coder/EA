@@ -199,7 +199,13 @@ class WriterUnresponsiveError(RuntimeError):
     """The writer thread did not run the poll's no-op probe within
     `writer_probe_timeout`. It is alive but not serving jobs, so nothing
     is being stored; the poll stops, and with it the listener, for the
-    supervisor to restart."""
+    supervisor to restart. `plain` says it in the user's words, for the
+    watch window; the message is the technical detail, for the log file
+    (group-2 review leftover G2L-2)."""
+
+    def __init__(self, message: str, *, plain: str) -> None:
+        super().__init__(message)
+        self.plain = plain
 
 
 def _retrieve_outcome(task: asyncio.Future[object]) -> None:
@@ -353,7 +359,11 @@ class HistoryPoll:
             raise WriterUnresponsiveError(
                 f"the writer thread did not run a no-op within {self.writer_probe_timeout:g}s "
                 "and finished no other job in that time; it is not storing anything, so "
-                "the poll is stopping the listener"
+                "the poll is stopping the listener",
+                plain=(
+                    f"The database stopped answering for {self.writer_probe_timeout:g} "
+                    "seconds, so nothing was being recorded."
+                ),
             ) from exc
 
     async def _poll_channel(
