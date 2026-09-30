@@ -1101,7 +1101,7 @@ def _invalidate(
         code,
         f"signal {signal_id} is now INVALID: {reason}. {skipped} queued entr"
         f"{'y' if skipped == 1 else 'ies'} skipped. {_live_clause(status)}"
-        f"{_old_post_doubt(ctx, status, changed=True)}",
+        f"{_old_post_doubt(ctx, row, status, changed=True)}",
         signal_id=signal_id,
     )
     # The signal's own message re-aimed or broken while nothing was
@@ -1398,7 +1398,7 @@ def _withdraw_signal(
                 "CRITICAL",
                 OLD_POST_WITHDREW_CALL,
                 f"signal {signal_id} is now VOIDED ({via}). Nothing had been executed; "
-                f"{entries}.{_old_post_doubt(ctx, status, changed=False)}",
+                f"{entries}.{_old_post_doubt(ctx, row, status, changed=False)}",
                 signal_id=signal_id,
             )
         else:
@@ -1423,7 +1423,7 @@ def _withdraw_signal(
         live_code,
         f"signal {signal_id} was withdrawn by the poster ({via}) but is {status}. Its live "
         f"legs were NOT closed -- a deletion or rewrite can be cosmetic -- review them by "
-        f"hand. {entries}.{_old_post_doubt(ctx, status, changed=False)}",
+        f"hand. {entries}.{_old_post_doubt(ctx, row, status, changed=False)}",
         signal_id=signal_id,
     )
     return ctx.result("flagged", new_kind, via, alert_ids=(alert,), skipped=skipped)
@@ -1586,20 +1586,25 @@ def _is_older_post(ctx: _Ctx) -> bool:
     return ctx.old_post is not None and ctx.old_post.kind == "earlier"
 
 
-def _old_post_doubt(ctx: _Ctx, status: TradeStatus, *, changed: bool) -> str:
-    """For an alert about an older post's removal or change (`_is_older_post`):
-    the doubt, and what to do if it was only the other channel tidying up.
+def _old_post_doubt(ctx: _Ctx, row: sqlite3.Row, status: TradeStatus, *, changed: bool) -> str:
+    """For an alert about an older post's removal or change (`_is_older_post`)
+    that withdrew or flagged signal `row`: the doubt, and what to do if it
+    was only the other channel tidying up -- never "trade it by hand" while
+    another signal carries the same call (ruling R5-5, `relay_repo.by_hand`).
     "" for any other post."""
     if not _is_older_post(ctx):
         return ""
     what = "changing" if changed else "removing"
     doubt = (
         f" This post may only have been channel {ctx.channel_id} {what} its old copy of the "
-        "call: if so, the call is still meant --"
+        "call: if so, the call is still meant"
     )
+    carrier = relay_repo.carrier_of(ctx.conn, signal_id=row["signal_id"])
+    if carrier is not None:
+        return f"{doubt}. {relay_repo.by_hand(ctx.conn, advice='', carrier=carrier)}"
     if status == "pending":
-        return f"{doubt} trade it by hand."
-    return f"{doubt} keep the trade, and trade by hand the entries that were skipped."
+        return f"{doubt} -- trade it by hand."
+    return f"{doubt} -- keep the trade, and trade by hand the entries that were skipped."
 
 
 def _log_echo(ctx: _Ctx, row: sqlite3.Row, *, how: str) -> None:
@@ -1850,12 +1855,18 @@ def _created_alert(ctx: _Ctx, route_result: RouteResult) -> int:
                 signal_id=row["signal_id"],
             )
     if route_result.kind == "signal":
+        # R5-5: never "trade it by hand" while the same call is live.
+        advice = relay_repo.by_hand(
+            ctx.conn,
+            advice="If it is a real call, trade it by hand.",
+            carrier=relay_repo.carrier_of(ctx.conn, call=route_result.signal),
+        )
         return ctx.alert(
             "WARNING",
             EDIT_CREATED_SIGNAL,
             f"an edit turned message {ctx.message_id} into a signal "
             f"({_describe(route_result)}). Edits never open trades: nothing was queued. "
-            "If it is a real call, trade it by hand.",
+            f"{advice}",
         )
     return ctx.alert(
         "WARNING",

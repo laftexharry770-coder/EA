@@ -118,7 +118,12 @@ anyone acts on:
   later posts the call again, those held-back copies repeat the new
   signal, their CRITICAL alerts are acknowledged and a WARNING says so
   (`COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED`): no "trade it by hand" is left
-  standing while the call is queued;
+  standing while the call is queued. Nor is one ever raised while it is:
+  every alert that would tell the user to trade a call by hand first
+  looks for another signal carrying it -- through `live_signal_for`, else
+  a live signal showing the same call -- and then names that signal and
+  says NOT to trade the call by hand as well (`carrier_of`, `by_hand`;
+  ruling R5-5);
 - a live match is always preferred to a withdrawn one -- also for a
   forward: a forward of a withdrawn post repeats the live signal of its
   call, or the live signal the poster posted again in its place (the
@@ -197,6 +202,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
@@ -775,6 +781,97 @@ def _release_closers_showing_call(
 # -- signals -------------------------------------------------------------------
 
 
+def carried_by(conn: sqlite3.Connection, signal_id: int) -> sqlite3.Row | None:
+    """The signal that carries `signal_id`'s call now, when it is another
+    one that is live or of which something was traded (`live_signal_for`):
+    the `signals` row, or None."""
+    newest = live_signal_for(conn, signal_id)
+    if newest == signal_id:
+        return None
+    row = _signal_row(conn, newest)
+    live = row["state"] == "NEW" and row["withdrawn_at_utc"] is None
+    if live or signals_repo.trade_status(conn, signal_id=newest) != "pending":
+        return row
+    return None
+
+
+def _call_key(call: Signal | sqlite3.Row) -> tuple[str, str, str, str]:
+    """A call's side, symbol and entry zone (at the trade hash's price
+    resolution, `same_price`), from a parse or a `signals` row."""
+    if isinstance(call, Signal):
+        side, symbol, lo, hi = call.side.value, call.symbol_alias, call.zone.lo, call.zone.hi
+    else:
+        parsed = json.loads(call["parsed_json"])
+        side, symbol = parsed["side"], parsed["symbol_alias"]
+        lo, hi = parsed["zone"]["lo"], parsed["zone"]["hi"]
+    return side, symbol, f"{lo:.3f}", f"{hi:.3f}"
+
+
+def live_same_call(
+    conn: sqlite3.Connection, call: Signal | sqlite3.Row, *, besides: Iterable[int] = ()
+) -> sqlite3.Row | None:
+    """The newest live signal (NEW, not withdrawn) showing `call` -- a
+    parse or a `signals` row: the same side, symbol and entry zone -- other
+    than the signals `besides`; or None."""
+    key, skip = _call_key(call), set(besides)
+    for row in conn.execute(
+        "SELECT * FROM signals WHERE state = 'NEW' AND withdrawn_at_utc IS NULL "
+        "ORDER BY signal_id DESC"
+    ).fetchall():
+        if row["signal_id"] not in skip and _call_key(row) == key:
+            return row
+    return None
+
+
+def carrier_of(
+    conn: sqlite3.Connection,
+    *,
+    signal_id: int | None = None,
+    call: Signal | sqlite3.Row | None = None,
+) -> sqlite3.Row | None:
+    """For an alert that would tell the user to trade a call by hand
+    (ruling R5-5): the signal that carries that call now, live, queued or
+    traded, when it is not signal `signal_id` itself -- first through
+    `live_signal_for` (`carried_by`: the call posted again or promoted),
+    else the newest live signal showing the same call outside that chain
+    (`live_same_call`: posted again as a signal of its own, e.g. after the
+    relay window). `call` is the call meant; by default signal
+    `signal_id`'s. None when nothing else carries it."""
+    if signal_id is not None:
+        carrier = carried_by(conn, signal_id)
+        if carrier is not None:
+            return carrier
+        if call is None:
+            call = _signal_row(conn, signal_id)
+    if call is None:
+        return None
+    besides = chain_ids(conn, signal_id) if signal_id is not None else ()
+    return live_same_call(conn, call, besides=besides)
+
+
+def by_hand(conn: sqlite3.Connection, *, advice: str, carrier: sqlite3.Row | None) -> str:
+    """The closing advice of an alert that would tell the user to trade a
+    call by hand (ruling R5-5): `advice` -- unless the same call is live,
+    queued or traded as another signal, `carrier` (`carrier_of`), when
+    trading it by hand as well would open it twice: the advice then names
+    that signal and says NOT to trade the call by hand as well. Every
+    "trade it by hand" goes through here."""
+    if carrier is None:
+        return advice
+    status = signals_repo.trade_status(conn, signal_id=carrier["signal_id"])
+    state = carrier["state"] + (", withdrawn" if carrier["withdrawn_at_utc"] else "")
+    return (
+        f"The same call is signal {carrier['signal_id']} (message {carrier['message_id']} on "
+        f"channel {carrier['channel_id']}; it is {state}, trade status {status}): "
+        "do NOT trade it by hand as well -- that would open the trade twice."
+    )
+
+
+def describe_call(signal: Signal) -> str:
+    """A signal's call, for an alert: side and entry zone."""
+    return f"{signal.side.value.upper()} {signal.zone.lo:g}-{signal.zone.hi:g}"
+
+
 def is_withdrawn_unexecuted(conn: sqlite3.Connection, signal: sqlite3.Row) -> bool:
     """`signal` (a `signals` row) is out of play -- VOIDED, INVALID or
     withdrawn -- and nothing of it was executed or is being executed."""
@@ -907,11 +1004,14 @@ def record_signal_copy(
     message_id: int,
     match: SignalMatch,
     now_utc: datetime,
+    signal: Signal | None = None,
 ) -> tuple[int, ...]:
     """Store that (`channel_id`, `message_id`) -- already on `messages` --
     repeats `match`'s signal: the link, the INFO line, the counter, and
-    for a copy of a withdrawn call the CRITICAL alert. Returns the ids of
-    the alerts raised."""
+    for a copy of a withdrawn call the CRITICAL alert. `signal` is the
+    copy's own parse: when another signal carries the withdrawn call now,
+    the alert says so (`by_hand`) and, if the copy shows another call than
+    that one, what it shows. Returns the ids of the alerts raised."""
     conn.execute(
         "UPDATE messages SET relay_of_signal_id = ? WHERE channel_id = ? AND message_id = ?",
         (match.signal_id, channel_id, message_id),
@@ -935,6 +1035,14 @@ def record_signal_copy(
         if match.closed_by is None
         else f" by message {match.closed_by[1]} on channel {match.closed_by[0]}"
     )
+    # The call meant is the withdrawn signal's: this copy may show another.
+    carrier = carrier_of(conn, signal_id=match.signal_id)
+    advice = by_hand(conn, advice="If the call is still meant, trade it by hand.", carrier=carrier)
+    if carrier is not None and signal is not None and not shows_call(signal, carrier):
+        advice += (
+            f" This copy itself reads as {describe_call(signal)}, which is not the call "
+            f"signal {carrier['signal_id']} carries."
+        )
     alert_id = alerts.record(
         conn,
         now_utc=now_utc,
@@ -947,8 +1055,7 @@ def record_signal_copy(
             f"message {message_id} on channel {channel_id} repeats signal {match.signal_id} "
             f"(message {match.message_id} on channel {match.channel_id}), which was "
             f"withdrawn{by} before anything was executed (it is {match.state}). This copy "
-            "was not traded either: one source withdrew the call. If the call is still "
-            "meant, trade it by hand."
+            f"was not traded either: one source withdrew the call. {advice}"
         ),
     )
     return (alert_id,)

@@ -517,7 +517,12 @@ def _ingest_new(
     )
     if relay.match is not None:
         relay_repo.record_signal_copy(
-            conn, channel_id=channel_id, message_id=message_id, match=relay.match, now_utc=now_utc
+            conn,
+            channel_id=channel_id,
+            message_id=message_id,
+            match=relay.match,
+            now_utc=now_utc,
+            signal=signal,
         )
         return IngestResult(
             outcome="relay_duplicate",

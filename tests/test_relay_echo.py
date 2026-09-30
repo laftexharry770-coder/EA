@@ -1395,3 +1395,120 @@ def test_a_reply_given_before_its_post_was_re_aimed_follows_the_call_in_either_o
     ((after,),) = _q(conn, "SELECT followup_id FROM followups WHERE message_id = 7004")
     assert relay_repo.signal_for_followup(conn, followup_id=before) == live
     assert relay_repo.signal_for_followup(conn, followup_id=after) is None
+
+
+# == Round 5 (ruling R5-5): "trade it by hand" never while the call is queued ==
+
+_DO_NOT = "do NOT trade it by hand as well"
+
+
+def test_a_held_back_forward_of_a_re_aimed_post_names_the_call_queued_in_its_place(
+    conn,  # noqa: F811
+):
+    """n4 (c): the VIP re-aimed its first post into a SELL while its repost
+    kept the BUY (promoted, signal 2, queued); a relay forwards the SELL
+    post, held back against signal 1 with a CRITICAL. That alert must not
+    tell the user to trade signal 1's call by hand: signal 2 carries it and
+    is queued. It names signal 2, says not to trade it by hand as well, and
+    says the copy itself shows the re-aimed SELL."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    assert _edit(conn, VIP, CALL, DIRECTION_EDIT, EDIT_1).promoted_signal_id == 2
+    conn.commit()
+    _ingest(conn, RELAY, COPY, DIRECTION_EDIT, posted=POSTED + timedelta(minutes=6), fwd=(V, CALL))
+
+    detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert "signal 2" in detail and f"message {REPOST}" in detail, detail
+    assert _DO_NOT in detail, detail
+    assert "trade it by hand." not in detail.replace(_DO_NOT, ""), detail
+    assert "SELL 4480-4485" in detail, detail
+
+
+def test_a_held_back_copy_of_a_call_nobody_posted_again_still_says_trade_it_by_hand(
+    conn,  # noqa: F811
+):
+    """The control: the VIP withdrew its call and nothing carries it; a copy
+    from another channel is held back and says to trade the call by hand if
+    it is still meant."""
+    _ingest(conn, VIP, CALL)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    _ingest(conn, OTHER, 8001, posted=POSTED + timedelta(minutes=2))
+
+    detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert detail.endswith("If the call is still meant, trade it by hand."), detail
+    assert _DO_NOT not in detail
+
+
+@pytest.mark.parametrize("live", [True, False], ids=["call-live", "call-withdrawn"])
+def test_an_edit_that_makes_a_post_the_live_call_says_not_to_trade_it_by_hand(
+    conn, live  # noqa: F811
+):
+    """One channel: the VIP's call is queued (signal 1), and the VIP edits
+    an old chatter post into the same call. Edits never open trades; the
+    alert used to say "if it is a real call, trade it by hand" -- which
+    would open the queued call twice. With the call live it names signal 1
+    and says not to trade it by hand as well; with the call withdrawn it
+    still says to trade it by hand if it is real."""
+    _ingest(conn, VIP, 4000, CHATTER_TEXT, posted=POSTED - timedelta(minutes=1))
+    _ingest(conn, VIP, CALL)
+    if not live:
+        _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    _edit(conn, VIP, 4000, SIGNAL_TEXT, POSTED + timedelta(minutes=2))
+    conn.commit()
+
+    detail = _detail(conn, edits_repo.EDIT_CREATED_SIGNAL)
+    if live:
+        assert "signal 1" in detail and f"message {CALL}" in detail, detail
+        assert _DO_NOT in detail, detail
+        assert "If it is a real call, trade it by hand." not in detail
+    else:
+        assert detail.split(" [found by")[0].endswith("If it is a real call, trade it by hand.")
+    assert _queued_entries(conn) == ([(1, "acct-1"), (1, "acct-2")] if live else [])
+
+
+def test_a_held_back_copy_names_the_same_call_queued_as_another_signal(conn):  # noqa: F811
+    """The VIP withdrew its call (signal 1, VOIDED) and posted the same call
+    again 20 minutes later -- outside the relay window: a new signal 2,
+    queued, not linked to signal 1. A relay's forward of the withdrawn post,
+    read late (after a reconnect), is held back against signal 1 with a
+    CRITICAL. It must not say to trade the call by hand: signal 2 carries
+    it and is queued (ruling R5-5)."""
+    _ingest(conn, VIP, CALL)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    again = _ingest(conn, VIP, 4020, posted=POSTED + timedelta(minutes=20))
+    assert (again.outcome, _live(conn)) == ("new", [2])
+    assert _promoted_from(conn, 2) is None
+
+    held = _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30), fwd=(V, CALL))
+
+    assert (held.outcome, held.relay_of_signal_id) == ("relay_duplicate", 1)
+    detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert "signal 2" in detail and "message 4020" in detail, detail
+    assert _DO_NOT in detail, detail
+    assert "trade it by hand." not in detail.replace(_DO_NOT, ""), detail
+    assert "reads as" not in detail, detail  # the copy shows that very call
+
+
+@pytest.mark.parametrize("order", ORDERS)
+def test_an_older_posts_doubt_names_the_same_call_queued_as_another_signal(
+    conn, order  # noqa: F811
+):
+    """R4-1 (c) with the same call queued elsewhere: the VIP deleted its
+    call and posted it again (signal 2), then posted it once more 18
+    minutes later -- outside the relay window, a new signal 3. The relay's
+    old hand copy is removed: an older post, which voids signal 2 with the
+    CRITICAL doubt. That doubt must not end "trade it by hand": signal 3
+    carries the call and is queued (ruling R5-5)."""
+    _store_call(conn, order)
+    live = _vip_deletes_and_posts_again(conn)
+    later = _ingest(conn, VIP, 4020, posted=POSTED + timedelta(minutes=20))
+    assert later.outcome == "new" and _live(conn) == [live, later.signal_id]
+
+    _delete(conn, RELAY, COPY, POSTED + timedelta(minutes=21))
+
+    assert _live(conn) == [later.signal_id]
+    detail = _detail(conn, edits_repo.OLD_POST_WITHDREW_CALL)
+    assert "old copy" in detail, detail
+    assert f"signal {later.signal_id}" in detail and "message 4020" in detail, detail
+    assert _DO_NOT in detail, detail
+    assert "trade it by hand." not in detail.replace(_DO_NOT, ""), detail
