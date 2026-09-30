@@ -1,10 +1,11 @@
 # EA
 
-MetaTrader 5 Expert Advisors, one folder per project.
+MetaTrader 5 Expert Advisors and Deriv Bot strategies, one folder per project.
 
 | Project | Market | What it trades |
 | --- | --- | --- |
 | [XAUUSD-Fractal-EMA-Scalper](XAUUSD-Fractal-EMA-Scalper/) | XAUUSD, 1 minute | Williams Fractals (periods 2) with EMA 20/50/100 pullbacks. Stop past the 50 EMA, or the 100 EMA if the 50 was crossed. Target 1.5 × risk. |
+| [Deriv-HL-Robot](Deriv-HL-Robot/) | Deriv Volatility 100 Index, 5 ticks | Deriv Bot XML. A $5 Higher and a $5 Lower on the same tick, then trade again. See its README for how to load it and check both sides open. |
 
 ## Installing an EA
 
