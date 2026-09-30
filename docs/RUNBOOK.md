@@ -60,6 +60,11 @@ you do, the recorder is logged out and stops, and you have to do this step
 again. (If you ever want to cut the program off for good, terminating it is
 exactly how.)
 
+**If it fails after you typed the code.** If the message says *IMPORTANT:
+Telegram had already accepted this login*, a XAUCOPIER-TRADEBOX session was
+made that this program has no copy of. Open **Settings → Devices**, end that
+extra XAUCOPIER-TRADEBOX session, and only then run step 2 again.
+
 **What is kept, and what is not.** The program saves your api_id, your
 api_hash and the login session, encrypted so that only your Windows user on
 this PC can read them. It **never stores the login code, your 2FA password
@@ -79,13 +84,26 @@ Type `.\xaucopier resolve-channels`. It asks:
 
 1. **Paste the channel's link or @username** — for example
    `https://t.me/somechannel`. If the channel is private and you have no
-   link, **just press Enter**: it lists every channel you have joined.
+   link, **just press Enter**: it lists every channel and group you have
+   joined, each marked *(channel)* or *(group)*.
 2. If you pressed Enter: **type the number** next to *MARKET MASTERY HUB /
    COMMUNITY*.
-3. It shows the channel it found. **Type `yes`** to save it.
+3. It shows what it found — a channel or a group — and its Telegram id.
+   **Type `yes`** to save it.
 
-It writes the channel's number into `config\channels.toml` and switches the
-channel on. If `watch` is running, stop it first (step 4 says how).
+It writes the channel's **Telegram id** (a long number starting with -100)
+into `config\channels.toml` and switches the channel on. It then says which
+**channel number** it is in `.\xaucopier channels` — the short number you
+use with `channels on` and `channels off`. If `watch` is running, stop it
+first (step 4 says how).
+
+**A group is asked about separately.** In a *channel* only its admins post.
+In a *group* anyone in it can post, and **every member's message would be
+read as a trading instruction**. So if what you picked is a group, it warns
+you and asks once more; type `yes` only if that group really is where the
+signals come from, and tell whoever looks after xaucopier that your source
+is a group. (`--yes` does not answer this question; only `--allow-group`
+does.)
 
 ## 4. Start recording: `.\xaucopier watch`
 
@@ -97,8 +115,16 @@ keeps running. **Leave the window open** — closing it stops the recording.
   question comes from Windows, not from xaucopier; answering Y is always
   safe.) Everything recorded so far is kept.
 - **After a restart of the PC**, or whenever it has stopped: run
-  `.\xaucopier watch` again. It catches up on the posts made while it was off.
+  `.\xaucopier watch` again. It catches up on the posts made while it was
+  stopped (not on posts from a channel that was switched off — see
+  **Choosing which channels to follow**).
 - **Only one at a time.** Do not start a second `watch` in another window.
+- **If it says *Could not reach Telegram within 60 seconds*,** this PC is
+  not online (or Telegram is not answering). It stops by itself (exit code
+  4). Start it again once the internet works.
+- **When it stops, it says why** in plain words, then
+  `watch stopped (exit code N: ...)`. The technical details go to the file
+  `data\watch.log`; send that file if someone asks for it.
 
 ## 5. Check on it: `.\xaucopier status`
 
@@ -121,16 +147,27 @@ What to look at, from the top:
    code 6). Then start it again with `.\xaucopier watch`. `NOT RUNNING` says
    when it stopped and why.
 3. **MISSED BY TELEGRAM'S LIVE FEED** — the most important number. Telegram
-   sometimes fails to deliver posts to programs like this one; watch checks
-   the channel every 5 seconds and picks up anything the live feed dropped.
-   *new posts* counts those rescues. A few a day is normal — it means the
-   safety net is working. Dozens a day means Telegram is being unreliable;
-   mention it.
+   sometimes fails to deliver posts to programs like this one while `watch`
+   is running; watch checks the channel every 5 seconds and picks up
+   anything the live feed dropped. *new posts* counts those rescues. A few
+   a day is normal — it means the safety net is working. Dozens a day means
+   Telegram is being unreliable; mention it. Posts made while `watch` was
+   **stopped** are not counted here: they are *caught up after a stop*, and
+   counted under **FOR INFORMATION** instead.
 4. **SHOULD STAY AT ZERO.** Every line there should be 0. A line marked
    `<-- look into this` means something went wrong — the first one means
    posts were **not** recorded. Send the whole status output.
-5. **SIGNALS** and **CHANNELS** show what has been recorded, and when the
+5. **FOR INFORMATION -- NOTHING TO DO.** Posts made while watch was
+   stopped and caught up after it started, and copies of a signal or an
+   instruction the program had already recorded (the same call relayed by
+   another channel, forwarded, or posted twice). A copy is recorded but
+   never traded or acted on twice. These numbers are never a problem.
+6. **SIGNALS** and **CHANNELS** show what has been recorded, and when the
    newest post in the channel arrived.
+
+If `status` (or any command) says the database *was written by a newer
+version of xaucopier*, use that newer version: this one does not read or
+change it.
 
 ### Clearing alerts: `.\xaucopier ack`
 
@@ -149,6 +186,30 @@ missed. Once you have dealt with one, clear it:
 - **TELEGRAM_API_ID_REJECTED** — Telegram will not accept your
   api_id/api_hash. Get a **new** pair (step 1), run step 2 again, then
   `watch`. This one also clears itself once `watch` reads the channel.
+- **TEMPLATE_CHANGED_SUSPECTED** — 3 messages in a row looked like trade
+  signals but could not be read. Either the channel has changed how it
+  writes its signals, or it writes some calls in a layout this program does
+  not read (a channel added although it never used the MARKET MASTERY HUB
+  layout, or a group whose members post calls of their own). Signals
+  written that way are **not traded**. Look at the channel, then send the
+  alert and two or three of those messages to whoever looks after
+  xaucopier.
+- **ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED** — a message looked like a trade
+  signal the program cannot read, and also like an instruction for a trade
+  already open (for example "move SL to 4470"). Neither was acted on. Look
+  at the message: if it was meant as an instruction, **apply it by hand**.
+- **EDIT_COMPLETED_SIGNAL** — a post that was not a readable signal was
+  edited into one within 2 minutes of being posted. It is now a signal,
+  recorded like any other. Nothing to do, unless the poster did not mean it
+  as a call: then check the channel.
+- **SIGNAL_REPOST_PROMOTED** — a signal's own post was deleted or withdrawn
+  while the channel still showed the same call in another post. That other
+  post is now the signal. Nothing to do, unless the poster meant to cancel
+  the call altogether: then check the channel.
+- **CHANNEL_OFF_ENTRIES_SKIPPED** — `watch` started with a channel switched
+  off that still had signals waiting to be traded; they were cancelled, not
+  traded. That is what switching a channel off does (see below). Nothing to
+  do.
 - **Any other alert** — copy its two lines and send them to whoever looks
   after xaucopier, then clear it.
 
@@ -160,20 +221,33 @@ Signals can come from more than one Telegram channel, and you choose which.
   **number**, whether it is **ON** or **OFF**, when its last message was
   recorded, and how many signals it has produced. It only reads, so run it
   whenever you like.
-- **Switch one off:** `.\xaucopier channels off 2` stops taking signals from
-  channel number 2. Nothing about it is deleted; you can switch it back on
-  later.
-- **Switch one on:** `.\xaucopier channels on 2`.
+- **Switch one off:** `.\xaucopier channels off 2` stops reading channel
+  number 2 **completely**: its new posts, and also the edits, deletions and
+  follow-ups (like "close all") of the signals it already posted. It tells
+  you how many of its signals are still waiting to be traded or already
+  traded. The waiting ones are cancelled the next time `watch` starts; a
+  trade already open keeps its stop loss and take profit. **Whatever it
+  posts while it is off is ignored for good** — it is not read later, not
+  even after you switch it back on. Nothing already recorded is deleted.
+- **Switch one on:** `.\xaucopier channels on 2`. From the next `watch` on,
+  it is read again from the moment you switched it on; the posts made while
+  it was off are skipped.
 - **Add a new channel:** first **join it in Telegram** on your phone. Then
   stop `watch` (click in its window, press **Ctrl+C** and answer **Y**) and
   type `.\xaucopier channels add`. Paste the channel's link, or just press
-  Enter and type the number next to it in the list of channels you have
-  joined. Then type `yes`. It is added **switched on**, with the next free
-  number. A channel that is already in the list is never added twice.
+  Enter and type the number next to it in the list of channels and groups
+  you have joined. Then type `yes`. It is added **switched on**, with the
+  next free number. A channel that is already in the list is never added
+  twice. A channel you removed and add again is read from now on, not from
+  where it stopped.
+- **A group needs a second `yes`.** The list marks each entry *(channel)*
+  or *(group)*. In a group anyone can post, and every member's message would
+  be read as a trading instruction, so adding a group warns you and asks
+  again. Say `yes` only if the signals really are posted there.
 
 The number to type is the one `.\xaucopier channels` shows next to the
-channel. It never changes, even when you add channels or switch them on and
-off.
+channel — a short number like 2, not the long Telegram id. It never
+changes, even when you add channels or switch them on and off.
 
 **A change takes effect the next time `watch` starts.** `watch` reads the
 list only when it starts. After switching a channel on or off, stop `watch`
@@ -187,24 +261,31 @@ until you run `.\xaucopier resolve-channels` for it (step 3).
 
 > **A new channel may be recorded but never traded.** So far the program can
 > only read signals written the way *MARKET MASTERY HUB / COMMUNITY* writes
-> them. A channel that writes its signals differently will still have its
-> messages recorded, but **nothing will be traded from it** until someone
-> builds a reader for that channel, which needs 5–10 of its real messages.
-> If you add such a channel, tell whoever looks after xaucopier.
+> them. From a channel that writes its signals differently, a signal is
+> recorded but **not traded**, until someone builds a reader for that
+> channel, which needs 5–10 of its real messages. A message that reads like
+> an instruction for a trade already open — for example "close all" or
+> "move SL to entry" — is still recorded as an instruction, whatever its
+> layout. When 3 messages in a row look like signals but cannot be read,
+> `status` shows a **TEMPLATE_CHANGED_SUSPECTED** alert. If you add such a
+> channel, tell whoever looks after xaucopier.
 
 ## What the exit codes mean
 
-When `watch` (or any command) stops, it prints an exit code:
+When a command cannot do what you asked, its last line is its exit code,
+for example `(exit code 6)`. When `watch` stops, it says
+`watch stopped (exit code N: ...)`. A command that did what you asked
+prints no code.
 
 | Code | What it means | What to do |
 |---|---|---|
 | 0 | Finished normally. | Nothing. |
-| 1 | The command could not do what you asked. | Read the message above it. |
+| 1 | The command could not do what you asked (for example Telegram asked us to wait, or another command changed `channels.toml` at the same moment). | Read the message above it. Where it says to run the command again, do. |
 | 2 | The command was typed wrong. | Check the spelling; try `.\xaucopier --help`. |
-| 3 | Telegram refuses this program's login: it was logged out (for example from Telegram → Settings → Devices), **a second copy of the session was used somewhere else at the same time**, or the account is deactivated, banned or frozen. | Do **not** just restart. Make sure nothing else uses this login, run step 2 again, then `watch`. A banned account cannot be fixed by any program. |
-| 4 | `watch` stopped unexpectedly (for example the internet dropped). | Safe to start `watch` again. |
+| 3 | Telegram refuses this program's login: it was logged out (for example from Telegram → Settings → Devices), **a second copy of the session was used somewhere else at the same time**, or the account is deactivated, banned or frozen. The watch window may name the reason *AuthKeyNotFound* ("auth key not found"): that is a dead login too. | Do **not** just restart. Make sure nothing else uses this login, run step 2 again, then `watch`. A banned account cannot be fixed by any program. |
+| 4 | `watch` stopped unexpectedly (for example the internet dropped, or it could not reach Telegram within 60 seconds of starting). | Safe to start `watch` again. |
 | 5 | Something in the setup is wrong (a config file, the channel number, the data folder, the session file) — or Telegram rejected your api_id/api_hash. | Read the message. Restarting will not help until it is fixed. For a rejected api_id: get a **new** pair (step 1), then run step 2 again. |
-| 6 | `watch` is already running on this PC. (`channels add` and `resolve-channels` also stop with this code while `watch` runs.) | Find its window. Never run two. To add a channel, stop `watch` first. |
+| 6 | `watch` is already running on this PC — or `channels add` or `resolve-channels` is, which use the Telegram login too. | Find its window. Never run two. To add a channel, stop `watch` first. If it says it is probably running in a window opened as administrator, find that window and stop it there. |
 | 130 | You pressed Ctrl+C (and answered **Y**). | Nothing — start it again when you want. |
 
 ## Only if asked: `.\xaucopier export-fixtures`

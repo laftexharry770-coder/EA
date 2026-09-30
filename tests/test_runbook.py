@@ -63,7 +63,57 @@ def test_the_runbook_says_what_the_user_must_know() -> None:
         ".\\xaucopier channels off 2",
         "A change takes effect the next time `watch` starts",
         "If every channel is OFF, `watch` will not start",
-        "nothing will be traded from it",
+        # Final review F07: a signal in another layout is recorded, not
+        # traded; an instruction-looking message is recorded as one.
+        "recorded but **not traded**",
+        "is still recorded as an instruction, whatever its",
         "5–10 of its real messages",
+        # The final fix wave. F15 / F28 (ruling M12): what OFF does.
+        'follow-ups (like "close all") of the signals it already posted',
+        "posts while it is off is ignored for good",
+        "it was off are skipped",
+        # F05: a group is not a channel.
+        "anyone in it can post, and **every member's message would be",
+        # F27: the Telegram id is not the channel number.
+        "writes the channel's **Telegram id**",
+        "not the long Telegram id",
+        # F26: the exit code is printed.
+        "its last line is its exit code",
+        # F06 / exit 3 and exit 4.
+        '*AuthKeyNotFound* ("auth key not found")',
+        "Could not reach Telegram within 60 seconds",
+        # F17 / STATUS-NEW-METRICS: missed by the live feed vs caught up.
+        "*caught up after a stop*",
+        "FOR INFORMATION -- NOTHING TO DO",
+        # F34: a login Telegram accepted before the failure.
+        "Telegram had already accepted this login",
+        # G1L-5: a database from a newer version.
+        "use that newer version",
+        # G4L-1: an unread instruction is applied by hand.
+        "**apply it by hand**",
+        # G2L-1: the administrator-window hint.
+        "running in a window opened as administrator",
     ):
         assert phrase in RUNBOOK, phrase
+
+
+def test_the_runbook_explains_every_alert_the_fix_wave_added() -> None:
+    """Each by its code, in the list of what to do before clearing one."""
+    from xaucopier.store import alerts, edits_repo, messages_repo
+
+    clearing = RUNBOOK.split("### Clearing alerts", 1)[1].split("\n## ", 1)[0]
+    for code in (
+        messages_repo.TEMPLATE_CHANGED_SUSPECTED,
+        messages_repo.ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED,
+        edits_repo.EDIT_COMPLETED_SIGNAL,
+        edits_repo.SIGNAL_REPOST_PROMOTED,
+        alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
+    ):
+        assert f"- **{code}** — " in clearing, code
+
+
+def test_the_runbook_uses_none_of_the_developer_words() -> None:
+    """The user knows this program and `.\\xaucopier watch`, not a
+    client, a listener, an RPC or a flood wait."""
+    for word in ("client", "listener", "rpc", "flood"):
+        assert word not in RUNBOOK.lower(), word
