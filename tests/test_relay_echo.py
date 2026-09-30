@@ -1692,3 +1692,50 @@ def test_an_older_posts_doubt_names_the_same_call_queued_as_another_signal(
     assert f"signal {later.signal_id}" in detail and "message 4020" in detail, detail
     assert _DO_NOT in detail, detail
     assert "trade it by hand." not in detail.replace(_DO_NOT, ""), detail
+
+
+def test_a_held_back_copy_of_a_call_withdrawn_twice_still_says_trade_it_by_hand(
+    conn,  # noqa: F811
+):
+    """The VIP deleted its call, posted it again (signal 2) and deleted that
+    too: nothing carries the call. A relay's forward of the first post,
+    read late, is held back with a CRITICAL that says to trade the call by
+    hand if it is still meant -- never "do not trade it by hand" in the
+    name of the withdrawn signal 2."""
+    _ingest(conn, VIP, CALL)
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=1))
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=2))
+    assert _promoted_from(conn, again.signal_id) == 1
+    _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=3))
+    assert _live(conn) == []
+
+    held = _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30), fwd=(V, CALL))
+
+    assert held.outcome == "relay_duplicate"
+    detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert detail.endswith("If the call is still meant, trade it by hand."), detail
+    assert _DO_NOT not in detail
+
+
+def test_a_held_back_forward_of_a_re_aimed_post_names_no_withdrawn_signal(
+    conn,  # noqa: F811
+):
+    """n4 (c) once the promoted repost is withdrawn too: the VIP re-aimed
+    V/4001 (signal 1 INVALID, V/4012 promoted as signal 2) and then deleted
+    V/4012 (signal 2 VOIDED). A relay's forward of the SELL post is held
+    back against signal 1. Nothing carries the call now: the alert says to
+    trade it by hand if it is still meant, and names no withdrawn signal
+    as carrying it."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=1))
+    assert _edit(conn, VIP, CALL, DIRECTION_EDIT, EDIT_1).promoted_signal_id == 2
+    conn.commit()
+    _delete(conn, VIP, REPOST, POSTED + timedelta(minutes=5))
+    assert _live(conn) == []
+
+    _ingest(conn, RELAY, COPY, DIRECTION_EDIT, posted=POSTED + timedelta(minutes=6), fwd=(V, CALL))
+
+    assert _link(conn, RELAY, COPY) == 1
+    detail = _detail(conn, relay_repo.COPY_OF_WITHDRAWN_SIGNAL)
+    assert detail.endswith("If the call is still meant, trade it by hand."), detail
+    assert _DO_NOT not in detail and "signal 2" not in detail, detail
