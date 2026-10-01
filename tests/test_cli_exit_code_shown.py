@@ -161,3 +161,36 @@ def test_watch_that_ran_and_stopped_says_its_code_once(
 
     assert cli_main.main(rig.argv()) == exit_codes.EXIT_LISTENER_STOPPED
     assert "watch stopped (exit code 4" in _said_once(capsys, 4)
+
+
+# -- a command typed wrong (fix round 2: argparse refused it before main() could say the code) --
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["chanels"], ["channels", "onn", "2"], ["channels", "on", "x"], ["ack", "1", "--all"]],
+    ids=["misspelt command", "misspelt action", "not a number", "two things at once"],
+)
+def test_a_command_typed_wrong_ends_with_exit_code_2(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The runbook says a command that cannot do what you asked ends with
+    its exit code. A typo argparse rejects exits 2 before the command runs;
+    it ended with argparse's own line and no code, while the CLI's own
+    usage refusal (`channels on` with no number) said "(exit code 2)"."""
+    with pytest.raises(SystemExit) as raised:
+        cli_main.main(argv)
+
+    assert raised.value.code == exit_codes.EXIT_USAGE
+    err = capsys.readouterr().err
+    assert err.rstrip().splitlines()[-1] == "(exit code 2)"
+    assert err.count("exit code") == 1
+
+
+def test_help_is_not_a_failure_and_prints_no_code(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli_main.main(["--help"])
+
+    assert raised.value.code == 0
+    captured = capsys.readouterr()
+    assert "(exit code" not in captured.out + captured.err

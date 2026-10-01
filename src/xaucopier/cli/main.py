@@ -624,7 +624,15 @@ def main(argv: list[str] | None = None) -> int:
     it stops ("watch stopped (exit code 4: ...)"), so it is said once."""
     _replace_what_cannot_be_shown()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        # A command typed wrong ("chanels", "channels on x") is refused by
+        # argparse before any command runs; it says its code like every
+        # other refusal (fix round 2 of F26). `--help` exits 0: no code.
+        if exc.code not in (0, None):
+            print(f"(exit code {exc.code})", file=sys.stderr)
+        raise
     code = args.func(args)
     if code != exit_codes.EXIT_OK and args.func is not cmd_watch:
         print(f"(exit code {code})", file=sys.stderr)
