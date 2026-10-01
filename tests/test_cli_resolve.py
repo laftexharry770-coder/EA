@@ -78,8 +78,10 @@ class ResolveClient(FakeTelegramClient):
     authorized: bool = True
     asked: list[Any] = field(default_factory=list)
 
-    async def is_user_authorized(self) -> bool:
-        return self.authorized
+    async def get_me(self) -> Any:
+        # Telethon's get_me(): None when Telegram says this login is not
+        # authorised (`cli/resolve.logged_in`).
+        return types.User(id=4242, is_self=True) if self.authorized else None
 
     async def get_entity(self, entity: Any) -> Any:
         self.calls.append("get_entity")
@@ -142,7 +144,7 @@ def rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Rig:
         resolve_module, "load_session",
         lambda path: SecretsBlob(api_id=1, api_hash="0" * 32, session_string="NOT_REAL"),
     )
-    monkeypatch.setattr(resolve_module, "build_client", lambda blob: client)
+    monkeypatch.setattr(resolve_module, "build_one_shot_client", lambda blob: client)
     monkeypatch.setattr(resolve_module, "acquire_single_instance_lock", lock)
     monkeypatch.setattr("builtins.input", lambda prompt="": answers.pop(0))
     return Rig(config_dir=config_dir, client=client, lock=lock, answers=answers)
@@ -523,7 +525,7 @@ def test_any_other_telegram_error_is_one_plain_sentence(
     async def trouble(*args: Any, **kwargs: Any) -> Any:
         raise errors.RpcCallFailError(request=None)
 
-    monkeypatch.setattr(rig.client, "is_user_authorized", trouble)
+    monkeypatch.setattr(rig.client, "get_me", trouble)
 
     assert cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes")) == 1
 

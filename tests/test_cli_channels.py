@@ -164,7 +164,7 @@ def rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Rig:
     _seed_db(db_path)
     rig = Rig(config_dir=config_dir, db_path=db_path, watch_running=False, telegram=Forbidden())
     monkeypatch.setattr(channels_module, "session_in_use", lambda: rig.watch_running)
-    for name in ("build_client", "load_session", "acquire_single_instance_lock"):
+    for name in ("build_one_shot_client", "load_session", "acquire_single_instance_lock"):
         if hasattr(channels_module, name):
             monkeypatch.setattr(channels_module, name, rig.telegram)
     return rig
@@ -607,8 +607,10 @@ class AddClient(FakeTelegramClient):
     authorized: bool = True
     asked: list[Any] = field(default_factory=list)
 
-    async def is_user_authorized(self) -> bool:
-        return self.authorized
+    async def get_me(self) -> Any:
+        # Telethon's get_me(): None when Telegram says this login is not
+        # authorised (`cli/resolve.logged_in`).
+        return types.User(id=4242, is_self=True) if self.authorized else None
 
     async def get_entity(self, entity: Any) -> Any:
         self.calls.append("get_entity")
@@ -664,7 +666,7 @@ def add_rig(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> AddRig:
         channels_module, "load_session",
         lambda path: SecretsBlob(api_id=1, api_hash="0" * 32, session_string="NOT_REAL"),
     )
-    monkeypatch.setattr(channels_module, "build_client", lambda blob: client)
+    monkeypatch.setattr(channels_module, "build_one_shot_client", lambda blob: client)
     monkeypatch.setattr(channels_module, "acquire_single_instance_lock", lock)
     monkeypatch.setattr("builtins.input", lambda prompt="": answers.pop(0))
     return AddRig(rig=rig, client=client, lock=lock, answers=answers)
@@ -1143,7 +1145,7 @@ def test_add_with_no_network_gives_up_after_its_wait_and_says_so(
     assert "disconnect" in add_rig.client.calls and add_rig.lock.released == 1
 
 
-@pytest.mark.parametrize("where", ["get_dialogs", "get_entity", "is_user_authorized"])
+@pytest.mark.parametrize("where", ["get_dialogs", "get_entity", "get_me"])
 def test_add_told_to_wait_by_telegram_says_how_long_in_minutes(
     add_rig: AddRig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], where: str
 ) -> None:

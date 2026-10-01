@@ -70,8 +70,10 @@ from xaucopier.cli.resolve import (
     _ask,
     _choose,
     accept_source,
+    build_one_shot_client,
     connect_one_shot,
     found_line,
+    logged_in,
     report_already_running,
     report_not_logged_in,
     report_permanent_error,
@@ -87,7 +89,6 @@ from xaucopier.ingest.client import (
     PERMANENT_TELEGRAM_ERRORS,
     AlreadyRunningError,
     acquire_single_instance_lock,
-    build_client,
     session_in_use,
 )
 from xaucopier.parsing.registry import parser_for
@@ -521,7 +522,7 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
     try:
         # Bounded: with no network Telethon's connect never gives up (F24).
         await connect_one_shot(client)
-        if not await client.is_user_authorized():
+        if not await logged_in(client):
             return report_not_logged_in()
         try:
             resolved = await _choose(client, "the channel to add", args.link, again="channels add")
@@ -643,7 +644,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     except AlreadyRunningError as exc:
         return report_already_running(ADD_WHILE_WATCH_RUNS, exc)
     try:
-        client = build_client(blob)
+        client = build_one_shot_client(blob)
         return asyncio.run(_add(args, client, path))
     except KeyboardInterrupt:
         complain(

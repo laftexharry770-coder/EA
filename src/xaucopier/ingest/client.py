@@ -254,7 +254,7 @@ def session_in_use() -> bool:
     return True
 
 
-def build_client(blob: SecretsBlob) -> TelegramClient:
+def build_client(blob: SecretsBlob, *, raise_last_call_error: bool = False) -> TelegramClient:
     """Construct a `TelegramClient` from `blob`. Does not connect.
 
     `device_model="XAUCOPIER-TRADEBOX"` makes the session identifiable in
@@ -263,6 +263,13 @@ def build_client(blob: SecretsBlob) -> TelegramClient:
     is infinite and `flood_sleep_threshold` generous (120s) because a
     dropped connection or a flood wait must be waited out, never treated
     as fatal by this layer -- only the terminal auth errors are.
+
+    `raise_last_call_error`: when Telegram keeps failing a request with its
+    own trouble (a 500, a timeout) past Telethon's retries, raise
+    Telegram's last error instead of Telethon's bare `ValueError("Request
+    was unsuccessful N time(s)")`, so the caller can say what happened.
+    The one-shot commands ask for it (`cli/resolve.build_one_shot_client`,
+    final review F23).
     """
     return TelegramClient(
         StringSession(blob.session_string),
@@ -275,6 +282,7 @@ def build_client(blob: SecretsBlob) -> TelegramClient:
         system_version="Windows",
         app_version="0.1",
         catch_up=True,
+        raise_last_call_error=raise_last_call_error,
     )
 
 

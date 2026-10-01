@@ -109,6 +109,19 @@ TELEGRAM_TROUBLE: tuple[type[BaseException], ...] = (
     OSError,
 )
 
+#: What a lookup by link must never call "not found" (final review F23): a
+#: wait Telegram asks for, Telegram's own trouble -- a 500 or a -500
+#: (`ServerError`), a -503 timeout (`TimedOutError`, not a `ServerError`)
+#: -- and no connection.
+NOT_A_LOOKUP_FAILURE: tuple[type[BaseException], ...] = (
+    errors.FloodError,
+    errors.ServerError,
+    errors.TimedOutError,
+    TelegramUnreachableError,
+    ConnectionError,
+    TimeoutError,
+)
+
 _HEADER = re.compile(r"^\s*\[")
 _CHANNELS_HEADER = re.compile(r"^\s*\[\[\s*channels\s*\]\]\s*(#.*)?$")
 _ID_LINE = re.compile(r"^(?P<lead>\s*channel_id\s*=\s*)(?P<value>0)(?P<gap>\s*)(?:#.*)?$")
@@ -636,7 +649,7 @@ async def resolve_link(client: Any, text: str, *, again: str = "resolve-channels
         entity = await client.get_entity(link)
     except PERMANENT_TELEGRAM_ERRORS:
         raise
-    except (errors.FloodError, errors.ServerError, ConnectionError, TimeoutError):
+    except NOT_A_LOOKUP_FAILURE:
         raise  # a wait, Telegram's own trouble or no connection: not "not found" (F23)
     except Exception as exc:  # noqa: BLE001 -- Telethon raises ValueError or an RPCError
         raise ResolveError(f"Telegram could not find {link!r}: {exc}") from None
@@ -695,6 +708,27 @@ def report_not_logged_in() -> int:
     return exit_codes.EXIT_TERMINAL_AUTH
 
 
+def build_one_shot_client(blob: Any) -> Any:
+    """The client `channels add` and `resolve-channels` use: `build_client`'s,
+    except that Telegram's own trouble that outlasts Telethon's retries is
+    raised as Telegram's last error -- which `report_telegram_trouble()`
+    says plainly -- instead of a bare `ValueError` that escaped as a
+    traceback, or was called "not found" for a link (final review F23)."""
+    return build_client(blob, raise_last_call_error=True)
+
+
+async def logged_in(client: Any) -> bool:
+    """Whether Telegram still knows this login. Asks who this account is
+    (`get_me()`), which answers None only when Telegram says the login is
+    not authorised (a 401). Any other error -- a wait Telegram asks for,
+    Telegram's own trouble -- is raised, for `report_telegram_trouble()`.
+    Telethon's `is_user_authorized()` read every one of those as "not
+    logged in", and the user was sent to run setup-login again, which makes
+    a second XAUCOPIER-TRADEBOX session and cures nothing (final review
+    F23)."""
+    return await client.get_me() is not None
+
+
 async def connect_one_shot(client: Any) -> None:
     """Connect a one-shot command (`setup-login`, `channels add`,
     `resolve-channels`) to Telegram, waiting at most
@@ -722,8 +756,10 @@ def report_telegram_trouble(exc: BaseException, *, again: str, nothing: str) -> 
             wait = "a while (an hour is safe)"
         text = f"Telegram asks to wait {wait}, then run it again ({command}). {nothing}"
     elif isinstance(exc, errors.RPCError):
+        # Telegram sends some as negative (-500 "no workers", -503 timeout).
+        number = abs(exc.code) if isinstance(exc.code, int) else exc.code
         text = (
-            f"Telegram could not do this just now (Telegram error {exc.code}). Wait a "
+            f"Telegram could not do this just now (Telegram error {number}). Wait a "
             f"minute, then run {command} again. {nothing}"
         )
     else:
@@ -783,7 +819,7 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
         # Inside the try: a bad api_id is reported by the connect itself
         # (final review F37); bounded, so no network is not a hang (F24).
         await connect_one_shot(client)
-        if not await client.is_user_authorized():
+        if not await logged_in(client):
             return report_not_logged_in()
         for index, cfg in pending:
             print(f"\nChannel {cfg.name!r} does not have its Telegram id yet.")
@@ -884,7 +920,7 @@ def cmd_resolve_channels(args: argparse.Namespace) -> int:
             exc,
         )
     try:
-        client = build_client(blob)
+        client = build_one_shot_client(blob)
         return asyncio.run(_resolve_all(args, client, channels))
     except KeyboardInterrupt:
         print()
