@@ -341,11 +341,10 @@ def _stored_pointer(conn: Connection, channel_id: int) -> int:
 #: `store.db`, which the store uses too).
 LOG_FILE_ONLY = db.LOG_FILE_ONLY
 
-#: What the window says for a stop no one gave plainer words to.
-UNEXPLAINED_STOP = (
-    "watch stopped on a problem this program did not expect; the details are in "
-    "the log file."
-)
+#: What the window says for a stop no one gave plainer words to. Where the
+#: details are is added by the window (`store.db.POINTS_TO_DETAILS`): the
+#: log file, or right below when there is none.
+UNEXPLAINED_STOP = "watch stopped on a problem this program did not expect."
 #: What the window says when the 5-second check stopped.
 _CHECK_STOPPED = (
     "The 5-second check of the channels stopped, so posts that Telegram's live feed "
@@ -2170,7 +2169,9 @@ async def run_listener(listener: Listener) -> int:
     except ListenerStopped as exc:
         # The window reads the plain sentence; the log file keeps the
         # technical detail too (G2L-2).
-        logger.error("%s", exc.plain)
+        logger.error(
+            "%s", exc.plain, extra=db.POINTS_TO_DETAILS if exc.plain == UNEXPLAINED_STOP else None
+        )
         if str(exc) != exc.plain:
             logger.error("%s", exc, extra=LOG_FILE_ONLY)
         return EXIT_LISTENER_STOPPED

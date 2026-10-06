@@ -267,31 +267,54 @@ def _for_the_window(record: logging.LogRecord) -> bool:
     return not getattr(record, db.FILE_ONLY_ATTRIBUTE, False)
 
 
+class _WindowFormatter(logging.Formatter):
+    """The watch window's lines: time, level and the message -- never the
+    name of the part of the program that logged it ("xaucopier.ingest.
+    listener"), which the log file keeps (fix round 2 of G2L-2). A line
+    marked `POINTS_TO_DETAILS` gets where its technical detail is: the
+    log file, or -- with none open -- right below, in this window."""
+
+    def __init__(self, log_file: Path | None) -> None:
+        super().__init__("%(asctime)s UTC %(levelname)-8s %(message)s")
+        self.converter = time.gmtime
+        self._where = (
+            f" The details are in {log_file}." if log_file is not None else " The details follow."
+        )
+
+    def formatMessage(self, record: logging.LogRecord) -> str:  # noqa: N802 -- logging's name
+        text = super().formatMessage(record)
+        if getattr(record, db.POINTS_TO_DETAILS_ATTRIBUTE, False):
+            text += self._where
+        return text
+
+
 def start_logging(log_path: Path) -> Callable[[], None]:
     """Log INFO and above to the console and to `log_path` (rotating), in
     UTC. Returns the function that undoes it. A line marked
     `LOG_FILE_ONLY` -- technical detail, such as why watch stopped in a
     developer's words -- goes to the log file only; with no log file it
-    shows in the window rather than nowhere (G2L-2)."""
+    shows in the window rather than nowhere (G2L-2). The window never
+    shows the logger's name; the log file does."""
     root = logging.getLogger()
     previous_level = root.level
-    formatter = logging.Formatter("%(asctime)s UTC %(levelname)-8s %(name)s: %(message)s")
-    formatter.converter = time.gmtime
+    file_formatter = logging.Formatter("%(asctime)s UTC %(levelname)-8s %(name)s: %(message)s")
+    file_formatter.converter = time.gmtime
     window = logging.StreamHandler(sys.stderr)
     handlers: list[logging.Handler] = [window]
     try:
-        handlers.append(
-            logging.handlers.RotatingFileHandler(
-                log_path, maxBytes=_LOG_MAX_BYTES, backupCount=_LOG_BACKUPS, encoding="utf-8"
-            )
+        log_file = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=_LOG_MAX_BYTES, backupCount=_LOG_BACKUPS, encoding="utf-8"
         )
     except OSError as exc:
         print(f"warning: cannot write the log file {log_path} ({exc}); logging to this window only",
               file=sys.stderr)
+        window.setFormatter(_WindowFormatter(None))
     else:
+        log_file.setFormatter(file_formatter)
+        handlers.append(log_file)
         window.addFilter(_for_the_window)
+        window.setFormatter(_WindowFormatter(log_path))
     for handler in handlers:
-        handler.setFormatter(formatter)
         root.addHandler(handler)
     root.setLevel(logging.INFO)
 
@@ -336,9 +359,8 @@ def _run(setup: WatchSetup, blob: SecretsBlob) -> int:
     except Exception:  # noqa: BLE001 -- anything else is "stopped, restart me"
         # One plain line for the window, the traceback for the log file (G2L-2).
         logger.error(
-            "watch stopped on a problem this program did not expect. The details are in "
-            "%s.",
-            paths.LOG_FILE_NAME,
+            "watch stopped on a problem this program did not expect.",
+            extra=db.POINTS_TO_DETAILS,
         )
         logger.exception("watch stopped on an unexpected error", extra=db.LOG_FILE_ONLY)
         return exit_codes.EXIT_LISTENER_STOPPED

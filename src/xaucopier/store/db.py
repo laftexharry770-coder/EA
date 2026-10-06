@@ -109,6 +109,14 @@ logger = logging.getLogger(__name__)
 FILE_ONLY_ATTRIBUTE = "xaucopier_file_only"
 #: `extra=` for such a line: `logger.error("...", extra=LOG_FILE_ONLY)`.
 LOG_FILE_ONLY: dict[str, object] = {FILE_ONLY_ATTRIBUTE: True}
+#: The `LogRecord` attribute that marks a plain line whose technical
+#: detail comes next, in a `LOG_FILE_ONLY` line or a traceback. `watch`'s
+#: window adds where that detail is: the log file, when one is open --
+#: or, with none, "The details follow.", since the window then shows it
+#: (fix round 2 of G2L-2).
+POINTS_TO_DETAILS_ATTRIBUTE = "xaucopier_points_to_details"
+#: `extra=` for such a line.
+POINTS_TO_DETAILS: dict[str, object] = {POINTS_TO_DETAILS_ATTRIBUTE: True}
 
 
 def connect(path: Path, *, role: Role) -> sqlite3.Connection:
