@@ -409,6 +409,48 @@ def test_duplicate_account_ordinal_is_a_load_error(tmp_path: Path):
         load_accounts(p)
 
 
+def test_duplicate_account_id_is_a_load_error(tmp_path: Path):
+    # Final fix FF18: the user copies the [[accounts]] block for a second
+    # terminal and changes everything but account_id. Loaded as-is, every
+    # signal would fan out twice to that one id and the second terminal
+    # would get no trade of its own.
+    p = _write(
+        tmp_path,
+        "accounts.toml",
+        """
+        [[accounts]]
+        account_id    = "ic_demo"
+        broker        = "ICMarkets"
+        terminal_path = "C:/MT5/a/terminal64.exe"
+        login         = 111
+        server        = "s1"
+        symbol        = "XAUUSD"
+        fixed_lot     = 0.01
+        magic_base    = 1
+        ordinal       = 1
+        enabled       = true
+
+        [[accounts]]
+        account_id    = "ic_demo"
+        broker        = "ICMarkets"
+        terminal_path = "C:/MT5/b/terminal64.exe"
+        login         = 222
+        server        = "s2"
+        symbol        = "XAUUSD"
+        fixed_lot     = 0.01
+        magic_base    = 2
+        ordinal       = 2
+        enabled       = true
+        """,
+    )
+    with pytest.raises(ConfigError) as info:
+        load_accounts(p)
+    message = str(info.value)
+    assert "'ic_demo'" in message
+    assert "ordinal 2" in message and "ordinal 1" in message
+    assert "account_id must be unique within accounts.toml" in message
+
+
 def test_account_ordinal_is_explicit_not_derived_from_list_position(tmp_path: Path):
     p = _write(
         tmp_path,

@@ -66,6 +66,8 @@ def load_accounts(path: Path) -> tuple[AccountCfg, ...]:
     accounts: list[AccountCfg] = []
     seen_ordinals: dict[int, str] = {}
     seen_magic_bases: dict[int, str] = {}
+    # account_id -> the ordinal of the block that first used it.
+    seen_account_ids: dict[str, Any] = {}
 
     for index, entry in enumerate(raw_accounts):
         account_id = _field(entry, "account_id", index)
@@ -85,6 +87,18 @@ def load_accounts(path: Path) -> tuple[AccountCfg, ...]:
                 f"{seen_ordinals[ordinal]!r} -- ordinal must be unique within accounts.toml"
             )
         seen_ordinals[ordinal] = account_id
+
+        # account_id is the outbox's key for a terminal: two blocks sharing
+        # one would give that id two ENTRY rows per signal and the other
+        # terminal none (final fix FF18). The realistic slip is copying the
+        # block for a second terminal and not changing account_id.
+        if account_id in seen_account_ids:
+            raise ConfigError(
+                f"account {account_id!r} (ordinal {ordinal}) uses the same account_id "
+                f"as the block with ordinal {seen_account_ids[account_id]} -- "
+                f"account_id must be unique within accounts.toml"
+            )
+        seen_account_ids[account_id] = ordinal
 
         # magic_base identifies this account's positions on the broker
         # side; two accounts sharing one would make reconciliation
