@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from xaucopier.cli import exit_codes, paths
+from xaucopier.cli.database_words import database_problem
 from xaucopier.cli.watch import SetupError, load_channels_config
 from xaucopier.config.channels import ChannelCfg
 from xaucopier.ingest.client import EXIT_CONFIG_ERROR, EXIT_TERMINAL_AUTH
@@ -109,37 +110,6 @@ _RESTART_ADVICE = (
 )
 #: The same advice where it follows a colon mid-sentence (FF25 c).
 _RESTART_ADVICE_AFTER_COLON = _RESTART_ADVICE[0].lower() + _RESTART_ADVICE[1:]
-
-
-def database_problem(path: Path, exc: sqlite3.DatabaseError) -> str:
-    """What is wrong with the database file at `path`, in plain words, for
-    every command that reads it (`status`, `ack`, `channels`,
-    `export-fixtures`): one written by a newer version of xaucopier
-    (G1L-5: running `watch` cannot bring *that* up to date), one from an
-    older version, one that is busy, or a file that is not xaucopier's
-    database at all (final review F25). The caller says what was, or was
-    not, done."""
-    if isinstance(exc, db.SchemaVersionError):
-        if exc.newer:
-            return (
-                f"The database at {path} was written by a newer version of xaucopier; "
-                "use that version. This version does not read or change it."
-            )
-        return (
-            f"The database at {path} is from an older version of xaucopier. Run "
-            f"`{_CMD} watch` once to bring it up to date, then try again."
-        )
-    if db.is_lock_error(exc):
-        return (
-            f"The database is busy -- watch is probably writing to it ({path}). Try "
-            "again in a moment."
-        )
-    if isinstance(exc, sqlite3.OperationalError):
-        return f"The database at {path} could not be used ({exc})."
-    return (
-        f"The file at {path} is not xaucopier's database, or it is damaged ({exc}). "
-        "Check that --db names the right file."
-    )
 
 
 def round_counts(detail: str | None) -> tuple[int, int] | None:

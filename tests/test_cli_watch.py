@@ -326,7 +326,38 @@ def test_a_database_file_that_is_not_a_database_exits_5_and_releases_the_lock(
     assert cli_main.main(rig.argv()) == 5
     assert rig.built == []
     assert rig.lock.acquired == 1 and rig.lock.released == 1
-    assert "cannot be used" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    # Final fix FF19: the same plain words as every other command, and no
+    # Python class name.
+    assert f"The file at {rig.db_path} is not xaucopier's database" in err
+    assert "Check that --db names the right file." in err
+    assert "DatabaseError" not in err
+
+
+def test_a_database_from_a_newer_version_says_to_use_that_version_and_exits_5(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final fix FF19: watch said '(SchemaVersionError: this database was
+    written by a newer version ...)' and only 'fix it'."""
+    from xaucopier.store.migrations import CURRENT_VERSION
+
+    db.connect(rig.db_path, role="writer").close()
+    raw = sqlite3.connect(rig.db_path)
+    raw.execute(f"PRAGMA user_version = {CURRENT_VERSION + 1}")
+    raw.commit()
+    raw.close()
+
+    assert cli_main.main(rig.argv()) == 5
+    assert rig.built == []
+    assert rig.lock.acquired == 1 and rig.lock.released == 1
+    err = capsys.readouterr().err
+    assert "was written by a newer version of xaucopier; use that version" in err
+    assert "SchemaVersionError" not in err
+    raw = sqlite3.connect(rig.db_path)
+    try:
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == CURRENT_VERSION + 1
+    finally:
+        raw.close()
 
 
 def test_exit_5_is_its_own_code_and_not_restartable() -> None:

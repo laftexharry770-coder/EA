@@ -43,6 +43,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from xaucopier.cli import exit_codes, paths
+from xaucopier.cli.database_words import database_problem
 from xaucopier.config.accounts import AccountCfg, load_accounts
 from xaucopier.config.channels import ChannelCfg, load_channels
 from xaucopier.config.loader import ConfigError
@@ -203,9 +204,8 @@ def stamp_start(db_path: Path) -> None:
     except sqlite3.Error as exc:
         if _is_transient(exc):
             raise
-        raise SetupError(
-            f"the database {db_path} cannot be used ({type(exc).__name__}: {exc})."
-        ) from None
+        # The same plain words as every other command (final fix FF19).
+        raise SetupError(database_problem(db_path, exc)) from None
     try:
         heartbeats.beat(conn, name=heartbeats.WATCH_STARTED, now_utc=_utcnow())
         conn.commit()
