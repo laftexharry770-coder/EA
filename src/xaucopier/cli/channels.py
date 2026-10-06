@@ -15,12 +15,12 @@
   the edits, deletions and follow-ups of the signals it already posted.
   `off` says how many of its signals are still waiting or already traded
   (`report.signals_in_play`); `watch` cancels the waiting entries at its
-  next start. **And posts made while it was off are never read** (ruling
-  M12, F28): `on` of a channel read before writes a seed cutoff of now
-  (`reseed_from_now`), so the next `watch` starts reading it from there
-  instead of catching up on everything posted meanwhile. `channels add`
-  does the same for a channel read before, removed and added back
-  (G2L-3).
+  next start. **And what it posts while it is off is never read** (ruling
+  M12, F28; fix round 2): `off` records when it was switched off and `on`
+  when it came back (`cli/channel_reading.py`), and the next `watch`
+  reads what it posted before the switch-off, skips the OFF period, and
+  reads on from the switch-on. `channels add` of a channel read before,
+  removed and added back, has it read from now on (G2L-3).
 - `channels add` adds a NEW channel: the only command here that contacts
   Telegram, once, to look the channel up -- by the same paste-a-link or
   pick-from-the-channels-you-joined flow `resolve-channels` uses. It takes
@@ -61,7 +61,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from xaucopier.cli import exit_codes, paths
+from xaucopier.cli import channel_reading, exit_codes, paths
 from xaucopier.cli.resolve import (
     PLACEHOLDER_ID,
     TELEGRAM_TROUBLE,
@@ -315,38 +315,36 @@ def _raw_channel(text: str, number: int) -> dict[str, Any] | None:
     return None
 
 
-def reseed_from_now(db_path: Path, channel_id: int, now: datetime) -> bool:
-    """Ask the next `watch` to read channel `channel_id` again from `now`
-    -- whole seconds, UTC -- instead of from where it stopped, if it was
-    read before (a `channel_state` row with a pointer or the seeded
-    marker): `channel_state.request_reseed`, in one short transaction.
-    For `channels on` (F28, ruling M12) and `channels add` of a channel
-    read before (G2L-3): posts made while it was off, or not in the list,
-    are never read. Returns whether a cutoff was written.
+def _utc_text(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
 
-    No database yet, or a channel never read: nothing to write, since its
-    first read seeds it at that watch's start anyway. A database another
-    program holds past SQLite's wait (10 s), one from a newer version, or
-    a file that is not a database raises `sqlite3.DatabaseError`, and
-    nothing is written -- the caller then changes nothing either."""
-    if not db_path.is_file():
-        return False
-    conn = db.connect(db_path, role="writer")
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            state = channel_state.read(conn, channel_id)
-            if not (state.seeded or state.pointer > 0):
-                conn.rollback()
-                return False
-            channel_state.request_reseed(conn, channel_id=channel_id, cutoff_utc=now)
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        return True
-    finally:
-        conn.close()
+
+def _on_lines(result: channel_state.SwitchOn | None) -> list[str]:
+    """What `channels on` did to where the next watch reads the channel
+    (fix round 2 of F28), in plain words. Nothing to say for a channel
+    never read, or with no database yet: its first read starts at that
+    watch's start, as for any new channel."""
+    if result is None or result.outcome == "never_read":
+        return []
+    if result.outcome in ("period_closed", "period_extended"):
+        off = f" ({_utc_text(result.off_at_utc)} UTC)" if result.off_at_utc is not None else ""
+        return [
+            f"The next `{_CMD} watch` reads what it posted until you switched it off{off} "
+            "that watch had not read yet, skips what it posted while it was off, and reads "
+            "everything it posts from now on."
+        ]
+    if result.outcome == "reseeded":
+        return [
+            "When it was switched off was not recorded, so the next watch reads it from now "
+            "on: everything it posted since watch last read it is skipped, not only what it "
+            "posted while it was off."
+        ]
+    # "first_read_kept"
+    return [
+        "When it was switched off was not recorded, and watch is running and has not "
+        "finished its first read of this channel, so what it posted while it was off may "
+        "still be read."
+    ]
 
 
 def max_signal_age_seconds(config_dir: Path) -> int:
@@ -367,15 +365,34 @@ def _is_are(count: int) -> str:
     return "is" if count == 1 else "are"
 
 
-def _off_lines(db_path: Path, cfg: ChannelCfg, *, max_age: int) -> list[str]:
+def _off_lines(
+    db_path: Path,
+    cfg: ChannelCfg,
+    *,
+    max_age: int,
+    recorded: bool,
+    problem: str | None,
+) -> list[str]:
     """What `channels off` does to the channel and to the signals it
     already posted, in plain words (final review F15). A waiting entry
     whose signal is older than `max_age` seconds is told apart: it can
-    never be traded (fix round 2)."""
-    lines = [
-        "While it is off, this program does not read it at all: what it posts then is "
-        "not recorded, and not read later either, even after you switch it back on."
-    ]
+    never be traded. `recorded`: when it was switched off was saved, so
+    what it posted before is still read once it is back on; `problem`:
+    why that could not be saved (fix round 2 of F28)."""
+    lines = ["While it is off, this program does not read it at all."]
+    if recorded:
+        lines.append(
+            "What it posts from now until you switch it back on is never read, not even "
+            "later. What it posted before now that watch has not read yet is still read "
+            "once it is back on."
+        )
+    else:
+        lines.append("What it posts while it is off is never read, not even later.")
+    if problem is not None:
+        lines.append(
+            f"When it was switched off could not be saved: {problem} So when you switch it "
+            "back on, everything it posted since watch last read it is skipped too."
+        )
     try:
         if db_path.is_file():
             conn = db.connect_readonly(db_path)
@@ -388,7 +405,11 @@ def _off_lines(db_path: Path, cfg: ChannelCfg, *, max_age: int) -> list[str]:
         else:
             counts = report.SignalsInPlay(waiting=0, too_old=0, traded=0)
     except sqlite3.DatabaseError as exc:
-        lines.append(f"Its signals could not be counted. {database_problem(db_path, exc)}")
+        lines.append(
+            "Its signals could not be counted either."
+            if problem is not None
+            else f"Its signals could not be counted. {database_problem(db_path, exc)}"
+        )
         return lines
     waiting, too_old, traded = counts.waiting, counts.too_old, counts.traded
     if not waiting and not too_old and not traded:
@@ -471,21 +492,42 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
         return exit_codes.EXIT_FAILED
     # No second block with this Telegram id can be ON already: the loader
     # refuses a file that lists one id twice (final review F40).
-    reseeded = False
-    if enabled:
-        # The cutoff first, then the switch: if the save below fails, the
-        # channel stays OFF -- never read -- so the cutoff does nothing and
-        # the next `channels on` writes its own. The other order could
-        # leave it ON with no cutoff, and the next watch would read
-        # everything posted while it was off as new (F28).
-        try:
-            reseeded = reseed_from_now(args.db, cfg.channel_id, _utcnow())
-        except sqlite3.DatabaseError as exc:
+    #
+    # The database first, then the switch, both ways (fix round 2 of F28).
+    # `on`: if the save below fails, the channel stays OFF -- never read --
+    # with its OFF period closed; the next `channels on` finds no open one
+    # and extends that one to its own time, so nothing is lost. The other
+    # order could leave it ON with its period still open, which no read
+    # skips: everything posted while it was off would be read as new.
+    # `off`: if the save fails, the channel stays ON with an open period,
+    # which no read skips and the next `channels off` replaces. An `off`
+    # whose time cannot be saved is still done -- switching a channel off
+    # must always work -- and says what that costs.
+    switched_on: channel_state.SwitchOn | None = None
+    off_recorded = False
+    off_problem: str | None = None
+    try:
+        if enabled:
+            switched_on = channel_reading.record_switch_on(
+                args.db,
+                cfg.channel_id,
+                _utcnow(),
+                # A running watch may be seeding the channel at its first
+                # cutoff; only with none may that be replaced.
+                may_replace_first_cutoff=not session_in_use(),
+            )
+        else:
+            off_recorded = bool(
+                channel_reading.record_switch_off(args.db, cfg.channel_id, _utcnow())
+            )
+    except sqlite3.DatabaseError as exc:
+        if enabled:
             complain(
                 database_problem(args.db, exc),
                 f"Nothing was changed: channel {number} is still OFF.",
             )
             return exit_codes.EXIT_FAILED
+        off_problem = database_problem(args.db, exc)
 
     try:
         save_switch(
@@ -513,13 +555,18 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
         return code
 
     say(f"Channel {number} ({name}) is now {word}.")
-    if reseeded:
+    if enabled:
+        say(*_on_lines(switched_on))
+    else:
         say(
-            "Messages posted while it was off are not read: the next watch reads it "
-            "from now on."
+            *_off_lines(
+                args.db,
+                cfg,
+                max_age=max_signal_age_seconds(args.config_dir),
+                recorded=off_recorded,
+                problem=off_problem,
+            )
         )
-    if not enabled:
-        say(*_off_lines(args.db, cfg, max_age=max_signal_age_seconds(args.config_dir)))
     if not enabled and not any(other.enabled for other in channels if other is not cfg):
         say(
             "WARNING: that was the last channel switched on. With no channel ON, "
@@ -625,9 +672,13 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
             say("Not added. Nothing was changed.")
             return exit_codes.EXIT_FAILED
     # A channel read before, removed and now added back, is read from now
-    # on -- as `channels on` does it, and in the same order (G2L-3).
+    # on, the database first, as `channels on` does it (G2L-3). This
+    # command holds the session, so no watch is seeding it: a first read
+    # still pending is moved to now too.
     try:
-        reseed_from_now(args.db, resolved.channel_id, _utcnow())
+        channel_reading.reseed_from_now(
+            args.db, resolved.channel_id, _utcnow(), may_replace_first_cutoff=True
+        )
     except sqlite3.DatabaseError as exc:
         complain(database_problem(args.db, exc), "Nothing was added.")
         return exit_codes.EXIT_FAILED

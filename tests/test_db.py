@@ -24,7 +24,7 @@ from xaucopier.store.migrations import CURRENT_VERSION
 
 EXPECTED_TABLES = {
     "messages", "signals", "followups", "outbox",
-    "channel_state", "metrics", "alerts", "heartbeats",
+    "channel_state", "metrics", "alerts", "heartbeats", "channel_off_periods",
 }
 
 

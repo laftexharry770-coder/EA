@@ -1431,18 +1431,75 @@ def on_rig(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> Rig:
     return rig
 
 
+def _periods(db_path: Path, channel_id: int) -> list[tuple]:
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT off_at_utc, on_at_utc FROM channel_off_periods WHERE channel_id = ? "
+            "ORDER BY period_id",
+            (channel_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _at(monkeypatch: pytest.MonkeyPatch, moment: datetime) -> None:
+    monkeypatch.setattr(channels_module, "_utcnow", lambda: moment)
+
+
 @pytest.mark.parametrize(
     ("pointer", "seeded"),
     [(5, "2026-09-01T00:00:00+00:00"), (0, "2026-09-01T00:00:00+00:00"), (5, None)],
     ids=["seeded", "seeded at 0: every post was newer", "a pointer from before the marker"],
 )
-def test_on_of_a_channel_read_before_asks_the_next_watch_to_start_reading_it_from_now(
+def test_off_then_on_skips_exactly_the_time_it_was_off(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pointer: int,
+    seeded: str | None,
+) -> None:
+    """Fix round 2 of F28: `channels off` records when, `channels on` when
+    it came back -- whole seconds, UTC -- and nothing else: the next watch
+    reads up to the switch-off, then from the switch-on
+    (tests/test_channels_off_on.py runs it end to end)."""
+    _set_state(rig.db_path, GOLD, pointer, seeded)
+    _at(monkeypatch, NOW + timedelta(microseconds=654321))
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    assert _periods(rig.db_path, GOLD) == [("2026-09-23T12:00:00+00:00", None)]
+    off_out = capsys.readouterr().out
+    assert "What it posts from now until you switch it back on is never read" in off_out
+    assert "What it posted before now that watch has not read yet is still read" in off_out
+
+    _at(monkeypatch, NOW + timedelta(hours=2, microseconds=1))
+    assert cli_main.main(rig.argv("on", "7")) == exit_codes.EXIT_OK
+
+    assert _switches(rig.channels_path)[7] is True
+    assert _periods(rig.db_path, GOLD) == [
+        ("2026-09-23T12:00:00+00:00", "2026-09-23T14:00:00+00:00")
+    ]
+    # No re-seed: the pointer and marker stay, and no cutoff is written.
+    assert _state_row(rig.db_path, GOLD) == (pointer, seeded, None)
+    out = capsys.readouterr().out
+    assert "Channel 7 (Gold Room) is now ON." in out
+    assert (
+        "The next `.\\xaucopier watch` reads what it posted until you switched it off "
+        "(2026-09-23 12:00:00 UTC) that watch had not read yet, skips what it posted while "
+        "it was off, and reads everything it posts from now on." in out
+    )
+
+
+@pytest.mark.parametrize(
+    ("pointer", "seeded"),
+    [(5, "2026-09-01T00:00:00+00:00"), (0, "2026-09-01T00:00:00+00:00"), (5, None)],
+    ids=["seeded", "seeded at 0: every post was newer", "a pointer from before the marker"],
+)
+def test_on_of_a_channel_whose_switch_off_was_not_recorded_reads_it_from_now(
     on_rig: Rig, capsys: pytest.CaptureFixture[str], pointer: int, seeded: str | None
 ) -> None:
-    """Ruling M12 (F28): OFF means posts made while it was off are ignored,
-    not paused. Before, `channels on` only flipped the switch, and the next
-    watch read everything posted while it was off as new -- signals and
-    'close all's included."""
+    """Quiet Signals is OFF in the file with no switch-off recorded (the
+    database could not be written then, or the file was edited by hand):
+    ruling M12 as round 1 had it -- the next watch reads it from now on."""
     _set_state(on_rig.db_path, QUIET, pointer, seeded)
 
     assert cli_main.main(on_rig.argv("on", "3")) == exit_codes.EXIT_OK
@@ -1452,7 +1509,129 @@ def test_on_of_a_channel_read_before_asks_the_next_watch_to_start_reading_it_fro
     assert _state_row(on_rig.db_path, QUIET) == (pointer, seeded, "2026-09-23T12:00:00+00:00")
     out = capsys.readouterr().out
     assert "Channel 3 (Quiet Signals) is now ON." in out
-    assert "posted while it was off are not read" in out
+    assert (
+        "When it was switched off was not recorded, so the next watch reads it from now on: "
+        "everything it posted since watch last read it is skipped" in out
+    )
+
+
+@pytest.mark.parametrize("watch_running", [False, True], ids=["no watch", "watch running"])
+def test_on_of_a_channel_whose_first_read_never_finished(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str], watch_running: bool
+) -> None:
+    """The reviewer's open (b), with no switch-off recorded: the first-attempt
+    cutoff is moved to now only when no watch holds the session (none can
+    be seeding the channel at the old one); otherwise it stays, and the
+    user is told what that means."""
+    conn = sqlite3.connect(on_rig.db_path)
+    conn.execute(
+        "INSERT INTO channel_state (channel_id, seed_cutoff_utc) VALUES (?, ?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET seed_cutoff_utc = excluded.seed_cutoff_utc",
+        (QUIET, "2026-09-23T08:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+    on_rig.watch_running = watch_running
+
+    assert cli_main.main(on_rig.argv("on", "3")) == exit_codes.EXIT_OK
+
+    cutoff = _state_row(on_rig.db_path, QUIET)[2]
+    out = capsys.readouterr().out
+    if watch_running:
+        assert cutoff == "2026-09-23T08:00:00+00:00"
+        assert "what it posted while it was off may still be read" in out
+    else:
+        assert cutoff == "2026-09-23T12:00:00+00:00"
+        assert "the next watch reads it from now on" in out
+
+
+def test_off_and_on_of_a_channel_never_read_record_nothing(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A channel switched OFF and ON again before watch read it at all
+    behaves as if it was never off: its first read starts at that watch's
+    start, like any new channel's."""
+    before = _state_row(rig.db_path, GOLD)
+    _at(monkeypatch, NOW)
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    off_out = capsys.readouterr().out
+    _at(monkeypatch, NOW + timedelta(hours=1))
+    assert cli_main.main(rig.argv("on", "7")) == exit_codes.EXIT_OK
+
+    assert _periods(rig.db_path, GOLD) == []
+    assert _state_row(rig.db_path, GOLD) == before
+    assert "What it posts while it is off is never read, not even later." in off_out
+    assert "still read" not in off_out
+    out = capsys.readouterr().out
+    assert "is now ON." in out and "skips" not in out and "from now on:" not in out
+
+
+def test_a_second_off_replaces_one_whose_save_failed(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`channels off` whose save fails leaves the channel ON with its
+    switch-off recorded; no read skips an open period, and the next
+    `channels off` records its own time instead."""
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    _at(monkeypatch, NOW)
+    with monkeypatch.context() as failing:
+        _inject("replace", failing, rig)
+        assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_FAILED
+    assert _switches(rig.channels_path)[7] is True
+    _at(monkeypatch, NOW + timedelta(hours=1))
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    assert _periods(rig.db_path, GOLD) == [("2026-09-23T13:00:00+00:00", None)]
+
+
+def test_an_on_whose_save_failed_is_completed_by_the_next_on(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The database first, then the switch. `on` whose save fails leaves
+    the channel OFF with its period closed; the next `on` extends that
+    period to its own time -- what was posted in between is still skipped,
+    and what was posted before the switch-off still read."""
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    _at(monkeypatch, NOW)
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    _at(monkeypatch, NOW + timedelta(hours=1))
+    with monkeypatch.context() as failing:
+        _inject("replace", failing, rig)
+        assert cli_main.main(rig.argv("on", "7")) == exit_codes.EXIT_FAILED
+    assert _switches(rig.channels_path)[7] is False
+    capsys.readouterr()
+
+    _at(monkeypatch, NOW + timedelta(hours=3))
+    assert cli_main.main(rig.argv("on", "7")) == exit_codes.EXIT_OK
+
+    assert _switches(rig.channels_path)[7] is True
+    assert _periods(rig.db_path, GOLD) == [
+        ("2026-09-23T12:00:00+00:00", "2026-09-23T15:00:00+00:00")
+    ]
+    assert _state_row(rig.db_path, GOLD)[2] is None
+    assert "skips what it posted while it was off" in capsys.readouterr().out
+
+
+def test_off_while_the_database_is_held_still_switches_off_and_says_what_that_costs(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Switching a channel off must always work."""
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 50)
+    holder = sqlite3.connect(rig.db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert _switches(rig.channels_path)[7] is False
+    assert _periods(rig.db_path, GOLD) == []
+    out = capsys.readouterr().out
+    assert "When it was switched off could not be saved: The database is busy" in out
+    assert "everything it posted since watch last read it is skipped too" in out
+    assert "Traceback" not in out
 
 
 @pytest.mark.parametrize(
@@ -1544,13 +1723,16 @@ def test_the_cutoff_is_written_before_the_switch_so_a_failed_save_leaves_it_off(
     assert _state_row(on_rig.db_path, QUIET)[2] == "2026-09-23T12:00:00+00:00"
 
 
-def test_off_writes_nothing_to_the_database(on_rig: Rig) -> None:
+def test_off_writes_only_when_it_was_switched_off(on_rig: Rig) -> None:
+    """Round 1 pinned that OFF wrote nothing; fix round 2 records one row,
+    and touches nothing else."""
     _set_state(on_rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
-    before = _sha(on_rig.db_path)
+    before = _state_row(on_rig.db_path, GOLD)
 
     assert cli_main.main(on_rig.argv("off", "7")) == exit_codes.EXIT_OK
 
-    assert _sha(on_rig.db_path) == before
+    assert _periods(on_rig.db_path, GOLD) == [("2026-09-23T12:00:00+00:00", None)]
+    assert _state_row(on_rig.db_path, GOLD) == before
 
 
 # -- F15: what OFF does to the signals already recorded ---------------------------------------
@@ -1590,7 +1772,7 @@ def test_off_says_how_many_signals_are_in_play_and_what_off_does_to_them(
     assert "edits, deletions and follow-ups (like 'close all') are no longer read" in out
     assert "cancelled the next time `.\\xaucopier watch` starts" in out
     assert "keeps its stop loss and take profit" in out
-    assert "not read later either" in out  # M12: posts made while off stay unread
+    assert "never read, not even later" in out  # M12: posts made while off stay unread
 
 
 def test_a_signal_one_account_has_taken_counts_as_traded_and_a_skipped_one_not_at_all(
@@ -1778,6 +1960,26 @@ def test_add_of_a_channel_read_before_asks_the_next_watch_to_start_reading_it_fr
     assert _state_row(add_rig.rig.db_path, SILVER_ID) == (
         40, "2026-09-01T00:00:00+00:00", "2026-09-23T12:00:00+00:00"
     )
+
+
+def test_add_of_a_channel_whose_first_read_never_finished_reads_it_from_now(
+    add_rig: AddRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`channels add` holds the session, so no watch is seeding the channel
+    at its first cutoff: that cutoff is moved to now (the reviewer's open
+    (b)), and nothing posted while it was gone is read."""
+    monkeypatch.setattr(channels_module, "_utcnow", lambda: SWITCHED_AT)
+    conn = sqlite3.connect(add_rig.rig.db_path)
+    conn.execute(
+        "INSERT INTO channel_state (channel_id, seed_cutoff_utc) VALUES (?, ?)",
+        (SILVER_ID, "2026-09-20T08:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    assert cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes")) == 0
+
+    assert _state_row(add_rig.rig.db_path, SILVER_ID) == (0, None, "2026-09-23T12:00:00+00:00")
 
 
 def test_add_of_a_channel_never_read_writes_no_cutoff(add_rig: AddRig) -> None:

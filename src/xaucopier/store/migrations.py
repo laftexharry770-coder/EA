@@ -187,6 +187,16 @@ two backfills every existing row keeps every value it had.
   recognised exactly, however late it arrives (F09), with the index
   ``idx_messages_fwd_from`` for that lookup.
 
+- ``channel_off_periods(period_id, channel_id, off_at_utc, on_at_utc)``,
+  with the indexes ``idx_channel_off_periods_channel`` and
+  ``idx_channel_off_periods_open`` (at most one open period per
+  channel): one row per time a channel already being read was switched
+  OFF (fix round 2 of F28). ``channels off`` opens a row, ``channels on``
+  closes it (``on_at_utc``), and the next read of the channel catches up
+  to ``off_at_utc``, skips to ``on_at_utc`` and deletes the row -- so OFF
+  skips exactly what the channel posted while it was off. See
+  ``store/channel_state.py``. Empty after the upgrade.
+
 ``sender_kind`` and ``is_post`` carry CHECK constraints; NULL (not
 known, or stored before migration 4) always passes.
 
@@ -327,6 +337,19 @@ _MIGRATION_4: tuple[str, ...] = (
     "CHECK (replacement_kind IN ('promoted', 'posted_again'))",
     "CREATE INDEX IF NOT EXISTS idx_messages_fwd_from "
     "ON messages(fwd_from_channel_id, fwd_from_post_id)",
+    # Fix round 2 of F28: one row per OFF period of a channel; see the
+    # module docstring and store/channel_state.py.
+    "CREATE TABLE IF NOT EXISTS channel_off_periods ("
+    "  period_id  INTEGER PRIMARY KEY,"
+    "  channel_id INTEGER NOT NULL,"
+    "  off_at_utc TEXT    NOT NULL,"
+    "  on_at_utc  TEXT"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_channel_off_periods_channel "
+    "ON channel_off_periods(channel_id, off_at_utc)",
+    # At most one OFF period still open per channel.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_off_periods_open "
+    "ON channel_off_periods(channel_id) WHERE on_at_utc IS NULL",
     # A pointer above 0 was written by a seed (or by ingest after one):
     # that channel has been seeded. Pointer-0 rows stay unmarked.
     "UPDATE channel_state SET seeded_at_utc = strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now') "

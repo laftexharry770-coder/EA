@@ -15,7 +15,7 @@ from xaucopier.store.migrations import CURRENT_VERSION, migrate
 
 EXPECTED_TABLES = {
     "messages", "signals", "followups", "outbox",
-    "channel_state", "metrics", "alerts", "heartbeats",
+    "channel_state", "metrics", "alerts", "heartbeats", "channel_off_periods",
 }
 
 
@@ -81,7 +81,10 @@ def test_no_extra_tables_beyond_the_brief(tmp_path):
     moved into Plan 2 with Task 10's migration 2: edits and deletions
     must be able to record an operator alert durably before Plan 3's
     notifier exists. `heartbeats` is Task 11's migration 3: `status`
-    runs in another process and can only report what `watch` stamped.)"""
+    runs in another process and can only report what `watch` stamped.
+    `channel_off_periods` is migration 4's, fix round 2 of F28: when a
+    channel was switched off and back on, so the next read skips exactly
+    what it posted while off.)"""
     conn = _connect(tmp_path)
     tables = {
         row[0]
@@ -910,6 +913,33 @@ def test_upgrading_a_version_3_database_to_4_preserves_every_row(tmp_path):
     ]
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert tables == EXPECTED_TABLES
+    # No channel was switched off under the old version: no OFF period.
+    assert conn.execute("SELECT COUNT(*) FROM channel_off_periods").fetchone() == (0,)
+    conn.close()
+
+
+def test_a_channel_has_at_most_one_open_off_period(tmp_path):
+    """Fix round 2 of F28: `channels off` replaces an open period rather
+    than adding a second; the index makes a second one impossible."""
+    conn = _connect(tmp_path)
+    conn.execute(
+        "INSERT INTO channel_off_periods (channel_id, off_at_utc) VALUES (1, '2026-09-05T11:00:00+00:00')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO channel_off_periods (channel_id, off_at_utc) "
+            "VALUES (1, '2026-09-05T12:00:00+00:00')"
+        )
+    # Closed periods are not limited; nor is another channel's open one.
+    conn.execute(
+        "INSERT INTO channel_off_periods (channel_id, off_at_utc, on_at_utc) "
+        "VALUES (1, '2026-09-04T11:00:00+00:00', '2026-09-04T12:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO channel_off_periods (channel_id, off_at_utc) VALUES (2, '2026-09-05T11:00:00+00:00')"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO channel_off_periods (channel_id) VALUES (3)")
     conn.close()
 
 

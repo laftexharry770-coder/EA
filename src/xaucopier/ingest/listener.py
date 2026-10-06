@@ -180,6 +180,12 @@ DEFAULT_RPC_TIMEOUT = 20.0
 #: ingests from. Absorbs what skew is left between the start time and
 #: Telegram's message dates; see `Listener._seed_pointer`.
 FIRST_RUN_SEED_MARGIN = timedelta(seconds=60)
+#: How far around an OFF period posts are still read: up to this long after
+#: the switch-off, and from this long before the switch-on (fix round 2 of
+#: F28). `channels off`/`on` stamp this computer's clock, the posts carry
+#: Telegram's; a post made just before the switch-off is never lost to a
+#: clock a little behind.
+OFF_PERIOD_MARGIN = FIRST_RUN_SEED_MARGIN
 #: How long `start()` waits for Telegram's clock (`updates.GetState`)
 #: before it uses this computer's own (ledger 143).
 TELEGRAM_CLOCK_TIMEOUT_SECONDS = 10.0
@@ -1171,6 +1177,17 @@ class Listener:
         verifiably has nothing older, and a channel with no messages at
         all is not read -- nor marked seeded -- until its first post.
 
+        **A channel switched off and back on** since it was last read has
+        an OFF period for each time (`channel_state.off_periods`; fix
+        round 2 of F28). Each is read in two ranges, oldest period first:
+        everything after the pointer posted up to the switch-off
+        (`_read_until_switched_off`, as many batches as it takes, each
+        call reading one) -- a 'close all' posted while the channel was
+        still ON and watch was stopped is read -- and only then a skip to
+        the switch-on (`_skip_while_off`). So OFF skips exactly what the
+        channel posted while it was off, give or take `OFF_PERIOD_MARGIN`
+        on either side. Only then does the ordinary read run.
+
         `rpc_timeout` is required: it bounds every `get_messages()` RPC
         this call makes (`asyncio.wait_for`; `TimeoutError` propagates),
         so no history read -- and no holder of the per-channel lock
@@ -1211,13 +1228,97 @@ class Listener:
                 if seeded is None:
                     return ()  # no messages at all yet: seeded by a later read
                 pointer = seeded
+            outcomes: list[HistoryIngest] = []
+            for period in channel_state.off_periods(self.reader, channel_id):
+                caught_up, pointer, read = await self._read_until_switched_off(
+                    channel_cfg, period, pointer, source=source, limit=limit,
+                    rpc_timeout=rpc_timeout,
+                )
+                outcomes.extend(read)
+                if not caught_up:
+                    return tuple(outcomes)  # the next read goes on from the pointer
+                pointer = await self._skip_while_off(channel_cfg, period, rpc_timeout=rpc_timeout)
             messages = await asyncio.wait_for(
                 self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
                 rpc_timeout,
             )
-            return await self.ingest_history(
-                channel_cfg, messages, min_id=pointer, source=source
+            outcomes.extend(
+                await self.ingest_history(channel_cfg, messages, min_id=pointer, source=source)
             )
+            return tuple(outcomes)
+
+    async def _read_until_switched_off(
+        self,
+        channel_cfg: ChannelCfg,
+        period: channel_state.OffPeriod,
+        pointer: int,
+        *,
+        source: str,
+        limit: int,
+        rpc_timeout: float,
+    ) -> tuple[bool, int, tuple[HistoryIngest, ...]]:
+        """The first of an OFF period's two ranges: one batch after
+        `pointer`, ingested up to the first post dated after the switch-off
+        (plus `OFF_PERIOD_MARGIN`). Returns whether the read has caught up
+        to the switch-off -- a post after it was met, or the batch was the
+        last there is, and every post before it is stored or skipped --
+        the pointer now, and what was ingested. Not caught up (a full
+        batch, or a post that failed): the next read goes on from the
+        pointer, and the period waits."""
+        channel_id = channel_cfg.channel_id
+        last_read = period.off_at_utc + OFF_PERIOD_MARGIN
+        messages = await asyncio.wait_for(
+            self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
+            rpc_timeout,
+        )
+        before: list[Any] = []
+        met_a_later_post = False
+        for message in sorted((m for m in messages if m.id > pointer), key=lambda m: m.id):
+            if message.date is not None and message.date > last_read:
+                met_a_later_post = True
+                break
+            before.append(message)
+        read = (
+            await self.ingest_history(channel_cfg, before, min_id=pointer, source=source)
+            if before
+            else ()
+        )
+        pointer_now = channel_state.read(self.reader, channel_id).pointer
+        caught_up = (met_a_later_post or len(messages) < limit) and (
+            not before or pointer_now >= before[-1].id
+        )
+        return caught_up, pointer_now, read
+
+    async def _skip_while_off(
+        self, channel_cfg: ChannelCfg, period: channel_state.OffPeriod, *, rpc_timeout: float
+    ) -> int:
+        """The second range: skip what the channel posted while it was OFF.
+        The pointer moves to the newest post dated before the switch-on
+        (less `OFF_PERIOD_MARGIN`) -- one RPC, as a seed's anchor -- never
+        down, and the period is deleted, in one writer job. Returns the
+        pointer."""
+        channel_id = channel_cfg.channel_id
+        offset = (period.on_at_utc - OFF_PERIOD_MARGIN).replace(microsecond=0)
+        before_on = await asyncio.wait_for(
+            self.client.get_messages(channel_id, limit=1, offset_date=offset), rpc_timeout
+        )
+        anchor_id = max((message.id for message in before_on), default=0)
+
+        def finish(conn: Connection) -> int:
+            return channel_state.finish_off_period(
+                conn, channel_id=channel_id, period_id=period.period_id, anchor_id=anchor_id
+            )
+
+        pointer = await self._run_on_writer(finish)
+        logger.warning(
+            "Channel %s (%s) was switched off from %s to %s UTC: what it posted in between "
+            "was not read. Everything it posted before and since is read.",
+            channel_id,
+            channel_cfg.name,
+            period.off_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
+            period.on_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        return pointer
 
     async def probe_writer(self) -> None:
         """Run a no-op (`SELECT 1`) on the writer thread and await it.
@@ -1346,8 +1447,10 @@ class Listener:
         (`start()`; `channel_state.claim_seed_cutoff`) and used by every
         attempt after it. Messages at or after it are ingested by the
         read that follows (`source="poll"`, so they count as missed, or
-        `"backfill"`). A channel switched back on (F28) carries the cutoff
-        `channels on` wrote: posts made while it was off are not read.
+        `"backfill"`). A channel added back (G2L-3), or switched back on with
+        no switch-off recorded (F28), carries the cutoff that command wrote:
+        what it posted since it was last read is not read. (A switch-off
+        that was recorded is an OFF period instead -- see `read_history`.)
 
         The cutoff is in whole seconds, and so is `offset_date` (ledger
         141): Telethon sends it as whole seconds, and a fraction here made
@@ -1522,8 +1625,9 @@ class Listener:
             if switched_on:
                 logger.log(
                     level,
-                    "%s was switched back on at %s UTC, %s ago: it is read from about a "
-                    "minute before then. Posts made while it was off are not read.",
+                    "%s is read again from %s UTC, %s ago, when it was added back or "
+                    "switched back on: it is read from about a minute before then. What it "
+                    "posted before that, since it was last read, is not read.",
                     channel,
                     cutoff_text,
                     _describe_age(age),

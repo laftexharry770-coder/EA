@@ -41,6 +41,7 @@ from test_poll import (
     _rows,
     _run_rounds,
     _stored,
+    _stored_ids,
     _until_asleep,
 )
 from xaucopier.ingest import listener as listener_module
@@ -612,3 +613,241 @@ def test_a_re_seed_never_moves_the_pointer_backward(tmp_path: Path) -> None:
     assert forward_from == [100]
     assert _stored(db_path) == [(101, "backfill"), (102, "backfill")]
     assert _seed_row(db_path) == (102, 1, None)
+
+
+# -- fix round 2 of F28: OFF periods are skipped exactly ------------------------------------
+
+
+def _hours_ago(hours: float) -> datetime:
+    return NOW - timedelta(hours=hours)
+
+
+def _read_before(db_path: Path, *periods: tuple[float, float], pointer: int = 100,
+                 seeded: bool = True, cutoff: datetime | None = None) -> None:
+    """Channel A as `channels off`/`on` left it: pointer `pointer` (with the
+    seeded marker, or a first-read cutoff), and each (off, on) period, in
+    hours before NOW."""
+    conn = db.connect(db_path, role="writer")
+    try:
+        conn.execute(
+            "INSERT INTO channel_state (channel_id, last_processed_message_id, seeded_at_utc, "
+            "seed_cutoff_utc) VALUES (?, ?, ?, ?)",
+            (A, pointer, "2026-09-01T00:00:00+00:00" if seeded else None,
+             channel_state.format_utc(cutoff) if cutoff is not None else None),
+        )
+        for off, on in periods:
+            channel_state.record_switch_off(conn, channel_id=A, off_at_utc=_hours_ago(off))
+            channel_state.record_switch_on(
+                conn, channel_id=A, on_at_utc=_hours_ago(on), may_replace_first_cutoff=True
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _history(*dated: tuple[int, float]) -> list[FakeMessage]:
+    return [FakeMessage(id=i, message=CHATTER_TEXT, date=_hours_ago(h)) for i, h in dated]
+
+
+def _periods_left(db_path: Path) -> list:
+    return _rows(db_path, "SELECT off_at_utc, on_at_utc FROM channel_off_periods")
+
+
+def test_two_off_periods_between_two_runs_are_each_skipped_exactly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """OFF 5 h ago, ON 4 h ago, OFF 3 h ago, ON 2 h ago, all while watch
+    was stopped: what was posted while ON is read, what was posted while
+    OFF is not, in order."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (5, 4), (3, 2))
+    history = _history((101, 6), (102, 4.5), (103, 3.5), (104, 2.5), (105, 1))
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history})
+        async with _watching(db_path, client, {"now": NOW}):
+            return _anchor_queries(client)
+
+    with caplog.at_level(logging.WARNING, logger="xaucopier.ingest.listener"):
+        anchors = asyncio.run(scenario())
+
+    assert _stored(db_path) == [(101, "backfill"), (103, "backfill"), (105, "backfill")]
+    assert anchors == [_hours_ago(4) - FIRST_RUN_SEED_MARGIN, _hours_ago(2) - FIRST_RUN_SEED_MARGIN]
+    assert _pointer(db_path) == 105
+    assert _periods_left(db_path) == []
+    assert _seed_row(db_path) == (105, 1, None)  # never re-seeded
+    skipped = [r.getMessage() for r in caplog.records if "was switched off from" in r.getMessage()]
+    assert skipped == [
+        f"Channel {A} ({CHANNEL_A.name}) was switched off from 2026-09-05 06:00:00 to "
+        "2026-09-05 07:00:00 UTC: what it posted in between was not read. Everything it "
+        "posted before and since is read.",
+        f"Channel {A} ({CHANNEL_A.name}) was switched off from 2026-09-05 08:00:00 to "
+        "2026-09-05 09:00:00 UTC: what it posted in between was not read. Everything it "
+        "posted before and since is read.",
+    ]
+    for text in skipped:
+        _assert_plain(text)
+
+
+def test_posts_within_a_minute_of_either_switch_are_read(tmp_path: Path) -> None:
+    """This computer's clock stamps the switches, Telegram's the posts: a
+    post up to a minute after the switch-off, or from a minute before the
+    switch-on, is read rather than lost to a clock a little off."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    minute = 1 / 60
+    history = _history(
+        (101, 3 - 0.99 * minute),   # 59 s after the switch-off: read
+        (102, 3 - 1.02 * minute),   # 61 s after: skipped
+        (103, 2 + 1.02 * minute),   # 61 s before the switch-on: skipped
+        (104, 2 + 0.99 * minute),   # 59 s before: read
+    )
+
+    async def scenario():
+        async with _watching(db_path, FakeTelegramClient(history={A: history}), {"now": NOW}):
+            pass
+
+    asyncio.run(scenario())
+
+    assert _stored(db_path) == [(101, "backfill"), (104, "backfill")]
+
+
+def test_the_read_up_to_a_switch_off_can_take_several_reads(tmp_path: Path) -> None:
+    """Two posts per read: the period is skipped only once everything
+    before the switch-off has been read -- never earlier, or posts before
+    it would be jumped over."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    history = _history((101, 4), (102, 4), (103, 4), (104, 4), (105, 4), (106, 2.5), (107, 1))
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history})
+        listener = Listener(
+            client=client,
+            channels=(CHANNEL_A,),
+            accounts=ACCOUNTS,
+            writer=db.Writer(db_path),
+            db_path=db_path,
+            now=lambda: NOW,
+            backfill_limit=2,
+            backfill_rpc_timeout=RPC_TIMEOUT,
+        )
+        await listener.start()  # the backfill: one read of two posts
+        steps = [(_stored_ids(db_path), len(_periods_left(db_path)))]
+        try:
+            for _ in range(3):
+                await listener.read_history(CHANNEL_A, source="poll", limit=2,
+                                            rpc_timeout=RPC_TIMEOUT)
+                steps.append((_stored_ids(db_path), len(_periods_left(db_path))))
+        finally:
+            await listener.aclose()
+        return steps
+
+    steps = asyncio.run(scenario())
+
+    assert steps == [
+        ([101, 102], 1),
+        ([101, 102, 103, 104], 1),
+        # 105 read, 106 met after the switch-off: skipped to the switch-on,
+        # then the ordinary read takes 107.
+        ([101, 102, 103, 104, 105, 107], 0),
+        ([101, 102, 103, 104, 105, 107], 0),
+    ]
+
+
+def test_a_post_before_the_switch_off_that_fails_holds_the_skip_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post before the switch-off that cannot be stored stops the read
+    there, as any read; the period must wait for it, or the skip would
+    jump the pointer over it and it would be lost for good."""
+    from xaucopier.store import messages_repo
+
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    history = _history((101, 4), (102, 4), (103, 2.5), (104, 1))
+    real_ingest = messages_repo.ingest
+    fail = {102}
+
+    def flaky_ingest(conn, **kwargs):
+        if kwargs["message_id"] in fail:
+            raise RuntimeError("simulated write failure")
+        return real_ingest(conn, **kwargs)
+
+    monkeypatch.setattr(messages_repo, "ingest", flaky_ingest)
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history})
+        async with _watching(db_path, client, {"now": NOW}) as (listener, _time):
+            first = (_stored_ids(db_path), _pointer(db_path), len(_periods_left(db_path)))
+            fail.clear()
+            await listener.read_history(CHANNEL_A, source="poll", limit=100,
+                                        rpc_timeout=RPC_TIMEOUT)
+            return first
+
+    first = asyncio.run(scenario())
+
+    assert first == ([101], 101, 1)
+    assert _stored_ids(db_path) == [101, 102, 104]
+    assert _periods_left(db_path) == []
+
+
+def test_a_first_read_pending_is_seeded_at_its_own_cutoff_before_the_period(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's open (b), the exact way: a channel whose first read
+    never finished, switched off and on while watch was stopped, is read
+    from its first cutoff up to the switch-off, then from the switch-on."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2), pointer=0, seeded=False, cutoff=_hours_ago(5))
+    history = _history((100, 30), (101, 4), (102, 2.5), (103, 1))
+
+    async def scenario():
+        async with _watching(db_path, FakeTelegramClient(history={A: history}), {"now": NOW}):
+            pass
+
+    asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 103]
+    assert _periods_left(db_path) == []
+
+
+def test_a_channel_that_posted_nothing_since_its_switch_off_is_done_with_it(
+    tmp_path: Path,
+) -> None:
+    """The last batch there is ends before the switch-off: caught up, so
+    the period is skipped now and does not hold up the reads that follow."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+
+    async def scenario():
+        history = _history((101, 4))
+        async with _watching(db_path, FakeTelegramClient(history={A: history}), {"now": NOW}):
+            pass
+
+    asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101]
+    assert _periods_left(db_path) == []
+
+
+def test_an_open_period_is_never_skipped(tmp_path: Path) -> None:
+    """Switched off while this watch was reading it (watch reads the list
+    only at start), or a `channels off` whose save failed: the channel is
+    still read, and nothing is skipped."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path)
+    conn = db.connect(db_path, role="writer")
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=_hours_ago(3))
+    conn.commit()
+    conn.close()
+    history = _history((101, 4), (102, 2.5), (103, 1))
+
+    async def scenario():
+        async with _watching(db_path, FakeTelegramClient(history={A: history}), {"now": NOW}):
+            pass
+
+    asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 102, 103]
+    assert len(_periods_left(db_path)) == 1

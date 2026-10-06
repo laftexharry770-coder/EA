@@ -225,8 +225,9 @@ def complete_seed(
 def request_reseed(conn: sqlite3.Connection, *, channel_id: int, cutoff_utc: datetime) -> None:
     """Ask the next `watch` to seed `channel_id` again at `cutoff_utc`
     (whole seconds): posts made before it (less the 60 s margin) are not
-    read, posts since are. For `channels on` of a channel that already has
-    a pointer (F28, ruling M12). Overwrites a cutoff already set; keeps the
+    read, posts since are. For a channel added back (G2L-3) and for
+    `channels on` of a channel whose switch-off was not recorded (F28,
+    ruling M12) -- see `reseed`. Overwrites a cutoff already set; keeps the
     pointer, which a re-seed never moves back. A `watch` already running
     re-seeds the channel at its next read."""
     conn.execute(
@@ -234,3 +235,200 @@ def request_reseed(conn: sqlite3.Connection, *, channel_id: int, cutoff_utc: dat
         "ON CONFLICT(channel_id) DO UPDATE SET seed_cutoff_utc = excluded.seed_cutoff_utc",
         (channel_id, format_utc(cutoff_utc)),
     )
+
+
+# -- OFF periods: what a channel posted while it was switched off -------------------------
+#
+# Fix round 2 of F28 (the controller's ruling on the round-1 review): OFF
+# skips EXACTLY what the channel posted while it was OFF. `channels off`
+# records when (`record_switch_off`), `channels on` when it came back
+# (`record_switch_on`), and the next `watch` reads the channel in two
+# ranges per period: first everything after the pointer posted up to the
+# switch-off -- a 'close all' posted while it was still ON and watch was
+# stopped included -- and only then skips to the switch-on
+# (`finish_off_period`). One row per period, so two OFF/ON switches
+# between two runs of watch are each skipped exactly, and a first read
+# still pending keeps its own cutoff.
+
+
+@dataclass(frozen=True, slots=True)
+class OffPeriod:
+    """One OFF period the next read of its channel must skip."""
+
+    period_id: int
+    off_at_utc: datetime
+    on_at_utc: datetime
+
+
+ReseedOutcome = Literal["reseeded", "never_read", "first_read_kept"]
+SwitchOnOutcome = Literal[
+    "period_closed", "period_extended", "reseeded", "never_read", "first_read_kept"
+]
+
+
+@dataclass(frozen=True, slots=True)
+class SwitchOn:
+    """What `record_switch_on` did."""
+
+    #: "period_closed": the open OFF period now ends at the switch-on;
+    #: "period_extended": no open one, so the latest closed one not yet
+    #: skipped ends there instead (the previous `channels on` did not get
+    #: saved, or the switch-off since was not recorded); "never_read":
+    #: nothing to skip, the first read of the channel starts at that
+    #: watch's start anyway; or `reseed`'s outcome, when no switch-off was
+    #: recorded at all.
+    outcome: SwitchOnOutcome
+    #: The switch-off the skipped period starts at, for the two period
+    #: outcomes; None otherwise.
+    off_at_utc: datetime | None = None
+
+
+def reading_started(state: ChannelState) -> bool:
+    """Whether a `watch` has started reading the channel: it has a pointer,
+    the seeded marker, or a seed cutoff stored (a first read pending, or a
+    re-seed asked for). A channel never read has nothing to skip: its
+    first read starts at that watch's start."""
+    return state.pointer > 0 or state.seeded or state.seed_cutoff_raw is not None
+
+
+def record_switch_off(conn: sqlite3.Connection, *, channel_id: int, off_at_utc: datetime) -> bool:
+    """`channels off`: open an OFF period for `channel_id` at `off_at_utc`
+    (whole seconds), if its reading has started. An open period already
+    there -- left by an earlier `channels off` whose save failed, so the
+    channel stayed ON -- is replaced. Returns whether a period was opened.
+    """
+    off_raw = format_utc(off_at_utc)
+    if not reading_started(read(conn, channel_id)):
+        return False
+    conn.execute(
+        "DELETE FROM channel_off_periods WHERE channel_id = ? AND on_at_utc IS NULL",
+        (channel_id,),
+    )
+    conn.execute(
+        "INSERT INTO channel_off_periods (channel_id, off_at_utc) VALUES (?, ?)",
+        (channel_id, off_raw),
+    )
+    return True
+
+
+def record_switch_on(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    on_at_utc: datetime,
+    may_replace_first_cutoff: bool,
+) -> SwitchOn:
+    """`channels on`: end `channel_id`'s OFF period at `on_at_utc` (whole
+    seconds; never before the period's own start, whatever the clock did).
+
+    - An open period is closed there.
+    - None open, but one closed and not yet skipped: that one is extended
+      to here. Either the previous `channels on` was not saved (the
+      channel stayed OFF, so this is exact), or the switch-off since was
+      not recorded -- and then this skips less than `reseed` would.
+    - None at all, and a channel never read: nothing to do (any stray
+      period is dropped), as if it had never been off.
+    - None at all for a channel read before (its switch-off was not
+      recorded: the database could not be written then, or the file was
+      edited by hand): `reseed` -- everything since its last read is
+      skipped, as ruling M12 first had it.
+    """
+    on_at = datetime.fromisoformat(format_utc(on_at_utc))
+    row = conn.execute(
+        "SELECT period_id, off_at_utc FROM channel_off_periods "
+        "WHERE channel_id = ? AND on_at_utc IS NULL",
+        (channel_id,),
+    ).fetchone()
+    outcome: SwitchOnOutcome = "period_closed"
+    if row is None:
+        row = conn.execute(
+            "SELECT period_id, off_at_utc FROM channel_off_periods "
+            "WHERE channel_id = ? AND on_at_utc IS NOT NULL "
+            "ORDER BY off_at_utc DESC, period_id DESC LIMIT 1",
+            (channel_id,),
+        ).fetchone()
+        outcome = "period_extended"
+    if row is not None and reading_started(read(conn, channel_id)):
+        period_id, off_raw = row
+        off_at = _parse(off_raw)
+        ends = max(on_at, off_at) if off_at is not None else on_at
+        conn.execute(
+            "UPDATE channel_off_periods SET on_at_utc = ? WHERE period_id = ?",
+            (format_utc(ends), period_id),
+        )
+        return SwitchOn(outcome=outcome, off_at_utc=off_at)
+    return SwitchOn(
+        outcome=reseed(
+            conn,
+            channel_id=channel_id,
+            cutoff_utc=on_at_utc,
+            may_replace_first_cutoff=may_replace_first_cutoff,
+        )
+    )
+
+
+def reseed(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    cutoff_utc: datetime,
+    may_replace_first_cutoff: bool,
+) -> ReseedOutcome:
+    """Ask the next `watch` to read `channel_id` from `cutoff_utc` on,
+    skipping everything posted since it last read it (`request_reseed`),
+    and drop its OFF periods, which this supersedes. For `channels add` /
+    `resolve-channels` of a channel read before (G2L-3) and `channels on`
+    with no switch-off recorded.
+
+    A channel whose first read has not finished (a cutoff stored, no
+    pointer, no marker) gets the new cutoff only when
+    `may_replace_first_cutoff` -- no `watch` holds the session -- since a
+    running one may still be seeding it at the old one (fix round 2, the
+    reviewer's open (b)); otherwise it is left as it is
+    ("first_read_kept"). A channel never read is left alone
+    ("never_read"): its first read starts at that watch's start anyway."""
+    format_utc(cutoff_utc)  # an aware time, before anything is decided
+    state = read(conn, channel_id)
+    if not reading_started(state):
+        conn.execute("DELETE FROM channel_off_periods WHERE channel_id = ?", (channel_id,))
+        return "never_read"
+    if not (state.pointer > 0 or state.seeded) and not may_replace_first_cutoff:
+        return "first_read_kept"
+    request_reseed(conn, channel_id=channel_id, cutoff_utc=cutoff_utc)
+    conn.execute("DELETE FROM channel_off_periods WHERE channel_id = ?", (channel_id,))
+    return "reseeded"
+
+
+def off_periods(conn: sqlite3.Connection, channel_id: int) -> tuple[OffPeriod, ...]:
+    """`channel_id`'s closed OFF periods not yet skipped, oldest first.
+    Read-only. A period whose times cannot be read is left out (never
+    skipped: what it covers is read, not lost)."""
+    periods = []
+    for period_id, off_raw, on_raw in conn.execute(
+        "SELECT period_id, off_at_utc, on_at_utc FROM channel_off_periods "
+        "WHERE channel_id = ? AND on_at_utc IS NOT NULL ORDER BY off_at_utc, period_id",
+        (channel_id,),
+    ).fetchall():
+        off_at, on_at = _parse(off_raw), _parse(on_raw)
+        if off_at is not None and on_at is not None:
+            periods.append(OffPeriod(period_id=period_id, off_at_utc=off_at, on_at_utc=on_at))
+    return tuple(periods)
+
+
+def finish_off_period(
+    conn: sqlite3.Connection, *, channel_id: int, period_id: int, anchor_id: int
+) -> int:
+    """The read caught up to an OFF period's start; skip the period: the
+    pointer becomes max(pointer, `anchor_id`) -- the newest post before
+    the switch-on, less the margin -- and the period is deleted, in one
+    transaction (the caller's). Returns the pointer. Only an existing row
+    is moved: a channel with a period has one."""
+    if isinstance(anchor_id, bool) or not isinstance(anchor_id, int) or anchor_id < 0:
+        raise ValueError(f"anchor_id must be a non-negative integer, got {anchor_id!r}")
+    conn.execute(
+        "UPDATE channel_state SET last_processed_message_id = "
+        "MAX(last_processed_message_id, ?) WHERE channel_id = ?",
+        (anchor_id, channel_id),
+    )
+    conn.execute("DELETE FROM channel_off_periods WHERE period_id = ?", (period_id,))
+    return read(conn, channel_id).pointer

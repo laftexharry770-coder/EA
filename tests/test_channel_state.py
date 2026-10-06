@@ -269,3 +269,214 @@ def test_request_reseed_creates_the_row_for_a_channel_never_read(conn) -> None:
 def test_request_reseed_needs_an_aware_time(conn) -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         channel_state.request_reseed(conn, channel_id=A, cutoff_utc=START.replace(tzinfo=None))
+
+
+# -- OFF periods (fix round 2 of F28): OFF skips exactly what was posted while off ----------
+
+SEEDED = "2026-09-01T00:00:00+00:00"
+OFF = START + timedelta(microseconds=250)  # the fraction is dropped
+ON = START + timedelta(hours=2)
+
+
+def _periods(conn, channel_id: int = A) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT off_at_utc, on_at_utc FROM channel_off_periods WHERE channel_id = ? "
+            "ORDER BY period_id",
+            (channel_id,),
+        ).fetchall()
+    ]
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"pointer": 100, "seeded_at": SEEDED},
+        {"pointer": 0, "seeded_at": SEEDED},
+        {"pointer": 100},
+        {"cutoff": "2026-09-05T10:00:00+00:00"},
+    ],
+    ids=["seeded", "seeded at 0", "a pointer from before the marker", "a first read pending"],
+)
+def test_switching_off_a_channel_being_read_opens_a_period(conn, state) -> None:
+    _insert(conn, **state)
+    assert channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF) is True
+    assert _periods(conn) == [("2026-09-05T11:00:00+00:00", None)]
+
+
+@pytest.mark.parametrize("row", [False, True], ids=["no row", "a counter's row at 0"])
+def test_switching_off_a_channel_never_read_records_nothing(conn, row) -> None:
+    """Its first read starts at that watch's start: nothing to skip."""
+    if row:
+        _insert(conn)
+    assert channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF) is False
+    assert _periods(conn) == []
+
+
+def test_a_second_switch_off_replaces_the_open_period(conn) -> None:
+    """The first `channels off` was recorded but its save failed, so the
+    channel stayed ON: only the second switch-off is real."""
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF + timedelta(hours=1))
+    assert _periods(conn) == [("2026-09-05T12:00:00+00:00", None)]
+
+
+def test_switching_on_closes_the_open_period(conn) -> None:
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+
+    done = channel_state.record_switch_on(
+        conn, channel_id=A, on_at_utc=ON + timedelta(microseconds=7), may_replace_first_cutoff=True
+    )
+
+    assert done == channel_state.SwitchOn("period_closed", START)
+    assert _periods(conn) == [("2026-09-05T11:00:00+00:00", "2026-09-05T13:00:00+00:00")]
+    assert _row(conn) == (100, SEEDED, None)  # no re-seed: the period says it all
+    assert channel_state.off_periods(conn, A) == (
+        channel_state.OffPeriod(
+            period_id=1, off_at_utc=START, on_at_utc=START + timedelta(hours=2)
+        ),
+    )
+
+
+def test_a_switch_on_never_ends_a_period_before_it_began(conn) -> None:
+    """A clock set back between the two: the period is empty, not inverted."""
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+    channel_state.record_switch_on(
+        conn, channel_id=A, on_at_utc=START - timedelta(hours=1), may_replace_first_cutoff=True
+    )
+    assert _periods(conn) == [("2026-09-05T11:00:00+00:00", "2026-09-05T11:00:00+00:00")]
+
+
+def test_two_switches_between_two_watches_are_two_periods(conn) -> None:
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    for hours in (0, 4):
+        channel_state.record_switch_off(conn, channel_id=A, off_at_utc=START + timedelta(hours=hours))
+        channel_state.record_switch_on(
+            conn,
+            channel_id=A,
+            on_at_utc=START + timedelta(hours=hours + 1),
+            may_replace_first_cutoff=True,
+        )
+    assert [(p.off_at_utc.hour, p.on_at_utc.hour) for p in channel_state.off_periods(conn, A)] == [
+        (11, 12),
+        (15, 16),
+    ]
+
+
+def test_a_switch_on_with_no_open_period_extends_the_last_one_not_yet_skipped(conn) -> None:
+    """The previous `channels on` closed the period but its save failed, so
+    the channel stayed OFF until now: the period runs to now."""
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+    channel_state.record_switch_on(conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=True)
+
+    done = channel_state.record_switch_on(
+        conn, channel_id=A, on_at_utc=ON + timedelta(hours=1), may_replace_first_cutoff=True
+    )
+
+    assert done == channel_state.SwitchOn("period_extended", START)
+    assert _periods(conn) == [("2026-09-05T11:00:00+00:00", "2026-09-05T14:00:00+00:00")]
+    assert _row(conn) == (100, SEEDED, None)
+
+
+def test_a_switch_on_with_no_switch_off_recorded_re_seeds_from_now(conn) -> None:
+    """The switch-off could not be recorded (the database was busy then):
+    everything since its last read is skipped, as ruling M12 first had it."""
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+
+    done = channel_state.record_switch_on(
+        conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=False
+    )
+
+    assert done == channel_state.SwitchOn("reseeded")
+    assert _row(conn) == (100, SEEDED, "2026-09-05T13:00:00+00:00")
+
+
+@pytest.mark.parametrize("row", [False, True], ids=["no row", "a counter's row at 0"])
+def test_a_switch_on_of_a_channel_never_read_changes_nothing(conn, row) -> None:
+    if row:
+        _insert(conn)
+    before = _row(conn)
+    done = channel_state.record_switch_on(conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=True)
+    assert done == channel_state.SwitchOn("never_read")
+    assert _row(conn) == before
+    assert _periods(conn) == []
+
+
+def test_a_stray_period_of_a_channel_never_read_is_dropped(conn) -> None:
+    conn.execute("INSERT INTO channel_off_periods (channel_id, off_at_utc) VALUES (?, ?)", (A, SEEDED))
+    done = channel_state.record_switch_on(conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=True)
+    assert done.outcome == "never_read"
+    assert _periods(conn) == []
+
+
+@pytest.mark.parametrize("may", [True, False], ids=["no watch running", "watch running"])
+def test_a_first_read_pending_is_re_seeded_only_when_no_watch_runs(conn, may) -> None:
+    """The reviewer's open (b): a channel whose first read never finished
+    keeps its first-attempt cutoff -- and reads everything since -- unless
+    the cutoff may be replaced: no watch holds the session, so none is
+    seeding the channel at the old one."""
+    first = "2026-09-05T10:00:00+00:00"
+    _insert(conn, cutoff=first)
+
+    outcome = channel_state.reseed(conn, channel_id=A, cutoff_utc=ON, may_replace_first_cutoff=may)
+
+    assert outcome == ("reseeded" if may else "first_read_kept")
+    assert _row(conn) == (0, None, "2026-09-05T13:00:00+00:00" if may else first)
+
+
+def test_a_re_seed_drops_every_off_period_it_supersedes(conn) -> None:
+    """`channels add` of a channel read before: everything since its last
+    read is skipped, so its OFF periods have nothing left to say."""
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+    channel_state.record_switch_on(conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=True)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=ON + timedelta(hours=1))
+    _insert(conn, pointer=5, seeded_at=SEEDED, channel_id=B)
+    channel_state.record_switch_off(conn, channel_id=B, off_at_utc=OFF)
+
+    assert channel_state.reseed(conn, channel_id=A, cutoff_utc=ON, may_replace_first_cutoff=True) == (
+        "reseeded"
+    )
+
+    assert _periods(conn) == []
+    assert _periods(conn, B) == [("2026-09-05T11:00:00+00:00", None)]
+
+
+def test_finishing_a_period_moves_the_pointer_up_only_and_deletes_it(conn) -> None:
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+    channel_state.record_switch_on(conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=True)
+    (period,) = channel_state.off_periods(conn, A)
+
+    assert channel_state.finish_off_period(conn, channel_id=A, period_id=period.period_id,
+                                           anchor_id=90) == 100
+    assert _periods(conn) == []
+    _insert(conn, pointer=100, seeded_at=SEEDED, channel_id=B)
+    channel_state.record_switch_off(conn, channel_id=B, off_at_utc=OFF)
+    channel_state.record_switch_on(conn, channel_id=B, on_at_utc=ON, may_replace_first_cutoff=True)
+    (period,) = channel_state.off_periods(conn, B)
+    assert channel_state.finish_off_period(conn, channel_id=B, period_id=period.period_id,
+                                           anchor_id=140) == 140
+    assert _row(conn, B) == (140, SEEDED, None)
+
+
+def test_finishing_a_period_never_creates_a_row(conn) -> None:
+    """A pointer-0 row without the marker would read as "never seeded"."""
+    assert channel_state.finish_off_period(conn, channel_id=A, period_id=99, anchor_id=7) == 0
+    assert _row(conn) is None
+
+
+def test_open_and_unreadable_periods_are_never_skipped(conn) -> None:
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+    conn.execute(
+        "INSERT INTO channel_off_periods (channel_id, off_at_utc, on_at_utc) "
+        "VALUES (?, 'not a time', ?)",
+        (A, SEEDED),
+    )
+    assert channel_state.off_periods(conn, A) == ()

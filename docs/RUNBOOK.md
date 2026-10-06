@@ -116,7 +116,7 @@ keeps running. **Leave the window open** — closing it stops the recording.
   safe.) Everything recorded so far is kept.
 - **After a restart of the PC**, or whenever it has stopped: run
   `.\xaucopier watch` again. It catches up on the posts made while it was
-  stopped (not on posts from a channel that was switched off — see
+  stopped (not on what a channel posted while it was switched off — see
   **Choosing which channels to follow**).
 - **Only one at a time.** Do not start a second `watch` in another window.
 - **If it says *Could not reach Telegram within 60 seconds*,** this PC is
@@ -228,12 +228,23 @@ Signals can come from more than one Telegram channel, and you choose which.
   too old to be traded (a signal posted more than 2 minutes ago never is),
   and how many were already traded. The waiting ones are cancelled the
   next time `watch` starts; a trade already open keeps its stop loss and
-  take profit. **Whatever it
-  posts while it is off is ignored for good** — it is not read later, not
-  even after you switch it back on. Nothing already recorded is deleted.
-- **Switch one on:** `.\xaucopier channels on 2`. From the next `watch` on,
-  it is read again from the moment you switched it on; the posts made while
-  it was off are skipped.
+  take profit. **Whatever it posts while it is off is ignored for good** —
+  it is not read later, not even after you switch it back on. Nothing
+  already recorded is deleted.
+- **Switch one on:** `.\xaucopier channels on 2`. The next `watch` then
+  reads the channel in two parts. First, whatever it posted **before you
+  switched it off** that `watch` had not read yet — for example a "close
+  all" posted while `watch` was stopped — is read, as usual. Then the posts
+  it made while it was off are skipped, and everything from the moment you
+  switched it on is read. (Give or take a minute at either end: your PC's
+  clock and Telegram's are never exactly the same, so a post made within a
+  minute of a switch is read rather than lost.) Switching it off and on
+  again several times before `watch` runs is fine: each time it was off is
+  skipped, and only that.
+- **If it says the time it was switched off could not be saved** (the
+  database was busy or could not be used), the channel is still switched
+  off. But when you switch it back on, everything it posted since `watch`
+  last read it is skipped, not only what it posted while it was off.
 - **Add a new channel:** first **join it in Telegram** on your phone. Then
   stop `watch` (click in its window, press **Ctrl+C** and answer **Y**) and
   type `.\xaucopier channels add`. Paste the channel's link, or just press
