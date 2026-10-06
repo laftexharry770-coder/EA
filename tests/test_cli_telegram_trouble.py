@@ -253,3 +253,29 @@ def test_a_login_telegram_no_longer_knows_is_still_exit_3(
 
     assert code == exit_codes.EXIT_TERMINAL_AUTH
     assert "setup-login" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("error", "number"), TROUBLE[:1])
+def test_telethons_own_warning_lines_never_reach_the_user(
+    command: Command,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    error: tuple[int, str],
+    number: str,
+) -> None:
+    """Final fix FF10: with the real client, a 500 printed 4-5 of
+    Telethon's own lines ('Telegram is having internal issues
+    RpcCallFailError ... (caused by GetDialogsRequest)') before the plain
+    sentence. Python prints a library's WARNING to the window when nothing
+    else handles it; here pytest's own handler stands in for the window,
+    so no Telethon record may reach it."""
+    caplog.set_level("DEBUG")
+    _use(monkeypatch, {**LOGGED_IN, functions.messages.GetDialogsRequest: error})
+
+    assert cli_main.main(command.argv()) == exit_codes.EXIT_FAILED
+
+    telethon_lines = [r.getMessage() for r in caplog.records if r.name.startswith("telethon")]
+    assert telethon_lines == []
+    err = capsys.readouterr().err
+    assert f"Telegram could not do this just now (Telegram error {number})" in err

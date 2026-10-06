@@ -45,6 +45,7 @@ import asyncio
 import contextlib
 import getpass
 import io
+import logging
 import sys
 from pathlib import Path
 
@@ -618,6 +619,31 @@ def _replace_what_cannot_be_shown() -> None:
             pass
 
 
+@contextlib.contextmanager
+def _telethon_kept_quiet(quiet: bool):
+    """Keep Telethon's own log lines out of a one-shot command's window.
+
+    Python prints a library's WARNING to the window when nothing else
+    handles it, so with Telegram's own trouble (a 500) the user saw 4-5
+    lines such as 'Telegram is having internal issues RpcCallFailError ...
+    (caused by GetUsersRequest)' or 'Attempt 2 at connecting failed' before
+    the command's own plain sentence (final fix FF10). The command already
+    says what went wrong in plain words; Telethon's lines are dropped.
+    `watch` keeps them -- in its log file, see watch.start_logging. The
+    level is put back afterwards (tests run many commands in one process).
+    """
+    if not quiet:
+        yield
+        return
+    logger = logging.getLogger("telethon")
+    before = logger.level
+    logger.setLevel(logging.CRITICAL + 1)
+    try:
+        yield
+    finally:
+        logger.setLevel(before)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one command. A command that does not finish normally ends with
     "(exit code N)" -- the number the runbook's table explains (final
@@ -634,7 +660,23 @@ def main(argv: list[str] | None = None) -> int:
         if exc.code not in (0, None):
             print(f"(exit code {exc.code})", file=sys.stderr)
         raise
-    code = args.func(args)
+    try:
+        with _telethon_kept_quiet(args.func is not cmd_watch):
+            code = args.func(args)
+    except KeyboardInterrupt:
+        # Ctrl+C -- the runbook's own stop gesture -- while a command waits
+        # (up to 10 s for a database watch is writing, or for the
+        # channels.toml write lock) escaped as a Python traceback with
+        # Windows' own exit status (final fix FF22). Nothing is half
+        # written: every write is one transaction or an atomic replace.
+        # watch, setup-login, resolve-channels and channels add say their
+        # own words first; this is the rest.
+        print(
+            "Cancelled with Ctrl+C. Nothing was changed unless a line above said so.",
+            file=sys.stderr,
+        )
+        print(f"(exit code {exit_codes.EXIT_INTERRUPTED})", file=sys.stderr)
+        return exit_codes.EXIT_INTERRUPTED
     if code != exit_codes.EXIT_OK and args.func is not cmd_watch:
         print(f"(exit code {code})", file=sys.stderr)
     return code

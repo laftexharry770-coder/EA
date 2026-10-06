@@ -160,3 +160,40 @@ def test_a_database_locked_past_the_timeout_is_explained_and_changes_nothing(
         holder.rollback()
         holder.close()
     assert _uncleared(store) == [1, 2, 3]
+
+
+# -- Ctrl+C while a command waits (final fix FF22) ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("where", "args"),
+    [
+        ("ack_all", ("--all",)),
+        ("ack", ("1",)),
+        ("unacked", ()),
+    ],
+)
+def test_ctrl_c_while_ack_waits_is_one_plain_line_and_exit_130(
+    store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    where: str,
+    args: tuple[str, ...],
+) -> None:
+    """`ack` waits up to 10 s for a database watch is writing; the user's
+    Ctrl+C there escaped main() as a Python traceback, with Windows' own
+    exit status instead of the runbook's 130."""
+
+    def interrupted(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(alerts, where, interrupted)
+
+    assert _ack(store, *args) == exit_codes.EXIT_INTERRUPTED
+
+    captured = capsys.readouterr()
+    assert "Cancelled with Ctrl+C. Nothing was changed unless a line above said so." in captured.err
+    assert captured.err.rstrip().endswith("(exit code 130)")
+    assert "Traceback" not in captured.err + captured.out
+    monkeypatch.undo()
+    assert _uncleared(store) == [1, 2, 3]
