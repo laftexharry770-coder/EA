@@ -227,6 +227,10 @@ def test_a_stop_already_in_plain_words_is_written_once(
     window, log = _window_and_log(rig, capsys)
     assert window.count("Could not reach Telegram within 0.1 seconds") == 1
     assert log.count("Could not reach Telegram within 0.1 seconds") == 1
+    # The code is said once, by watch's own last line (round 1 left
+    # "(exit code 4)" in this sentence too: said twice).
+    assert window.count("exit code 4") == 1
+    assert "watch stopped (exit code 4:" in window
 
 
 # -- fix round 2: what is left of the window's jargon ------------------------------------------

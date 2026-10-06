@@ -1706,7 +1706,7 @@ class Listener:
             dialogs = await client_module.telegram_within(self.client.get_dialogs(), timeout)  # 2
         except client_module.TelegramUnreachableError as exc:
             message = (
-                f"{exc} watch stops now (exit code 4); start it again once this "
+                f"{exc} watch stops now; start it again once this "
                 "computer is back online."
             )
             raise ListenerStartupError(message, plain=message) from exc

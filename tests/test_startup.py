@@ -110,7 +110,9 @@ def test_a_start_up_that_cannot_reach_telegram_stops_with_exit_4_in_plain_words(
     messages = [r.getMessage() for r in caplog.records]
     assert any(m.startswith("Could not reach Telegram within 0.1 seconds.") for m in messages)
     stop = next(m for m in messages if m.startswith("Could not reach Telegram"))
-    assert "exit code 4" in stop
+    # watch says the code itself, once, as its last line ("watch stopped
+    # (exit code 4: ...)"; tests/test_plain_stop_messages.py).
+    assert "watch stops now; start it again once this computer is back online." in stop
     for jargon in ("RPC", "client", "listener", "flood"):
         assert jargon not in stop
 
