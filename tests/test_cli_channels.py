@@ -1960,6 +1960,10 @@ def test_add_of_a_channel_read_before_asks_the_next_watch_to_start_reading_it_fr
     assert _state_row(add_rig.rig.db_path, SILVER_ID) == (
         40, "2026-09-01T00:00:00+00:00", "2026-09-23T12:00:00+00:00"
     )
+    assert (
+        "It was read before, so the next watch reads it from now on: what it posted since it "
+        "was last read is skipped."
+    ) in capsys.readouterr().out
 
 
 def test_add_of_a_channel_whose_first_read_never_finished_reads_it_from_now(
@@ -1982,10 +1986,13 @@ def test_add_of_a_channel_whose_first_read_never_finished_reads_it_from_now(
     assert _state_row(add_rig.rig.db_path, SILVER_ID) == (0, None, "2026-09-23T12:00:00+00:00")
 
 
-def test_add_of_a_channel_never_read_writes_no_cutoff(add_rig: AddRig) -> None:
+def test_add_of_a_channel_never_read_writes_no_cutoff(
+    add_rig: AddRig, capsys: pytest.CaptureFixture[str]
+) -> None:
     assert cli_main.main(add_rig.argv("--link", "https://t.me/silver", "--yes")) == 0
 
     assert _state_row(add_rig.rig.db_path, SILVER_ID) is None
+    assert "It was read before" not in capsys.readouterr().out
 
 
 def test_add_while_the_database_is_held_adds_nothing(

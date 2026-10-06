@@ -450,6 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_config_dir(resolve)
+    _add_db(resolve)
     _add_secrets(resolve)
     resolve.add_argument(
         "--link",

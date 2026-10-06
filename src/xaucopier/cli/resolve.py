@@ -57,6 +57,7 @@ import copy
 import hashlib
 import os
 import re
+import sqlite3
 import sys
 import time
 import tomllib
@@ -74,7 +75,8 @@ import winerror
 from telethon import errors, utils
 from telethon.tl import types
 
-from xaucopier.cli import exit_codes, paths
+from xaucopier.cli import channel_reading, exit_codes, paths
+from xaucopier.cli.status import database_problem
 from xaucopier.cli.watch import SetupError, load_channels_config, load_session
 from xaucopier.config.channels import ChannelCfg, load_channels
 from xaucopier.ingest.client import (
@@ -801,6 +803,17 @@ def report_permanent_error(exc: BaseException) -> int:
     return exit_codes.EXIT_TERMINAL_AUTH
 
 
+#: Said when a channel read before is put back (G2L-3; fix round 2).
+READ_FROM_NOW = (
+    "It was read before, so the next watch reads it from now on: what it posted since it "
+    "was last read is skipped."
+)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
 async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[ChannelCfg, ...]) -> int:
     channels_path: Path = args.config_dir / paths.CHANNELS_FILE
     pending = [(index, cfg) for index, cfg in enumerate(channels) if cfg.channel_id == PLACEHOLDER_ID]
@@ -852,12 +865,23 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
                 if confirm.lower() not in ("y", "yes"):
                     print("Not saved. Nothing was changed.")
                     return exit_codes.EXIT_FAILED
+            # A channel read before -- removed, then put back as a placeholder
+            # -- is read from now on, the database first, as `channels add`
+            # does it (G2L-3; fix round 2). This command holds the session,
+            # so no watch is seeding it: a first read pending moves too.
+            try:
+                reread = channel_reading.reseed_from_now(
+                    args.db, resolved.channel_id, _utcnow(), may_replace_first_cutoff=True
+                )
+            except sqlite3.DatabaseError as exc:
+                print(f"{database_problem(args.db, exc)} {nothing()}", file=sys.stderr)
+                return exit_codes.EXIT_FAILED
             try:
                 save_resolved(
                     channels_path,
                     index=index,
                     resolved=resolved,
-                    today=datetime.now(UTC).date().isoformat(),
+                    today=_utcnow().date().isoformat(),
                 )
             except Exception as exc:  # noqa: BLE001 -- the writer leaves the file untouched on any failure
                 code = save_failure_code(exc)
@@ -884,6 +908,8 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
                 f"switched it on. It is channel {cfg.ordinal} in "
                 f"`{paths.USER_COMMAND} channels`."
             )
+            if reread == "reseeded":
+                print(READ_FROM_NOW)
     except PERMANENT_TELEGRAM_ERRORS as exc:
         return report_permanent_error(exc)
     except TELEGRAM_TROUBLE as exc:

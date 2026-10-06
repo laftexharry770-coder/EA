@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
 import tomllib
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -35,6 +37,7 @@ from xaucopier.config.channels import load_channels
 from xaucopier.config.loader import ConfigError
 from xaucopier.ingest.client import AlreadyRunningError
 from xaucopier.ingest.secrets import SecretsBlob
+from xaucopier.store import db
 
 REPO = Path(__file__).resolve().parents[1]
 REAL_CHANNELS = REPO / "config" / "channels.toml"
@@ -118,11 +121,17 @@ class Rig:
     def channels_path(self) -> Path:
         return self.config_dir / "channels.toml"
 
+    @property
+    def db_path(self) -> Path:
+        """Never created by the rig: a test that needs a database makes it."""
+        return self.config_dir.parent / "state.db"
+
     def argv(self, *extra: str) -> list[str]:
         return [
             "resolve-channels",
             "--config-dir", str(self.config_dir),
             "--secrets", str(self.config_dir / "no-session.dpapi"),
+            "--db", str(self.db_path),
             *extra,
         ]
 
@@ -702,3 +711,110 @@ def test_saved_names_the_telegram_id_and_the_channel_number_apart(
     ) in out
     assert "is now channel -100" not in out
     assert "does not have its Telegram id yet" in out
+
+
+# -- fix round 2: a channel read before and resolved again is read from now on --------------
+
+RESOLVED_AT = datetime(2026, 9, 23, 12, 0, 0, 654321, tzinfo=UTC)
+
+
+def _make_db(rig: Rig, *, state: tuple | None) -> None:
+    """The rig's database, with channel MMH's reading state (pointer,
+    seeded marker, cutoff) when `state` is given."""
+    conn = db.connect(rig.db_path, role="writer")
+    try:
+        if state is not None:
+            conn.execute(
+                "INSERT INTO channel_state (channel_id, last_processed_message_id, "
+                "seeded_at_utc, seed_cutoff_utc) VALUES (?, ?, ?, ?)",
+                (MMH_ID, *state),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _mmh_state(rig: Rig) -> tuple | None:
+    conn = db.connect_readonly(rig.db_path)
+    try:
+        row = conn.execute(
+            "SELECT last_processed_message_id, seeded_at_utc, seed_cutoff_utc FROM channel_state "
+            "WHERE channel_id = ?",
+            (MMH_ID,),
+        ).fetchone()
+        return None if row is None else tuple(row)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("state", "after"),
+    [
+        ((40, "2026-09-01T00:00:00+00:00", None),
+         (40, "2026-09-01T00:00:00+00:00", "2026-09-23T12:00:00+00:00")),
+        # A first read that never finished: this command holds the session,
+        # so no watch is seeding it at the old cutoff (the reviewer's (b)).
+        ((0, None, "2026-09-20T08:00:00+00:00"), (0, None, "2026-09-23T12:00:00+00:00")),
+    ],
+    ids=["read before", "first read pending"],
+)
+def test_resolving_to_a_channel_read_before_reads_it_from_now(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state: tuple,
+    after: tuple,
+) -> None:
+    """G2L-3's `channels add` rule, for `resolve-channels` too (fix round 2
+    of the reviewer's open (a)): a channel removed and put back as a
+    placeholder kept its old pointer, so the next watch read everything it
+    posted meanwhile as new."""
+    _make_db(rig, state=state)
+    monkeypatch.setattr(resolve_module, "_utcnow", lambda: RESOLVED_AT)
+
+    assert cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes")) == 0
+
+    assert load_channels(rig.channels_path)[0].channel_id == MMH_ID
+    assert _mmh_state(rig) == after
+    assert (
+        "It was read before, so the next watch reads it from now on: what it posted "
+        "since it was last read is skipped."
+    ) in capsys.readouterr().out
+
+
+def test_resolving_a_channel_never_read_writes_nothing(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _make_db(rig, state=None)
+
+    assert cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes")) == 0
+
+    assert _mmh_state(rig) is None
+    assert "It was read before" not in capsys.readouterr().out
+
+
+def test_resolving_with_no_database_creates_none(rig: Rig) -> None:
+    assert cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes")) == 0
+    assert not rig.db_path.exists()
+
+
+def test_resolving_while_the_database_is_held_saves_nothing(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The database first, then channels.toml, as `channels add`."""
+    _make_db(rig, state=(40, "2026-09-01T00:00:00+00:00", None))
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 50)
+    before = rig.channels_path.read_bytes()
+    holder = sqlite3.connect(rig.db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        code = cli_main.main(rig.argv("--link", "https://t.me/mmhcommunity", "--yes"))
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert code == exit_codes.EXIT_FAILED
+    assert rig.channels_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert "The database is busy" in err and "Nothing was changed." in err
+    assert "Traceback" not in err

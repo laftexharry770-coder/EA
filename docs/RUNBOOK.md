@@ -251,8 +251,9 @@ Signals can come from more than one Telegram channel, and you choose which.
   Enter and type the number next to it in the list of channels and groups
   you have joined. Then type `yes`. It is added **switched on**, with the
   next free number. A channel that is already in the list is never added
-  twice. A channel you removed and add again is read from now on, not from
-  where it stopped.
+  twice. A channel you removed and add again — with `channels add`, or by
+  looking it up again with `resolve-channels` — is read from now on, not
+  from where it stopped; it says so.
 - **A group needs a second `yes`.** The list marks each entry *(channel)*
   or *(group)*. In a group anyone can post, and every member's message would
   be read as a trading instruction, so adding a group warns you and asks

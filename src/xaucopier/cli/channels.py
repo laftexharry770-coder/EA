@@ -19,8 +19,9 @@
   M12, F28; fix round 2): `off` records when it was switched off and `on`
   when it came back (`cli/channel_reading.py`), and the next `watch`
   reads what it posted before the switch-off, skips the OFF period, and
-  reads on from the switch-on. `channels add` of a channel read before,
-  removed and added back, has it read from now on (G2L-3).
+  reads on from the switch-on. `channels add` and `resolve-channels` of a
+  channel read before, removed and added back, have it read from now on
+  (G2L-3).
 - `channels add` adds a NEW channel: the only command here that contacts
   Telegram, once, to look the channel up -- by the same paste-a-link or
   pick-from-the-channels-you-joined flow `resolve-channels` uses. It takes
@@ -64,6 +65,7 @@ from typing import Any
 from xaucopier.cli import channel_reading, exit_codes, paths
 from xaucopier.cli.resolve import (
     PLACEHOLDER_ID,
+    READ_FROM_NOW,
     TELEGRAM_TROUBLE,
     ChangedMeanwhileError,
     ResolveError,
@@ -676,7 +678,7 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
     # command holds the session, so no watch is seeding it: a first read
     # still pending is moved to now too.
     try:
-        channel_reading.reseed_from_now(
+        reread = channel_reading.reseed_from_now(
             args.db, resolved.channel_id, _utcnow(), may_replace_first_cutoff=True
         )
     except sqlite3.DatabaseError as exc:
@@ -706,6 +708,8 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
         f"It takes effect the next time you run `{_CMD} watch`. See every channel with "
         f"`{_CMD} channels`; switch this one off with `{_CMD} channels off {number}`.",
     )
+    if reread == "reseeded":
+        say(READ_FROM_NOW)
     return exit_codes.EXIT_OK
 
 
