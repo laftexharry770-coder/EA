@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG_DIR = PROJECT_ROOT / "config"
 CHANNELS_FILE = "channels.toml"
 ACCOUNTS_FILE = "accounts.toml"
+POLICY_FILE = "policy.toml"
 
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "state.db"
 #: `watch`'s log file, next to the database it records into.

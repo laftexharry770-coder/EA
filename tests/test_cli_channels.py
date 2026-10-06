@@ -1556,12 +1556,25 @@ def test_off_writes_nothing_to_the_database(on_rig: Rig) -> None:
 # -- F15: what OFF does to the signals already recorded ---------------------------------------
 
 
+def _patient_policy(rig: Rig, seconds: int = 86400) -> None:
+    """A policy.toml (the shipped one) whose signals may be up to `seconds`
+    old when traded -- so the seeded signals, hours old, still count as
+    waiting."""
+    shipped = (REPO / "config" / "policy.toml").read_bytes().decode("utf-8")
+    assert "max_signal_age_seconds   = 120" in shipped
+    (rig.config_dir / "policy.toml").write_bytes(
+        shipped.replace("max_signal_age_seconds   = 120", f"max_signal_age_seconds   = {seconds}")
+        .encode("utf-8")
+    )
+
+
 def test_off_says_how_many_signals_are_in_play_and_what_off_does_to_them(
     on_rig: Rig, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Final review F15: OFF also stops reading the edits, deletions and
     follow-ups of the channel's signals already recorded. Gold Room has 3
     signals queued; one of them is marked traded here."""
+    _patient_policy(on_rig)
     conn = sqlite3.connect(on_rig.db_path)
     conn.execute(
         "UPDATE outbox SET state = 'DONE' WHERE outbox_id = (SELECT MIN(outbox_id) FROM outbox)"
@@ -1586,6 +1599,7 @@ def test_a_signal_one_account_has_taken_counts_as_traded_and_a_skipped_one_not_a
     """Gold Room's first signal is taken (CLAIMED) by one account and still
     waiting for a second: it is traded, not waiting. Its second signal's
     entry was skipped: neither. Its third is waiting."""
+    _patient_policy(on_rig)
     conn = sqlite3.connect(on_rig.db_path)
     first, second, _ = [
         row[0] for row in conn.execute("SELECT signal_id FROM signals ORDER BY signal_id")
@@ -1604,6 +1618,120 @@ def test_a_signal_one_account_has_taken_counts_as_traded_and_a_skipped_one_not_a
 
     out = capsys.readouterr().out
     assert "1 of its signals is still waiting to be traded, and 1 has already been traded." in out
+
+
+def test_a_signal_older_than_the_age_limit_is_too_old_to_be_traded_not_waiting(
+    on_rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Fix round 2 of F15: a queued entry is only "still waiting to be
+    traded" while its signal is younger than the policy's
+    max_signal_age_seconds (120 s here: no policy.toml beside the rig's
+    channels.toml); an older one can never be traded, and weeks of
+    watch-only queue must not read as dozens of signals about to trade.
+    Gold Room's signals were posted 4, 5 and 6 hours before NOW; it is
+    switched off 30 seconds after the newest."""
+    monkeypatch.setattr(channels_module, "_utcnow", lambda: NOW - timedelta(hours=4, seconds=-30))
+
+    assert cli_main.main(on_rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert (
+        "1 of its signals is still waiting to be traded, 2 are too old to be traded (posted "
+        "more than 120 seconds ago), and 0 have already been traded." in out
+    )
+    assert "cancelled the next time `.\\xaucopier watch` starts" in out
+
+
+def test_a_channel_whose_waiting_signals_are_all_too_old_says_so(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Hours after its last signal: every entry is still queued, none can
+    be traded -- said as such, not as "none of its signals"."""
+    assert cli_main.main(on_rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert (
+        "0 of its signals are still waiting to be traded, 3 are too old to be traded (posted "
+        "more than 120 seconds ago), and 0 have already been traded." in out
+    )
+    assert "None of its signals" not in out
+
+
+def test_the_age_limit_is_the_one_in_policy_toml(
+    on_rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """max_signal_age_seconds = 5400 (90 min): at 30 minutes past the
+    newest signal, the newest two (30 and 90 minutes old) are waiting."""
+    _patient_policy(on_rig, 5400)
+    monkeypatch.setattr(channels_module, "_utcnow", lambda: NOW - timedelta(hours=4, seconds=-1800))
+
+    assert cli_main.main(on_rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    assert (
+        "2 of its signals are still waiting to be traded, 1 is too old to be traded (posted "
+        "more than 5400 seconds ago), and 0 have already been traded."
+    ) in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        "max_signal_age_seconds = 0\n",
+        "max_signal_age_seconds = 'soon'\n",
+        "max_signal_age_seconds = true\n",
+        "not toml [[\n",
+    ],
+    ids=["zero", "not a number", "true", "not readable"],
+)
+def test_a_policy_toml_it_cannot_use_falls_back_to_120_seconds(
+    on_rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], policy: str
+) -> None:
+    (on_rig.config_dir / "policy.toml").write_bytes(policy.encode("utf-8"))
+    monkeypatch.setattr(channels_module, "_utcnow", lambda: NOW - timedelta(hours=4, seconds=-30))
+
+    assert cli_main.main(on_rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    assert "2 are too old to be traded (posted more than 120 seconds ago)" in (
+        capsys.readouterr().out
+    )
+
+
+def test_a_signal_whose_post_time_cannot_be_read_counts_as_waiting(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Not known to be too old, so the user is told it may still trade."""
+    conn = sqlite3.connect(on_rig.db_path)
+    conn.execute(
+        "UPDATE messages SET posted_at_utc = 'not a time' WHERE channel_id = ? AND message_id = 10",
+        (GOLD,),
+    )
+    conn.commit()
+    conn.close()
+
+    assert cli_main.main(on_rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    assert (
+        "1 of its signals is still waiting to be traded, 2 are too old to be traded"
+        in capsys.readouterr().out
+    )
+
+
+def test_a_channel_whose_signals_were_all_traded_says_so(
+    on_rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Traded, none waiting: never "None of its signals is waiting to be
+    traded or already traded" (a mutant of that test survived round 1)."""
+    conn = sqlite3.connect(on_rig.db_path)
+    conn.execute("UPDATE outbox SET state = 'DONE' WHERE kind = 'ENTRY'")
+    conn.commit()
+    conn.close()
+
+    assert cli_main.main(on_rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "0 of its signals are still waiting to be traded, and 3 have already been traded." in out
+    assert "None of its signals" not in out
+    assert "keeps its stop loss and take profit" in out
 
 
 def test_off_of_a_channel_with_nothing_in_play_says_so(

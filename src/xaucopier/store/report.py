@@ -122,6 +122,17 @@ def _dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value is not None else None
 
 
+def _parse_utc(value: object) -> datetime | None:
+    """A stored time, aware; None if missing, unreadable or naive."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.utcoffset() is not None else None
+
+
 def collect(conn: sqlite3.Connection, *, today: str) -> StatusReport:
     """Read the whole report. `today` is the UTC day key (`YYYY-MM-DD`,
     `metrics.day_key_for(now)`) the "today" column is counted for."""
@@ -196,20 +207,50 @@ def collect(conn: sqlite3.Connection, *, today: str) -> StatusReport:
     )
 
 
-def signals_in_play(conn: sqlite3.Connection, channel_id: int) -> tuple[int, int]:
-    """(waiting, traded) for `channel_id`'s signals: how many still have a
-    trade entry waiting (QUEUED) and none taken, and how many have one
-    taken by a trading account (CLAIMED or DONE) -- what `channels off`
-    tells the user OFF stops following (final review F15)."""
+@dataclass(frozen=True, slots=True)
+class SignalsInPlay:
+    """One channel's signals that still matter, by what can happen to them
+    (`signals_in_play`)."""
+
+    #: A trade entry waiting (QUEUED), none taken, and posted no longer than
+    #: the policy's maximum signal age ago: it could still be traded.
+    waiting: int
+    #: The same, but posted longer ago than that: never traded -- its
+    #: entry fails the age check whenever it is looked at (Plan 3's STALE).
+    too_old: int
+    #: An entry taken by a trading account (CLAIMED or DONE).
+    traded: int
+
+
+def signals_in_play(
+    conn: sqlite3.Connection, channel_id: int, *, now_utc: datetime, max_age_seconds: int
+) -> SignalsInPlay:
+    """What `channels off` tells the user OFF stops following (final review
+    F15): `channel_id`'s signals with an entry still waiting, split by age
+    -- a signal's age is from its message's own post time, as the age gate
+    measures it -- and those taken by a trading account. A signal whose
+    post time cannot be read counts as waiting: it is not known to be too
+    old. A skipped entry counts as neither (fix round 2: in a watch-only
+    queue weeks old, every entry used to count as "still waiting")."""
     rows = conn.execute(
-        "SELECT MAX(o.state IN ('CLAIMED', 'DONE')), MAX(o.state = 'QUEUED') "
+        "SELECT MAX(o.state IN ('CLAIMED', 'DONE')), MAX(o.state = 'QUEUED'), "
+        "MAX(m.posted_at_utc) "
         "FROM signals s JOIN outbox o ON o.signal_id = s.signal_id AND o.kind = 'ENTRY' "
+        "LEFT JOIN messages m ON m.channel_id = s.channel_id AND m.message_id = s.message_id "
         "WHERE s.channel_id = ? GROUP BY s.signal_id",
         (channel_id,),
     ).fetchall()
-    traded = sum(1 for taken, _ in rows if taken)
-    waiting = sum(1 for taken, queued in rows if not taken and queued)
-    return waiting, traded
+    waiting = too_old = traded = 0
+    for taken, queued, posted_text in rows:
+        if taken:
+            traded += 1
+        elif queued:
+            posted = _parse_utc(posted_text)
+            if posted is not None and (now_utc - posted).total_seconds() > max_age_seconds:
+                too_old += 1
+            else:
+                waiting += 1
+    return SignalsInPlay(waiting=waiting, too_old=too_old, traded=traded)
 
 
 def signals_per_channel(conn: sqlite3.Connection) -> tuple[tuple[int, int], ...]:

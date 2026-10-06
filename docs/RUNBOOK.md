@@ -224,9 +224,11 @@ Signals can come from more than one Telegram channel, and you choose which.
 - **Switch one off:** `.\xaucopier channels off 2` stops reading channel
   number 2 **completely**: its new posts, and also the edits, deletions and
   follow-ups (like "close all") of the signals it already posted. It tells
-  you how many of its signals are still waiting to be traded or already
-  traded. The waiting ones are cancelled the next time `watch` starts; a
-  trade already open keeps its stop loss and take profit. **Whatever it
+  you how many of its signals are still waiting to be traded, how many are
+  too old to be traded (a signal posted more than 2 minutes ago never is),
+  and how many were already traded. The waiting ones are cancelled the
+  next time `watch` starts; a trade already open keeps its stop loss and
+  take profit. **Whatever it
   posts while it is off is ignored for good** — it is not read later, not
   even after you switch it back on. Nothing already recorded is deleted.
 - **Switch one on:** `.\xaucopier channels on 2`. From the next `watch` on,

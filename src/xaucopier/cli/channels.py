@@ -85,6 +85,8 @@ from xaucopier.cli.resolve import (
 from xaucopier.cli.status import ago, database_problem, when
 from xaucopier.cli.watch import SetupError, load_channels_config, load_session
 from xaucopier.config.channels import ChannelCfg
+from xaucopier.config.loader import ConfigError, load_policy_dict
+from xaucopier.domain.market import Policy
 from xaucopier.ingest.client import (
     PERMANENT_TELEGRAM_ERRORS,
     AlreadyRunningError,
@@ -347,9 +349,29 @@ def reseed_from_now(db_path: Path, channel_id: int, now: datetime) -> bool:
         conn.close()
 
 
-def _off_lines(db_path: Path, cfg: ChannelCfg) -> list[str]:
+def max_signal_age_seconds(config_dir: Path) -> int:
+    """`max_signal_age_seconds` from `policy.toml` beside channels.toml: how
+    old a signal may be and still be traded. The built-in default (120 s,
+    `domain.market.Policy`) when the file is missing, unreadable, or does
+    not hold a whole number above 0 there."""
+    try:
+        value = load_policy_dict(config_dir / paths.POLICY_FILE).get("max_signal_age_seconds")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ConfigError):
+        value = None
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return Policy().max_signal_age_seconds
+
+
+def _is_are(count: int) -> str:
+    return "is" if count == 1 else "are"
+
+
+def _off_lines(db_path: Path, cfg: ChannelCfg, *, max_age: int) -> list[str]:
     """What `channels off` does to the channel and to the signals it
-    already posted, in plain words (final review F15)."""
+    already posted, in plain words (final review F15). A waiting entry
+    whose signal is older than `max_age` seconds is told apart: it can
+    never be traded (fix round 2)."""
     lines = [
         "While it is off, this program does not read it at all: what it posts then is "
         "not recorded, and not read later either, even after you switch it back on."
@@ -358,20 +380,29 @@ def _off_lines(db_path: Path, cfg: ChannelCfg) -> list[str]:
         if db_path.is_file():
             conn = db.connect_readonly(db_path)
             try:
-                waiting, traded = report.signals_in_play(conn, cfg.channel_id)
+                counts = report.signals_in_play(
+                    conn, cfg.channel_id, now_utc=_utcnow(), max_age_seconds=max_age
+                )
             finally:
                 conn.close()
         else:
-            waiting = traded = 0
+            counts = report.SignalsInPlay(waiting=0, too_old=0, traded=0)
     except sqlite3.DatabaseError as exc:
         lines.append(f"Its signals could not be counted. {database_problem(db_path, exc)}")
         return lines
-    if not waiting and not traded:
+    waiting, too_old, traded = counts.waiting, counts.too_old, counts.traded
+    if not waiting and not too_old and not traded:
         lines.append("None of its signals is waiting to be traded or already traded.")
         return lines
+    old = (
+        f"{too_old} {_is_are(too_old)} too old to be traded (posted more than {max_age} "
+        "seconds ago), "
+        if too_old
+        else ""
+    )
     lines.append(
-        f"{waiting} of its signals {'is' if waiting == 1 else 'are'} still waiting to be "
-        f"traded, and {traded} {'has' if traded == 1 else 'have'} already been traded. "
+        f"{waiting} of its signals {_is_are(waiting)} still waiting to be traded, {old}"
+        f"and {traded} {'has' if traded == 1 else 'have'} already been traded. "
         "Their edits, deletions and follow-ups (like 'close all') are no longer read. "
         f"The waiting ones are cancelled the next time `{_CMD} watch` starts; a trade "
         "already open keeps its stop loss and take profit."
@@ -488,7 +519,7 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
             "from now on."
         )
     if not enabled:
-        say(*_off_lines(args.db, cfg))
+        say(*_off_lines(args.db, cfg, max_age=max_signal_age_seconds(args.config_dir)))
     if not enabled and not any(other.enabled for other in channels if other is not cfg):
         say(
             "WARNING: that was the last channel switched on. With no channel ON, "
