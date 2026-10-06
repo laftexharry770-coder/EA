@@ -107,6 +107,8 @@ _RESTART_ADVICE = (
     "If the watch window is still open, click in it, press Ctrl+C and answer Y; "
     f"then start it again with `{_CMD} watch`."
 )
+#: The same advice where it follows a colon mid-sentence (FF25 c).
+_RESTART_ADVICE_AFTER_COLON = _RESTART_ADVICE[0].lower() + _RESTART_ADVICE[1:]
 
 
 def database_problem(path: Path, exc: sqlite3.DatabaseError) -> str:
@@ -252,7 +254,7 @@ def _watch_lines(rep: report.StatusReport, now: datetime, secrets_path: Path) ->
                 f"{counts[1]} channel(s): Telegram is not answering for the rest (see "
                 f"CHANNELS below, and {paths.LOG_FILE_NAME}), so nothing new is being "
                 "recorded from them. If this lasts more than a few minutes: "
-                + _RESTART_ADVICE
+                + _RESTART_ADVICE_AFTER_COLON
             )
         else:
             lines.append(

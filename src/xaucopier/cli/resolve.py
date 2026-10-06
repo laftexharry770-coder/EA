@@ -612,7 +612,8 @@ async def accept_source(resolved: Resolved, *, allow_group: bool) -> bool:
         )
     if resolved.kind == "channel":
         return True
-    print("", f"WARNING: {GROUP_WARNING if resolved.kind == 'group' else UNKNOWN_KIND_WARNING}")
+    print()
+    print(f"WARNING: {GROUP_WARNING if resolved.kind == 'group' else UNKNOWN_KIND_WARNING}")
     if allow_group:
         print("--allow-group was given, so it is used anyway.")
         return True

@@ -1275,6 +1275,9 @@ def test_a_group_picked_from_the_list_needs_its_own_yes(
     assert (added.channel_id, added.enabled) == (VIP_GROUP_ID, True)
     out = capsys.readouterr().out
     assert GROUP_WARNING in out
+    # FF25 (a): a blank line, then the warning -- not ' WARNING:'.
+    assert "\n\nWARNING: " + GROUP_WARNING in out
+    assert " WARNING: " not in out
     assert "Found: Gold Signals VIP -- a group" in out
     # The group question comes before, and apart from, the ordinary one.
     assert prompts[2] == "Type yes to use it anyway: "

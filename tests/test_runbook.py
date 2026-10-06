@@ -81,6 +81,8 @@ def test_the_runbook_says_what_the_user_must_know() -> None:
         # F27: the Telegram id is not the channel number.
         "writes the channel's **Telegram id**",
         "not the long Telegram id",
+        # FF25 (b): exit 5 is about a channel's Telegram id, not its number.
+        "a config file, a channel's Telegram id, the data folder",
         # F26: the exit code is printed.
         "its last line is its exit code",
         # F06 / exit 3 and exit 4.

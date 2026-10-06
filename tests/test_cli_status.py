@@ -467,6 +467,8 @@ def test_a_round_that_could_not_read_every_channel_is_not_healthy(
     assert "NOT HEALTHY: started" in out
     assert f"could read only {read} of {tried} channel(s)" in out
     assert "press Ctrl+C and answer Y" in out
+    # FF25 (c): the advice after the colon goes on in lower case.
+    assert "If this lasts more than a few minutes: if the watch window is still open" in out
     # The channel itself is flagged at once, not only after two minutes.
     assert "<-- could not be read in the last check" in out
 

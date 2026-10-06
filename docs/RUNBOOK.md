@@ -298,7 +298,7 @@ prints no code.
 | 2 | The command was typed wrong. | Check the spelling; try `.\xaucopier --help`. |
 | 3 | Telegram refuses this program's login: it was logged out (for example from Telegram → Settings → Devices), **a second copy of the session was used somewhere else at the same time**, or the account is deactivated, banned or frozen. The watch window may name the reason *AuthKeyNotFound* ("auth key not found"): that is a dead login too. | Do **not** just restart. Make sure nothing else uses this login, run step 2 again, then `watch`. A banned account cannot be fixed by any program. |
 | 4 | `watch` stopped unexpectedly (for example the internet dropped, or it could not reach Telegram within 60 seconds of starting). | Safe to start `watch` again. |
-| 5 | Something in the setup is wrong (a config file, the channel number, the data folder, the session file) — or Telegram rejected your api_id/api_hash. | Read the message. Restarting will not help until it is fixed. For a rejected api_id: get a **new** pair (step 1), then run step 2 again. |
+| 5 | Something in the setup is wrong (a config file, a channel's Telegram id, the data folder, the session file) — or Telegram rejected your api_id/api_hash. | Read the message. Restarting will not help until it is fixed. For a rejected api_id: get a **new** pair (step 1), then run step 2 again. |
 | 6 | `watch` is already running on this PC — or `channels add` or `resolve-channels` is, which use the Telegram login too. | Find its window. Never run two. To add a channel, stop `watch` first. If it says it is probably running in a window opened as administrator, find that window and stop it there. |
 | 130 | You pressed Ctrl+C (and answered **Y**). | Nothing — start it again when you want. |
 
