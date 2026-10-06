@@ -558,7 +558,8 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
 
     say(f"Channel {number} ({name}) is now {word}.")
     if enabled:
-        say(*_on_lines(switched_on))
+        for line in _on_lines(switched_on):
+            say(line)
     else:
         say(
             *_off_lines(

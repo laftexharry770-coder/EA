@@ -328,6 +328,8 @@ def test_on_switches_on_exactly_the_channel_with_that_number(
     out = capsys.readouterr().out
     assert "Channel 3 (Quiet Signals) is now ON." in out
     assert "takes effect the next time you run `.\\xaucopier watch`" in out
+    # A channel never read: nothing more to say, and no blank line for it.
+    assert "Channel 3 (Quiet Signals) is now ON.\nwatch reads this list" in out
 
 
 def test_off_switches_off_exactly_that_channel_and_keeps_crlf_line_endings(
