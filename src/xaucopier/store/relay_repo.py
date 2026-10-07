@@ -229,7 +229,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
@@ -1040,13 +1040,20 @@ def describe_call(signal: Signal) -> str:
     return f"{signal.side.value.upper()} {signal.zone.lo:g}-{signal.zone.hi:g}"
 
 
+def describe_stored_call(parsed_json: str) -> str:
+    """A `signals` row's call (its `parsed_json`), as `describe_call`
+    says a parse's: side and entry zone."""
+    parsed = json.loads(parsed_json)
+    zone = parsed["zone"]
+    return f"{parsed['side'].upper()} {zone['lo']:g}-{zone['hi']:g}"
+
+
 def _describe_both(signal: Signal, row: sqlite3.Row) -> tuple[str, str]:
     """A parse's call and a `signals` row's, for an alert that sets them
     side by side: side and entry zone (`describe_call`), and the symbol
     too when the two differ."""
     parsed = json.loads(row["parsed_json"])
-    zone = parsed["zone"]
-    stored = f"{parsed['side'].upper()} {zone['lo']:g}-{zone['hi']:g}"
+    stored = describe_stored_call(row["parsed_json"])
     if parsed["symbol_alias"] == signal.symbol_alias:
         return describe_call(signal), stored
     return (
@@ -1161,6 +1168,7 @@ def admit_signal(
     fwd_from_post_id: int | None,
     accounts: tuple,
     now_utc: datetime,
+    deleted_in_report: tuple[datetime, Collection[int]] | None = None,
 ) -> Admission:
     """A message of `channel_cfg`'s channel -- already on `messages` --
     read as signal `signal` for the first time, admitted by the relay
@@ -1172,7 +1180,15 @@ def admit_signal(
     for a new signal: `messages_repo.ingest` for a message stored for the
     first time, and `edits_repo` for a post an edit completed within the
     grace (final review F11), so both follow the same rules -- the same
-    call already live or queued is never a second signal (G3L-1)."""
+    call already live or queued is never a second signal (G3L-1).
+
+    `deleted_in_report` (the report's time and every id it named): a
+    deletion report named this message before it was stored (final review
+    F18). When the same report deleted the post that withdrew the call
+    this one would replace -- a double post deleted together, one of them
+    raced -- it is no call posted again but a copy of the call that report
+    withdrew (`_withdrawn_in_report`, final fix FF5): linked quietly,
+    exactly as the report handled after both were stored leaves it."""
     channel_id = channel_cfg.channel_id
     relay = relay_of_signal(
         conn,
@@ -1197,6 +1213,16 @@ def admit_signal(
             relay_window_seconds=relay_window_seconds,
         )
         return Admission(relay.match, None, None, 0, raised)
+    if (
+        relay.replaces is not None
+        and deleted_in_report is not None
+        and _withdrawn_in_report(conn, relay.replaces, channel_id, *deleted_in_report)
+    ):
+        withdrawn = _signal_match(conn, _signal_row(conn, relay.replaces), via="hash")
+        _record_copy_withdrawn_with(
+            conn, channel_id=channel_id, message_id=message_id, match=withdrawn, now_utc=now_utc
+        )
+        return Admission(withdrawn, None, None, 0, ())
     signal_id = signals_repo.insert_signal(
         conn,
         channel_id=channel_id,
@@ -1227,6 +1253,57 @@ def admit_signal(
             channel_cfg=channel_cfg,
         )
     return Admission(None, signal_id, relay.replaces, queued, raised)
+
+
+def _withdrawn_in_report(
+    conn: sqlite3.Connection,
+    signal_id: int,
+    channel_id: int,
+    reported_at_utc: datetime,
+    report_ids: Collection[int],
+) -> bool:
+    """For `admit_signal` (final fix FF5): whether signal `signal_id` was
+    withdrawn by the deletion of a post of `channel_id` that the report
+    made at `reported_at_utc` naming `report_ids` deleted -- every job of
+    one report is stamped with the report's moment
+    (`Listener.ingest_deletion`)."""
+    row = _signal_row(conn, signal_id)
+    if row["closed_by_channel_id"] != channel_id or row["closed_by_message_id"] not in set(
+        report_ids
+    ):
+        return False
+    closer = conn.execute(
+        "SELECT deleted_at_utc FROM messages WHERE channel_id = ? AND message_id = ?",
+        (channel_id, row["closed_by_message_id"]),
+    ).fetchone()
+    return closer is not None and closer["deleted_at_utc"] == reported_at_utc.isoformat()
+
+
+def _record_copy_withdrawn_with(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    message_id: int,
+    match: SignalMatch,
+    now_utc: datetime,
+) -> None:
+    """Store that (`channel_id`, `message_id`) -- already on `messages`,
+    deleted in the report that withdrew `match`'s signal -- is a copy of
+    it: the link, the INFO line and the counter, and no alert. The report
+    withdrew the call once, and said so; this post went with it."""
+    conn.execute(
+        "UPDATE messages SET relay_of_signal_id = ? WHERE channel_id = ? AND message_id = ?",
+        (match.signal_id, channel_id, message_id),
+    )
+    metrics.bump(conn, day_key=metrics.day_key_for(now_utc), name=RELAY_DUPLICATES_METRIC)
+    logger.info(
+        "channel %s message %s repeats signal %s (message %s), and was deleted in the same "
+        "report as the post that withdrew it: stored as its copy, not traded",
+        channel_id,
+        message_id,
+        match.signal_id,
+        match.message_id,
+    )
 
 
 def find_signal_relay(

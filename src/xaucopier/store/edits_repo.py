@@ -256,7 +256,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
@@ -539,6 +539,35 @@ def window_versions(
         )
         for row in reversed(rows)
     )
+
+
+def waiting_trades(
+    conn: sqlite3.Connection, *, channel_id: int, message_ids: Iterable[int]
+) -> tuple[str, ...]:
+    """For a re-read of the channel's newest messages that did not return
+    `message_ids` and is not believed (`WINDOW_READ_SUSPECT`; final fix
+    FF13): one plain sentence for each of them that is a signal with trade
+    entries still queued -- what is at stake if the post really is gone (a
+    withdrawn signal has none: its entries were skipped). Read-only: the
+    listener calls this on its reader connection."""
+    said: list[str] = []
+    for message_id in message_ids:
+        row = conn.execute(
+            "SELECT s.signal_id, s.parsed_json, "
+            "  (SELECT COUNT(*) FROM outbox o WHERE o.signal_id = s.signal_id "
+            "     AND o.kind = 'ENTRY' AND o.state = 'QUEUED') "
+            "FROM signals s WHERE s.channel_id = ? AND s.message_id = ?",
+            (channel_id, message_id),
+        ).fetchone()
+        if row is None or row[2] == 0:
+            continue
+        waiting = "1 trade entry is" if row[2] == 1 else f"{row[2]} trade entries are"
+        said.append(
+            f"Message {message_id} is signal {row[0]}, "
+            f"{relay_repo.describe_stored_call(row[1])}, and {waiting} still waiting for it. "
+            "If the post is gone in Telegram, the trade should not be placed."
+        )
+    return tuple(said)
 
 
 # -- edits -------------------------------------------------------------------

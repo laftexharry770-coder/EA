@@ -148,7 +148,11 @@ arriving a moment later gives. A signal is VOIDED and its entries
 SKIPPED before any worker could claim them; a relay copy stored before
 or after sees a post of the call that was deleted (ruling C2), whichever
 was stored first. For a message already stored it is ignored (the
-deletion found it stored and applied itself).
+deletion found it stored and applied itself). One thing the report
+itself tells: a signal whose call the SAME report withdrew -- a double
+post deleted together, the report handled before this one was stored --
+is a copy of that call, not the call posted again (final fix FF5), as it
+would have been stored before the report.
 """
 from __future__ import annotations
 
@@ -388,6 +392,9 @@ def ingest(
             accounts=accounts,
             relay_window_seconds=relay_window_seconds,
             provenance=provenance,
+            deleted_in_report=None
+            if deleted_by_event_at_utc is None
+            else (deleted_by_event_at_utc, frozenset(deleted_by_event_with)),
         )
         if retraction is not None:
             _cancelled_when_first_read(conn, channel_cfg, message_id, text, now_utc=now_utc)
@@ -552,6 +559,7 @@ def _ingest_new(
     accounts: tuple[_AccountCfgLike, ...],
     relay_window_seconds: int,
     provenance: dict[str, Any],
+    deleted_in_report: tuple[datetime, frozenset[int]] | None = None,
 ) -> IngestResult:
     kind = route_result.kind
 
@@ -696,6 +704,7 @@ def _ingest_new(
         fwd_from_post_id=provenance["fwd_from_post_id"],
         accounts=accounts,
         now_utc=now_utc,
+        deleted_in_report=deleted_in_report,
     )
     if admission.match is not None:
         return IngestResult(

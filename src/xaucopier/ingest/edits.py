@@ -381,16 +381,23 @@ async def _suspect_read(
     shown = ", ".join(str(message_id) for message_id in absent[:10])
     more = f" and {len(absent) - 10} more" if len(absent) > 10 else ""
     try:
+        # What is at stake if they really are gone (final fix FF13): a lone
+        # signal deleted unseen trips this as surely as a bad answer.
+        at_stake = edits_repo.waiting_trades(
+            listener.reader, channel_id=channel_id, message_ids=absent
+        )
         await listener.record_alert(
             "CRITICAL",
             edits_repo.WINDOW_READ_SUSPECT,
-            f"the window re-read of channel {channel_id} ({channel_cfg.name}) did not return "
-            f"{len(absent)} of the {expected} messages it expected (ids {shown}{more}). "
-            "That looks like a bad answer rather than that many deletions, so no deletion "
-            "is inferred while reads look like this; edits of the messages that did come "
-            "back are still applied, and MessageDeleted events still act. If those "
-            "messages really were deleted, check the channel by hand. Raised once until a "
-            "read looks normal again.",
+            f"this program re-read the newest messages of channel {channel_id} "
+            f"({channel_cfg.name}), and Telegram did not return {len(absent)} of the "
+            f"{expected} it expected (ids {shown}{more}). That looks like a bad answer "
+            "rather than that many deletions, so none of them is taken as deleted while "
+            "reads look like this; edits of the messages that did come back are still "
+            "applied, and a deletion Telegram reports by itself still counts. "
+            + "".join(f"{sentence} " for sentence in at_stake)
+            + "If those messages really were deleted, check the channel by hand. Raised "
+            "once until a read looks normal again.",
             channel_id=channel_id,
         )
     except db.WriterDeadError:

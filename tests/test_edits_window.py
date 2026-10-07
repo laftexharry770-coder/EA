@@ -643,3 +643,236 @@ def test_a_report_naming_a_post_not_stored_yet_is_applied_as_that_report(tmp_pat
     raced_state, reference_state = states
     assert raced_state == reference_state
     assert [(row[2], row[5]) for row in raced_state["signals"]] == [(4002, "VOIDED")]
+
+
+def _report_outcome(conn) -> tuple:
+    """What one report deleting a double post left: the signals' states,
+    the ENTRY rows' states, and the alerts -- with no ids or times, so a
+    run in which the other post holds the signal compares equal."""
+    return (
+        [tuple(r) for r in conn.execute(
+            "SELECT state, withdrawn_at_utc IS NOT NULL FROM signals ORDER BY signal_id"
+        ).fetchall()],
+        sorted(s for (s,) in conn.execute("SELECT state FROM outbox WHERE kind = 'ENTRY'")),
+        [tuple(r) for r in conn.execute("SELECT level, code FROM alerts ORDER BY alert_id")],
+    )
+
+
+@pytest.mark.parametrize("raced_id", [4001, 4002])
+@pytest.mark.parametrize("order", ["4001-first", "4002-first"])
+def test_a_double_post_deleted_in_one_report_and_raced_is_one_signal_voided_once(
+    tmp_path, raced_id: int, order: str
+) -> None:
+    """Final fix FF5. The VIP posts the same call twice (4001, 4002) and
+    deletes both in one report; one of them is raced -- the whole report
+    is handled before the read that stores it. The stored one is the
+    signal, and the report withdrew it. The raced post, stored then, saw a
+    withdrawn call its channel posted again and became a second signal,
+    voided the same moment: two signals rows, two ENTRY fan-outs and a
+    WARNING about a signal the user never saw. It is a copy of the call
+    the same report withdrew: one signal, voided once -- exactly as the
+    report handled after both were stored."""
+    report = frozenset({4001, 4002})
+    reported_at = POSTED + timedelta(seconds=20)
+    deletions = (4001, 4002) if order == "4001-first" else (4002, 4001)
+
+    def store(conn, message_id, **extra):
+        result = ingest(
+            conn, channel_cfg=CHANNEL, message_id=message_id, text=SIGNAL_TEXT,
+            posted_at_utc=POSTED + timedelta(seconds=message_id - 4000), edit_date_utc=None,
+            reply_to_message_id=None, source="poll", now_utc=POSTED + timedelta(seconds=10),
+            accounts=ACCOUNTS, **extra,
+        )
+        conn.commit()
+        return result
+
+    def delete(conn, message_id):
+        result = edits_repo.apply_deletion(
+            conn, channel_cfg=CHANNEL, message_id=message_id, now_utc=reported_at,
+            accounts=ACCOUNTS, detected_by="event", also_deleted=report,
+        )
+        conn.commit()
+        return result
+
+    outcomes = []
+    for raced in (True, False):
+        conn = db.connect(tmp_path / f"{raced}.db", role="writer")
+        try:
+            if raced:
+                store(conn, ({4001, 4002} - {raced_id}).pop())
+                for message_id in deletions:
+                    delete(conn, message_id)
+                result = store(
+                    conn, raced_id,
+                    deleted_by_event_at_utc=reported_at, deleted_by_event_with=report,
+                )
+                assert result.outcome == "relay_duplicate" and result.relay_of_signal_id == 1
+            else:
+                for message_id in (4001, 4002):
+                    store(conn, message_id)
+                for message_id in deletions:
+                    delete(conn, message_id)
+            outcomes.append(_report_outcome(conn))
+        finally:
+            conn.close()
+    raced_outcome, reference = outcomes
+    assert raced_outcome == reference == (
+        [("VOIDED", 1)],
+        ["SKIPPED", "SKIPPED"],
+        [("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)],
+    )
+
+
+def test_a_raced_repost_of_a_call_withdrawn_in_an_earlier_report_is_still_the_call_again(
+    tmp_path,
+) -> None:
+    """FF5's limit: only the report that withdrew the call makes the raced
+    post a copy. The VIP deletes its call (one report), posts it again and
+    deletes that too (a later report), the repost raced: the repost is the
+    call posted again -- signal 2 -- and that later report withdrew it."""
+    conn = db.connect(tmp_path / "store.db", role="writer")
+    try:
+        ingest(
+            conn, channel_cfg=CHANNEL, message_id=4001, text=SIGNAL_TEXT,
+            posted_at_utc=POSTED, edit_date_utc=None, reply_to_message_id=None,
+            source="poll", now_utc=POSTED + timedelta(seconds=1), accounts=ACCOUNTS,
+        )
+        edits_repo.apply_deletion(
+            conn, channel_cfg=CHANNEL, message_id=4001, now_utc=POSTED + timedelta(seconds=10),
+            accounts=ACCOUNTS, detected_by="event", also_deleted=frozenset({4001}),
+        )
+        result = ingest(
+            conn, channel_cfg=CHANNEL, message_id=4002, text=SIGNAL_TEXT,
+            posted_at_utc=POSTED + timedelta(seconds=15), edit_date_utc=None,
+            reply_to_message_id=None, source="poll", now_utc=POSTED + timedelta(seconds=30),
+            accounts=ACCOUNTS, deleted_by_event_at_utc=POSTED + timedelta(seconds=20),
+            deleted_by_event_with=frozenset({4001, 4002}),
+        )
+        conn.commit()
+        assert (result.outcome, result.signal_id) == ("new", 2)
+        assert [tuple(r) for r in conn.execute(
+            "SELECT signal_id, state FROM signals ORDER BY signal_id"
+        ).fetchall()] == [(1, "VOIDED"), (2, "VOIDED")]
+    finally:
+        conn.close()
+
+
+def test_only_the_report_that_withdrew_the_call_makes_a_raced_post_its_copy(tmp_path) -> None:
+    """FF5's test, `relay_repo._withdrawn_in_report`: the call counts as
+    withdrawn in a report only when the post that withdrew it is on the
+    same channel, is one of the ids that report named, and was deleted at
+    the report's moment."""
+    from xaucopier.store import relay_repo
+
+    reported_at = POSTED + timedelta(seconds=20)
+    conn = db.connect(tmp_path / "store.db", role="writer")
+    try:
+        for channel_cfg in (CHANNEL, relay.RELAY):  # the relay's 4001 is chatter
+            ingest(
+                conn, channel_cfg=channel_cfg, message_id=4001,
+                text=SIGNAL_TEXT if channel_cfg is CHANNEL else CHATTER_TEXT,
+                posted_at_utc=POSTED, edit_date_utc=None, reply_to_message_id=None,
+                source="poll", now_utc=POSTED + timedelta(seconds=1), accounts=ACCOUNTS,
+            )
+            edits_repo.apply_deletion(
+                conn, channel_cfg=channel_cfg, message_id=4001, now_utc=reported_at,
+                accounts=ACCOUNTS, detected_by="event", also_deleted=frozenset({4001, 4002}),
+            )
+        conn.commit()
+        withdrawn = relay_repo._withdrawn_in_report
+        channel = CHANNEL.channel_id
+        assert withdrawn(conn, 1, channel, reported_at, {4001, 4002}) is True
+        assert withdrawn(conn, 1, channel, reported_at, {4002, 4003}) is False  # another report
+        assert withdrawn(conn, 1, channel, reported_at + timedelta(seconds=1), {4001}) is False
+        assert withdrawn(conn, 1, relay.RELAY.channel_id, reported_at, {4001}) is False
+    finally:
+        conn.close()
+
+
+def test_a_channels_only_signal_deleted_unseen_is_named_with_its_waiting_trade(
+    tmp_path,
+) -> None:
+    """Final fix FF13. A channel's only stored message is a signal (a
+    channel first read today). It is deleted while the deletion update is
+    lost: every re-read misses 1 of the 1 message it expects, which the
+    breaker cannot tell from a bad answer -- so nothing is applied, and
+    the signal's trade stays queued. The CRITICAL said only 'did not
+    return 1 of the 1 messages', in this program's own terms. It now says
+    which signal that message is, that its trade is still waiting, and
+    that it should not be placed if the post is gone -- in plain words."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        assert await client.emit(A, FakeMessage(id=NEWEST_SIGNAL, message=SIGNAL_TEXT, date=POSTED))
+        with client.blackout():
+            assert not await client.emit_delete(A, NEWEST_SIGNAL)
+        for _ in range(3):
+            await _round(listener, time)
+
+    _run(db_path, body)
+
+    assert _signal(db_path, NEWEST_SIGNAL)["state"] == "NEW"  # the breaker held
+    assert _alerts(db_path) == [("CRITICAL", edits_repo.WINDOW_READ_SUSPECT)]
+    (detail,) = _rows(db_path, "SELECT detail FROM alerts")[0]
+    assert (
+        f"Message {NEWEST_SIGNAL} is signal 1, BUY 4480-4485, and 2 trade entries are still "
+        "waiting for it. If the post is gone in Telegram, the trade should not be placed."
+    ) in detail
+    for jargon in ("window re-read", "MessageDeleted", "event"):
+        assert jargon not in detail
+
+
+def test_a_suspect_read_names_no_trade_when_none_is_waiting(tmp_path) -> None:
+    """The same breaker trip over chatter alone: no trade is named."""
+    db_path = tmp_path / "store.db"
+
+    async def body(client, listener, time):
+        assert await client.emit(A, FakeMessage(id=NEWEST_SIGNAL, message=CHATTER_TEXT, date=POSTED))
+        with client.blackout():
+            assert not await client.emit_delete(A, NEWEST_SIGNAL)
+        for _ in range(3):
+            await _round(listener, time)
+
+    _run(db_path, body)
+
+    (detail,) = _rows(db_path, "SELECT detail FROM alerts WHERE code = ?",
+                      (edits_repo.WINDOW_READ_SUSPECT,))[0]
+    assert "signal" not in detail and "trade" not in detail
+
+
+def test_waiting_trades_names_only_entries_still_queued(tmp_path) -> None:
+    """FF13's helper: a signal whose entries are all taken names no trade;
+    one left waiting is said in the singular; chatter is never named."""
+    from xaucopier.store import outbox
+
+    conn = db.connect(tmp_path / "store.db", role="writer")
+    try:
+        for message_id, text in ((4001, SIGNAL_TEXT), (4002, CHATTER_TEXT)):
+            ingest(
+                conn, channel_cfg=CHANNEL, message_id=message_id, text=text,
+                posted_at_utc=POSTED, edit_date_utc=None, reply_to_message_id=None,
+                source="poll", now_utc=POSTED, accounts=ACCOUNTS,
+            )
+        conn.commit()
+
+        def said():
+            return edits_repo.waiting_trades(
+                conn, channel_id=CHANNEL.channel_id, message_ids=(4001, 4002, 4003)
+            )
+
+        assert said() == (
+            "Message 4001 is signal 1, BUY 4480-4485, and 2 trade entries are still waiting "
+            "for it. If the post is gone in Telegram, the trade should not be placed.",
+        )
+        for n, account in enumerate(ACCOUNTS):
+            assert outbox.claim(conn, account_id=account.account_id, pid=1, now_utc=POSTED)
+            conn.commit()
+            if n == 0:
+                assert said() == (
+                    "Message 4001 is signal 1, BUY 4480-4485, and 1 trade entry is still "
+                    "waiting for it. If the post is gone in Telegram, the trade should not be "
+                    "placed.",
+                )
+        assert said() == ()
+    finally:
+        conn.close()
