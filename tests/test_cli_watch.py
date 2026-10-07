@@ -550,3 +550,35 @@ def test_a_watch_held_off_by_an_administrator_window_says_so(
     err = capsys.readouterr().err
     assert "administrator" in err
     assert rig.built == []
+
+
+def _refuse_channels_toml(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows refusing channels.toml for good (FF9), waited out briefly."""
+    import xaucopier.config.loader as loader_module
+
+    monkeypatch.setattr(loader_module, "REPLACE_WAIT_SECONDS", 0.2)
+    real_open = Path.open
+
+    def opened(path, *args, **kwargs):
+        if path.name == "channels.toml":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", opened)
+
+
+def test_a_channels_file_another_command_keeps_open_is_no_setup_problem(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final fix FF9: watch's own start-up read of channels.toml, refused
+    for longer than the wait: nothing is started, and it is safe to start
+    again (exit 4) -- not a setup problem to fix (exit 5)."""
+    _refuse_channels_toml(monkeypatch)
+
+    exit_code = cli_main.main(rig.argv())
+
+    assert exit_code == exit_codes.EXIT_LISTENER_STOPPED
+    assert rig.built == [] and rig.lock.acquired == 0
+    err = capsys.readouterr().err
+    assert "start it again" in err and "exit code 4" in err
+    assert "exit code 5" not in err and "PermissionError" not in err

@@ -818,3 +818,31 @@ def test_resolving_while_the_database_is_held_saves_nothing(
     err = capsys.readouterr().err
     assert "The database is busy" in err and "Nothing was changed." in err
     assert "Traceback" not in err
+
+
+def _refuse_channels_toml(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows refusing channels.toml for good (FF9), waited out briefly."""
+    import xaucopier.config.loader as loader_module
+
+    monkeypatch.setattr(loader_module, "REPLACE_WAIT_SECONDS", 0.2)
+    real_open = Path.open
+
+    def opened(path, *args, **kwargs):
+        if path.name == "channels.toml":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", opened)
+
+
+def test_a_channels_file_another_command_keeps_open_asks_to_run_it_again(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final fix FF9, for resolve-channels: exit 1 and "run the command
+    again", never the setup-problem exit 5."""
+    _refuse_channels_toml(monkeypatch)
+
+    assert cli_main.main(rig.argv()) == exit_codes.EXIT_FAILED
+
+    err = capsys.readouterr().err
+    assert "Run the command again" in err and "PermissionError" not in err

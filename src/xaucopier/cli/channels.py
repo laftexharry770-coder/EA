@@ -85,7 +85,13 @@ from xaucopier.cli.resolve import (
     save_switch,
 )
 from xaucopier.cli.status import ago, database_problem, when
-from xaucopier.cli.watch import SetupError, load_channels_config, load_session
+from xaucopier.cli.watch import (
+    ConfigReadBusyError,
+    SetupError,
+    load_channels_config,
+    load_session,
+)
+from xaucopier.config.loader import read_while_replaced
 from xaucopier.config.channels import ChannelCfg
 from xaucopier.config.loader import ConfigError, load_policy_dict
 from xaucopier.domain.market import Policy
@@ -261,6 +267,10 @@ def render_list(
 
 
 def _config_problem(exc: SetupError) -> int:
+    if isinstance(exc, ConfigReadBusyError):
+        # Not the file's fault: another command was saving it (FF9).
+        complain(f"{exc}.", "Nothing was changed. Run the command again.")
+        return exit_codes.EXIT_FAILED
     complain(
         f"channels.toml cannot be used: {exc}",
         f"`{_CMD} watch` will refuse to start until this is fixed. Nothing was changed.",
@@ -380,7 +390,8 @@ def _off_lines(
     whose signal is older than `max_age` seconds is told apart: it can
     never be traded. `recorded`: when it was switched off was saved, so
     what it posted before is still read once it is back on; `problem`:
-    why that could not be saved (fix round 2 of F28)."""
+    that it could not be saved, and why (fix round 2 of F28;
+    `_off_not_saved`)."""
     lines = ["While it is off, this program does not read it at all."]
     if recorded:
         lines.append(
@@ -391,10 +402,7 @@ def _off_lines(
     else:
         lines.append("What it posts while it is off is never read, not even later.")
     if problem is not None:
-        lines.append(
-            f"When it was switched off could not be saved: {problem} So when you switch it "
-            "back on, everything it posted since watch last read it is skipped too."
-        )
+        lines.append(problem)
     try:
         if db_path.is_file():
             conn = db.connect_readonly(db_path)
@@ -433,6 +441,53 @@ def _off_lines(
     return lines
 
 
+def _off_not_saved(db_path: Path, exc: sqlite3.DatabaseError, number: int) -> str:
+    """Why `channels off NUMBER` could not save when the channel was
+    switched off, and what that costs. A busy database is worth running
+    the command again for -- `off` on a channel already OFF saves a
+    switch-off never saved (final fix FF11) -- so it says exactly that
+    command; for anything else it would not help."""
+    cost = "everything it posted since watch last read it is skipped too"
+    if db.is_lock_error(exc):
+        return (
+            f"When it was switched off could not be saved: The database is busy -- watch "
+            f"is probably writing to it ({db_path}). Run `{_CMD} channels off {number}` "
+            f"again in a moment to save it; until then, when you switch it back on, {cost}."
+        )
+    return (
+        f"When it was switched off could not be saved: {database_problem(db_path, exc)} "
+        f"So when you switch it back on, {cost}."
+    )
+
+
+def _already_off(args: argparse.Namespace, cfg: ChannelCfg, number: int, name: str) -> int:
+    """`channels off NUMBER` for a channel already OFF: nothing changes in
+    channels.toml, but a switch-off whose time was never saved is saved now
+    (final fix FF11), and said."""
+    try:
+        saved = channel_reading.record_missing_switch_off(args.db, cfg.channel_id, _utcnow())
+    except sqlite3.DatabaseError as exc:
+        say(
+            f"Channel {number} ({name}) is already OFF. Nothing was changed.",
+            _off_not_saved(args.db, exc, number).replace(
+                "When it was switched off could not be saved",
+                "Whether its switch-off was saved could not be checked",
+                1,
+            ),
+        )
+        return exit_codes.EXIT_OK
+    if not saved:
+        say(f"Channel {number} ({name}) is already OFF. Nothing was changed.")
+        return exit_codes.EXIT_OK
+    say(
+        f"Channel {number} ({name}) is already OFF.",
+        "When it was switched off had not been saved; it is saved now, as now. So when you "
+        "switch it back on, what it posted before now that watch has not read yet is still "
+        "read, and only what it posts from now until then is skipped.",
+    )
+    return exit_codes.EXIT_OK
+
+
 def _takes_effect() -> str:
     if session_in_use():
         return WATCH_RUNNING_NOTE
@@ -448,9 +503,11 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
     path: Path = args.config_dir / paths.CHANNELS_FILE
     word = "ON" if enabled else "OFF"
     try:
-        original = path.read_bytes().decode("utf-8")
+        original = read_while_replaced(path).decode("utf-8")
     except FileNotFoundError:
         return _config_problem(SetupError(f"{path} does not exist."))
+    except PermissionError:
+        return _config_problem(ConfigReadBusyError(path))
     except (OSError, UnicodeDecodeError) as exc:
         return _config_problem(SetupError(f"{path} could not be read: {exc}"))
 
@@ -482,6 +539,8 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
     name = _printable(cfg.name)
 
     if cfg.enabled == enabled:
+        if not enabled:
+            return _already_off(args, cfg, number, name)
         say(f"Channel {number} ({name}) is already {word}. Nothing was changed.")
         return exit_codes.EXIT_OK
     if enabled and cfg.channel_id == PLACEHOLDER_ID:
@@ -529,7 +588,7 @@ def cmd_switch(args: argparse.Namespace, *, enabled: bool) -> int:
                 f"Nothing was changed: channel {number} is still OFF.",
             )
             return exit_codes.EXIT_FAILED
-        off_problem = database_problem(args.db, exc)
+        off_problem = _off_not_saved(args.db, exc, number)
 
     try:
         save_switch(
@@ -625,10 +684,12 @@ async def _add(args: argparse.Namespace, client: Any, path: Path) -> int:
     # Read the file now, not before the lookup: the user may have taken a
     # while to choose. The writer also refuses if it changes after this.
     try:
-        original = path.read_bytes().decode("utf-8")
+        original = read_while_replaced(path).decode("utf-8")
         channels = load_channels_config(args.config_dir)
     except SetupError as exc:
         return _config_problem(exc)
+    except PermissionError:
+        return _config_problem(ConfigReadBusyError(path))
     except (OSError, UnicodeDecodeError) as exc:
         return _config_problem(SetupError(f"{path} could not be read: {exc}"))
 

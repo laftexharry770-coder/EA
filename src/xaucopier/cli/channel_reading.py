@@ -60,6 +60,18 @@ def record_switch_off(db_path: Path, channel_id: int, now: datetime) -> bool | N
     )
 
 
+def record_missing_switch_off(db_path: Path, channel_id: int, now: datetime) -> bool | None:
+    """`channels off` for a channel already OFF: save its switch-off at
+    `now` if it was never saved (`channel_state.record_missing_switch_off`).
+    Returns whether it was; None with no database."""
+    return _in_one_transaction(
+        db_path,
+        lambda conn: channel_state.record_missing_switch_off(
+            conn, channel_id=channel_id, off_at_utc=now
+        ),
+    )
+
+
 def record_switch_on(
     db_path: Path, channel_id: int, now: datetime, *, may_replace_first_cutoff: bool
 ) -> channel_state.SwitchOn | None:

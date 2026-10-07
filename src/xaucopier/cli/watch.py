@@ -101,6 +101,19 @@ class SetupError(Exception):
     it and exits `EXIT_CONFIG_ERROR` without starting anything."""
 
 
+class ConfigReadBusyError(SetupError):
+    """A config file Windows kept refusing to open for
+    `loader.REPLACE_WAIT_SECONDS` -- most likely another xaucopier command
+    was replacing it (final fix FF9). Not a setup problem: running the
+    command again is the fix (exit 1; `watch`: 4, safe to start again)."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(
+            f"{path} could not be opened just now -- another xaucopier command was "
+            "probably saving it at that moment"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class WatchSetup:
     """What `check_setup` found: the loaded config and a usable store path."""
@@ -119,6 +132,8 @@ def _load(loader: Callable[[Path], tuple], path: Path) -> tuple:
         return loader(path)
     except FileNotFoundError:
         raise SetupError(f"{path} does not exist.") from None
+    except PermissionError:
+        raise ConfigReadBusyError(path) from None
     except (ConfigError, tomllib.TOMLDecodeError) as exc:
         raise SetupError(f"{path} is not valid: {exc}") from None
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
@@ -370,6 +385,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
     try:
         setup = check_setup(args.config_dir, args.db)
         blob = load_session(args.secrets)
+    except ConfigReadBusyError as exc:
+        print(
+            f"xaucopier watch cannot start: {exc}. Nothing was started; start it again in "
+            f"a moment. (exit code {exit_codes.EXIT_LISTENER_STOPPED})",
+            file=sys.stderr,
+        )
+        return exit_codes.EXIT_LISTENER_STOPPED
     except SetupError as exc:
         _print_setup_error(exc)
         return exit_codes.EXIT_CONFIG_ERROR

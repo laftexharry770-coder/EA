@@ -1639,6 +1639,126 @@ def test_off_while_the_database_is_held_still_switches_off_and_says_what_that_co
     assert "Traceback" not in out
 
 
+def _hold(db_path: Path, monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
+    """Another connection holding the database's write lock."""
+    monkeypatch.setattr(db, "_BUSY_TIMEOUT_MS", 50)
+    holder = sqlite3.connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    return holder
+
+
+def test_off_again_after_a_busy_database_saves_when_it_was_switched_off(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final fix FF11. `channels off` with the database busy still switches
+    the channel off, but cannot save when. It said "Try again in a
+    moment" -- and running it again only answered "already OFF". Its
+    advice now names the command to run again, and that command, on a
+    channel already OFF whose switch-off was never saved, saves it: the
+    next `on` then skips only the time it was off, not everything since
+    watch last read it."""
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    _at(monkeypatch, NOW)
+    holder = _hold(rig.db_path, monkeypatch)
+    try:
+        assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    finally:
+        holder.rollback()
+        holder.close()
+    out = capsys.readouterr().out
+    assert _switches(rig.channels_path)[7] is False and _periods(rig.db_path, GOLD) == []
+    assert "Run `.\\xaucopier channels off 7` again in a moment to save it" in out
+    assert "Try again in a moment" not in out
+
+    _at(monkeypatch, NOW + timedelta(minutes=5))
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "is already OFF" in out
+    assert "When it was switched off had not been saved; it is saved now" in out
+    assert _periods(rig.db_path, GOLD) == [("2026-09-23T12:05:00+00:00", None)]
+    before = rig.channels_path.read_bytes()
+
+    _at(monkeypatch, NOW + timedelta(hours=3))
+    assert cli_main.main(rig.argv("on", "7")) == exit_codes.EXIT_OK
+    assert _periods(rig.db_path, GOLD) == [
+        ("2026-09-23T12:05:00+00:00", "2026-09-23T15:00:00+00:00")
+    ]
+    assert _state_row(rig.db_path, GOLD)[2] is None  # no re-seed: nothing more skipped
+    assert rig.channels_path.read_bytes() != before
+
+
+def test_off_of_a_channel_already_off_keeps_the_time_it_was_switched_off(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Its switch-off saved: `off` again changes nothing, the time
+    included."""
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    _at(monkeypatch, NOW)
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    capsys.readouterr()
+    _at(monkeypatch, NOW + timedelta(hours=1))
+
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert out == "Channel 7 (Gold Room) is already OFF. Nothing was changed.\n"
+    assert _periods(rig.db_path, GOLD) == [("2026-09-23T12:00:00+00:00", None)]
+
+
+def test_off_of_a_channel_left_off_by_an_on_not_saved_adds_no_period(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An `on` whose save failed left the channel OFF with its period
+    closed; the next `on` extends that period. `off` meanwhile keeps it:
+    a second period would read what it posted in between."""
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    _at(monkeypatch, NOW)
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    _at(monkeypatch, NOW + timedelta(hours=1))
+    with monkeypatch.context() as failing:
+        _inject("replace", failing, rig)
+        assert cli_main.main(rig.argv("on", "7")) == exit_codes.EXIT_FAILED
+    capsys.readouterr()
+    _at(monkeypatch, NOW + timedelta(hours=2))
+
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    assert capsys.readouterr().out == "Channel 7 (Gold Room) is already OFF. Nothing was changed.\n"
+    assert _periods(rig.db_path, GOLD) == [
+        ("2026-09-23T12:00:00+00:00", "2026-09-23T13:00:00+00:00")
+    ]
+
+
+def test_off_of_a_channel_already_off_and_never_read_records_nothing(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli_main.main(rig.argv("off", "3")) == exit_codes.EXIT_OK
+
+    assert "is already OFF. Nothing was changed." in capsys.readouterr().out
+    assert _periods(rig.db_path, QUIET) == []
+
+
+def test_off_of_a_channel_already_off_with_the_database_busy_says_to_run_it_again(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    _at(monkeypatch, NOW)
+    holder = _hold(rig.db_path, monkeypatch)
+    try:
+        assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+        capsys.readouterr()
+        assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    finally:
+        holder.rollback()
+        holder.close()
+
+    out = capsys.readouterr().out
+    assert "is already OFF" in out
+    assert "Run `.\\xaucopier channels off 7` again in a moment to save it" in out
+    assert _periods(rig.db_path, GOLD) == []
+
+
 @pytest.mark.parametrize(
     "state",
     [None, (0, None)],
@@ -2018,3 +2138,62 @@ def test_add_while_the_database_is_held_adds_nothing(
     assert add_rig.rig.channels_path.read_bytes() == before
     err = capsys.readouterr().err
     assert "The database is busy" in err and "Nothing was added." in err
+
+
+# -- channels.toml being replaced by another command while this one reads it (FF9) -------
+
+
+class _Replacing:
+    """`Path.open`, refusing channels.toml `times` times (None: always)
+    with the PermissionError Windows gives a reader in the moment another
+    xaucopier command replaces the file."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, times: int | None) -> None:
+        self.times = times
+        self.refused = 0
+        real_open = Path.open
+
+        def opened(path: Path, *args: Any, **kwargs: Any) -> Any:
+            if path.name == "channels.toml" and (self.times is None or self.refused < self.times):
+                self.refused += 1
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", opened)
+
+
+@pytest.mark.parametrize("command", [(), ("off", "7"), ("on", "3")], ids=["list", "off", "on"])
+def test_a_read_that_meets_another_command_replacing_the_file_waits_for_it(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], command
+) -> None:
+    """Final fix FF9: two `channels` commands at once. The one reading
+    channels.toml in the moment the other replaces it got a PermissionError
+    and said the setup was broken (exit 5) although the file was fine. A
+    refusal that passes is waited out."""
+    replacing = _Replacing(monkeypatch, times=3)
+
+    assert cli_main.main(rig.argv(*command)) == exit_codes.EXIT_OK
+    assert replacing.refused == 3
+    assert "cannot be used" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", [(), ("off", "7"), ("on", "3")], ids=["list", "off", "on"])
+def test_a_file_that_stays_locked_asks_to_run_the_command_again_not_to_fix_the_setup(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], command
+) -> None:
+    """Refused for longer than about a second: exit 1, nothing changed,
+    and the advice is to run the command again -- not a setup problem."""
+    import xaucopier.config.loader as loader_module
+
+    monkeypatch.setattr(loader_module, "REPLACE_WAIT_SECONDS", 0.2)
+    before = rig.channels_path.read_bytes()
+    _Replacing(monkeypatch, times=None)
+
+    assert cli_main.main(rig.argv(*command)) == exit_codes.EXIT_FAILED
+
+    err = capsys.readouterr().err
+    assert "Run the command again" in err and "Nothing was changed" in err
+    for wrong in ("exit code 5", "cannot be used", "PermissionError", "refuse to start"):
+        assert wrong not in err
+    monkeypatch.undo()
+    assert rig.channels_path.read_bytes() == before

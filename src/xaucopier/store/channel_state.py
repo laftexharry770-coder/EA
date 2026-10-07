@@ -311,6 +311,30 @@ def record_switch_off(conn: sqlite3.Connection, *, channel_id: int, off_at_utc: 
     return True
 
 
+def record_missing_switch_off(
+    conn: sqlite3.Connection, *, channel_id: int, off_at_utc: datetime
+) -> bool:
+    """`channels off` for a channel already OFF (final fix FF11): when its
+    reading has started and it has no OFF period at all -- the switch-off's
+    time was never saved (the database was busy then, or the file was
+    edited by hand) -- open one at `off_at_utc` (whole seconds), so the
+    next `channels on` skips from here rather than re-seeding (everything
+    since the last read). Later than the real switch-off, so a little more
+    is read, never less. A period already there is kept as it is. Returns
+    whether one was opened."""
+    if not reading_started(read(conn, channel_id)):
+        return False
+    if conn.execute(
+        "SELECT 1 FROM channel_off_periods WHERE channel_id = ? LIMIT 1", (channel_id,)
+    ).fetchone() is not None:
+        return False
+    conn.execute(
+        "INSERT INTO channel_off_periods (channel_id, off_at_utc) VALUES (?, ?)",
+        (channel_id, format_utc(off_at_utc)),
+    )
+    return True
+
+
 def record_switch_on(
     conn: sqlite3.Connection,
     *,

@@ -77,7 +77,12 @@ from telethon.tl import types
 
 from xaucopier.cli import channel_reading, exit_codes, paths
 from xaucopier.cli.status import database_problem
-from xaucopier.cli.watch import SetupError, load_channels_config, load_session
+from xaucopier.cli.watch import (
+    ConfigReadBusyError,
+    SetupError,
+    load_channels_config,
+    load_session,
+)
 from xaucopier.config.channels import ChannelCfg, load_channels
 from xaucopier.ingest.client import (
     API_CREDENTIAL_ERRORS,
@@ -925,6 +930,13 @@ async def _resolve_all(args: argparse.Namespace, client: Any, channels: tuple[Ch
 def cmd_resolve_channels(args: argparse.Namespace) -> int:
     try:
         channels = load_channels_config(args.config_dir)
+    except ConfigReadBusyError as exc:  # another command was saving it (FF9)
+        print(
+            f"resolve-channels cannot start: {exc}. Nothing was changed. Run the command "
+            "again.",
+            file=sys.stderr,
+        )
+        return exit_codes.EXIT_FAILED
     except SetupError as exc:
         print(f"resolve-channels cannot start: {exc}", file=sys.stderr)
         return exit_codes.EXIT_CONFIG_ERROR
