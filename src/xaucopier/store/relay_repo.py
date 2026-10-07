@@ -1656,7 +1656,11 @@ def _deleted_with_closer(
     lowest id is recorded (`edits_repo._closing_post`), yet each withdrew
     the call as much: a forward of any of them echoes that withdrawal. A
     promotion's closer withdrew nothing (`closed_by_promotion`), and a post
-    that had left the call before the report withdrew nothing in it."""
+    that had left the call before the report withdrew nothing in it -- the
+    recorded closer included: one that had withdrawn the call earlier by an
+    edit (into chatter, or re-aimed) and is only deleted in this report
+    withdrew nothing in it either (final fix FF1), so the report counts
+    only while that closer still showed the call too."""
     if post["deleted_at_utc"] is None or post["kind"] != "signal":
         return False
     marks = ", ".join("?" for _ in chain)
@@ -1669,7 +1673,18 @@ def _deleted_with_closer(
     ).fetchall():
         if closed_by_promotion(conn, signal["signal_id"]):
             continue
-        if channel_cfg is None or post_shows_call(post, signal, channel_cfg=channel_cfg):
+        closer = conn.execute(
+            "SELECT * FROM messages WHERE channel_id = ? AND message_id = ?",
+            (signal["closed_by_channel_id"], signal["closed_by_message_id"]),
+        ).fetchone()
+        # The closer still showing the call: not stored as something that is
+        # no signal (edited into chatter, or CANCELLED), nor re-aimed.
+        if closer["kind"] != "signal":
+            continue
+        if channel_cfg is None or (
+            post_shows_call(closer, signal, channel_cfg=channel_cfg)
+            and post_shows_call(post, signal, channel_cfg=channel_cfg)
+        ):
             return True
     return False
 

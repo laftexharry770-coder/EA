@@ -2290,6 +2290,54 @@ def test_a_forward_of_a_repeat_deleted_the_moment_another_channel_withdrew_is_no
     _removed_forward_withdraws_the_call_posted_again(conn, forward=9001, again=again.signal_id)
 
 
+@pytest.mark.parametrize("together", [True, False], ids=["with-the-closer", "separately"])
+@pytest.mark.parametrize("how", ["chatter", "re-aim"])
+def test_a_repeat_deleted_with_a_closer_that_had_withdrawn_by_an_edit_is_no_echo(
+    conn, how, together  # noqa: F811
+):
+    """Final fix FF1 (R6-3's limit, round-6 leftover): the relay's only copy
+    R/7001 withdrew signal 1 by an EDIT (into chatter, or re-aimed) -- long
+    before any report. The relay posts the call again (R/7002, signal 2) and
+    doubles it (R/7003); the other channel forwards R/7003. The relay then
+    deletes R/7001 together with R/7003 in one report: that report withdrew
+    nothing (R/7001 had already left the call), so R/7003 went as a mere
+    repeat. Whether R/7001 went in that report or alone must not matter:
+    once the relay's last post is gone too and the VIP has posted the call
+    again, the forward's removal withdraws it, loudly."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, RELAY, COPY, posted=POSTED + timedelta(seconds=30))
+    text = CHATTER_TEXT if how == "chatter" else DIRECTION_EDIT
+    assert _edit(conn, RELAY, COPY, text, POSTED + timedelta(minutes=1)).outcome in (
+        "voided", "invalidated",
+    )
+    conn.commit()
+    assert _closer_of(conn, 1) == (R, COPY)
+    assert _ingest(conn, RELAY, 7002, posted=POSTED + timedelta(minutes=2)).signal_id == 2
+    _ingest(conn, RELAY, 7003, posted=POSTED + timedelta(seconds=150))
+    forward = _ingest(conn, OTHER, 9001, posted=POSTED + timedelta(minutes=3), fwd=(R, 7003))
+    assert forward.relay_of_signal_id == 2
+    if together:
+        for message_id in (COPY, 7003):
+            _delete(conn, RELAY, message_id, POSTED + timedelta(minutes=4), also=(COPY, 7003))
+    else:
+        _delete(conn, RELAY, COPY, POSTED + timedelta(seconds=230))
+        _delete(conn, RELAY, 7003, POSTED + timedelta(minutes=4))
+    if how == "chatter":
+        # With no channel to re-read posts by, the closer's stored kind
+        # still tells that it had left the call before the report.
+        row = conn.execute(
+            "SELECT * FROM messages WHERE channel_id = ? AND message_id = 7003", (R,)
+        ).fetchone()
+        chain = relay_repo.chain_ids(conn, 1)
+        assert relay_repo._deleted_with_closer(conn, row, chain, None) is False
+    assert _delete(conn, RELAY, 7002, POSTED + timedelta(minutes=5)).outcome == "voided"
+    _delete(conn, VIP, CALL, POSTED + timedelta(minutes=6))
+    again = _ingest(conn, VIP, REPOST, posted=POSTED + timedelta(minutes=7))
+    assert (again.outcome, _live(conn)) == ("new", [again.signal_id])
+
+    _removed_forward_withdraws_the_call_posted_again(conn, forward=9001, again=again.signal_id)
+
+
 #: The relay channel's bare id, as a forward header names it.
 _R_BARE = -R - 10**12
 
