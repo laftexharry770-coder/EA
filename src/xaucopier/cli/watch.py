@@ -469,7 +469,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         try:
             if exit_code is not None:
                 stamp_stop(setup.db_path, exit_code, start_after_utc=start_after)
-                print(f"watch stopped ({exit_codes.stopped_with(exit_code, start_after)}).")
+                how = exit_codes.stopped_with(exit_code, start_after, now=_utcnow())
+                print(f"watch stopped ({how}).")
                 if exit_code in _TELEGRAM_STOPS:
                     print(_TELEGRAM_STOPS[exit_code][1], file=sys.stderr)
         finally:

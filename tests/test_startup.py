@@ -590,7 +590,7 @@ class _WaitAskedClient(FakeTelegramClient):
         raise errors.FloodWaitError(request=None, capture=self.seconds)
 
 
-@pytest.mark.parametrize("seconds", [90, 900])
+@pytest.mark.parametrize("seconds", [90, 900, 86400])
 def test_telegram_asking_watch_to_wait_at_start_is_said_with_when_to_start_again(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, seconds: int
 ) -> None:
@@ -615,9 +615,11 @@ def test_telegram_asking_watch_to_wait_at_start_is_said_with_when_to_start_again
     # Asked with the library's own sleeping off, and put back after.
     assert client.threshold_seen == [0] and client.flood_sleep_threshold == 120
     (stop,) = [r.getMessage() for r in caplog.records if "asked watch to wait" in r.getMessage()]
-    minutes = {90: "about 2 minutes", 900: "about 15 minutes"}[seconds]
+    minutes = {90: "about 2 minutes", 900: "about 15 minutes", 86400: "about 24 hours"}[seconds]
     over = NOW + timedelta(seconds=seconds)  # the minute it is over, rounded up
-    again = (over + timedelta(seconds=(-over.second) % 60)).strftime("%H:%M")
+    over += timedelta(seconds=(-over.second) % 60)
+    # Not today: with its date (final fix round 3, R3-2).
+    again = over.strftime("%H:%M" if over.date() == NOW.date() else "%Y-%m-%d %H:%M")
     assert f"Telegram asked watch to wait {minutes} before starting" in stop
     assert f"start it again after {again} UTC" in stop
     for wrong in ("internet", "did not expect", "flood", "Flood", "RPC", "client"):

@@ -139,3 +139,6 @@ def test_the_exit_4_row_says_to_wait_when_telegram_asked_watch_to_wait() -> None
     (row,) = re.findall(r"^\| 4 \|.*$", RUNBOOK, flags=re.MULTILINE)
     assert "Telegram asked watch to wait" in row
     assert "after the time it names" in row
+    # Final fix round 3 (R3-2): the date, and a time that has passed.
+    assert "with its date, when that is not today" in row
+    assert "Once that time has passed" in row

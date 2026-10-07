@@ -629,3 +629,49 @@ def test_a_stop_after_telegram_asked_watch_to_wait_says_when_to_start_again(
     assert expected in stopped
     if "Telegram asked" in expected:
         assert "safe to start it again" not in stopped
+
+
+@pytest.mark.parametrize(
+    ("after", "expected"),
+    [
+        (
+            "2026-09-22T16:43:00+00:00",
+            "exit code 4: Telegram had asked watch to wait until 16:43 UTC; that time has "
+            "passed -- safe to start it again.",
+        ),
+        (
+            NOW.isoformat(),
+            "exit code 4: Telegram had asked watch to wait until 12:00 UTC; that time has "
+            "passed -- safe to start it again.",
+        ),
+        (
+            "2026-09-23T12:01:00+00:00",
+            "exit code 4: Telegram asked watch to wait -- start it again after 12:01 UTC.",
+        ),
+        (
+            "2026-09-24T00:05:00+00:00",
+            "exit code 4: Telegram asked watch to wait -- start it again after "
+            "2026-09-24 00:05 UTC.",
+        ),
+    ],
+    ids=["passed-yesterday", "passed-just-now", "ahead-today", "ahead-tomorrow"],
+)
+def test_the_time_telegram_asked_watch_to_wait_until_is_said_as_it_stands_now(
+    tmp_path: Path, after: str, expected: str
+) -> None:
+    """Final fix round 3 (R3-2): `status` named the time to start watch
+    again after with no date, and kept naming it once it had passed -- read
+    the next morning, 'start it again after 16:43 UTC' meant waiting until
+    16:43 that day, hours with nothing read. Once the time has passed it
+    says so, and safe to start it again; a time still ahead but not today
+    carries its date."""
+    out = _render(
+        _report(
+            _beat(heartbeats.WATCH_STARTED, timedelta(hours=20)),
+            _beat(heartbeats.WATCH_STOPPED, timedelta(hours=19), f"4; start after {after}"),
+        ),
+        tmp_path,
+    )
+
+    (stopped,) = [line for line in out.splitlines() if "NOT RUNNING" in line]
+    assert expected in stopped, stopped

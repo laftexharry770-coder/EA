@@ -1861,8 +1861,9 @@ class Listener:
             # because it was started many times in a row: each start asks
             # for the chat list again. Starting again before the wait is
             # over only earns a longer one.
-            after = _start_after(exc, self._now())
-            message = _start_wait_words(exc, after)
+            stopped_at = self._now()
+            after = _start_after(exc, stopped_at)
+            message = _start_wait_words(exc, after, stopped_at)
             raise ListenerStartupError(message, plain=message, start_after_utc=after) from exc
         self._name_sources(dialogs)
         self._started_at = self._decide_start(local_start, telegram_clock)
@@ -2440,19 +2441,30 @@ def _start_after(exc: Exception, now: datetime) -> datetime:
     return over
 
 
-def _start_wait_words(exc: Exception, after: datetime) -> str:
+def _start_wait_words(exc: Exception, after: datetime, now: datetime) -> str:
     """What watch says when Telegram asked it to wait before starting
     (final fix FF21): how long, and the minute after which starting it
-    again is fine (`_start_after`). A wait with no length given is "a few
-    minutes"."""
+    again is fine (`_start_after`, said by `start_after_words`). A wait
+    with no length given is "a few minutes"."""
     seconds = _wait_seconds(exc)
     how_long = "" if seconds is None else f" {wait_words(seconds)}"
     return (
         f"Telegram asked watch to wait{how_long} before starting (it asks this when "
         "watch is started many times in a row). watch stops now; start it again after "
-        f"{after.strftime('%H:%M')} UTC -- starting it sooner only makes Telegram ask for "
-        "a longer wait."
+        f"{start_after_words(after, now)} -- starting it sooner only makes Telegram ask "
+        "for a longer wait."
     )
+
+
+def start_after_words(after: datetime, now: datetime) -> str:
+    """The time to start watch again after, as watch and `status` say it:
+    "16:43 UTC" on the day it is said, "2026-09-24 00:05 UTC" on any other
+    (final fix round 3, R3-2) -- a bare time read the next day is a time
+    that day."""
+    after_utc, now_utc = after.astimezone(UTC), now.astimezone(UTC)
+    if after_utc.date() == now_utc.date():
+        return f"{after_utc:%H:%M} UTC"
+    return f"{after_utc:%Y-%m-%d %H:%M} UTC"
 
 
 def wait_words(seconds: float) -> str:

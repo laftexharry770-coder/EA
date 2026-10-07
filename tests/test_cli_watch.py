@@ -195,9 +195,12 @@ def _minutes_after(start: datetime, end: datetime, seconds: int) -> set[str]:
     times = set()
     moment = start.replace(microsecond=0)
     while moment <= end + timedelta(seconds=1):
-        over = moment + timedelta(seconds=seconds)
-        times.add(over.strftime("%H:%M"))
-        times.add((over + timedelta(minutes=1)).strftime("%H:%M"))
+        for over in (
+            moment + timedelta(seconds=seconds),
+            moment + timedelta(seconds=seconds, minutes=1),
+        ):
+            # A time on another day carries its date (final fix round 3).
+            times.add(over.strftime("%H:%M" if over.date() == moment.date() else "%Y-%m-%d %H:%M"))
         moment += timedelta(seconds=1)
     return times
 

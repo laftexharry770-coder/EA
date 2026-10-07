@@ -273,7 +273,9 @@ def _watch_lines(rep: report.StatusReport, now: datetime, secrets_path: Path) ->
     else:
         code, start_after = heartbeats.read_stop(stopped.detail)
         how = (
-            exit_codes.stopped_with(code, start_after) if code is not None else "exit code unknown"
+            exit_codes.stopped_with(code, start_after, now=now)
+            if code is not None
+            else "exit code unknown"
         )
         lines.append(
             f"  NOT RUNNING: stopped {when(stopped.at_utc)} ({ago(now, stopped.at_utc)}), {how}."
