@@ -317,6 +317,9 @@ def test_a_window_void_with_nothing_promoted_is_still_summarised(tmp_path) -> No
     assert "1 signal(s)" in detail and f"[{other_signal}]" in detail
     assert str(first_signal) not in detail.split("signal(s)")[1].split(".")[0]
     assert _signal(db_path, SIGNAL_ID_MSG + 2)["state"] == "NEW"  # promoted, queued
+    # Final fix round 2 (the re-check's nit): plain words, no jargon.
+    assert "watch checked the newest messages again and voided 1 signal(s)" in detail
+    assert "re-read" not in detail and "two reads" not in detail
 
 
 # -- a deletion that arrives before the message is stored (F18) --------------------

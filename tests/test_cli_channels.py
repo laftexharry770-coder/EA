@@ -1634,9 +1634,32 @@ def test_off_while_the_database_is_held_still_switches_off_and_says_what_that_co
     assert _switches(rig.channels_path)[7] is False
     assert _periods(rig.db_path, GOLD) == []
     out = capsys.readouterr().out
-    assert "When it was switched off could not be saved: The database is busy" in out
+    assert "When it was switched off could not be saved: the database is busy" in out
     assert "everything it posted since watch last read it is skipped too" in out
     assert "Traceback" not in out
+
+
+def test_off_with_a_database_from_a_newer_version_says_so_in_lower_case_after_the_colon(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Switching off still works; why its time could not be saved follows
+    a colon, in lower case (final fix round 2, the FF25 c slip)."""
+    from xaucopier.store.migrations import CURRENT_VERSION
+
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    raw = sqlite3.connect(rig.db_path)
+    raw.execute(f"PRAGMA user_version = {CURRENT_VERSION + 1}")
+    raw.commit()
+    raw.close()
+
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    assert _switches(rig.channels_path)[7] is False
+    out = capsys.readouterr().out
+    assert (
+        f"When it was switched off could not be saved: the database at {rig.db_path} was "
+        "written by a newer version of xaucopier"
+    ) in out
 
 
 def _hold(db_path: Path, monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
@@ -2240,6 +2263,7 @@ def test_a_file_that_stays_locked_asks_to_run_the_command_again_not_to_fix_the_s
 
     err = capsys.readouterr().err
     assert "Run the command again" in err and "Nothing was changed" in err
+    assert "If this keeps happening, check that the file can be opened." in err
     for wrong in ("exit code 5", "cannot be used", "PermissionError", "refuse to start"):
         assert wrong not in err
     monkeypatch.undo()

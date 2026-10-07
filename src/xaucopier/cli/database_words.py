@@ -15,6 +15,20 @@ from xaucopier.cli import paths
 from xaucopier.store import db
 
 _CMD = paths.USER_COMMAND
+#: First words that only start a sentence: lower-cased after a colon.
+_SENTENCE_STARTS = frozenset({"The", "This", "It", "Its", "No", "Nothing", "A", "An"})
+
+
+def after_colon(text: str) -> str:
+    """`text` -- one of these sentences, or any other a command prints --
+    where it follows a colon mid-line ("watch cannot start: the database
+    at ..."): its first word lower-cased when that word only starts a
+    sentence ("The"), as everywhere else (final fix FF25 c, round 2). A
+    path, a name or any other first word is left as it is."""
+    first, space, rest = text.partition(" ")
+    if first in _SENTENCE_STARTS:
+        return first.lower() + space + rest
+    return text
 
 
 def database_problem(path: Path, exc: sqlite3.DatabaseError) -> str:

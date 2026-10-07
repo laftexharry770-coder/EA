@@ -932,8 +932,8 @@ def cmd_resolve_channels(args: argparse.Namespace) -> int:
         channels = load_channels_config(args.config_dir)
     except ConfigReadBusyError as exc:  # another command was saving it (FF9)
         print(
-            f"resolve-channels cannot start: {exc}. Nothing was changed. Run the command "
-            "again.",
+            f"resolve-channels cannot start: {exc}. Nothing was changed. "
+            f"Run the command again. {exc.KEEPS_HAPPENING}",
             file=sys.stderr,
         )
         return exit_codes.EXIT_FAILED

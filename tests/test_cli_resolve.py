@@ -846,3 +846,4 @@ def test_a_channels_file_another_command_keeps_open_asks_to_run_it_again(
 
     err = capsys.readouterr().err
     assert "Run the command again" in err and "PermissionError" not in err
+    assert "If this keeps happening, check that the file can be opened." in err

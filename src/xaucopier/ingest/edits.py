@@ -463,9 +463,10 @@ async def _report_voids(
         await listener.record_alert(
             "CRITICAL",
             edits_repo.WINDOW_VOIDED_SIGNALS,
-            f"one window re-read of channel {channel_id} ({channel_cfg.name}) voided "
-            f"{len(voided)} signal(s): {voided}. Each had stopped coming back in two reads "
-            "in a row and was never executed. Check they really were deleted.",
+            f"channel {channel_id} ({channel_cfg.name}): watch checked the newest messages "
+            f"again and voided {len(voided)} signal(s): {voided}. Each had stopped coming "
+            "back in two checks in a row and was never executed. Check they really were "
+            "deleted.",
             channel_id=channel_id,
         )
     except db.WriterDeadError:

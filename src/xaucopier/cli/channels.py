@@ -84,6 +84,7 @@ from xaucopier.cli.resolve import (
     save_failure_code,
     save_switch,
 )
+from xaucopier.cli.database_words import after_colon
 from xaucopier.cli.status import ago, database_problem, when
 from xaucopier.cli.watch import (
     ConfigReadBusyError,
@@ -269,7 +270,7 @@ def render_list(
 def _config_problem(exc: SetupError) -> int:
     if isinstance(exc, ConfigReadBusyError):
         # Not the file's fault: another command was saving it (FF9).
-        complain(f"{exc}.", "Nothing was changed. Run the command again.")
+        complain(f"{exc}.", f"Nothing was changed. Run the command again. {exc.KEEPS_HAPPENING}")
         return exit_codes.EXIT_FAILED
     complain(
         f"channels.toml cannot be used: {exc}",
@@ -462,12 +463,13 @@ def _off_not_saved(db_path: Path, exc: sqlite3.DatabaseError, number: int) -> st
     cost = "everything it posted since watch last read it is skipped too"
     if db.is_lock_error(exc):
         return (
-            f"When it was switched off could not be saved: The database is busy -- watch "
+            f"When it was switched off could not be saved: the database is busy -- watch "
             f"is probably writing to it ({db_path}). Run `{_CMD} channels off {number}` "
             f"again in a moment to save it; until then, when you switch it back on, {cost}."
         )
+    problem = after_colon(database_problem(db_path, exc))
     return (
-        f"When it was switched off could not be saved: {database_problem(db_path, exc)} "
+        f"When it was switched off could not be saved: {problem} "
         f"So when you switch it back on, {cost}."
     )
 

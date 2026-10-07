@@ -433,7 +433,7 @@ def test_a_database_file_that_is_not_a_database_exits_5_and_releases_the_lock(
     err = capsys.readouterr().err
     # Final fix FF19: the same plain words as every other command, and no
     # Python class name.
-    assert f"The file at {rig.db_path} is not xaucopier's database" in err
+    assert f"cannot start: the file at {rig.db_path} is not xaucopier's database" in err
     assert "Check that --db names the right file." in err
     assert "DatabaseError" not in err
 
@@ -456,6 +456,8 @@ def test_a_database_from_a_newer_version_says_to_use_that_version_and_exits_5(
     assert rig.lock.acquired == 1 and rig.lock.released == 1
     err = capsys.readouterr().err
     assert "was written by a newer version of xaucopier; use that version" in err
+    # Final fix round 2: lower case after the colon (the FF25 c slip).
+    assert f"xaucopier watch cannot start: the database at {rig.db_path}" in err
     assert "SchemaVersionError" not in err
     raw = sqlite3.connect(rig.db_path)
     try:
@@ -686,3 +688,5 @@ def test_a_channels_file_another_command_keeps_open_is_no_setup_problem(
     err = capsys.readouterr().err
     assert "start it again" in err and "exit code 4" in err
     assert "exit code 5" not in err and "PermissionError" not in err
+    # Final fix round 2: a file that stays unopenable is a real problem.
+    assert "If this keeps happening, check that the file can be opened." in err

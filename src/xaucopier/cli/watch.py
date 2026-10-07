@@ -43,7 +43,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from xaucopier.cli import exit_codes, paths
-from xaucopier.cli.database_words import database_problem
+from xaucopier.cli.database_words import after_colon, database_problem
 from xaucopier.config.accounts import AccountCfg, load_accounts
 from xaucopier.config.channels import ChannelCfg, load_channels
 from xaucopier.config.loader import ConfigError
@@ -105,7 +105,12 @@ class ConfigReadBusyError(SetupError):
     """A config file Windows kept refusing to open for
     `loader.REPLACE_WAIT_SECONDS` -- most likely another xaucopier command
     was replacing it (final fix FF9). Not a setup problem: running the
-    command again is the fix (exit 1; `watch`: 4, safe to start again)."""
+    command again is the fix (exit 1; `watch`: 4, safe to start again) --
+    unless it keeps happening (`KEEPS_HAPPENING`)."""
+
+    #: Said after the advice to run the command again (final fix round 2):
+    #: a file that stays unopenable is a real problem, not a save.
+    KEEPS_HAPPENING = "If this keeps happening, check that the file can be opened."
 
     def __init__(self, path: Path) -> None:
         super().__init__(
@@ -364,7 +369,7 @@ def start_logging(log_path: Path) -> Callable[[], None]:
 
 
 def _print_setup_error(exc: SetupError) -> None:
-    print(f"xaucopier watch cannot start: {exc}", file=sys.stderr)
+    print(f"xaucopier watch cannot start: {after_colon(str(exc))}", file=sys.stderr)
     print(
         "Nothing was started. This is a setup problem that restarting will not fix "
         f"(exit code {exit_codes.EXIT_CONFIG_ERROR}); fix it and run "
@@ -409,8 +414,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
         blob = load_session(args.secrets)
     except ConfigReadBusyError as exc:
         print(
-            f"xaucopier watch cannot start: {exc}. Nothing was started; start it again in "
-            f"a moment. (exit code {exit_codes.EXIT_LISTENER_STOPPED})",
+            f"xaucopier watch cannot start: {exc}. Nothing was started; "
+            f"start it again in a moment. {exc.KEEPS_HAPPENING} "
+            f"(exit code {exit_codes.EXIT_LISTENER_STOPPED})",
             file=sys.stderr,
         )
         return exit_codes.EXIT_LISTENER_STOPPED

@@ -179,3 +179,23 @@ def test_each_kind_of_database_problem_has_its_own_plain_sentence(tmp_path: Path
     assert io_error == f"The database at {path} could not be used (disk I/O error)."
     not_db = database_problem(path, sqlite3.DatabaseError("file is not a database"))
     assert not_db.startswith(f"The file at {path} is not xaucopier's database")
+
+
+@pytest.mark.parametrize(
+    ("text", "said"),
+    [
+        ("The database at x.db is busy.", "the database at x.db is busy."),
+        ("This file is damaged.", "this file is damaged."),
+        ("C:/x/channels.toml does not exist.", "C:/x/channels.toml does not exist."),
+        ("Telegram refused it.", "Telegram refused it."),
+        ("no channel is switched on", "no channel is switched on"),
+    ],
+)
+def test_a_sentence_after_a_colon_starts_in_lower_case_unless_it_starts_with_a_name(
+    text: str, said: str
+) -> None:
+    """Final fix round 2 (FF25 c): "watch cannot start: the database at
+    ..." -- never a path or a name lower-cased."""
+    from xaucopier.cli.database_words import after_colon
+
+    assert after_colon(text) == said
