@@ -82,8 +82,12 @@ _STOP_VALUE = re.compile(rf"\b(?:SL|STOP\s*LOSS)\b\s*[:=@-]?\s*{_NUM}", re.I)
 #: A target given as a value -- "TP: 4490", "TP1 4490", "TP2: 4495",
 #: "Take Profit 4490", "Takeprofit: 4490".
 _TARGET_VALUE = re.compile(rf"\b(?:TP\s*\d*|TAKE\s*PROFIT)\b\s*[:=@-]?\s*{_NUM}", re.I)
-#: The channel's own "SYMBOL | SIDE" header shape, with its symbol.
-_PIPE_HEADER = re.compile(r"\b([A-Z][A-Z0-9]{1,9})\s*\|\s*(?:BUY|SELL)\b", re.I)
+#: The channel's own "SYMBOL | SIDE" header shape, with its symbol -- a
+#: broker's suffix after a dot, underscore or dash included ("US30.CASH",
+#: "GER40_CASH"; final fix round 2).
+_PIPE_HEADER = re.compile(
+    r"\b([A-Z][A-Z0-9]{1,11}(?:[._-][A-Z0-9]{1,8})?)\s*\|\s*(?:BUY|SELL)\b", re.I
+)
 #: The codes a traded pair is made of -- currencies, metals other than gold,
 #: coins and stablecoins: "EURUSD", "XAGUSD", "BTCUSDT" are two of them.
 _PAIR_CODES = frozenset(
@@ -107,8 +111,15 @@ _MARKET_NAMES = frozenset(
 #: (final fix FF3, controller decision). A timeframe ("H1", "M15", "D1")
 #: has one letter; a numbered tag ("VIP1", "TOP1", "VIP2025") has letters
 #: that name no index or market (`_INDEX_NAMES`, `_MARKET_NAMES`). A
-#: broker's suffix may follow ("US30CASH", "NAS100M").
-_INDEX_LIKE = re.compile(r"([A-Z]{2,})(\d{2,})[A-Z]*")
+#: broker's suffix may follow, after a dot, underscore or dash or not
+#: ("US30CASH", "NAS100M", "US30.CASH", "NAS100.R", "GER40_CASH"; final
+#: fix round 2).
+_INDEX_LIKE = re.compile(r"([A-Z]{2,})(\d{2,})(?:[._-]?[A-Z0-9]*)")
+#: The common index symbols with one letter -- Nikkei 225 ("N225",
+#: "J225") and the CAC 40 ("F40") -- with a broker's suffix or not. Only
+#: these: one letter and a number is otherwise a timeframe or a tag.
+_ONE_LETTER_INDEX = re.compile(r"([A-Z]\d{2,})(?:[._-]?[A-Z0-9]*)")
+_ONE_LETTER_INDEXES = frozenset({"N225", "J225", "F40"})
 #: The letters of an index's symbol, as brokers and channels write them.
 _INDEX_NAMES = frozenset(
     {
@@ -116,7 +127,7 @@ _INDEX_NAMES = frozenset(
         "GER", "DE", "DAX", "UK", "FTSE", "JP", "JPN", "NIK", "NIKKEI", "HK", "HSI", "AUS",
         "AU", "ASX", "FRA", "FR", "CAC", "EU", "EUSTX", "ESTX", "STOXX", "ESP", "ES", "IBEX",
         "IT", "ITA", "CHN", "CN", "CHINA", "SG", "SGP", "IND", "SA", "SWI", "SMI", "CH",
-        "NL", "NETH", "AEX", "RUS", "RUT", "RTY", "TSX", "VIX",
+        "NL", "NETH", "AEX", "RUS", "RUT", "RTY", "TSX", "VIX", "RUSSELL",
     }
 )
 
@@ -157,13 +168,17 @@ def _names_another_instrument(clean: str) -> bool:
 
 def _is_instrument(symbol: str) -> bool:
     """Whether a header's upper-cased `symbol` names a market: an index's
-    name and number (`_INDEX_LIKE`: "US30", "NAS100", "GER40" -- never a
-    timeframe such as "H1" or a numbered tag such as "VIP1"), a pair of two
+    name and number (`_INDEX_LIKE`: "US30", "NAS100", "GER40", with a
+    broker's suffix or not -- never a timeframe such as "H1" or a numbered
+    tag such as "VIP1"; and the one-letter "N225", "J225", "F40"), a pair of two
     `_PAIR_CODES` ("EURUSD", "XAGUSD", "BTCUSDT") or one of them alone
     ("BTC"), or a market's name (`_MARKET_NAMES`: "SILVER", "USOIL")."""
     index = _INDEX_LIKE.fullmatch(symbol)
     if index is not None:
         return index.group(1) in _INDEX_NAMES or index.group(1) in _MARKET_NAMES
+    one_letter = _ONE_LETTER_INDEX.fullmatch(symbol)
+    if one_letter is not None:
+        return one_letter.group(1) in _ONE_LETTER_INDEXES
     if symbol in _PAIR_CODES or symbol in _MARKET_NAMES:
         return True
     return any(

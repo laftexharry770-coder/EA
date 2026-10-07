@@ -280,6 +280,36 @@ def test_an_index_over_the_fixture_body_is_another_instruments_skip(header):
     assert r.kind == "skip", r
 
 
+@pytest.mark.parametrize(
+    "header",
+    ["US30.CASH | BUY SIGNAL", "NAS100.R | BUY SIGNAL", "GER40_CASH | BUY SIGNAL",
+     "US30-CASH | BUY SIGNAL", "N225 | BUY SIGNAL", "J225 | BUY SIGNAL", "F40 | BUY SIGNAL",
+     "RUSSELL2000 | BUY SIGNAL", "N225.CASH | BUY SIGNAL"],
+)
+def test_an_index_with_a_brokers_suffix_or_a_one_letter_name_is_another_instruments_skip(
+    header,
+):
+    """Final fix round 2 (the re-check's FF3 nit): an index written with a
+    dot, underscore or dash before its broker's suffix, the common
+    one-letter index symbols and RUSSELL2000 are another market -- skipped,
+    not counted as the channel's template changing."""
+    r = _route(FIXTURE_TEXT.replace(FIXTURE_HEADER, header))
+    assert r.kind == "skip", r
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["XAUUSD.m | BUY SIGNAL", "GOLD.CASH | BUY SIGNAL", "VIP1.A | BUY SIGNAL",
+     "H1.CASH | BUY SIGNAL", "N1 | BUY SIGNAL", "F4 | BUY SIGNAL", "J22 | BUY SIGNAL"],
+)
+def test_a_suffix_never_makes_a_tag_or_gold_another_instrument(header):
+    """Controls: a separator before a suffix does not turn gold, a numbered
+    tag or a timeframe into another market, and only the listed one-letter
+    index symbols are one."""
+    r = _route(FIXTURE_TEXT.replace(FIXTURE_HEADER, header))
+    assert r.kind != "skip", r
+
+
 # -- FF4: the two instrument guards, pinned -------------------------------------
 
 
