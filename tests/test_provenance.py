@@ -127,6 +127,86 @@ def test_a_message_without_any_of_it_reads_as_unknown() -> None:
     assert _provenance(normalise_message(bare, channel_id=CHANNEL_ID)) == (None,) * 6
 
 
+# -- a reply to a message in another chat (final fix FF14) ------------------------------
+
+#: The bare id of the channel these tests read (CHANNEL_ID is its -100... form).
+_OWN_BARE = -CHANNEL_ID - 10**12
+
+
+def _reply(peer) -> types.Message:
+    """A real Telethon message replying to message 1001 -- of the chat
+    `peer` names ("reply in another chat"), or of this one (None)."""
+    return types.Message(
+        id=1002,
+        peer_id=types.PeerChannel(channel_id=_OWN_BARE),
+        date=NOW,
+        message="Close all now",
+        post=True,
+        reply_to=types.MessageReplyHeader(reply_to_msg_id=1001, reply_to_peer_id=peer),
+    )
+
+
+@pytest.mark.parametrize(
+    "peer",
+    [types.PeerChannel(channel_id=3333333333), types.PeerChat(chat_id=77), types.PeerUser(user_id=42)],
+    ids=["another-channel", "a-group", "a-person"],
+)
+def test_a_reply_to_a_message_in_another_chat_is_no_reply_here(peer, caplog) -> None:
+    """Telegram's "reply in another chat" quotes message 1001 of ANOTHER
+    chat; Telethon still says reply_to_msg_id 1001. Read as a reply to
+    this channel's own 1001, a 'close all' reached whatever signal that
+    is here. It is read as no reply at all, and the log says why."""
+    message = _reply(peer)
+    assert message.reply_to_msg_id == 1001  # what Telethon says
+
+    with caplog.at_level("INFO", logger="xaucopier.ingest.listener"):
+        incoming = normalise_message(message, channel_id=CHANNEL_ID)
+
+    assert incoming.reply_to_message_id is None
+    assert any("another chat" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "peer", [None, types.PeerChannel(channel_id=_OWN_BARE)], ids=["plain", "this-channel-named"]
+)
+def test_a_reply_within_the_channel_keeps_its_message(peer) -> None:
+    incoming = normalise_message(_reply(peer), channel_id=CHANNEL_ID)
+    assert incoming.reply_to_message_id == 1001
+
+
+def test_a_close_all_replying_in_another_chat_never_targets_this_channels_signal(
+    tmp_path,
+) -> None:
+    """End to end on the store: this channel's 1001 is a signal; the
+    'close all' quoting 1001 of another chat is no reply to it."""
+    from test_listener import ACCOUNTS
+
+    from xaucopier.store import db
+    from xaucopier.store.messages_repo import ingest
+
+    conn = db.connect(tmp_path / "store.db", role="writer")
+    try:
+        signal = types.Message(
+            id=1001, peer_id=types.PeerChannel(channel_id=_OWN_BARE), date=NOW,
+            message=SIGNAL_TEXT, post=True,
+        )
+        for message in (signal, _reply(types.PeerChannel(channel_id=3333333333))):
+            incoming = normalise_message(message, channel_id=CHANNEL_ID)
+            ingest(
+                conn, channel_cfg=CHANNEL, message_id=incoming.message_id, text=incoming.text,
+                posted_at_utc=incoming.posted_at_utc, edit_date_utc=incoming.edit_date_utc,
+                reply_to_message_id=incoming.reply_to_message_id, source="live",
+                now_utc=incoming.posted_at_utc, accounts=ACCOUNTS,
+            )
+            conn.commit()
+        rows = conn.execute(
+            "SELECT reply_to_message_id, target_signal_id, resolution_path FROM followups"
+        ).fetchall()
+        assert [tuple(r) for r in rows] == [(None, None, None)]
+    finally:
+        conn.close()
+
+
 # -- every path that stores a message stores it ------------------------------------------
 
 

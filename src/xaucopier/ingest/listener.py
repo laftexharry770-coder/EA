@@ -526,6 +526,14 @@ def _forward_of(header: Any) -> tuple[int | None, int | None, datetime | None]:
     return channel_id, post_id, date_utc
 
 
+def _reply_chat(peer: Any) -> int | None:
+    """The chat a reply header's `reply_to_peer_id` names, in the -100...
+    form when it is a channel; None for any other chat."""
+    if isinstance(peer, tl_types.PeerChannel):
+        return _marked_channel_id(peer)
+    return None
+
+
 def normalise_message(message: Any, *, channel_id: int) -> IncomingMessage:
     """Flatten a Telethon `Message` (or the fake's stand-in). Pure
     attribute reads -- no RPC, no awaits, no clock.
@@ -538,9 +546,23 @@ def normalise_message(message: Any, *, channel_id: int) -> IncomingMessage:
     if text is None:
         text = getattr(message, "raw_text", None)
 
+    header = getattr(message, "reply_to", None)
     reply_to = getattr(message, "reply_to_msg_id", None)
     if reply_to is None:
-        reply_to = getattr(getattr(message, "reply_to", None), "reply_to_msg_id", None)
+        reply_to = getattr(header, "reply_to_msg_id", None)
+    reply_peer = getattr(header, "reply_to_peer_id", None)
+    if reply_to is not None and reply_peer is not None and _reply_chat(reply_peer) != channel_id:
+        # Telegram's "reply in another chat" quotes a message of ANOTHER
+        # chat by its id there (final fix FF14): no reply to this
+        # channel's message of the same id.
+        logger.info(
+            "channel %s message %s replies to message %s in another chat (%s): read as no reply",
+            channel_id,
+            getattr(message, "id", None),
+            reply_to,
+            type(reply_peer).__name__,
+        )
+        reply_to = None
 
     edit_date = getattr(message, "edit_date", None)
 
