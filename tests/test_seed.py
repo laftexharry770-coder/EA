@@ -677,13 +677,16 @@ def test_two_off_periods_between_two_runs_are_each_skipped_exactly(
     assert _periods_left(db_path) == []
     assert _seed_row(db_path) == (105, 1, None)  # never re-seeded
     skipped = [r.getMessage() for r in caplog.records if "was switched off from" in r.getMessage()]
+    either = (
+        "Everything it posted before and since is read, and so is what it posted within a "
+        "minute of either switch, in case this computer's clock was off by up to that much "
+        "when you switched."
+    )
     assert skipped == [
         f"Channel {A} ({CHANNEL_A.name}) was switched off from 2026-09-05 06:00:00 to "
-        "2026-09-05 07:00:00 UTC: what it posted in between was not read. Everything it "
-        "posted before and since is read.",
+        f"2026-09-05 07:00:00 UTC: what it posted in between was not read. {either}",
         f"Channel {A} ({CHANNEL_A.name}) was switched off from 2026-09-05 08:00:00 to "
-        "2026-09-05 09:00:00 UTC: what it posted in between was not read. Everything it "
-        "posted before and since is read.",
+        f"2026-09-05 09:00:00 UTC: what it posted in between was not read. {either}",
     ]
     for text in skipped:
         _assert_plain(text)
@@ -876,7 +879,7 @@ def _stamp_period(db_path: Path, off_at: datetime, on_at: datetime) -> None:
 
 
 @pytest.mark.parametrize("skew", [-180, 180], ids=["clock-3-min-slow", "clock-3-min-fast"])
-def test_off_times_are_corrected_by_how_far_this_computers_clock_is_off(
+def test_off_times_allow_for_how_far_this_computers_clock_is_off(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, skew: int
 ) -> None:
     """Final fix FF8/FF17. `channels off`/`on` stamp this computer's clock;
@@ -884,10 +887,11 @@ def test_off_times_are_corrected_by_how_far_this_computers_clock_is_off(
     90 s before the real switch-off (the channel still ON) was never read;
     with it 3 minutes fast, a signal posted 90 s after the real switch-on
     was never read -- the only trace a WARNING saying nothing is skipped.
-    watch measures the difference at start (Telegram's clock) and corrects
-    each OFF period by it: the post before the switch-off and the post
-    after the switch-on are read, what was posted while OFF is not, and
-    the warning names the difference."""
+    watch measures the difference at start (Telegram's clock) and reads
+    that much more around each switch (round 2: it never shifts them):
+    the post before the switch-off and the post after the switch-on are
+    read, what was posted while OFF is not, and the line says how far
+    around each switch was read."""
     db_path = tmp_path / "store.db"
     real_off, real_on = _hours_ago(3), _hours_ago(2)  # Telegram's time
     clock_off = timedelta(seconds=skew)
@@ -909,11 +913,102 @@ def test_off_times_are_corrected_by_how_far_this_computers_clock_is_off(
     assert _stored_ids(db_path) == [101, 103]
     assert _periods_left(db_path) == []
     (skipped,) = [r.getMessage() for r in caplog.records if "was switched off from" in r.getMessage()]
-    assert "180 seconds" in skipped
+    assert "within 240 seconds of either switch" in skipped
     _assert_plain(skipped)
     clock = [r.getMessage() for r in caplog.records
              if r.getMessage().startswith("This computer's clock is")]
     assert len(clock) == 1 and "so nothing is skipped" not in clock[0]
+
+
+def _ten_posts_around(real_off: datetime, real_on: datetime) -> list[FakeMessage]:
+    """101 posted 90 s before the switch-off (the channel ON), 102 90 s
+    after it, 103 half an hour into the OFF time, 104 90 s before the
+    switch-on, 105 90 s after it (ON again) -- all by Telegram's clock."""
+    return [
+        FakeMessage(id=101, message=SIGNAL_TEXT, date=real_off - timedelta(seconds=90)),
+        FakeMessage(id=102, message=CHATTER_TEXT, date=real_off + timedelta(seconds=90)),
+        FakeMessage(id=103, message=CHATTER_TEXT, date=real_off + timedelta(minutes=30)),
+        FakeMessage(id=104, message=CHATTER_TEXT, date=real_on - timedelta(seconds=90)),
+        FakeMessage(id=105, message=SIGNAL_TEXT, date=real_on + timedelta(seconds=90)),
+    ]
+
+
+@pytest.mark.parametrize("start_skew", [180, -180], ids=["fast-at-start", "slow-at-start"])
+def test_a_clock_put_wrong_after_the_switches_never_skips_a_post_made_while_on(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, start_skew: int
+) -> None:
+    """Final fix round 2 (FF8/FF17 regression). The clock was right at
+    `channels off`/`on` and 3 minutes off when watch starts. Every stamp
+    was shifted by the difference measured at the start -- one never
+    measured when the stamps were taken: with the clock fast, BUY 101,
+    posted 90 s before the switch-off while the channel was ON, was lost;
+    with it slow, BUY 105, posted 90 s after the switch-on. Nothing is
+    shifted now: the range skipped shrinks by the difference at either
+    end, so what was posted while ON is read, and the cost is reading a
+    little of what was posted while OFF (102 and 104)."""
+    db_path = tmp_path / "store.db"
+    real_off, real_on = _hours_ago(3), _hours_ago(2)
+    _stamp_period(db_path, real_off, real_on)
+
+    async def scenario():
+        client = FakeTelegramClient(
+            history={A: _ten_posts_around(real_off, real_on)}, server_time=NOW
+        )
+        async with _watching(db_path, client, {"now": NOW + timedelta(seconds=start_skew)}):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 102, 104, 105]
+    assert _periods_left(db_path) == []
+    (skipped,) = [r.getMessage() for r in caplog.records if "was switched off from" in r.getMessage()]
+    assert "within 240 seconds of either switch" in skipped
+    _assert_plain(skipped)
+
+
+@pytest.mark.parametrize(
+    ("stamp_skew", "start_skew"),
+    [(-45, 45), (45, -45)],
+    ids=["slow-at-switches-fast-at-start", "fast-at-switches-slow-at-start"],
+)
+def test_a_clock_never_a_minute_off_still_reads_every_post_made_while_on(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, stamp_skew: int, start_skew: int
+) -> None:
+    """Final fix round 2 (the re-check's p_skew_swing). The clock is never
+    more than 45 s off -- no clock warning -- but it moved by 90 s between
+    the switches and this start. Slow then fast: BUY 101, posted 20 s
+    before the switch-off while the channel was ON and watch stopped, was
+    lost to the shift. Fast then slow: the period, closed a minute before
+    this start, looked closed AFTER it by this computer's clock, so watch
+    left it to the next start and read 102, posted while OFF. Both are
+    decided without comparing clocks now."""
+    db_path = tmp_path / "store.db"
+    real_off, real_on = NOW - timedelta(minutes=30), NOW - timedelta(seconds=60)
+    _stamp_period(
+        db_path,
+        real_off + timedelta(seconds=stamp_skew),
+        real_on + timedelta(seconds=stamp_skew),
+    )
+    history = [
+        FakeMessage(id=101, message=SIGNAL_TEXT, date=real_off - timedelta(seconds=20)),
+        FakeMessage(id=102, message=CHATTER_TEXT, date=real_off + timedelta(minutes=10)),
+        FakeMessage(id=105, message=CHATTER_TEXT, date=real_on + timedelta(seconds=20)),
+    ]
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
+        async with _watching(db_path, client, {"now": NOW + timedelta(seconds=start_skew)}):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 105]
+    assert _periods_left(db_path) == []
+    assert not [r for r in caplog.records if r.getMessage().startswith("This computer's clock is")]
+    (skipped,) = [r.getMessage() for r in caplog.records if "was switched off from" in r.getMessage()]
+    assert "within 105 seconds of either switch" in skipped
 
 
 def test_without_telegrams_clock_the_off_times_are_taken_as_they_are(tmp_path: Path) -> None:
@@ -987,3 +1082,57 @@ def test_a_period_closed_while_this_watch_runs_is_left_to_the_next_start(
     assert _stored_ids(db_path) == [101, 102]
     assert _periods_left(db_path) == []
     assert not [r for r in caplog.records if "was not read" in r.getMessage()]
+
+
+def test_a_period_extended_while_this_watch_runs_is_skipped_as_it_was_at_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final fix FF24, round 2. A period closed before this start waits for
+    a post before its switch-off that failed. While watch runs, a
+    `channels off` whose time could not be saved and a `channels on`
+    extend that period to now. This watch skips only what the period
+    covered when it started: never what was posted while it ran (104,
+    whose live update was dropped), and never what was posted while the
+    channel was OFF before it started (102)."""
+    from xaucopier.store import messages_repo
+
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    history = _history((101, 4), (102, 2.5), (103, 1))
+    real_ingest = messages_repo.ingest
+    fail = {101}
+
+    def flaky_ingest(conn, **kwargs):
+        if kwargs["message_id"] in fail:
+            raise RuntimeError("simulated write failure")
+        return real_ingest(conn, **kwargs)
+
+    monkeypatch.setattr(messages_repo, "ingest", flaky_ingest)
+    clock = {"now": NOW}
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
+        async with _watching(db_path, client, clock) as (listener, _time):
+            assert (_stored_ids(db_path), len(_periods_left(db_path))) == ([], 1)
+            conn = db.connect(db_path, role="writer")
+            try:
+                extended = channel_state.record_switch_on(
+                    conn, channel_id=A, on_at_utc=NOW + timedelta(minutes=10),
+                    may_replace_first_cutoff=False,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            assert extended.outcome == "period_extended"
+            client.history[A].append(
+                FakeMessage(id=104, message=SIGNAL_TEXT, date=NOW + timedelta(minutes=3))
+            )
+            clock["now"] = NOW + timedelta(minutes=11)
+            fail.clear()
+            await listener.read_history(CHANNEL_A, source="poll", limit=100,
+                                        rpc_timeout=RPC_TIMEOUT)
+
+    asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 103, 104]
+    assert _periods_left(db_path) == []

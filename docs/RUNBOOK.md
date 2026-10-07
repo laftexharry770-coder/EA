@@ -253,8 +253,11 @@ Signals can come from more than one Telegram channel, and you choose which.
   switched it on is read. (Give or take a minute at either end: your PC's
   clock and Telegram's are never exactly the same, so a post made within a
   minute of a switch is read rather than lost. If your PC's clock is
-  further off than that, `watch` measures by how much when it starts and
-  allows for it — and warns you to fix the clock.) Switching it off and on
+  further off than that when `watch` starts, `watch` reads that much more
+  around each switch — and warns you to fix the clock. A clock that was
+  more than a minute wrong when you switched, but right again when `watch`
+  starts, can still cost a post made close to a switch: keep **Set time
+  automatically** on.) Switching it off and on
   again several times before `watch` runs is fine: each time it was off is
   skipped, and only that.
 - **If it says the time it was switched off could not be saved** (the
