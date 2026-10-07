@@ -210,6 +210,10 @@ missed. Once you have dealt with one, clear it:
   waiting, or already traded, as another signal (the alert names it). That
   other post now repeats it, and nothing more was queued. Nothing to do: do
   not trade the call by hand as well, which would open it twice.
+- **CANCELLED_WHEN_FIRST_READ** — a post that reads as a trade signal had
+  already been edited when the program first read it, and it says CANCELLED
+  (or VOID, or INVALID). It was not traded. Nothing to do, unless the poster
+  still means the call: then check the channel.
 - **CHANNEL_OFF_ENTRIES_SKIPPED** — `watch` started with a channel switched
   off that still had signals waiting to be traded; they were cancelled, not
   traded. That is what switching a channel off does (see below). Nothing to

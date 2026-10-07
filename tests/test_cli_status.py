@@ -576,6 +576,7 @@ def _new_alert_codes() -> list[str]:
         edits.EDIT_COMPLETED_SIGNAL,
         edits.SIGNAL_REPOST_PROMOTED,
         edits.SIGNAL_REPOST_ALREADY_LIVE,
+        edits.CANCELLED_WHEN_FIRST_READ,
         alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
     ]
 

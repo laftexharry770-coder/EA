@@ -376,6 +376,13 @@ def ingest(
     existing = _get_message(conn, channel_id=channel_id, message_id=message_id)
 
     if existing is None:
+        retraction = edits_repo.first_read_retraction(
+            text, route_result, edit_date_utc=edit_date_utc
+        )
+        if retraction is not None:
+            # Already edited, and it says CANCELLED (final fix FF6): never
+            # traded, never a copy of the call (FF15) -- loudly.
+            route_result, new_hash = retraction, edits_repo.content_hash_for(retraction, text)
         result = _ingest_new(
             conn,
             channel_cfg=channel_cfg,
@@ -392,6 +399,8 @@ def ingest(
             relay_window_seconds=relay_window_seconds,
             provenance=provenance,
         )
+        if retraction is not None:
+            _cancelled_when_first_read(conn, channel_cfg, message_id, text, now_utc=now_utc)
         if deleted_by_event_at_utc is not None:
             # A MessageDeleted event named it before it was stored (final
             # review F18): that event, applied now in this same transaction
@@ -465,6 +474,40 @@ def _template_changed(
             "Signals written that way are NOT traded until this program is updated to read "
             "them. Look at the channel. This alert is raised once; a signal read normally "
             "again ends it."
+        ),
+    )
+
+
+def _cancelled_when_first_read(
+    conn: sqlite3.Connection,
+    channel_cfg: _ChannelCfgLike,
+    message_id: int,
+    text: str,
+    *,
+    now_utc: datetime,
+) -> int:
+    """The WARNING CANCELLED_WHEN_FIRST_READ for a post first read already
+    edited and carrying a retraction word (`edits_repo.first_read_retraction`)."""
+    words = " / ".join(sorted(edits_repo.retraction_words(text)))
+    logger.warning(
+        "channel %s message %s was first read already edited and saying %s: stored as no "
+        "signal, not traded",
+        channel_cfg.channel_id,
+        message_id,
+        words,
+    )
+    return alerts.record(
+        conn,
+        now_utc=now_utc,
+        level="WARNING",
+        code=edits_repo.CANCELLED_WHEN_FIRST_READ,
+        channel_id=channel_cfg.channel_id,
+        message_id=message_id,
+        detail=(
+            f"Message {message_id} on {_named(channel_cfg)} was edited and says {words}; it "
+            "was not traded. It reads as a trade signal, but it had already been changed when "
+            "this program first read it. Nothing to do, unless the poster still means the "
+            "call: then check the channel."
         ),
     )
 

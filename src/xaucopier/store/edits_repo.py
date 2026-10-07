@@ -353,6 +353,11 @@ _RETRACTION_WORD = re.compile(
 )
 #: `RouteResult.detail` of a version read as a retraction starts with this.
 _RETRACTION_DETAIL = "edited to add "
+#: WARNING: a post read for the first time as a trade signal had already
+#: been edited (Telegram's edit_date set) and carries a retraction word: it
+#: was stored as no signal and not traded (final fix FF6, controller
+#: decision (a)).
+CANCELLED_WHEN_FIRST_READ = "CANCELLED_WHEN_FIRST_READ"
 
 # -- metrics ------------------------------------------------------------------
 EDIT_MISSED_BY_EVENTSTREAM_METRIC = "edit_missed_by_eventstream"
@@ -655,6 +660,33 @@ def reconcile(
 def retraction_words(text: str) -> frozenset[str]:
     """The retraction words (`RETRACTION_WORDS`) `text` carries, upper-cased."""
     return frozenset(match.group(0).upper() for match in _RETRACTION_WORD.finditer(normalize(text)))
+
+
+def first_read_retraction(
+    text: str, route_result: RouteResult, *, edit_date_utc: datetime | None
+) -> RouteResult | None:
+    """A message stored for the first time that reads as a signal but
+    carries a retraction word, read as no signal ('skip'), or None (final
+    fix FF6, controller decision (a)) -- ONLY when Telegram marks it as
+    edited: its NewMessage update was dropped and the poster appended
+    "CANCELLED" before the next read, or watch caught up after a stop. An
+    unedited post keeps the call -- a template that always says "setup
+    invalid below 4460" still trades. Stored as no signal, it is never a
+    copy either, so no relay rule counts it as a post of the call: never
+    promoted, never standing (final fix FF15). A later version keeps it so
+    while the word stays (`_as_retraction`)."""
+    if route_result.kind != "signal" or edit_date_utc is None:
+        return None
+    words = retraction_words(text)
+    if not words:
+        return None
+    return RouteResult(
+        kind="skip",
+        detail=(
+            f"{_RETRACTION_DETAIL}{', '.join(sorted(words))} (a retraction, edited in before "
+            "this program first read it)"
+        ),
+    )
 
 
 def _as_retraction(

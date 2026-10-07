@@ -490,3 +490,111 @@ def route_kind(text: str) -> str:
     from xaucopier.parsing.router import route
 
     return route(text, channel_cfg=VIP, message_id=4001, posted_at_utc=POSTED).kind
+
+
+# -- FF6 / FF15: a post first read already edited and cancelled ---------------------
+#
+# Controller decision, option (a): a post read for the first time as a
+# signal that carries a retraction word is stored as no signal ('skip'),
+# not traded, with a WARNING -- ONLY when Telegram marks it as edited
+# (`edit_date` set): the NewMessage update was dropped and the poster
+# appended CANCELLED before the next read, or watch caught up after a
+# stop. An unedited post keeps today's behaviour, so a template that
+# always carries e.g. "invalid" still trades.
+
+TEMPLATE_WITH_INVALID = SIGNAL_TEXT + "\nSetup invalid below 4460"
+
+
+def _first_read(conn, text: str, *, message_id: int = 4001, edited: bool, channel=VIP,  # noqa: F811
+                posted=POSTED, fwd=None):
+    result = ingest(
+        conn, channel_cfg=channel, message_id=message_id, text=text, posted_at_utc=posted,
+        edit_date_utc=posted + timedelta(seconds=40) if edited else None,
+        reply_to_message_id=None, source="history", now_utc=posted + timedelta(minutes=2),
+        accounts=ACCOUNTS,
+        fwd_from_channel_id=None if fwd is None else fwd[0],
+        fwd_from_post_id=None if fwd is None else fwd[1],
+        fwd_from_date_utc=None if fwd is None else POSTED,
+    )
+    conn.commit()
+    return result
+
+
+def test_a_post_first_read_edited_and_cancelled_is_not_traded(conn) -> None:  # noqa: F811
+    result = _first_read(conn, CANCELLED, edited=True)
+
+    assert (result.outcome, result.kind, result.signal_id) == ("new", "skip", None)
+    assert _q(conn, "SELECT COUNT(*) FROM signals") == [(0,)]
+    assert _q(conn, "SELECT COUNT(*) FROM outbox") == [(0,)]
+    assert _q(conn, "SELECT kind, raw_text FROM messages") == [("skip", CANCELLED)]
+    (alert,) = _q(conn, "SELECT level, code, message_id, detail FROM alerts")
+    assert alert[:3] == ("WARNING", edits_repo.CANCELLED_WHEN_FIRST_READ, 4001)
+    assert "was edited" in alert[3] and "CANCELLED" in alert[3]
+    assert "it was not traded" in alert[3]
+
+
+def test_an_unedited_post_whose_template_says_invalid_still_trades(conn) -> None:  # noqa: F811
+    result = _first_read(conn, TEMPLATE_WITH_INVALID, edited=False)
+
+    assert (result.outcome, result.kind, result.signal_id) == ("new", "signal", 1)
+    assert _q(conn, "SELECT state FROM outbox WHERE kind = 'ENTRY'") == [("QUEUED",), ("QUEUED",)]
+    assert _q(conn, "SELECT COUNT(*) FROM alerts") == [(0,)]
+
+
+def test_an_edited_post_with_no_retraction_word_still_trades(conn) -> None:  # noqa: F811
+    result = _first_read(conn, SIGNAL_TEXT, edited=True)
+
+    assert (result.kind, result.signal_id) == ("signal", 1)
+    assert _q(conn, "SELECT COUNT(*) FROM outbox WHERE kind = 'ENTRY'") == [(2,)]
+
+
+def test_a_post_first_read_cancelled_stays_so_while_the_word_stays(conn) -> None:  # noqa: F811
+    _first_read(conn, CANCELLED, edited=True)
+    later = edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=4001, text=CANCELLED + " - sorry",
+        posted_at_utc=POSTED, edit_date_utc=POSTED + timedelta(seconds=60), reply_to_message_id=None,
+        now_utc=POSTED + timedelta(seconds=61), accounts=ACCOUNTS, detected_by="event",
+    )
+    conn.commit()
+
+    assert later.kind == "skip"
+    assert _q(conn, "SELECT COUNT(*) FROM signals") == [(0,)]
+
+
+@pytest.mark.parametrize("bump", [False, True], ids=["by-hand", "forward"])
+def test_a_repost_first_read_cancelled_is_never_promoted(conn, bump) -> None:  # noqa: F811
+    """FF15: 4001 is signal 1; the same call posted again as 4002 is first
+    read already edited and CANCELLED. Deleting 4001 withdraws the call:
+    the cancelled repost is no post of it, so it is never promoted."""
+    _first_read(conn, SIGNAL_TEXT, edited=False)
+    repost = _first_read(
+        conn, CANCELLED, message_id=4002, edited=True, posted=POSTED + timedelta(seconds=30),
+        fwd=(VIP.channel_id, 4001) if bump else None,
+    )
+    assert (repost.outcome, repost.kind) == ("new", "skip")
+
+    deletion = edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4001, now_utc=POSTED + timedelta(minutes=3),
+        accounts=ACCOUNTS, detected_by="event",
+    )
+    conn.commit()
+
+    assert (deletion.outcome, deletion.promoted_signal_id) == ("voided", None)
+    assert _q(conn, "SELECT signal_id, state FROM signals") == [(1, "VOIDED")]
+    assert _q(conn, "SELECT COUNT(*) FROM outbox WHERE state = 'QUEUED'") == [(0,)]
+
+
+def test_a_follow_up_first_read_edited_and_saying_cancel_is_still_queued(conn) -> None:  # noqa: F811
+    """Only a post that reads as a signal is read as a retraction: an
+    instruction that mentions cancelling is still the instruction."""
+    _first_read(conn, SIGNAL_TEXT, edited=False)
+    followup = ingest(
+        conn, channel_cfg=VIP, message_id=4005, text="Close half now, cancel the pending orders",
+        posted_at_utc=POSTED + timedelta(minutes=1),
+        edit_date_utc=POSTED + timedelta(minutes=2), reply_to_message_id=4001, source="history",
+        now_utc=POSTED + timedelta(minutes=3), accounts=ACCOUNTS,
+    )
+    conn.commit()
+
+    assert (followup.kind, followup.followup_id) == ("followup", 1)
+    assert _q(conn, "SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP'") == [(2,)]
