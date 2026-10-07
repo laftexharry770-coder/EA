@@ -307,6 +307,12 @@ SIGNAL_REPOST_PROMOTED = "SIGNAL_REPOST_PROMOTED"
 #: queued or traded as another signal: the standing post now repeats that
 #: signal, and nothing more is queued (final fix FF12).
 SIGNAL_REPOST_ALREADY_LIVE = "SIGNAL_REPOST_ALREADY_LIVE"
+#: WARNING: an unreadable trade entry that also reads as an instruction for
+#: an open trade -- stored that way, or edited into it (final fix FF2).
+#: Entry-shaped text is never a follow-up (ruling F07), so the instruction
+#: was NOT queued; the user is told which one it was. Raised by
+#: `messages_repo` at ingest, and here for an edit.
+ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED = "ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED"
 #: CRITICAL: an older post of a call -- stored with a signal of it that
 #: another post had withdrawn, before the call was posted again -- was
 #: deleted or edited away, and that voided the call's newest signal. It may
@@ -2073,7 +2079,11 @@ def _edit_of_followup(ctx: _Ctx, route_result: RouteResult, new_hash: str) -> Ed
         return ctx.result("followup_edited", new_kind, _describe(route_result), alert_ids=raised)
 
     partial = _withdraw_followup(
-        ctx, followup_id, code=FOLLOWUP_RETRACTED_BY_EDIT, via=f"edited into {new_kind}"
+        ctx,
+        followup_id,
+        code=FOLLOWUP_RETRACTED_BY_EDIT,
+        via=f"edited into {new_kind}",
+        then=_unqueued_instruction(route_result),
     )
     if new_kind != "signal":
         return ctx.result(
@@ -2135,7 +2145,25 @@ def _followup_copy_changed(ctx: _Ctx, *, how: str, new_hash: str | None) -> tupl
     return (alert,)
 
 
-def _withdraw_followup(ctx: _Ctx, followup_id: int, *, code: str, via: str) -> _Partial:
+def _unqueued_instruction(route_result: RouteResult) -> str:
+    """For an edit into entry-shaped text that the channel's parser cannot
+    read but that also reads as an instruction for an open trade
+    (`RouteResult.unqueued_followup`, ruling F07): the sentences naming it,
+    in the same plain words as at ingest, and saying it was NOT done
+    (final fix FF2); else ""."""
+    followup = route_result.unqueued_followup  # only ever on a parse_failed result
+    if followup is None:
+        return ""
+    return (
+        " The new text could also be an instruction for a trade already open -- "
+        f"'{store_words.instruction_words(followup)}' -- and that was NOT done: look at the "
+        "message, and if it is an instruction, carry it out by hand."
+    )
+
+
+def _withdraw_followup(
+    ctx: _Ctx, followup_id: int, *, code: str, via: str, then: str = ""
+) -> _Partial:
     skipped = outbox.skip_queued(
         ctx.conn, kind="FOLLOWUP", followup_id=followup_id, reason=f"follow-up withdrawn: {via}"
     )
@@ -2145,7 +2173,7 @@ def _withdraw_followup(ctx: _Ctx, followup_id: int, *, code: str, via: str) -> _
         "WARNING",
         code,
         f"follow-up {followup_id} withdrawn ({via}): {skipped} queued instruction(s) "
-        f"skipped; {dispatched} already taken by a worker, which is not undone.",
+        f"skipped; {dispatched} already taken by a worker, which is not undone.{then}",
     )
     return _Partial(alert_ids=(alert,), skipped=skipped)
 
@@ -2158,6 +2186,19 @@ def _edit_of_other(ctx: _Ctx, stored_kind: str, route_result: RouteResult) -> Ed
         alert = _created_alert(ctx, route_result)
         return ctx.result(
             "reclassified", new_kind, f"{stored_kind} edited into {new_kind}", alert_ids=(alert,)
+        )
+    if instruction := _unqueued_instruction(route_result):
+        # Entry-shaped text that is also an instruction: never a follow-up
+        # (ruling F07), never silent either (final fix FF2).
+        alert = ctx.alert(
+            "WARNING",
+            ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED,
+            f"an edit turned message {ctx.message_id} into what looks like a trade signal "
+            "written in a way this program cannot read, so nothing was traded from it."
+            f"{instruction}",
+        )
+        return ctx.result(
+            "recorded", new_kind, f"{stored_kind} edited into {new_kind}", alert_ids=(alert,)
         )
     logger.info(
         "edit of channel %s message %s (%s -> %s): recorded; nothing to do",

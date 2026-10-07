@@ -175,7 +175,7 @@ TEMPLATE_CHANGE_STREAK = 3
 #: WARNING: an unreadable trade entry that also reads as an instruction for
 #: an open trade. Entry-shaped text is never a follow-up (ruling F07), so
 #: the instruction was NOT queued; the user is told which one it was.
-ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED = "ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED"
+ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED = edits_repo.ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED
 
 IngestOutcome = Literal["new", "duplicate", "edited", "relay_duplicate"]
 SenderKind = Literal["user", "channel", "chat"]
