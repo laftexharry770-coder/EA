@@ -1806,7 +1806,11 @@ def _join_carrier(
     `withdrawn`'s call is NOT promoted -- the same trade is already
     `carrier`, another signal (final fix FF12). The repost and the
     withdrawn call's other copies and follow-ups repeat `carrier` now
-    (`relay_repo.record_carried`), and a WARNING names it."""
+    (`relay_repo.record_carried`), and a WARNING names it. It says "Do NOT
+    trade it by hand as well" only when the carrier is traded, being
+    traded or waiting to be: of one with no entry waiting (a worker
+    refused them), trading it by hand would not open it twice (final fix
+    round 2)."""
     conn = ctx.conn
     old_id, carrier_id = withdrawn["signal_id"], carrier["signal_id"]
     relay_repo.record_carried(
@@ -1829,7 +1833,15 @@ def _join_carrier(
             f"entr{'y is' if queued == 1 else 'ies are'} waiting for it)"
         )
     else:
-        already = f"already signal {carrier_id} (none of its trade entries is waiting)"
+        already = (
+            f"already signal {carrier_id}, which is not being traded (none of its trade "
+            "entries is waiting)"
+        )
+    twice = (
+        " Do NOT trade it by hand as well -- that would open the trade twice."
+        if status != "pending" or queued
+        else ""
+    )
     alert = ctx.alert(
         "WARNING",
         SIGNAL_REPOST_ALREADY_LIVE,
@@ -1837,8 +1849,7 @@ def _join_carrier(
         f"and the same call posted again as message {repost['message_id']} on this channel "
         f"still stands. That call is {already}: message {carrier['message_id']} on channel "
         f"{carrier['channel_id']}. So no second signal was made and nothing more was queued; "
-        f"message {repost['message_id']} now repeats signal {carrier_id}. Do NOT trade it by "
-        "hand as well -- that would open the trade twice.",
+        f"message {repost['message_id']} now repeats signal {carrier_id}.{twice}",
         signal_id=carrier_id,
         message_id=repost["message_id"],
     )

@@ -44,6 +44,15 @@ more: it stands again (ruling R4-5, `edits_repo._stands_again`) -- and so
 does one read or edited back first, once its channel posts the call again
 (`record_replacement`): which of the two came first does not matter.
 
+**A signal whose channel was switched off carries nothing** (final fix
+round 2, `switched_off`): `watch` cancels its waiting entries at start,
+so nothing trades it any more. It is never the live call a new post
+repeats (`relay_of_signal`), never the signal a promotion defers to
+(`carrier_of_trade`), and never the carrier an alert names when it says
+"do NOT trade it by hand as well" (`carrier_of`): the same call posted on
+a channel switched on is traded instead. A signal whose entries were
+refused for any other reason still carries its call.
+
 **An older post of a call** (ruling R4-1, `old_post`). When a call was
 withdrawn and posted again, the other channel's posts of the withdrawn
 signal are still posts of the call, and their edits reach its newest
@@ -822,8 +831,10 @@ def carrier_of_trade(
     sharing one of `trade_hashes` (current or first accepted) whose own
     message was posted within `window` seconds of `posted_at_utc`, the
     repost's own time, and which is not withdrawn-unexecuted: live,
-    queued, in flight or traded. Exactly what that repost would repeat if
-    it were stored now (`relay_of_signal`: "a live call wins"). The window
+    queued, in flight or traded -- and can still trade (`switched_off`:
+    never one whose entries were cancelled because its channel was
+    switched off, final fix round 2). Exactly what that repost would
+    repeat if it were stored now (`relay_of_signal`: "a live call wins"). The window
     is measured from each signal's own message, so a call posted 890 s and
     910 s after its first post has a copy of the first and a signal of its
     own, and promoting the copy would open the same trade twice (ruling
@@ -835,7 +846,7 @@ def carrier_of_trade(
             conn, trade_hash=trade_hash, posted_at_utc=posted_at_utc, window=window
         ):
             newest = _signal_row(conn, live_signal_for(conn, candidate["signal_id"]))
-            if not is_withdrawn_unexecuted(conn, newest):
+            if carries(conn, newest):
                 return newest
     return None
 
@@ -925,14 +936,17 @@ def _release_closers_showing_call(
 
 def carried_by(conn: sqlite3.Connection, signal_id: int) -> sqlite3.Row | None:
     """The signal that carries `signal_id`'s call now, when it is another
-    one that is live or of which something was traded (`live_signal_for`):
-    the `signals` row, or None."""
+    one that is live or of which something was traded (`live_signal_for`),
+    and not one whose channel was switched off (`switched_off`): the
+    `signals` row, or None."""
     newest = live_signal_for(conn, signal_id)
     if newest == signal_id:
         return None
     row = _signal_row(conn, newest)
     live = row["state"] == "NEW" and row["withdrawn_at_utc"] is None
-    if live or signals_repo.trade_status(conn, signal_id=newest) != "pending":
+    if (
+        live or signals_repo.trade_status(conn, signal_id=newest) != "pending"
+    ) and not switched_off(conn, row):
         return row
     return None
 
@@ -960,8 +974,9 @@ def live_same_call(
     """The newest live signal (NEW, not withdrawn) showing `call` -- a
     parse or a `signals` row: the same side, symbol and entry zone -- whose
     own message was posted within `window` seconds (both ends included) of
-    one of the moments `around`, other than the signals `besides`; or None.
-    Signals stay NEW for ever: a call with the same zone posted days ago is
+    one of the moments `around`, other than the signals `besides`, and not
+    one whose channel was switched off (`switched_off`); or None. Signals
+    stay NEW for ever: a call with the same zone posted days ago is
     another call, so it is never named (ruling R6-1)."""
     key, skip = _call_key(call), set(besides)
     moments, limit = tuple(around), timedelta(seconds=window)
@@ -973,7 +988,9 @@ def live_same_call(
         if row["signal_id"] in skip or _call_key(row) != key:
             continue
         posted = datetime.fromisoformat(row["message_posted_at_utc"])
-        if any(abs(posted - moment) <= limit for moment in moments):
+        if any(abs(posted - moment) <= limit for moment in moments) and not switched_off(
+            conn, row
+        ):
             return row
     return None
 
@@ -1069,6 +1086,39 @@ def is_withdrawn_unexecuted(conn: sqlite3.Connection, signal: sqlite3.Row) -> bo
     return closed and signals_repo.trade_status(conn, signal_id=signal["signal_id"]) == "pending"
 
 
+def switched_off(conn: sqlite3.Connection, signal: sqlite3.Row) -> bool:
+    """`signal` (a `signals` row) can no longer trade because its channel
+    was switched off (final fix round 2): nothing of it was executed or is
+    being executed, no trade entry of it is waiting, and its waiting ones
+    were cancelled as `outbox.CHANNEL_OFF_REASON` -- which `watch` writes
+    at start for every channel not switched on, so this is also how the
+    store knows a signal's channel is not enabled. Such a signal is never
+    the live carrier of a call (`carries`): a post of the same call on a
+    channel switched on is traded instead of repeating it.
+
+    Entries refused for any other reason -- a worker's age gate, say --
+    leave a signal the carrier: a later copy must never re-open a call a
+    gate refused (the age-gate basis for forwards is a Plan 3 decision)."""
+    counts = outbox.state_counts(conn, kind="ENTRY", signal_id=signal["signal_id"])
+    if counts.get("QUEUED") or counts.get("CLAIMED") or counts.get("DONE"):
+        return False
+    return (
+        conn.execute(
+            "SELECT 1 FROM outbox WHERE kind = 'ENTRY' AND signal_id = ? AND state = 'SKIPPED' "
+            "AND reason = ? LIMIT 1",
+            (signal["signal_id"], outbox.CHANNEL_OFF_REASON),
+        ).fetchone()
+        is not None
+    )
+
+
+def carries(conn: sqlite3.Connection, signal: sqlite3.Row) -> bool:
+    """`signal` (a `signals` row) can be the live carrier of its call: it
+    is not withdrawn-unexecuted (`is_withdrawn_unexecuted`) and its channel
+    was not switched off (`switched_off`)."""
+    return not is_withdrawn_unexecuted(conn, signal) and not switched_off(conn, signal)
+
+
 def relay_of_signal(
     conn: sqlite3.Connection,
     *,
@@ -1103,7 +1153,21 @@ def relay_of_signal(
         if found is None or (found["channel_id"], found["message_id"]) == own:
             continue
         if not is_withdrawn_unexecuted(conn, found):
-            return SignalRelay(_signal_match(conn, found, via="forward"))
+            if not switched_off(conn, found):
+                return SignalRelay(_signal_match(conn, found, via="forward"))
+            # The post's signal can no longer trade -- its channel was
+            # switched off (final fix round 2): a live call on a channel
+            # switched on, or this post as a new signal.
+            live = _live_same_trade(
+                conn,
+                trade_hash=trade_hash,
+                around=(posted_at_utc, _posted_at(conn, found)),
+                window=relay_window_seconds,
+                exclude=own,
+            )
+            if live is not None:
+                return SignalRelay(_signal_match(conn, live, via="hash"))
+            return SignalRelay(None)
         # The post is withdrawn; the call may be live again as a repost.
         live = _live_same_trade(
             conn,
@@ -1128,6 +1192,10 @@ def relay_of_signal(
             # This channel withdrew the call and forwards the same post
             # again: a new signal in its place, as a hand repost (R4-3).
             return SignalRelay(None, replaces=newest["signal_id"])
+        if not is_withdrawn_unexecuted(conn, newest) and switched_off(conn, newest):
+            # The call lives on as a signal whose channel was switched off
+            # (final fix round 2): nothing trades it there.
+            return SignalRelay(None)
         return SignalRelay(_signal_match(conn, newest, via="forward"))
 
     withdrawn_elsewhere: sqlite3.Row | None = None
@@ -1141,6 +1209,10 @@ def relay_of_signal(
         if (newest["channel_id"], newest["message_id"]) == own:
             continue
         if not is_withdrawn_unexecuted(conn, newest):
+            if switched_off(conn, newest):
+                # It can no longer trade: its channel was switched off
+                # (final fix round 2). The call is not carried there.
+                continue
             return SignalRelay(_signal_match(conn, newest, via="hash"))  # a live call wins
         if withdrew_call(
             conn, signal_id=newest["signal_id"], channel_id=channel_id, channel_cfg=channel_cfg
@@ -1899,8 +1971,9 @@ def _live_same_trade(
     exclude: tuple[int, int],
 ) -> sqlite3.Row | None:
     """The newest signal of the oldest call on `trade_hash` posted within
-    `window` seconds of any of the `around` times that is not
-    withdrawn-unexecuted, or None. Never a signal of `exclude`'s own."""
+    `window` seconds of any of the `around` times that can carry it
+    (`carries`: not withdrawn-unexecuted, its channel not switched off), or
+    None. Never a signal of `exclude`'s own."""
     for moment in around:
         for candidate in _same_trade(
             conn, trade_hash=trade_hash, posted_at_utc=moment, window=window
@@ -1910,7 +1983,7 @@ def _live_same_trade(
             signal = _signal_row(conn, live_signal_for(conn, candidate["signal_id"]))
             if (signal["channel_id"], signal["message_id"]) == exclude:
                 continue
-            if not is_withdrawn_unexecuted(conn, signal):
+            if carries(conn, signal):
                 return signal
     return None
 
