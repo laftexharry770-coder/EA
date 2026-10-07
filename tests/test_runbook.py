@@ -116,6 +116,7 @@ def test_the_runbook_explains_every_alert_the_fix_wave_added() -> None:
         edits_repo.SIGNAL_REPOST_ALREADY_LIVE,
         edits_repo.CANCELLED_WHEN_FIRST_READ,
         alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
+        alerts.TELEGRAM_CHANNEL_UNREADABLE,
     ):
         assert f"- **{code}** — " in clearing, code
 

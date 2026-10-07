@@ -186,6 +186,12 @@ missed. Once you have dealt with one, clear it:
 - **TELEGRAM_API_ID_REJECTED** — Telegram will not accept your
   api_id/api_hash. Get a **new** pair (step 1), run step 2 again, then
   `watch`. This one also clears itself once `watch` reads the channel.
+- **TELEGRAM_CHANNEL_UNREADABLE** — this Telegram account can no longer
+  read one of your channels: it left the channel, was removed from it (for
+  example when a paid membership ended), or the channel is gone. Nothing
+  that channel posts is recorded until you join it again in Telegram with
+  this account; restarting `watch` does not help. This one clears itself
+  once `watch` reads the channel again.
 - **TEMPLATE_CHANGED_SUSPECTED** — 3 messages in a row looked like trade
   signals but could not be read. Either the channel has changed how it
   writes its signals, or it writes some calls in a layout this program does

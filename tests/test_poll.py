@@ -1249,5 +1249,5 @@ def test_backlog_posted_before_this_watch_started_is_counted_apart_from_what_the
     assert _missed(db_path) == 2
     backlog_lines = [r.getMessage() for r in caplog.records if "while watch was not running" in r.getMessage()]
     assert len(backlog_lines) == 1 and "[11]" in backlog_lines[0], backlog_lines
-    missed_lines = [r.getMessage() for r in caplog.records if "never delivered" in r.getMessage()]
+    missed_lines = [r.getMessage() for r in caplog.records if "did not arrive as they were posted" in r.getMessage()]
     assert len(missed_lines) == 1 and "[12, 13]" in missed_lines[0], missed_lines

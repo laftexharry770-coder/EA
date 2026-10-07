@@ -146,6 +146,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 
+from telethon import errors as tl_errors
 from telethon import events, functions
 from telethon import utils as tl_utils
 from telethon.tl import types as tl_types
@@ -1431,33 +1432,51 @@ class Listener:
         await self._run_on_writer(bump)
 
     async def record_heartbeats(
-        self, beats: Mapping[str, str | None], *, resolve_alerts: tuple[str, ...] = ()
+        self,
+        beats: Mapping[str, str | None],
+        *,
+        resolve_alerts: tuple[str, ...] = (),
+        readable_channels: tuple[int, ...] = (),
     ) -> int:
         """Stamp every `name -> detail` in `beats` at this listener's
         injected "now" (`store.heartbeats.beat`), in one writer job -- so a
         round's stamps land together or not at all -- and in the same job
         acknowledge every unacknowledged alert whose code is in
-        `resolve_alerts` (the condition it reported is gone). Returns how
+        `resolve_alerts` (the condition it reported is gone), and every
+        `TELEGRAM_CHANNEL_UNREADABLE` alert about one of
+        `readable_channels` (read again: final fix FF20). Returns how
         many alerts that cleared. Through `_run_on_writer()`, so a dead
         writer stops the listener here too. `xaucopier status` reads the
         stamps from its own process."""
         now_utc = self._now()
         items = tuple(beats.items())
         codes = tuple(resolve_alerts)
+        readable = tuple(readable_channels)
 
-        def job(conn: Connection) -> int:
+        def job(conn: Connection) -> tuple[int, int]:
             for name, detail in items:
                 heartbeats.beat(conn, name=name, now_utc=now_utc, detail=detail)
-            return alerts.ack_all(conn, codes=codes) if codes else 0
+            return (
+                alerts.ack_all(conn, codes=codes) if codes else 0,
+                alerts.ack_for_channels(
+                    conn, code=alerts.TELEGRAM_CHANNEL_UNREADABLE, channel_ids=readable
+                ),
+            )
 
-        cleared = await self._run_on_writer(job)
+        cleared, readable_again = await self._run_on_writer(job)
         if cleared:
             logger.warning(
                 "cleared %d alert(s) %s: Telegram is answering this session again",
                 cleared,
                 list(codes),
             )
-        return cleared
+        if readable_again:
+            logger.warning(
+                "cleared %d alert(s) saying this account cannot read a channel: it reads "
+                "it again",
+                readable_again,
+            )
+        return cleared + readable_again
 
     async def record_alert(
         self,
@@ -1780,12 +1799,24 @@ class Listener:
         try:
             await client_module.connect_within(self.client, timeout)  # 1
             telegram_clock = await self._read_telegram_clock()
-            dialogs = await client_module.telegram_within(self.client.get_dialogs(), timeout)  # 2
+            dialogs = await client_module.chat_list_within(self.client, timeout)  # 2
         except client_module.TelegramUnreachableError as exc:
             message = (
                 f"{exc} watch stops now; start it again once this "
                 "computer is back online."
             )
+            raise ListenerStartupError(message, plain=message) from exc
+        except client_module.PERMANENT_TELEGRAM_ERRORS:
+            # Some of them are of the same kind as a wait Telegram asks
+            # for (FrozenMethodInvalidError is a FloodError), but none is
+            # healed by waiting: each stops watch with its own code.
+            raise
+        except tl_errors.FloodError as exc:
+            # Telegram asked watch to wait (final fix FF21) -- most likely
+            # because it was started many times in a row: each start asks
+            # for the chat list again. Starting again before the wait is
+            # over only earns a longer one.
+            message = _start_wait_words(exc, self._now())
             raise ListenerStartupError(message, plain=message) from exc
         self._name_sources(dialogs)
         self._started_at = self._decide_start(local_start, telegram_clock)
@@ -2036,12 +2067,22 @@ class Listener:
             # same pointer, which only a successful history read moves,
             # so a channel skipped now is retried shortly -- loudly
             # logged, never silent.
+            # One plain line for the window; the traceback for the log
+            # file only (final fix FF20).
+            logger.warning(
+                "%s (id %s) could not be read at start; watch tries again every few "
+                "seconds, and the other channels go on.",
+                channel.name,
+                channel.channel_id,
+                extra=db.POINTS_TO_DETAILS,
+            )
             logger.exception(
                 "backfill failed for channel %s (%s); continuing -- the poll "
                 "will retry from the stored pointer: %s",
                 channel.channel_id,
                 channel.name,
                 exc,
+                extra=db.LOG_FILE_ONLY,
             )
 
     def _register_handlers(self) -> None:
@@ -2291,7 +2332,8 @@ class Listener:
         try:
             await self.client.disconnect()
         except Exception:  # noqa: BLE001 -- shutdown is best-effort
-            logger.exception("error disconnecting the Telegram client")
+            # Nothing is lost by it: watch is stopping anyway (FF20).
+            logger.exception("error disconnecting the Telegram client", extra=db.LOG_FILE_ONLY)
 
         # stop() drains every queued write, then joins the thread. Run it
         # off the loop thread so the join never blocks the loop.
@@ -2316,6 +2358,41 @@ def _writer_noop(conn: Connection) -> None:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _start_wait_words(exc: Exception, now: datetime) -> str:
+    """What watch says when Telegram asked it to wait before starting
+    (final fix FF21): how long, and the minute after which starting it
+    again is fine (rounded up). A wait with no length given is "a few
+    minutes"."""
+    seconds = getattr(exc, "seconds", None)
+    if not isinstance(seconds, int | float) or seconds < 0:
+        return (
+            "Telegram asked watch to wait before starting (it asks this when watch is "
+            "started many times in a row). watch stops now; start it again in a few "
+            "minutes -- starting it sooner only makes Telegram ask for a longer wait."
+        )
+    over = now.astimezone(UTC) + timedelta(seconds=seconds)
+    if over.second or over.microsecond:
+        over += timedelta(seconds=60 - over.second, microseconds=-over.microsecond)
+    return (
+        f"Telegram asked watch to wait {wait_words(seconds)} before starting (it asks "
+        "this when watch is started many times in a row). watch stops now; start it "
+        f"again after {over.strftime('%H:%M')} UTC -- starting it sooner only makes "
+        "Telegram ask for a longer wait."
+    )
+
+
+def wait_words(seconds: float) -> str:
+    """A wait Telegram asked for, as the window says it: "about 45
+    seconds", "about 5 minutes", "about 2 hours" (final fix FF20/FF21)."""
+    if seconds < 90:
+        whole = max(1, int(round(seconds)))
+        return f"about {whole} second{'' if whole == 1 else 's'}"
+    minutes = int(round(seconds / 60))
+    if minutes < 120:
+        return f"about {minutes} minutes"
+    return f"about {int(round(seconds / 3600))} hours"
 
 
 def _describe_age(age: timedelta) -> str:

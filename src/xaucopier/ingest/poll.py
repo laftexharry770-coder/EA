@@ -163,6 +163,7 @@ from xaucopier.ingest.listener import (
     FIRST_RUN_SEED_MARGIN,
     HistoryIngest,
     Listener,
+    wait_words,
 )
 from xaucopier.store import alerts, db, heartbeats
 
@@ -193,6 +194,26 @@ BACKLOG_RECOVERED_METRIC = "backlog_recovered"
 #: its own: the forward history read, then the window re-read.
 HISTORY_STEP = "history"
 WINDOW_STEP = "window"
+
+#: What a step's trouble is, for the window's one line when it starts and
+#: for the round stamp `status` reads (final fix FF20).
+TroubleKind = str
+_WAIT = "wait"
+_UNREADABLE = "unreadable"
+_TIMEOUT = "timeout"
+_FAILED = "failed"
+
+
+def _doing(step: str, channel: ChannelCfg) -> str:
+    if step == HISTORY_STEP:
+        return f"reading {channel.name}"
+    return f"checking the recent messages of {channel.name} for edits and deletions"
+
+
+def _unreadable_errors() -> tuple[type[Exception], ...]:
+    """What Telegram answers when this account cannot read a channel: it
+    left it, was removed from it, or the channel is gone."""
+    return (errors.ChannelPrivateError, errors.ChannelInvalidError)
 
 
 class WriterUnresponsiveError(RuntimeError):
@@ -291,6 +312,9 @@ class HistoryPoll:
         # that channel is not run again (a flood wait). Local: it belongs
         # to this run.
         flood_until: dict[tuple[str, int], float] = {}
+        # (step, channel_id) -> the trouble that step is in, while it lasts:
+        # said once when it starts and once when it is over (FF20). Local.
+        trouble: dict[tuple[str, int], TroubleKind] = {}
         # Absences the window re-read is waiting to see confirmed, and
         # which channels' reads are suspect (ingest/edits.py). Local too.
         absences = AbsenceTracker()
@@ -306,28 +330,51 @@ class HistoryPoll:
             read: list[int] = []
             for channel in channels:
                 if await self._poll_channel(
-                    listener, channel, flood_until, PERMANENT_TELEGRAM_ERRORS, absences
+                    listener, channel, flood_until, PERMANENT_TELEGRAM_ERRORS, absences, trouble
                 ):
                     read.append(channel.channel_id)
-            await self._stamp_round(listener, read=tuple(read), total=len(channels))
+            unread = [c.channel_id for c in channels if c.channel_id not in read]
+            await self._stamp_round(
+                listener,
+                read=tuple(read),
+                total=len(channels),
+                waiting=sum(1 for c in unread if trouble.get((HISTORY_STEP, c)) == _WAIT),
+                unreadable=sum(
+                    1 for c in unread if trouble.get((HISTORY_STEP, c)) == _UNREADABLE
+                ),
+            )
 
     async def _stamp_round(
-        self, listener: Listener, *, read: tuple[int, ...], total: int
+        self,
+        listener: Listener,
+        *,
+        read: tuple[int, ...],
+        total: int,
+        waiting: int = 0,
+        unreadable: int = 0,
     ) -> None:
         """Step 5: record that this round finished, and which channels it
         read, for `xaucopier status`. One writer job. Never raises except
         `WriterDeadError` (and cancellation): a stamp is a report, and
-        failing to write one must not stop the poll that recovers trades."""
-        beats: dict[str, str | None] = {
-            heartbeats.POLL_ROUND: f"{len(read)} of {total} channel(s) read"
-        }
+        failing to write one must not stop the poll that recovers trades.
+        Of the channels not read, how many wait because Telegram asked
+        (`waiting`) and how many this account cannot read (`unreadable`)
+        follow the count, so `status` can say why (FF20)."""
+        detail = f"{len(read)} of {total} channel(s) read"
+        if waiting:
+            detail += f"; waiting: {waiting}"
+        if unreadable:
+            detail += f"; cannot read: {unreadable}"
+        beats: dict[str, str | None] = {heartbeats.POLL_ROUND: detail}
         for channel_id in read:
             beats[heartbeats.channel_read_name(channel_id)] = None
         try:
             # A read that succeeded proves Telegram accepts this session and
             # this api_id again: the alerts saying otherwise are resolved.
             await listener.record_heartbeats(
-                beats, resolve_alerts=alerts.SESSION_ALERT_CODES if read else ()
+                beats,
+                resolve_alerts=alerts.SESSION_ALERT_CODES if read else (),
+                readable_channels=read,
             )
         except db.WriterDeadError:
             raise
@@ -373,6 +420,7 @@ class HistoryPoll:
         flood_until: dict[tuple[str, int], float],
         terminal_errors: tuple[type[Exception], ...],
         absences: AbsenceTracker,
+        trouble: dict[tuple[str, int], TroubleKind] | None = None,
     ) -> bool:
         """One channel's step: its forward history read, then -- only if
         that read succeeded this round -- its window re-read. Each is
@@ -380,12 +428,15 @@ class HistoryPoll:
         defers the other. Returns whether the forward read succeeded.
         Never raises, except for the three stop conditions (and
         cancellation)."""
+        trouble = {} if trouble is None else trouble
         read = await self._guarded(
             channel,
             flood_until,
             terminal_errors,
             step=HISTORY_STEP,
             action=lambda: self._forward_read(listener, channel),
+            trouble=trouble,
+            listener=listener,
         )
         if not read:
             return False
@@ -393,6 +444,8 @@ class HistoryPoll:
             channel,
             flood_until,
             terminal_errors,
+            trouble=trouble,
+            listener=listener,
             step=WINDOW_STEP,
             action=lambda: reconcile_window(
                 listener,
@@ -416,11 +469,11 @@ class HistoryPoll:
         if missed:
             await listener.record_metric(MISSED_BY_EVENTSTREAM_METRIC, len(missed))
             logger.warning(
-                "poll recovered %d message(s) on channel %s (%s) that the update "
-                "stream never delivered: %s",
+                "%d message(s) of %s (id %s) did not arrive as they were posted; they "
+                "were read a moment later: %s",
                 len(missed),
-                channel.channel_id,
                 channel.name,
+                channel.channel_id,
                 missed,
             )
         if backlog:
@@ -442,14 +495,24 @@ class HistoryPoll:
         *,
         step: str,
         action: Callable[[], Awaitable[object]],
+        trouble: dict[tuple[str, int], TroubleKind] | None = None,
+        listener: Listener | None = None,
     ) -> bool:
         """Run one step of one channel; True if it ran and succeeded.
         False if it is deferred by an earlier flood wait, or failed (which
         is logged and handled here -- see the module docstring). Only the
-        three stop conditions propagate."""
+        three stop conditions propagate.
+
+        The window gets one plain line when a step's trouble starts (or
+        changes kind) and one when it is over; the technical detail -- a
+        traceback, the error's name -- goes to watch.log only (final fix
+        FF20: a traceback every round, for ever, was the window's lot). A
+        channel this account cannot read is a WARNING alert as well, once
+        per spell, cleared when the channel is read again."""
         channel_id = channel.channel_id
         key = (step, channel_id)
         what = "poll" if step == HISTORY_STEP else "window re-read"
+        trouble = {} if trouble is None else trouble
         resume_at = flood_until.get(key)
         if resume_at is not None:
             if self.clock() < resume_at:
@@ -464,42 +527,121 @@ class HistoryPoll:
             raise
         except errors.FloodError as exc:
             seconds = getattr(exc, "seconds", None)
-            if not isinstance(seconds, int | float):
-                logger.exception(
-                    "%s of channel %s (%s) hit a flood error with no wait time; "
-                    "retrying next round",
-                    what,
-                    channel_id,
-                    channel.name,
+            if isinstance(seconds, int | float):
+                flood_until[key] = self.clock() + seconds
+                logger.info(
+                    "%s of channel %s (%s) must wait %ss (%s); not run again until then",
+                    what, channel_id, channel.name, seconds, type(exc).__name__,
+                    extra=db.LOG_FILE_ONLY,
+                )
+                trouble[key] = _WAIT
+                logger.warning(
+                    "Telegram asked watch to wait %s before %s again. watch goes on with "
+                    "the rest meanwhile; new posts still arrive as they are posted.",
+                    wait_words(seconds),
+                    _doing(step, channel),
                 )
                 return False
-            flood_until[key] = self.clock() + seconds
-            logger.error(
-                "%s of channel %s (%s) must wait %ss (%s); it is NOT run again until "
-                "then. Telethon applies a flood wait to every channel's request of the "
-                "same type, so the others will likely report the same; the writer probe "
-                "keeps running",
-                what,
-                channel_id,
-                channel.name,
-                seconds,
-                type(exc).__name__,
+            self._failed(channel, step, trouble, _FAILED, what)
+            return False
+        except _unreadable_errors() as exc:
+            logger.info(
+                "%s of channel %s (%s) refused: %r", what, channel_id, channel.name, exc,
+                extra=db.LOG_FILE_ONLY,
             )
+            if trouble.get(key) != _UNREADABLE:
+                trouble[key] = _UNREADABLE
+                said = (
+                    f"This Telegram account can no longer read {channel.name} (id "
+                    f"{channel_id}): it may have left the channel or been removed from it, or "
+                    "the channel is gone. Please join it again in Telegram with this account; "
+                    "until then nothing it posts is recorded."
+                )
+                # The alert's own line says it in the window; this one only
+                # when the alert could not be recorded.
+                if not await self._channel_unreadable(listener, channel, said):
+                    logger.warning("%s", said)
             return False
         except TimeoutError:
-            logger.warning(
-                "%s of channel %s (%s) timed out after %gs; retrying next round (if "
-                "this repeats, Telethon may be sleeping through a flood wait of up to "
-                "its 120 s flood_sleep_threshold)",
-                what,
-                channel_id,
-                channel.name,
-                self.rpc_timeout,
+            logger.info(
+                "%s of channel %s (%s) timed out after %gs", what, channel_id, channel.name,
+                self.rpc_timeout, extra=db.LOG_FILE_ONLY,
             )
+            if trouble.get(key) != _TIMEOUT:
+                trouble[key] = _TIMEOUT
+                logger.warning(
+                    "Telegram did not answer within %g seconds when %s; watch tries again "
+                    "every few seconds.",
+                    self.rpc_timeout,
+                    _doing(step, channel),
+                )
             return False
         except Exception:  # noqa: BLE001 -- one channel's failure must not stop the poll
+            self._failed(channel, step, trouble, _FAILED, what)
+            return False
+        if trouble.pop(key, None) is not None:
+            doing = _doing(step, channel)
+            logger.warning("%s works again.", doing[0].upper() + doing[1:])
+        return True
+
+    def _failed(
+        self,
+        channel: ChannelCfg,
+        step: str,
+        trouble: dict[tuple[str, int], TroubleKind],
+        kind: TroubleKind,
+        what: str,
+    ) -> None:
+        """A step that failed for a reason nobody gave words to: one plain
+        line when it starts, pointing at the log file, where the traceback
+        goes (only the first of a spell's; the rest one line each)."""
+        key = (step, channel.channel_id)
+        if trouble.get(key) == kind:
+            logger.info(
+                "%s of channel %s (%s) failed again; retrying next round",
+                what, channel.channel_id, channel.name, exc_info=False, extra=db.LOG_FILE_ONLY,
+            )
+            return
+        trouble[key] = kind
+        subject = (
+            channel.name
+            if step == HISTORY_STEP
+            else f"The recent messages of {channel.name}"
+        )
+        verb = "read" if step == HISTORY_STEP else "checked"
+        logger.warning(
+            "%s could not be %s just now; watch tries again every few seconds.",
+            subject,
+            verb,
+            extra=db.POINTS_TO_DETAILS,
+        )
+        logger.exception(
+            "%s of channel %s (%s) failed; retrying next round",
+            what, channel.channel_id, channel.name, extra=db.LOG_FILE_ONLY,
+        )
+
+    async def _channel_unreadable(
+        self, listener: Listener | None, channel: ChannelCfg, said: str
+    ) -> bool:
+        """The WARNING alert for a channel this account can no longer read
+        (FF20); whether it was recorded. A failure to record it is logged;
+        the poll goes on."""
+        if listener is None:
+            return False
+        try:
+            await listener.record_alert(
+                "WARNING",
+                alerts.TELEGRAM_CHANNEL_UNREADABLE,
+                said[0].lower() + said[1:] + " This alert clears itself once watch reads the "
+                "channel again.",
+                channel_id=channel.channel_id,
+            )
+        except db.WriterDeadError:
+            raise
+        except Exception:  # noqa: BLE001 -- the caller says it in the window instead
             logger.exception(
-                "%s of channel %s (%s) failed; retrying next round", what, channel_id, channel.name
+                "could not record the alert for channel %s", channel.channel_id,
+                extra=db.LOG_FILE_ONLY,
             )
             return False
         return True

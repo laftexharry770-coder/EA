@@ -129,6 +129,24 @@ async def connect_within(client: Any, seconds: float) -> None:
     await telegram_within(client.connect(), seconds)
 
 
+async def chat_list_within(client: Any, seconds: float) -> Any:
+    """`client.get_dialogs()`, bounded by `telegram_within`, with the
+    Telegram library's own sleeping through a wait Telegram asks for
+    switched off for this one call (final fix FF21): with it on, a wait of
+    up to `flood_sleep_threshold` (120 s) was slept INSIDE the call, so the
+    start-up bound fired first and the user read "no internet". The wait
+    now comes back at once as `errors.FloodError`, for the caller to say
+    what it is. The setting is put back afterwards."""
+    before = getattr(client, "flood_sleep_threshold", None)
+    if before is not None:
+        client.flood_sleep_threshold = 0
+    try:
+        return await telegram_within(client.get_dialogs(), seconds)
+    finally:
+        if before is not None:
+            client.flood_sleep_threshold = before
+
+
 #: What a source is, as `source_kind()` tells it (final review F05).
 SourceKind = Literal["channel", "group", "unknown"]
 

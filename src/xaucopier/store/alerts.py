@@ -41,6 +41,11 @@ CHANNEL_OFF_ENTRIES_SKIPPED = "CHANNEL_OFF_ENTRIES_SKIPPED"
 #: Alerts a successful read resolves: Telegram answering this session
 #: proves the condition is gone. The poll acknowledges them (poll.py).
 SESSION_ALERT_CODES: tuple[str, ...] = (TELEGRAM_SESSION_DEAD, TELEGRAM_API_ID_REJECTED)
+#: WARNING, recorded by `xaucopier watch` when Telegram says this account
+#: cannot read a channel (it left it, was removed, or the channel is gone;
+#: final fix FF20). Fix: join it again. Acknowledged by the poll once that
+#: channel is read again (`ack_for_channels`).
+TELEGRAM_CHANNEL_UNREADABLE = "TELEGRAM_CHANNEL_UNREADABLE"
 
 _LOG_LEVELS: dict[str, int] = {"WARNING": logging.WARNING, "CRITICAL": logging.CRITICAL}
 
@@ -98,16 +103,18 @@ def record(
         ),
     )
     alert_id = int(cursor.lastrowid)
-    logger.log(
-        _LOG_LEVELS[level],
-        "ALERT %s #%s channel=%s message_id=%s signal_id=%s: %s",
-        code,
-        alert_id,
-        channel_id,
-        message_id,
-        signal_id,
-        detail,
+    # Only what it is about: "channel=None message_id=None ..." told the
+    # window nothing (final fix FF20).
+    about = "".join(
+        f" {label}={value}"
+        for label, value in (
+            ("channel", channel_id),
+            ("message_id", message_id),
+            ("signal_id", signal_id),
+        )
+        if value is not None
     )
+    logger.log(_LOG_LEVELS[level], "ALERT %s #%s%s: %s", code, alert_id, about, detail)
     return alert_id
 
 
@@ -131,6 +138,20 @@ def unacked(conn: sqlite3.Connection) -> tuple[Alert, ...]:
         )
         for row in rows
     )
+
+
+def ack_for_channels(conn: sqlite3.Connection, *, code: str, channel_ids: tuple[int, ...]) -> int:
+    """Acknowledge every unacknowledged `code` alert about one of
+    `channel_ids` -- the condition it reported is gone for that channel.
+    Returns how many. Never commits."""
+    if not channel_ids:
+        return 0
+    marks = ", ".join("?" for _ in channel_ids)
+    cursor = conn.execute(
+        f"UPDATE alerts SET acked = 1 WHERE acked = 0 AND code = ? AND channel_id IN ({marks})",
+        (code, *channel_ids),
+    )
+    return cursor.rowcount
 
 
 def ack_all(conn: sqlite3.Connection, *, codes: tuple[str, ...] | None = None) -> int:

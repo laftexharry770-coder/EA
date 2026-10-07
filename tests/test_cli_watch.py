@@ -154,7 +154,8 @@ def test_watch_records_live_and_poll_recovered_messages_and_stops_cleanly_on_dis
     assert f"id {CHANNEL_ID}" in out
     assert "exit code 4" in out
     log = (rig.db_path.parent / "watch.log").read_text(encoding="utf-8")
-    assert "poll recovered 1 message(s)" in log
+    assert "1 message(s) of Test Channel (id" in log
+    assert "did not arrive as they were posted; they were read a moment later" in log
 
 
 def test_ctrl_c_stops_watch_cleanly_with_exit_130(

@@ -567,3 +567,94 @@ def test_a_chat_list_that_is_not_a_list_never_stops_watch(tmp_path: Path) -> Non
     kinds, calls = _start_and_read_kinds(tmp_path / "store.db", NoListClient())
     assert kinds == {CHANNEL_ID: "unknown"}
     assert "add_event_handler" in calls
+
+
+# -- final fix FF21: Telegram asking watch to wait at start -------------------------------
+
+
+class _WaitAskedClient(FakeTelegramClient):
+    """The fake, whose chat list Telegram answers with "wait N seconds"."""
+
+    def __init__(self, seconds: int) -> None:
+        super().__init__()
+        self.seconds = seconds
+        #: As the real library has it; what it was during the chat list.
+        self.flood_sleep_threshold = 120
+        self.threshold_seen: list[int] = []
+
+    async def get_dialogs(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append("get_dialogs")
+        self.threshold_seen.append(self.flood_sleep_threshold)
+        from telethon import errors
+
+        raise errors.FloodWaitError(request=None, capture=self.seconds)
+
+
+@pytest.mark.parametrize("seconds", [90, 900])
+def test_telegram_asking_watch_to_wait_at_start_is_said_with_when_to_start_again(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, seconds: int
+) -> None:
+    """Final fix FF21: a wait Telegram asked for on the chat list read as
+    'no internet' (61-120 s: Telethon slept inside the call past the 60 s
+    bound) or as 'a problem this program did not expect' (longer), with
+    'safe to start it again' -- and every restart asks for the chat list
+    again, which is what earns the wait. watch now stops at once, says
+    Telegram asked it to wait, and when to start it again (exit 4)."""
+    db_path = tmp_path / "store.db"
+
+    client = _WaitAskedClient(seconds)
+
+    async def scenario():
+        listener = _build_listener(db_path, client)
+        return await asyncio.wait_for(run_listener(listener), timeout=10.0)
+
+    with caplog.at_level(logging.ERROR, logger=listener_module.__name__):
+        exit_code = asyncio.run(scenario())
+
+    assert exit_code == EXIT_LISTENER_STOPPED
+    # Asked with the library's own sleeping off, and put back after.
+    assert client.threshold_seen == [0] and client.flood_sleep_threshold == 120
+    (stop,) = [r.getMessage() for r in caplog.records if "asked watch to wait" in r.getMessage()]
+    minutes = {90: "about 2 minutes", 900: "about 15 minutes"}[seconds]
+    over = NOW + timedelta(seconds=seconds)  # the minute it is over, rounded up
+    again = (over + timedelta(seconds=(-over.second) % 60)).strftime("%H:%M")
+    assert f"Telegram asked watch to wait {minutes} before starting" in stop
+    assert f"start it again after {again} UTC" in stop
+    for wrong in ("internet", "did not expect", "flood", "Flood", "RPC", "client"):
+        assert wrong not in stop, (wrong, stop)
+
+
+def test_the_chat_list_at_start_never_sleeps_through_a_wait_inside_the_call() -> None:
+    """With the real Telegram library (no network: its sender is replaced),
+    a 90 s wait on the chat list is slept INSIDE the call -- Telethon's
+    own flood_sleep_threshold is 120 s -- so the 60 s start-up bound fired
+    first and said 'no internet'. For the start-up chat list that sleeping
+    is off: the wait comes back at once, as what it is, and the setting is
+    put back afterwards."""
+    from telethon import errors
+
+    from xaucopier.ingest.secrets import SecretsBlob
+
+    async def scenario():
+        client = client_module.build_client(
+            SecretsBlob(api_id=12345, api_hash="0" * 32, session_string="")
+        )
+        sent: list[str] = []
+
+        def send(request, ordered=False):
+            sent.append(type(request).__name__)
+            answer = asyncio.get_running_loop().create_future()
+            answer.set_exception(errors.FloodWaitError(request=request, capture=90))
+            return answer
+
+        client._sender.send = send
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(errors.FloodWaitError) as caught:
+            await client_module.chat_list_within(client, 5.0)
+        return caught.value, loop.time() - started, client.flood_sleep_threshold, sent
+
+    error, elapsed, threshold, sent = asyncio.run(scenario())
+    assert error.seconds == 90 and elapsed < 2.0
+    assert threshold == 120
+    assert sent == ["GetDialogsRequest"]

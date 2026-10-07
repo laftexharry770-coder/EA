@@ -112,6 +112,46 @@ _RESTART_ADVICE = (
 _RESTART_ADVICE_AFTER_COLON = _RESTART_ADVICE[0].lower() + _RESTART_ADVICE[1:]
 
 
+_ROUND_WAITING = re.compile(r"; waiting: (\d+)")
+_ROUND_UNREADABLE = re.compile(r"; cannot read: (\d+)")
+
+
+def round_trouble(detail: str | None) -> list[str]:
+    """Why a round stamp's channels were not all read, in plain words, one
+    reason each (final fix FF20): this account cannot read some -- joining
+    them again is the fix, not a restart -- Telegram asked watch to wait
+    before reading some again, or Telegram is not answering for the rest.
+    Empty when every channel was read."""
+    counts = round_counts(detail)
+    if counts is None or counts[0] >= counts[1]:
+        return []
+    found = _ROUND_UNREADABLE.search(detail or "")
+    unreadable = int(found[1]) if found else 0
+    found = _ROUND_WAITING.search(detail or "")
+    waiting = int(found[1]) if found else 0
+    rest = counts[1] - counts[0] - unreadable - waiting
+    reasons = []
+    if unreadable:
+        reasons.append(
+            f"this Telegram account cannot read {unreadable} of them -- join "
+            f"{'it' if unreadable == 1 else 'them'} again in Telegram (see ALERTS above); "
+            "restarting watch does not help"
+        )
+    if waiting:
+        reasons.append(
+            f"Telegram asked watch to wait before reading {waiting} of them again; it "
+            "reads them again after the wait, and their new posts still arrive as they "
+            "are posted"
+        )
+    if rest > 0:
+        reasons.append(
+            "Telegram is not answering for the rest (see "
+            f"CHANNELS below, and {paths.LOG_FILE_NAME}), so nothing new is being recorded "
+            "from them. If this lasts more than a few minutes: " + _RESTART_ADVICE_AFTER_COLON
+        )
+    return reasons
+
+
 def round_counts(detail: str | None) -> tuple[int, int] | None:
     """(channels read, channels tried) from a round stamp's detail, or
     None if it does not say."""
@@ -217,14 +257,13 @@ def _watch_lines(rep: report.StatusReport, now: datetime, secrets_path: Path) ->
             )
         elif (counts := round_counts(last_round.detail)) is not None and counts[0] < counts[1]:
             # A round that finished but read fewer channels than it tried is
-            # not health: nothing is being recorded from the rest.
+            # not health: nothing is being recorded from the rest -- said
+            # with why, when the round knew (FF20).
             lines.append(
                 f"  NOT HEALTHY: {since}, and still checking -- but the last check "
                 f"({ago(now, last_round.at_utc)}) could read only {counts[0]} of "
-                f"{counts[1]} channel(s): Telegram is not answering for the rest (see "
-                f"CHANNELS below, and {paths.LOG_FILE_NAME}), so nothing new is being "
-                "recorded from them. If this lasts more than a few minutes: "
-                + _RESTART_ADVICE_AFTER_COLON
+                f"{counts[1]} channel(s): " + "; and ".join(round_trouble(last_round.detail))
+                + ("" if round_trouble(last_round.detail)[-1].endswith(".") else ".")
             )
         else:
             lines.append(

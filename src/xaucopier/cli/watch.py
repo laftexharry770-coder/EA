@@ -278,7 +278,12 @@ async def run_watch(client: object, setup: WatchSetup) -> int:
 
 
 def _for_the_window(record: logging.LogRecord) -> bool:
-    """False for a line meant for the log file only (`LOG_FILE_ONLY`)."""
+    """False for a line meant for the log file only (`LOG_FILE_ONLY`), and
+    for every line of the Telegram library's own ("Attempt 2 at connecting
+    failed", "Sleeping for 90s on GetDialogsRequest flood wait"): watch
+    says what matters in its own words (final fix FF20)."""
+    if record.name == "telethon" or record.name.startswith("telethon."):
+        return False
     return not getattr(record, db.FILE_ONLY_ATTRIBUTE, False)
 
 
