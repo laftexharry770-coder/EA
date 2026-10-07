@@ -305,7 +305,10 @@ async def reconcile_window(
         else:
             if absences.leave_suspect(channel_id):
                 logger.warning(
-                    "window re-read of channel %s (%s) looks normal again", channel_id, channel_cfg.name
+                    "Telegram's answers about the newest messages of %s (id %s) look normal "
+                    "again.",
+                    channel_cfg.name,
+                    channel_id,
                 )
             confirmed = absences.settle(channel_id, absent)
             reported_at = listener.now_utc()  # one report, one moment (R6-3)
@@ -368,15 +371,21 @@ async def _suspect_read(
     expected: int,
 ) -> None:
     channel_id = channel_cfg.channel_id
+    first = absences.enter_suspect(channel_id)
+    # Said in the window once per run of suspect reads -- its CRITICAL
+    # alert says what it means -- and every few seconds after that in the
+    # log file only (final fix FF20: no line repeated for ever).
     logger.error(
-        "window re-read of channel %s (%s) is missing %d of the %d messages it expected; "
-        "not believed, so no deletion is inferred from it",
-        channel_id,
+        "Checking the newest messages of %s (id %s) for deletions: Telegram did not "
+        "return %d of the %d messages expected. That looks like a bad answer, so none "
+        "of them is taken as deleted.",
         channel_cfg.name,
+        channel_id,
         len(absent),
         expected,
+        extra=None if first else db.LOG_FILE_ONLY,
     )
-    if not absences.enter_suspect(channel_id):
+    if not first:
         return  # alerted when this run of suspect reads began
     shown = ", ".join(str(message_id) for message_id in absent[:10])
     more = f" and {len(absent) - 10} more" if len(absent) > 10 else ""

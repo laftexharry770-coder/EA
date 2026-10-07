@@ -1983,8 +1983,11 @@ class Listener:
         from xaucopier.ingest import client as client_module
 
         try:
+            # The library's own sleeping through a wait Telegram asks for
+            # is off for this one call: a wait slept inside it would only
+            # be cut short by the bound and read as "no answer" (FF21).
             state = await client_module.telegram_within(
-                self.client(functions.updates.GetStateRequest()),
+                self.client(functions.updates.GetStateRequest(), flood_sleep_threshold=0),
                 TELEGRAM_CLOCK_TIMEOUT_SECONDS,
             )
             telegram_now = state.date
@@ -1997,10 +2000,16 @@ class Listener:
         except client_module.PERMANENT_TELEGRAM_ERRORS:
             raise
         except Exception as exc:  # noqa: BLE001 -- no answer: this computer's clock, with a warning
-            reason = (
-                f"no answer within {TELEGRAM_CLOCK_TIMEOUT_SECONDS:g} seconds"
-                if isinstance(exc, client_module.TelegramUnreachableError)
-                else type(exc).__name__
+            if isinstance(exc, client_module.TelegramUnreachableError):
+                reason = f"no answer within {TELEGRAM_CLOCK_TIMEOUT_SECONDS:g} seconds"
+            elif isinstance(exc, tl_errors.FloodError):
+                reason = "Telegram asked watch to wait before asking again"
+            else:
+                reason = "Telegram did not give it"
+            # The error's own name and words, for whoever reads the log
+            # file; the window says it plainly (FF21).
+            logger.info(
+                "reading Telegram's clock failed: %r", exc, extra=db.LOG_FILE_ONLY
             )
             logger.warning(
                 "Could not read Telegram's clock (%s), so watch goes by this computer's "

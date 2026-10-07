@@ -658,3 +658,43 @@ def test_the_chat_list_at_start_never_sleeps_through_a_wait_inside_the_call() ->
     assert error.seconds == 90 and elapsed < 2.0
     assert threshold == 120
     assert sent == ["GetDialogsRequest"]
+
+
+@pytest.mark.parametrize("failure", ["wait", "error"])
+def test_asking_telegrams_clock_never_sleeps_through_a_wait_and_says_why_plainly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    """Final fix FF21, the same for Telegram's clock: a wait Telegram asks
+    for is not slept inside the 10 s bound (the call is made with the
+    library's own sleeping off), and the warning says why in plain words --
+    never an error's Python name such as 'FloodWaitError'."""
+    from telethon import errors
+
+    seen: list[object] = []
+
+    class AskedClient(FakeTelegramClient):
+        async def __call__(self, request: Any, *args: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs.get("flood_sleep_threshold"))
+            return await super().__call__(request, *args, **kwargs)
+
+    client = AskedClient(
+        history={CHANNEL_ID: _old_history()},
+        get_state_failure=(
+            errors.FloodWaitError(request=None, capture=30)
+            if failure == "wait"
+            else ConnectionError("the socket closed")
+        ),
+    )
+    local = NOW + timedelta(minutes=5)
+    with caplog.at_level(logging.WARNING):
+        started_at, _ = _start_and_report(tmp_path / "store.db", client, local)
+
+    assert started_at == local
+    assert seen == [0]
+    (warning,) = _clock_warnings(caplog)
+    text = warning.getMessage()
+    assert "this computer's clock" in text
+    if failure == "wait":
+        assert "Telegram asked watch to wait" in text
+    for word in ("Error", "Flood", "flood", "socket"):
+        assert word not in text, (word, text)

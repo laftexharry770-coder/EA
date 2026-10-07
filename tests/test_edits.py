@@ -1449,3 +1449,35 @@ def test_a_flood_wait_on_the_window_never_defers_the_forward_read(tmp_path: Path
     assert recovered == [("poll",)]
     assert reads_while_deferred == 0
     assert reads_after == 1
+
+
+def test_a_run_of_suspect_reads_is_said_in_the_window_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """While reads keep looking wrong, the poll says so every few seconds.
+    The window gets that line once per run of suspect reads (its CRITICAL
+    alert says what it means); the rest go to the log file only."""
+    db_path = tmp_path / "store.db"
+    client = ScriptedClient(history={A: _signals_and_chatter(5, 3)})
+
+    async def body(client, listener, time):
+        await _round(listener, time)
+        client.ids_answer = lambda result: [None] * len(result)
+        for _ in range(4):
+            await _round(listener, time)
+        client.ids_answer = None
+        await _round(listener, time)  # a good read: all there
+
+    with caplog.at_level(logging.INFO, logger=edits.__name__):
+        _run(db_path, body, client=client)
+
+    missing = [
+        r for r in caplog.records if r.name == edits.__name__ and "did not return" in r.getMessage()
+    ]
+    assert len(missing) == 4, [r.getMessage() for r in caplog.records]
+    shown = [r for r in missing if not getattr(r, db.FILE_ONLY_ATTRIBUTE, False)]
+    assert len(shown) == 1 and shown[0] is missing[0]
+    (normal,) = [r.getMessage() for r in caplog.records if "look normal again" in r.getMessage()]
+    for line in (shown[0].getMessage(), normal):
+        for word in ("re-read", "window", "pointer"):
+            assert word not in line, (word, line)
