@@ -575,6 +575,7 @@ def _new_alert_codes() -> list[str]:
         messages.ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED,
         edits.EDIT_COMPLETED_SIGNAL,
         edits.SIGNAL_REPOST_PROMOTED,
+        edits.SIGNAL_REPOST_ALREADY_LIVE,
         alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
     ]
 

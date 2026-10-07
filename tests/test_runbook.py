@@ -113,6 +113,7 @@ def test_the_runbook_explains_every_alert_the_fix_wave_added() -> None:
         messages_repo.ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED,
         edits_repo.EDIT_COMPLETED_SIGNAL,
         edits_repo.SIGNAL_REPOST_PROMOTED,
+        edits_repo.SIGNAL_REPOST_ALREADY_LIVE,
         alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
     ):
         assert f"- **{code}** — " in clearing, code

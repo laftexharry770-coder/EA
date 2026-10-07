@@ -410,7 +410,9 @@ async def _report_voids(
     and whether such a void happens at all depends only on which post of
     a relayed call was stored first (a copy's deletion is a repeat
     removal), so "check they really were deleted" would be noise that
-    comes and goes with storage order."""
+    comes and goes with storage order. So is a void whose standing repost
+    repeats another signal that already carried the same trade (final fix
+    FF12): the call is still queued, or traded, as that signal."""
     channel_id = channel_cfg.channel_id
     for d in deletions:
         if d.outcome == "voided" and d.promoted_signal_id is not None:
@@ -422,8 +424,22 @@ async def _report_voids(
                 d.signal_id,
                 d.promoted_signal_id,
             )
+        elif d.outcome == "voided" and d.carried_by_signal_id is not None:
+            logger.info(
+                "window re-read of channel %s (%s): signal %s voided, its call still carried "
+                "by signal %s (the same trade, which its standing repost repeats); not in the "
+                "void summary",
+                channel_id,
+                channel_cfg.name,
+                d.signal_id,
+                d.carried_by_signal_id,
+            )
     voided = [
-        d.signal_id for d in deletions if d.outcome == "voided" and d.promoted_signal_id is None
+        d.signal_id
+        for d in deletions
+        if d.outcome == "voided"
+        and d.promoted_signal_id is None
+        and d.carried_by_signal_id is None
     ]
     if not voided:
         return

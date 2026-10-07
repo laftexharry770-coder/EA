@@ -44,6 +44,30 @@ call with "CANCELLED" (which never shows it) -- and let the final
 withdrawal cancel a post too. They are families
 of their own (seeds 20000 + 1000 * channels + n and 26000 + n), so the
 scenarios the families above generate are exactly what they were.
+
+**Time that crosses the relay window** (final fix FF12). The families
+above tick 20 s per event, so no post is ever outside the 900 s window of
+another, and a promotion making a second live signal for a call another
+signal already carried -- a repost 890 s after the first post, a third
+post 910 s after it, the first post then withdrawn -- could not happen
+in them. The window-crossing family (seeds 90000 + 1000 * channels + n)
+ticks a random 20-500 s per event, and its worker takes only entries
+younger than Plan 1's 120 s age gate, as Plan 3 will. Two posts of the
+same trade more than 900 s apart are two calls by design (ruling
+d4c7d7a), so its no-double-trade check is per call:
+
+- **INV-3w.** No account holds (executed, in flight, or claimable while
+  younger than the age gate) entries of two signals of the same trade
+  whose own messages were posted within 900 s of each other.
+
+The window-crossing family reaches that scenario only rarely (seed 93195
+first, beyond the default seeds), so a pattern family (seeds 95000 +
+1000 * channels + n) builds it on purpose: the first post unexecuted,
+posts of the call on either side of the 900 s mark (by hand or forwards,
+on either channel, in a random order, some taken by the worker), then the
+first post deleted (event or window) or edited away (chatter, re-aimed,
+broken, cancelled), then every post withdrawn: INV-3w after every step,
+INV-1 at the end.
 """
 from __future__ import annotations
 
@@ -146,9 +170,17 @@ class _World:
     next_id: dict[int, int] = field(default_factory=lambda: dict(FIRST_ID))
     clock: datetime = POSTED
     log: list[str] = field(default_factory=list)
+    #: Seconds an event advances the clock: one value, or (the
+    #: window-crossing family) a random choice among several.
+    ticks: tuple[int, ...] = (20,)
+    tick_rng: random.Random | None = None
 
     def tick(self) -> datetime:
-        self.clock += timedelta(seconds=20)
+        if len(self.ticks) == 1:
+            step = self.ticks[0]
+        else:
+            step = self.tick_rng.choice(self.ticks)
+        self.clock += timedelta(seconds=step)
         return self.clock
 
     def name(self, key: tuple[int, int]) -> str:
@@ -377,6 +409,58 @@ def _no_double_trade(conn) -> list[str]:
     return problems
 
 
+#: The window-crossing family's clock steps, and Plan 1's age gate.
+CROSSING_TICKS = (20, 20, 60, 200, 400, 500)
+AGE_GATE = 120
+
+
+def _held_twice(world: _World) -> list[str]:
+    """INV-3w: per account, no two signals of the same trade (first trade
+    hash) whose own messages were posted within the relay window of each
+    other are both held -- executed, in flight, or claimable while younger
+    than the age gate."""
+    young = world.clock - timedelta(seconds=AGE_GATE)
+    held: dict[tuple[str, str], set[tuple[int, datetime]]] = {}
+    for row in world.conn.execute(
+        "SELECT o.account_id, o.state, s.signal_id, s.first_trade_hash, "
+        "  s.state = 'NEW' AND s.withdrawn_at_utc IS NULL AS live, m.posted_at_utc "
+        "FROM outbox o JOIN signals s ON s.signal_id = o.signal_id "
+        "JOIN messages m ON m.channel_id = s.channel_id AND m.message_id = s.message_id "
+        "WHERE o.kind = 'ENTRY'"
+    ).fetchall():
+        posted = datetime.fromisoformat(row["posted_at_utc"])
+        claimable = row["state"] == "QUEUED" and row["live"] and posted >= young
+        if row["state"] in ("DONE", "CLAIMED") or claimable:
+            held.setdefault((row["account_id"], row["first_trade_hash"]), set()).add(
+                (row["signal_id"], posted)
+            )
+    problems = []
+    for (account, _), signals in sorted(held.items()):
+        ordered = sorted(signals, key=lambda signal: signal[1])
+        for index, (first, first_at) in enumerate(ordered):
+            for second, second_at in ordered[index + 1:]:
+                if (second_at - first_at).total_seconds() <= WINDOW:
+                    problems.append(
+                        f"INV-3w: {account} holds signals {first} and {second} of one trade, "
+                        f"posted {(second_at - first_at).total_seconds():.0f} s apart"
+                    )
+    return problems
+
+
+def _take_young(world: _World) -> None:
+    """acct-1's worker takes every entry it can claim that is younger than
+    the age gate (Plan 3 skips the rest)."""
+    world.conn.execute(
+        "UPDATE outbox SET state = 'DONE' WHERE kind = 'ENTRY' AND account_id = 'acct-1' "
+        "AND state = 'QUEUED' AND signal_id IN (SELECT s.signal_id FROM signals s "
+        "  JOIN messages m ON m.channel_id = s.channel_id AND m.message_id = s.message_id "
+        "  WHERE s.state = 'NEW' AND s.withdrawn_at_utc IS NULL AND m.posted_at_utc >= ?)",
+        ((world.clock - timedelta(seconds=AGE_GATE)).isoformat(),),
+    )
+    world.conn.commit()
+    world.log.append("acct-1 takes its entries younger than the age gate")
+
+
 def _retracted(conn) -> list[str]:
     """INV-1, once every post is withdrawn."""
     problems = []
@@ -483,6 +567,98 @@ def _retraction_run(
         return [_crash(exc)], world.log
     finally:
         world.conn.close()
+
+
+def _crossing_run(seed: int, events: list[tuple], channels: int) -> tuple[list[str], list[str]]:
+    """One window-crossing scenario: the VIP's call, the events -- each
+    advancing the clock 20-500 s -- then every post withdrawn. INV-3w after
+    every step, INV-1 at the end. Returns (problems, log)."""
+    world = _World(_fresh(), ticks=CROSSING_TICKS, tick_rng=random.Random(seed * 7 + 1))
+    try:
+        world.store(_Post(0, world.new_id(0), SIGNAL_TEXT, world.clock))
+        world.log.append("post VIP/4001")
+        for op, event_seed in events:
+            rng = random.Random(event_seed)
+            if op == "post":
+                _post(world, rng, channels)
+            elif op == "forward":
+                _forward(world, rng, channels, cross_only=False)
+            elif op == "delete":
+                _delete(world, rng)
+            elif op == "edit":
+                _edit(world, rng)
+            elif op == "execute":
+                _take_young(world)
+            elif op == "read back":
+                _read_back(world, rng)
+            if problems := _held_twice(world):
+                return problems, [*world.log, f"(clock at +{_age(world)} s)"]
+        _withdraw_everything(world, random.Random(seed))
+        return _held_twice(world) + _retracted(world.conn), world.log
+    except Exception as exc:  # noqa: BLE001 -- reported with the seed and the events
+        return [_crash(exc)], world.log
+    finally:
+        world.conn.close()
+
+
+def _pattern_events(rng: random.Random, channels: int) -> list[tuple]:
+    """For the pattern family: posts of the call around the 900 s mark,
+    some worker passes, then the first post withdrawn."""
+    times = [rng.randint(850, 899), rng.randint(901, 950)]
+    times += [rng.randint(1, 1000) for _ in range(rng.randint(0, 2))]
+    events: list[tuple] = []
+    for at in sorted(times):
+        events.append(("post", at, rng.randrange(channels), rng.random() < 0.3))
+        if rng.random() < 0.25:
+            events.append(("execute", at + 1))
+    end = max(times) + rng.randint(1, 30)
+    events.append(("withdraw", end, rng.choice(["event", "window", "CHAT", "SELL", "BROKEN",
+                                                 "CANCEL"])))
+    if rng.random() < 0.5:
+        events.append(("execute", end + 1))
+    return events
+
+
+def _pattern_run(seed: int, events: list[tuple]) -> tuple[list[str], list[str]]:
+    """One pattern scenario (`_pattern_events`) after the VIP's call at
+    +0 s, then every post withdrawn. Returns (problems, log)."""
+    world = _World(_fresh())
+    try:
+        world.store(_Post(0, world.new_id(0), SIGNAL_TEXT, world.clock))
+        world.log.append("post VIP/4001 at +0 s")
+        for event in events:
+            world.clock = POSTED + timedelta(seconds=event[1])
+            if event[0] == "post":
+                _, at, channel, forwarded = event
+                post = _Post(
+                    channel, world.new_id(channel), SIGNAL_TEXT, world.clock,
+                    (0, 4001) if forwarded else None,
+                )
+                world.store(post)
+                what = "forward of VIP/4001" if forwarded else "post"
+                world.log.append(f"{what} {world.name((channel, post.message_id))} at +{at} s")
+            elif event[0] == "execute":
+                _take_young(world)
+            else:
+                _, at, how = event
+                if (0, 4001) not in world.standing():
+                    continue
+                if how in ("event", "window"):
+                    world.delete([(0, 4001)], by=how)
+                else:
+                    world.edit((0, 4001), how)
+            if problems := _held_twice(world):
+                return problems, world.log
+        _withdraw_everything(world, random.Random(seed))
+        return _held_twice(world) + _retracted(world.conn), world.log
+    except Exception as exc:  # noqa: BLE001 -- reported with the seed and the events
+        return [_crash(exc)], world.log
+    finally:
+        world.conn.close()
+
+
+def _age(world: _World) -> int:
+    return int((world.clock - POSTED).total_seconds())
 
 
 def _retraction_events(rng: random.Random, *, cancel: bool = False) -> list[tuple]:
@@ -666,4 +842,41 @@ def test_which_post_is_stored_first_never_changes_what_a_cancel_does(seeds):
             )
             problems, log = _order_problems(base, forwards, small, cancel=True)
             failures.append(_report("order with cancels", base, problems, log))
+    assert not failures, "\n\n".join(failures)
+
+
+@pytest.mark.parametrize("seeds", _blocks(), ids=lambda r: f"seeds{r.start}-{r.stop - 1}")
+@pytest.mark.parametrize("channels", [1, 2], ids=["one-channel", "two-channels"])
+def test_a_call_posted_across_the_relay_window_is_never_traded_twice(channels, seeds):
+    """INV-3w and INV-1 with time crossing the 900 s relay window (final
+    fix FF12): posts of one call on either side of the window, the first
+    one unexecuted and then withdrawn, never give one account two entries
+    of the same call."""
+    failures = []
+    for seed in seeds:
+        base = 90000 + 1000 * channels + seed
+        events = _retraction_events(random.Random(base))
+        problems, log = _crossing_run(base, events, channels)
+        if problems:
+            small = _shrink(lambda e: bool(_crossing_run(base, e, channels)[0]), events)
+            problems, log = _crossing_run(base, small, channels)
+            failures.append(_report(f"window crossing ({channels} channel(s))", base, problems, log))
+    assert not failures, "\n\n".join(failures)
+
+
+@pytest.mark.parametrize("seeds", _blocks(), ids=lambda r: f"seeds{r.start}-{r.stop - 1}")
+@pytest.mark.parametrize("channels", [1, 2], ids=["one-channel", "two-channels"])
+def test_posts_on_either_side_of_the_window_then_the_first_withdrawn_trade_once(channels, seeds):
+    """INV-3w and INV-1 on the pattern of final fix FF12, built on purpose:
+    the first post unexecuted, posts of the call on either side of the
+    900 s mark, then the first post withdrawn."""
+    failures = []
+    for seed in seeds:
+        base = 95000 + 1000 * channels + seed
+        events = _pattern_events(random.Random(base), channels)
+        problems, log = _pattern_run(base, events)
+        if problems:
+            small = _shrink(lambda e: bool(_pattern_run(base, e)[0]), events)
+            problems, log = _pattern_run(base, small)
+            failures.append(_report(f"window pattern ({channels} channel(s))", base, problems, log))
     assert not failures, "\n\n".join(failures)

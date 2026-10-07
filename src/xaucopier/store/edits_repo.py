@@ -138,6 +138,15 @@ The post that closed one of the chain's signals stays with that signal.
   either (ruling R5-3): a reply to it reaches the promoted signal too --
   unless it was re-aimed to another call, when it stays with the signal
   it closed (ruling R4-4; `relay_repo.kept_closer`).
+  Nothing is promoted when the same trade is already live, queued or
+  traded as another signal, posted within the relay window of that
+  repost (final fix FF12, ruling P2 "one live signal per call";
+  `relay_repo.carrier_of_trade`): the window is measured from each
+  signal's own message, so a call posted again 890 s and 910 s after its
+  first post has a copy of the first and a signal of its own. The repost,
+  and every other copy and follow-up of the withdrawn call, then repeat
+  that signal (`relay_repo.record_carried`), and a WARNING
+  `SIGNAL_REPOST_ALREADY_LIVE` names it.
   Never promoted: a repost of an executed
   signal (trading it would open the trade twice), and a post on any other
   channel. (A repost posted *after* the withdrawal is not a copy at all:
@@ -293,6 +302,10 @@ SIGNAL_REPEAT_REMOVED = "SIGNAL_REPEAT_REMOVED"
 #: channel still showed the same call in another post: that post is now the
 #: signal, queued for trading (final review F04).
 SIGNAL_REPOST_PROMOTED = "SIGNAL_REPOST_PROMOTED"
+#: WARNING: as SIGNAL_REPOST_PROMOTED, but the same trade was already live,
+#: queued or traded as another signal: the standing post now repeats that
+#: signal, and nothing more is queued (final fix FF12).
+SIGNAL_REPOST_ALREADY_LIVE = "SIGNAL_REPOST_ALREADY_LIVE"
 #: CRITICAL: an older post of a call -- stored with a signal of it that
 #: another post had withdrawn, before the call was posted again -- was
 #: deleted or edited away, and that voided the call's newest signal. It may
@@ -430,6 +443,9 @@ class EditResult:
     reversed_deletion: bool = False
     #: The withdrawn signal's standing repost this change promoted, if any.
     promoted_signal_id: int | None = None
+    #: The signal that already carried the withdrawn signal's call, which
+    #: its standing repost now repeats instead of being promoted (FF12).
+    carried_by_signal_id: int | None = None
 
     @property
     def changed(self) -> bool:
@@ -448,6 +464,8 @@ class DeletionResult:
     alert_ids: tuple[int, ...]
     #: The withdrawn signal's standing repost this deletion promoted, if any.
     promoted_signal_id: int | None = None
+    #: The signal that already carried the withdrawn signal's call (FF12).
+    carried_by_signal_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1255,7 +1273,7 @@ def _invalidate(
         new_kind,
         reason,
         alert_ids=(alert, *_alerts_of(promoted)),
-        promoted_signal_id=_signal_of(promoted),
+        promoted=promoted,
     )
 
 
@@ -1595,7 +1613,7 @@ def _withdraw_signal(
             via,
             alert_ids=(alert, *_alerts_of(promoted)),
             skipped=skipped,
-            promoted_signal_id=_signal_of(promoted),
+            promoted=promoted,
         )
     alert = ctx.alert(
         "CRITICAL",
@@ -1608,9 +1626,7 @@ def _withdraw_signal(
     return ctx.result("flagged", new_kind, via, alert_ids=(alert,), skipped=skipped)
 
 
-def _promote_repost(
-    ctx: _Ctx, withdrawn: sqlite3.Row
-) -> tuple[int, tuple[int, ...]] | None:
+def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> _Promotion | None:
     """`withdrawn`'s own message -- `ctx`'s post -- was withdrawn (deleted,
     edited into something else, re-aimed or broken) before anything was
     executed, while its channel still shows the same call in another
@@ -1622,69 +1638,148 @@ def _promote_repost(
     this same writer job, unlinked, and announced with a WARNING naming
     both messages. Every other copy of the call now repeats it,
     and `relay_repo.record_replacement` moves the call's follow-ups to
-    it. Only ever on the signal's own channel (ruling R3-P1). Returns
-    (new signal id, alert ids) or None."""
-    conn = ctx.conn
-    old_id = withdrawn["signal_id"]
+    it. Only ever on the signal's own channel (ruling R3-P1).
+
+    Unless the same trade is already live, queued or traded as another
+    signal posted within the relay window of that post
+    (`relay_repo.carrier_of_trade`, final fix FF12): then nothing is
+    promoted and nothing queued -- the post, and every other copy and
+    follow-up of the withdrawn call, repeat that signal
+    (`_join_carrier`). Returns what was done, or None."""
     # Never the post that withdrew the call, a post deleted in the same
     # report, one that no longer shows the call, or one with a signals row
     # of its own (`_standing_others`, `_promotable`).
-    for repost, routed in _promotable(ctx, _standing_others(ctx, withdrawn)):
-        new_id = signals_repo.insert_signal(
-            conn,
-            channel_id=ctx.channel_id,
-            message_id=repost["message_id"],
-            signal=routed.signal,
-            promoted_from_signal_id=old_id,
-            replacement_kind="promoted",
+    promotable = _promotable(ctx, _standing_others(ctx, withdrawn))
+    if not promotable:
+        return None
+    repost, routed = promotable[0]
+    conn = ctx.conn
+    carrier = relay_repo.carrier_of_trade(
+        conn,
+        trade_hashes=(
+            routed.signal.content_hash,
+            withdrawn["trade_hash"],
+            withdrawn["first_trade_hash"],
+        ),
+        posted_at_utc=relay_repo.posted_at(
+            conn, channel_id=ctx.channel_id, message_id=repost["message_id"]
+        ),
+    )
+    if carrier is not None:
+        return _join_carrier(ctx, withdrawn, repost, carrier)
+    old_id = withdrawn["signal_id"]
+    new_id = signals_repo.insert_signal(
+        conn,
+        channel_id=ctx.channel_id,
+        message_id=repost["message_id"],
+        signal=routed.signal,
+        promoted_from_signal_id=old_id,
+        replacement_kind="promoted",
+    )
+    queued = outbox.fan_out_checked(
+        conn,
+        kind="ENTRY",
+        signal_id=new_id,
+        followup_id=None,
+        accounts=ctx.accounts,
+        now_utc=ctx.now_utc,
+    )
+    conn.execute(
+        "UPDATE messages SET relay_of_signal_id = NULL WHERE channel_id = ? AND message_id = ?",
+        (ctx.channel_id, repost["message_id"]),
+    )
+    # Every other copy of the call, on any channel, now repeats the
+    # promoted signal -- not the post that withdrew it, which keeps
+    # naming the signal it closed. The call never stopped: none of them
+    # is an older post of a withdrawn call (ruling R4-1).
+    conn.execute(
+        "UPDATE messages SET relay_of_signal_id = ? "
+        "WHERE relay_of_signal_id = ? AND deleted_at_utc IS NULL "
+        "  AND NOT (channel_id = ? AND message_id = ?)",
+        (new_id, old_id, ctx.channel_id, ctx.message_id),
+    )
+    replaced = relay_repo.record_replacement(
+        conn, new_signal_id=new_id, replaced_signal_id=old_id, now_utc=ctx.now_utc
+    )
+    alert = ctx.alert(
+        "WARNING",
+        SIGNAL_REPOST_PROMOTED,
+        f"message {ctx.message_id} withdrew signal {old_id} before anything was "
+        f"executed, but the same call posted again as message {repost['message_id']} on "
+        f"this channel still stands: it is now signal {new_id}, and {queued} trade "
+        f"entr{'y is' if queued == 1 else 'ies are'} queued for it. If the poster meant to "
+        "cancel the call altogether, check the channel.",
+        signal_id=new_id,
+        message_id=repost["message_id"],
+    )
+    logger.warning(
+        "channel %s: repost %s promoted to signal %s after signal %s (message %s) was "
+        "withdrawn",
+        ctx.channel_id,
+        repost["message_id"],
+        new_id,
+        old_id,
+        ctx.message_id,
+    )
+    return _Promotion(new_id, (alert, *replaced), promoted=True)
+
+
+def _join_carrier(
+    ctx: _Ctx, withdrawn: sqlite3.Row, repost: sqlite3.Row, carrier: sqlite3.Row
+) -> _Promotion:
+    """For `_promote_repost`: the standing `repost` of withdrawn signal
+    `withdrawn`'s call is NOT promoted -- the same trade is already
+    `carrier`, another signal (final fix FF12). The repost and the
+    withdrawn call's other copies and follow-ups repeat `carrier` now
+    (`relay_repo.record_carried`), and a WARNING names it."""
+    conn = ctx.conn
+    old_id, carrier_id = withdrawn["signal_id"], carrier["signal_id"]
+    relay_repo.record_carried(
+        conn,
+        carrier_signal_id=carrier_id,
+        withdrawn_signal_id=old_id,
+    )
+    status = trade_status(conn, signal_id=carrier_id)
+    (queued,) = conn.execute(
+        "SELECT COUNT(*) FROM outbox WHERE kind = 'ENTRY' AND signal_id = ? AND state = 'QUEUED'",
+        (carrier_id,),
+    ).fetchone()
+    if status == "executed":
+        already = f"already traded as signal {carrier_id}"
+    elif status == "in_flight":
+        already = f"already being traded as signal {carrier_id}"
+    elif queued:
+        already = (
+            f"already queued as signal {carrier_id} ({queued} trade "
+            f"entr{'y is' if queued == 1 else 'ies are'} waiting for it)"
         )
-        queued = outbox.fan_out_checked(
-            conn,
-            kind="ENTRY",
-            signal_id=new_id,
-            followup_id=None,
-            accounts=ctx.accounts,
-            now_utc=ctx.now_utc,
-        )
-        conn.execute(
-            "UPDATE messages SET relay_of_signal_id = NULL WHERE channel_id = ? AND message_id = ?",
-            (ctx.channel_id, repost["message_id"]),
-        )
-        # Every other copy of the call, on any channel, now repeats the
-        # promoted signal -- not the post that withdrew it, which keeps
-        # naming the signal it closed. The call never stopped: none of them
-        # is an older post of a withdrawn call (ruling R4-1).
-        conn.execute(
-            "UPDATE messages SET relay_of_signal_id = ? "
-            "WHERE relay_of_signal_id = ? AND deleted_at_utc IS NULL "
-            "  AND NOT (channel_id = ? AND message_id = ?)",
-            (new_id, old_id, ctx.channel_id, ctx.message_id),
-        )
-        replaced = relay_repo.record_replacement(
-            conn, new_signal_id=new_id, replaced_signal_id=old_id, now_utc=ctx.now_utc
-        )
-        alert = ctx.alert(
-            "WARNING",
-            SIGNAL_REPOST_PROMOTED,
-            f"message {ctx.message_id} withdrew signal {old_id} before anything was "
-            f"executed, but the same call posted again as message {repost['message_id']} on "
-            f"this channel still stands: it is now signal {new_id}, and {queued} trade "
-            f"entr{'y is' if queued == 1 else 'ies are'} queued for it. If the poster meant to "
-            "cancel the call altogether, check the channel.",
-            signal_id=new_id,
-            message_id=repost["message_id"],
-        )
-        logger.warning(
-            "channel %s: repost %s promoted to signal %s after signal %s (message %s) was "
-            "withdrawn",
-            ctx.channel_id,
-            repost["message_id"],
-            new_id,
-            old_id,
-            ctx.message_id,
-        )
-        return new_id, (alert, *replaced)
-    return None
+    else:
+        already = f"already signal {carrier_id} (none of its trade entries is waiting)"
+    alert = ctx.alert(
+        "WARNING",
+        SIGNAL_REPOST_ALREADY_LIVE,
+        f"message {ctx.message_id} withdrew signal {old_id} before anything was executed, "
+        f"and the same call posted again as message {repost['message_id']} on this channel "
+        f"still stands. That call is {already}: message {carrier['message_id']} on channel "
+        f"{carrier['channel_id']}. So no second signal was made and nothing more was queued; "
+        f"message {repost['message_id']} now repeats signal {carrier_id}. Do NOT trade it by "
+        "hand as well -- that would open the trade twice.",
+        signal_id=carrier_id,
+        message_id=repost["message_id"],
+    )
+    logger.warning(
+        "channel %s: repost %s not promoted after signal %s (message %s) was withdrawn: "
+        "the same trade is signal %s (channel %s message %s, trade status %s)",
+        ctx.channel_id,
+        repost["message_id"],
+        old_id,
+        ctx.message_id,
+        carrier_id,
+        carrier["channel_id"],
+        carrier["message_id"],
+        status,
+    )
+    return _Promotion(carrier_id, (alert,), promoted=False)
 
 
 def _call_row(ctx: _Ctx) -> sqlite3.Row | None:
@@ -1881,12 +1976,27 @@ def _repeat_removed(
     )
 
 
-def _alerts_of(promoted: tuple[int, tuple[int, ...]] | None) -> tuple[int, ...]:
-    return () if promoted is None else promoted[1]
+@dataclass(frozen=True, slots=True)
+class _Promotion:
+    """What `_promote_repost` did for a withdrawn signal's standing repost."""
+
+    signal_id: int
+    alert_ids: tuple[int, ...]
+    #: True: the repost became signal `signal_id`. False: the same trade was
+    #: already carried by signal `signal_id`, which the repost now repeats.
+    promoted: bool
 
 
-def _signal_of(promoted: tuple[int, tuple[int, ...]] | None) -> int | None:
-    return None if promoted is None else promoted[0]
+def _alerts_of(promoted: _Promotion | None) -> tuple[int, ...]:
+    return () if promoted is None else promoted.alert_ids
+
+
+def _signal_of(promoted: _Promotion | None) -> int | None:
+    return promoted.signal_id if promoted is not None and promoted.promoted else None
+
+
+def _carrier_of(promoted: _Promotion | None) -> int | None:
+    return promoted.signal_id if promoted is not None and not promoted.promoted else None
 
 
 def _edit_of_followup(ctx: _Ctx, route_result: RouteResult, new_hash: str) -> EditResult:
@@ -2452,6 +2562,7 @@ def _deletion_result(
         result.skipped,
         result.alert_ids,
         result.promoted_signal_id,
+        result.carried_by_signal_id,
     )
 
 
@@ -2528,7 +2639,7 @@ class _Ctx:
         amendments: tuple[int, ...] = (),
         alert_ids: tuple[int, ...] = (),
         skipped: int = 0,
-        promoted_signal_id: int | None = None,
+        promoted: _Promotion | None = None,
     ) -> EditResult:
         return EditResult(
             outcome=outcome,
@@ -2539,7 +2650,8 @@ class _Ctx:
             alert_ids=alert_ids,
             detail=detail,
             skipped=skipped,
-            promoted_signal_id=promoted_signal_id,
+            promoted_signal_id=_signal_of(promoted),
+            carried_by_signal_id=_carrier_of(promoted),
         )
 
 

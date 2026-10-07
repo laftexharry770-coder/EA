@@ -718,24 +718,7 @@ def record_replacement(
         for sid in earlier
         if not closed_by_promotion(conn, sid) and (closer := kept_closer(conn, sid)) is not None
     }
-    for followup in conn.execute(
-        "SELECT followup_id, channel_id, reply_to_message_id, resolution_path FROM followups "
-        f"WHERE edit_seq = 0 AND target_signal_id IN ({marks}) ORDER BY followup_id",
-        earlier,
-    ).fetchall():
-        if (followup["channel_id"], followup["reply_to_message_id"]) in kept:
-            continue  # about the signal that post closed (R4-4, R5-3)
-        path = followup["resolution_path"]
-        if path in (REPLY_PATH, RELAY_REPLY_PATH):
-            own = (followup["channel_id"], followup["reply_to_message_id"]) == (
-                new["channel_id"],
-                new["message_id"],
-            )
-            path = REPLY_PATH if own else RELAY_REPLY_PATH
-        conn.execute(
-            "UPDATE followups SET target_signal_id = ?, resolution_path = ? WHERE followup_id = ?",
-            (new_signal_id, path, followup["followup_id"]),
-        )
+    _move_followups(conn, earlier=earlier, new=new, kept=kept)
     held_back = conn.execute(
         "SELECT alert_id, channel_id, message_id, signal_id, acked FROM alerts "
         f"WHERE code = ? AND signal_id IN ({marks}) ORDER BY alert_id",
@@ -790,6 +773,111 @@ def record_replacement(
             )
         )
     return tuple(raised)
+
+
+def _move_followups(
+    conn: sqlite3.Connection,
+    *,
+    earlier: list[int],
+    new: sqlite3.Row,
+    kept: set[tuple[int, int]],
+) -> None:
+    """Every follow-up that targeted one of the `earlier` signals of a call
+    targets signal `new` now (path `'reply'` when it replies to `new`'s own
+    message, `'relay-reply'` for any other post) -- except one replying to
+    a post in `kept`, which stays with the signal that post closed (rulings
+    R4-4, R5-3)."""
+    marks = ", ".join("?" for _ in earlier)
+    for followup in conn.execute(
+        "SELECT followup_id, channel_id, reply_to_message_id, resolution_path FROM followups "
+        f"WHERE edit_seq = 0 AND target_signal_id IN ({marks}) ORDER BY followup_id",
+        earlier,
+    ).fetchall():
+        if (followup["channel_id"], followup["reply_to_message_id"]) in kept:
+            continue  # about the signal that post closed (R4-4, R5-3)
+        path = followup["resolution_path"]
+        if path in (REPLY_PATH, RELAY_REPLY_PATH):
+            own = (followup["channel_id"], followup["reply_to_message_id"]) == (
+                new["channel_id"],
+                new["message_id"],
+            )
+            path = REPLY_PATH if own else RELAY_REPLY_PATH
+        conn.execute(
+            "UPDATE followups SET target_signal_id = ?, resolution_path = ? WHERE followup_id = ?",
+            (new["signal_id"], path, followup["followup_id"]),
+        )
+
+
+def carrier_of_trade(
+    conn: sqlite3.Connection,
+    *,
+    trade_hashes: Iterable[str],
+    posted_at_utc: datetime,
+    window: int = RELAY_WINDOW_SECONDS,
+) -> sqlite3.Row | None:
+    """For a promotion (`edits_repo._promote_repost`, final fix FF12): the
+    signal that already carries the trade a standing repost of a withdrawn
+    signal shows -- the newest signal (`live_signal_for`) of a call
+    sharing one of `trade_hashes` (current or first accepted) whose own
+    message was posted within `window` seconds of `posted_at_utc`, the
+    repost's own time, and which is not withdrawn-unexecuted: live,
+    queued, in flight or traded. Exactly what that repost would repeat if
+    it were stored now (`relay_of_signal`: "a live call wins"). The window
+    is measured from each signal's own message, so a call posted 890 s and
+    910 s after its first post has a copy of the first and a signal of its
+    own, and promoting the copy would open the same trade twice (ruling
+    P2). The withdrawn signal's own chain is never named: by then every
+    signal of it is withdrawn and unexecuted. None when no signal carries
+    the trade."""
+    for trade_hash in dict.fromkeys(trade_hashes):
+        for candidate in _same_trade(
+            conn, trade_hash=trade_hash, posted_at_utc=posted_at_utc, window=window
+        ):
+            newest = _signal_row(conn, live_signal_for(conn, candidate["signal_id"]))
+            if not is_withdrawn_unexecuted(conn, newest):
+                return newest
+    return None
+
+
+def record_carried(
+    conn: sqlite3.Connection,
+    *,
+    carrier_signal_id: int,
+    withdrawn_signal_id: int,
+) -> None:
+    """Signal `withdrawn_signal_id` was withdrawn before anything of it was
+    executed while its channel still shows its call in a standing repost,
+    and that call is already carried by signal `carrier_signal_id`
+    (`carrier_of_trade`): nothing is promoted (final fix FF12). Every
+    copy of the withdrawn signal -- that repost included, on any channel,
+    and one deleted before, which a window read may still read back --
+    repeats the carrier now, as every copy of a promoted repost's call
+    reaches it through `live_signal_for` (the post that withdrew it is
+    the signal's own message, no copy), and every follow-up that targeted one of the withdrawn
+    call's signals targets the carrier, as `record_replacement` moves them
+    to a promoted repost: the call never stopped (ruling R5-3), so a reply
+    to the post that withdrew it follows the call too."""
+    carrier = _signal_row(conn, carrier_signal_id)
+    earlier = chain_ids(conn, withdrawn_signal_id)
+    conn.execute(
+        "UPDATE messages SET relay_of_signal_id = ? WHERE relay_of_signal_id = ?",
+        (carrier_signal_id, withdrawn_signal_id),
+    )
+    kept = {
+        post
+        for sid in earlier
+        if sid != withdrawn_signal_id and (post := kept_closer(conn, sid)) is not None
+    }
+    _move_followups(conn, earlier=earlier, new=carrier, kept=kept)
+    logger.info(
+        "withdrawn signal %s: its call is carried by signal %s (channel %s message %s); its "
+        "copies and follow-ups repeat that signal now (the call's earlier signals: %s)",
+        withdrawn_signal_id,
+        carrier_signal_id,
+        carrier["channel_id"],
+        carrier["message_id"],
+        earlier,
+    )
 
 
 def _release_closers_showing_call(

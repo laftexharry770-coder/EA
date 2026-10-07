@@ -206,6 +206,10 @@ missed. Once you have dealt with one, clear it:
   while the channel still showed the same call in another post. That other
   post is now the signal. Nothing to do, unless the poster meant to cancel
   the call altogether: then check the channel.
+- **SIGNAL_REPOST_ALREADY_LIVE** — as above, but the same trade was already
+  waiting, or already traded, as another signal (the alert names it). That
+  other post now repeats it, and nothing more was queued. Nothing to do: do
+  not trade the call by hand as well, which would open it twice.
 - **CHANNEL_OFF_ENTRIES_SKIPPED** — `watch` started with a channel switched
   off that still had signals waiting to be traded; they were cancelled, not
   traded. That is what switching a channel off does (see below). Nothing to
