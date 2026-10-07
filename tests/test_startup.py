@@ -638,7 +638,7 @@ class _WaitUnsaidClient(FakeTelegramClient):
     ("client", "after"),
     [
         (_WaitAskedClient(900), NOW + timedelta(seconds=900)),
-        (_WaitUnsaidClient(), NOW + listener_module.UNSAID_START_WAIT),
+        (_WaitUnsaidClient(), NOW + timedelta(minutes=5)),  # "a few minutes"
     ],
     ids=["fifteen-minutes", "no-length-given"],
 )

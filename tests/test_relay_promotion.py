@@ -293,7 +293,10 @@ def test_a_call_already_executed_as_another_signal_is_not_opened_again(
     assert result.carried_by_signal_id == 2
     done = sorted((account, signal) for account, signal, state in acted if state == "DONE")
     assert done == [("acct-1", 2), ("acct-2", 2)]
-    assert "already traded as signal 2" in _detail(conn, edits_repo.SIGNAL_REPOST_ALREADY_LIVE)
+    detail = _detail(conn, edits_repo.SIGNAL_REPOST_ALREADY_LIVE)
+    assert "already traded as signal 2" in detail
+    # Traded, with nothing left waiting: trading it by hand would open it twice.
+    assert "Do NOT trade it by hand as well" in detail
 
 
 # -- end to end: the real listener, poll and writer -----------------------------
@@ -685,7 +688,11 @@ def test_a_signal_traded_before_its_channel_was_switched_off_still_carries_the_c
     result = _withdraw(conn, "event")
 
     assert (result.promoted_signal_id, result.carried_by_signal_id) == (None, 2)
-    assert words in _detail(conn, edits_repo.SIGNAL_REPOST_ALREADY_LIVE)
+    detail = _detail(conn, edits_repo.SIGNAL_REPOST_ALREADY_LIVE)
+    assert words in detail
+    # Nothing waits for signal 2, but it is traded or being traded: by hand
+    # as well would open it twice.
+    assert "Do NOT trade it by hand as well" in detail
     assert _q(conn, "SELECT COUNT(*) FROM outbox WHERE state = 'QUEUED'") == [(0,)]
 
 
