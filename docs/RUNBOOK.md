@@ -263,9 +263,11 @@ Signals can come from more than one Telegram channel, and you choose which.
 - **If it says the time it was switched off could not be saved** (the
   database was busy or could not be used), the channel is still switched
   off. If the database was busy, run the same `.\xaucopier channels off 2`
-  again in a moment: it then saves the time (and says so). Until it is
-  saved, when you switch it back on, everything it posted since `watch`
-  last read it is skipped, not only what it posted while it was off.
+  again in a moment: it then saves the time you run it (and says so) —
+  also when you had switched the channel off and on before without
+  `watch` running since. Until it is saved, switching it back on skips
+  more than what it posted while it was off: everything it posted since
+  `watch` last read it, or since you last switched it off before.
 - **Add a new channel:** first **join it in Telegram** on your phone. Then
   stop `watch` (click in its window, press **Ctrl+C** and answer **Y**) and
   type `.\xaucopier channels add`. Paste the channel's link, or just press

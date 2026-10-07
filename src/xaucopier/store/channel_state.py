@@ -315,17 +315,24 @@ def record_missing_switch_off(
     conn: sqlite3.Connection, *, channel_id: int, off_at_utc: datetime
 ) -> bool:
     """`channels off` for a channel already OFF (final fix FF11): when its
-    reading has started and it has no OFF period at all -- the switch-off's
+    reading has started and it has no OPEN OFF period -- the switch-off's
     time was never saved (the database was busy then, or the file was
     edited by hand) -- open one at `off_at_utc` (whole seconds), so the
     next `channels on` skips from here rather than re-seeding (everything
-    since the last read). Later than the real switch-off, so a little more
-    is read, never less. A period already there is kept as it is. Returns
-    whether one was opened."""
+    since the last read) or extending an earlier period over the time the
+    channel was ON (round 2: a closed period no watch has skipped yet
+    does not count). Later than the real switch-off, so a little more is
+    read, never less. An open period is kept as it is. Returns whether one
+    was opened.
+
+    The cost: a `channels on` whose save failed left the channel OFF with
+    its period closed, and an `off` then opens a second one -- the time in
+    between is read, not skipped. More is read, never less."""
     if not reading_started(read(conn, channel_id)):
         return False
     if conn.execute(
-        "SELECT 1 FROM channel_off_periods WHERE channel_id = ? LIMIT 1", (channel_id,)
+        "SELECT 1 FROM channel_off_periods WHERE channel_id = ? AND on_at_utc IS NULL LIMIT 1",
+        (channel_id,),
     ).fetchone() is not None:
         return False
     conn.execute(

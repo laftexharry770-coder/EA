@@ -75,7 +75,10 @@ def test_the_runbook_says_what_the_user_must_know() -> None:
         "whatever it posted **before you\n  switched it off** that `watch` had not read yet",
         "it made while it was off are skipped, and everything from the moment you\n  switched it on is read",
         "each time it was off is\n  skipped, and only that",
-        "everything it posted since `watch`\n  last read it is skipped",
+        # Final fix round 2 (FF11 case B): the re-run saves it then too.
+        "it then saves the time you run it (and says so) —\n  also when you had switched the "
+        "channel off and on before",
+        "switching it back on skips\n  more than what it posted while it was off",
         # F05: a group is not a channel.
         "anyone in it can post, and **every member's message would be",
         # F27: the Telegram id is not the channel number.

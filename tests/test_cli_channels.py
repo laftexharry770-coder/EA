@@ -1688,6 +1688,46 @@ def test_off_again_after_a_busy_database_saves_when_it_was_switched_off(
     assert rig.channels_path.read_bytes() != before
 
 
+def test_off_again_after_a_busy_database_saves_it_though_an_earlier_period_waits(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final fix round 2 (FF11 case B). An earlier `off`/`on` left a closed
+    OFF period no watch has skipped yet. Then `off` with the database busy:
+    the advised re-run answered "already OFF. Nothing was changed." -- it
+    saved only when there was no period at all -- and the next `on`
+    extended the old period across the hour the channel was ON, so what it
+    posted then was skipped. The re-run saves the switch-off whenever no
+    period is OPEN; the hour it was ON is read."""
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    _at(monkeypatch, NOW)
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    _at(monkeypatch, NOW + timedelta(minutes=10))
+    assert cli_main.main(rig.argv("on", "7")) == exit_codes.EXIT_OK
+    _at(monkeypatch, NOW + timedelta(minutes=60))
+    holder = _hold(rig.db_path, monkeypatch)
+    try:
+        assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    finally:
+        holder.rollback()
+        holder.close()
+    out = capsys.readouterr().out
+    assert "Run `.\\xaucopier channels off 7` again in a moment to save it" in out
+
+    _at(monkeypatch, NOW + timedelta(minutes=61))
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "When it was switched off had not been saved; it is saved now" in out
+    assert "Nothing was changed" not in out
+    _at(monkeypatch, NOW + timedelta(minutes=90))
+    assert cli_main.main(rig.argv("on", "7")) == exit_codes.EXIT_OK
+    assert _periods(rig.db_path, GOLD) == [
+        ("2026-09-23T12:00:00+00:00", "2026-09-23T12:10:00+00:00"),
+        ("2026-09-23T13:01:00+00:00", "2026-09-23T13:30:00+00:00"),
+    ]
+    assert _state_row(rig.db_path, GOLD)[2] is None  # no re-seed
+
+
 def test_off_of_a_channel_already_off_keeps_the_time_it_was_switched_off(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1706,12 +1746,16 @@ def test_off_of_a_channel_already_off_keeps_the_time_it_was_switched_off(
     assert _periods(rig.db_path, GOLD) == [("2026-09-23T12:00:00+00:00", None)]
 
 
-def test_off_of_a_channel_left_off_by_an_on_not_saved_adds_no_period(
+def test_off_of_a_channel_left_off_by_an_on_not_saved_reads_more_never_less(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """An `on` whose save failed left the channel OFF with its period
-    closed; the next `on` extends that period. `off` meanwhile keeps it:
-    a second period would read what it posted in between."""
+    closed. In the database that looks exactly like FF11 case B (an
+    `off`/`on` saved, then an `off` whose time was not), so `off` now
+    saves a switch-off whenever no period is open (final fix round 2): a
+    second period. The hour between the two is read although the channel
+    was OFF -- more is read, never less; the other way skipped an hour the
+    channel was ON."""
     _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
     _at(monkeypatch, NOW)
     assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
@@ -1724,9 +1768,12 @@ def test_off_of_a_channel_left_off_by_an_on_not_saved_adds_no_period(
 
     assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
 
-    assert capsys.readouterr().out == "Channel 7 (Gold Room) is already OFF. Nothing was changed.\n"
+    assert "it is saved now" in capsys.readouterr().out
+    _at(monkeypatch, NOW + timedelta(hours=3))
+    assert cli_main.main(rig.argv("on", "7")) == exit_codes.EXIT_OK
     assert _periods(rig.db_path, GOLD) == [
-        ("2026-09-23T12:00:00+00:00", "2026-09-23T13:00:00+00:00")
+        ("2026-09-23T12:00:00+00:00", "2026-09-23T13:00:00+00:00"),
+        ("2026-09-23T14:00:00+00:00", "2026-09-23T15:00:00+00:00"),
     ]
 
 
