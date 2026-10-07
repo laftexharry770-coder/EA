@@ -187,7 +187,7 @@ def test_a_restart_after_a_run_whose_seed_never_succeeded_loses_nothing(
     clock["now"] = _at(300)
 
     async def run_2():
-        client = FakeTelegramClient(history={A: history})
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
         async with _watching(db_path, client, clock):
             return _anchor_queries(client)
 
@@ -316,7 +316,7 @@ def test_a_cutoff_with_a_fraction_of_a_second_cannot_block_a_channel_for_ever(
     history = [FakeMessage(id=1, message=CHATTER_TEXT, date=NOW - FIRST_RUN_SEED_MARGIN)]
 
     async def scenario():
-        client = FakeTelegramClient(history={A: history})
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
         async with _watching(db_path, client, clock) as (listener, time):
             clock["now"] = _at(30)
             with client.blackout():
@@ -353,7 +353,7 @@ def test_a_stored_cutoff_carrying_a_fraction_is_still_asked_in_whole_seconds(
     history = [FakeMessage(id=1, message=CHATTER_TEXT, date=offset)]
 
     async def scenario():
-        client = FakeTelegramClient(history={A: history})
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
         async with _watching(db_path, client, {"now": NOW}) as (listener, time):
             await _run_rounds(listener, time, rounds=2)
             return _anchor_queries(client), listener.handler_error_count
@@ -604,7 +604,7 @@ def test_a_re_seed_never_moves_the_pointer_backward(tmp_path: Path) -> None:
     ]
 
     async def scenario():
-        client = FakeTelegramClient(history={A: history})
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
         async with _watching(db_path, client, {"now": NOW}):
             return [c.min_id for c in client.get_messages_calls if c.reverse and c.min_id]
 
@@ -664,7 +664,7 @@ def test_two_off_periods_between_two_runs_are_each_skipped_exactly(
     history = _history((101, 6), (102, 4.5), (103, 3.5), (104, 2.5), (105, 1))
 
     async def scenario():
-        client = FakeTelegramClient(history={A: history})
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
         async with _watching(db_path, client, {"now": NOW}):
             return _anchor_queries(client)
 
@@ -704,7 +704,7 @@ def test_posts_within_a_minute_of_either_switch_are_read(tmp_path: Path) -> None
     )
 
     async def scenario():
-        async with _watching(db_path, FakeTelegramClient(history={A: history}), {"now": NOW}):
+        async with _watching(db_path, FakeTelegramClient(history={A: history}, server_time=NOW), {"now": NOW}):
             pass
 
     asyncio.run(scenario())
@@ -721,7 +721,7 @@ def test_the_read_up_to_a_switch_off_can_take_several_reads(tmp_path: Path) -> N
     history = _history((101, 4), (102, 4), (103, 4), (104, 4), (105, 4), (106, 2.5), (107, 1))
 
     async def scenario():
-        client = FakeTelegramClient(history={A: history})
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
         listener = Listener(
             client=client,
             channels=(CHANNEL_A,),
@@ -777,7 +777,7 @@ def test_a_post_before_the_switch_off_that_fails_holds_the_skip_back(
     monkeypatch.setattr(messages_repo, "ingest", flaky_ingest)
 
     async def scenario():
-        client = FakeTelegramClient(history={A: history})
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
         async with _watching(db_path, client, {"now": NOW}) as (listener, _time):
             first = (_stored_ids(db_path), _pointer(db_path), len(_periods_left(db_path)))
             fail.clear()
@@ -803,7 +803,7 @@ def test_a_first_read_pending_is_seeded_at_its_own_cutoff_before_the_period(
     history = _history((100, 30), (101, 4), (102, 2.5), (103, 1))
 
     async def scenario():
-        async with _watching(db_path, FakeTelegramClient(history={A: history}), {"now": NOW}):
+        async with _watching(db_path, FakeTelegramClient(history={A: history}, server_time=NOW), {"now": NOW}):
             pass
 
     asyncio.run(scenario())
@@ -822,7 +822,7 @@ def test_a_channel_that_posted_nothing_since_its_switch_off_is_done_with_it(
 
     async def scenario():
         history = _history((101, 4))
-        async with _watching(db_path, FakeTelegramClient(history={A: history}), {"now": NOW}):
+        async with _watching(db_path, FakeTelegramClient(history={A: history}, server_time=NOW), {"now": NOW}):
             pass
 
     asyncio.run(scenario())
@@ -844,10 +844,146 @@ def test_an_open_period_is_never_skipped(tmp_path: Path) -> None:
     history = _history((101, 4), (102, 2.5), (103, 1))
 
     async def scenario():
-        async with _watching(db_path, FakeTelegramClient(history={A: history}), {"now": NOW}):
+        async with _watching(db_path, FakeTelegramClient(history={A: history}, server_time=NOW), {"now": NOW}):
             pass
 
     asyncio.run(scenario())
 
     assert _stored_ids(db_path) == [101, 102, 103]
     assert len(_periods_left(db_path)) == 1
+
+
+# -- final fix FF8/FF17: OFF times are this computer's; posts are Telegram's ---------------
+
+
+def _stamp_period(db_path: Path, off_at: datetime, on_at: datetime) -> None:
+    """`channels off` then `channels on`, stamped at `off_at` and `on_at`
+    by this computer's clock, for channel A read before (pointer 100)."""
+    conn = db.connect(db_path, role="writer")
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_state (channel_id, last_processed_message_id, "
+            "seeded_at_utc) VALUES (?, 100, '2026-09-01T00:00:00+00:00')",
+            (A,),
+        )
+        channel_state.record_switch_off(conn, channel_id=A, off_at_utc=off_at)
+        channel_state.record_switch_on(
+            conn, channel_id=A, on_at_utc=on_at, may_replace_first_cutoff=True
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("skew", [-180, 180], ids=["clock-3-min-slow", "clock-3-min-fast"])
+def test_off_times_are_corrected_by_how_far_this_computers_clock_is_off(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, skew: int
+) -> None:
+    """Final fix FF8/FF17. `channels off`/`on` stamp this computer's clock;
+    the posts carry Telegram's. With the clock 3 minutes slow, a post made
+    90 s before the real switch-off (the channel still ON) was never read;
+    with it 3 minutes fast, a signal posted 90 s after the real switch-on
+    was never read -- the only trace a WARNING saying nothing is skipped.
+    watch measures the difference at start (Telegram's clock) and corrects
+    each OFF period by it: the post before the switch-off and the post
+    after the switch-on are read, what was posted while OFF is not, and
+    the warning names the difference."""
+    db_path = tmp_path / "store.db"
+    real_off, real_on = _hours_ago(3), _hours_ago(2)  # Telegram's time
+    clock_off = timedelta(seconds=skew)
+    _stamp_period(db_path, real_off + clock_off, real_on + clock_off)
+    history = [
+        FakeMessage(id=101, message=CHATTER_TEXT, date=real_off - timedelta(seconds=90)),
+        FakeMessage(id=102, message=CHATTER_TEXT, date=real_off + timedelta(minutes=30)),
+        FakeMessage(id=103, message=CHATTER_TEXT, date=real_on + timedelta(seconds=90)),
+    ]
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
+        async with _watching(db_path, client, {"now": NOW + clock_off}):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 103]
+    assert _periods_left(db_path) == []
+    (skipped,) = [r.getMessage() for r in caplog.records if "was switched off from" in r.getMessage()]
+    assert "180 seconds" in skipped
+    _assert_plain(skipped)
+    clock = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith("This computer's clock is")]
+    assert len(clock) == 1 and "so nothing is skipped" not in clock[0]
+
+
+def test_without_telegrams_clock_the_off_times_are_taken_as_they_are(tmp_path: Path) -> None:
+    """No answer from Telegram's clock: nothing to correct by -- the times
+    as stamped, give or take the minute's margin."""
+    db_path = tmp_path / "store.db"
+    _stamp_period(db_path, _hours_ago(3), _hours_ago(2))
+    history = _history((101, 3 + 30 / 3600), (102, 2.5), (103, 2 - 30 / 3600))
+
+    async def scenario():
+        client = FakeTelegramClient(
+            history={A: history}, get_state_failure=RuntimeError("no clock")
+        )
+        async with _watching(db_path, client, {"now": NOW}):
+            pass
+
+    asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 103]
+
+
+# -- final fix FF24: an OFF period closed while this watch runs is not this watch's -------
+
+
+def test_a_period_closed_while_this_watch_runs_is_left_to_the_next_start(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Final fix FF24. watch reads channels.toml only at start, so it keeps
+    reading a channel switched off and on while it runs. Its next read
+    applied that period anyway: a post the update stream dropped while the
+    channel was 'off' was skipped, and the window said "what it posted in
+    between was not read" -- untrue. A period closed after this watch
+    started is left to the next start; there everything is already read,
+    so nothing is skipped and no such line is shown."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path)
+    history = _history((101, 4))
+    clock = {"now": NOW}
+
+    async def first_run():
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
+        async with _watching(db_path, client, clock) as (listener, _time):
+            # `channels off` at +5 s and `on` at +10 min, while this runs; a
+            # post at +3 min whose live update was dropped.
+            _stamp_period(db_path, NOW + timedelta(seconds=5), NOW + timedelta(minutes=10))
+            client.history[A].append(
+                FakeMessage(id=102, message=SIGNAL_TEXT, date=NOW + timedelta(minutes=3))
+            )
+            clock["now"] = NOW + timedelta(minutes=11)
+            client.server_time = clock["now"]
+            await listener.read_history(CHANNEL_A, source="poll", limit=100,
+                                        rpc_timeout=RPC_TIMEOUT)
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        asyncio.run(first_run())
+
+    assert _stored_ids(db_path) == [101, 102]
+    assert len(_periods_left(db_path)) == 1  # the next start's
+    assert not [r for r in caplog.records if "was switched off from" in r.getMessage()]
+
+    caplog.clear()
+
+    async def second_run():
+        client = FakeTelegramClient(history={A: history}, server_time=clock["now"])
+        async with _watching(db_path, client, clock):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="xaucopier.ingest.listener"):
+        asyncio.run(second_run())
+
+    assert _stored_ids(db_path) == [101, 102]
+    assert _periods_left(db_path) == []
+    assert not [r for r in caplog.records if "was not read" in r.getMessage()]

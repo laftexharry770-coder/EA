@@ -2197,3 +2197,23 @@ def test_a_file_that_stays_locked_asks_to_run_the_command_again_not_to_fix_the_s
         assert wrong not in err
     monkeypatch.undo()
     assert rig.channels_path.read_bytes() == before
+
+
+def test_off_while_watch_runs_says_watch_keeps_reading_it_until_restarted(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final fix FF24: with watch running, `channels off` said what the
+    channel posts from now on "is never read, not even later" -- while the
+    running watch, which read the list at its start, keeps reading and
+    recording it. It now says so."""
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    rig.watch_running = True
+
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "never read" not in out
+    assert (
+        "watch is running and keeps reading this channel until you restart it" in out
+    )
+    assert "watch is running now" in out  # how to restart it

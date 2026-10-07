@@ -184,7 +184,8 @@ FIRST_RUN_SEED_MARGIN = timedelta(seconds=60)
 #: the switch-off, and from this long before the switch-on (fix round 2 of
 #: F28). `channels off`/`on` stamp this computer's clock, the posts carry
 #: Telegram's; a post made just before the switch-off is never lost to a
-#: clock a little behind.
+#: clock a little behind. A clock further off is corrected by the
+#: difference `start()` measures (final fix FF8/FF17).
 OFF_PERIOD_MARGIN = FIRST_RUN_SEED_MARGIN
 #: How long `start()` waits for Telegram's clock (`updates.GetState`)
 #: before it uses this computer's own (ledger 143).
@@ -693,6 +694,11 @@ class Listener:
         # seconds. The seed cutoff start() stores for a channel that needs
         # one; see `started_at`.
         self._started_at: datetime | None = None
+        # This computer's clock when start() began, and how far it was
+        # ahead of Telegram's (None: Telegram's clock was not read). The
+        # OFF periods `channels off`/`on` stamp are read by both (FF8, FF24).
+        self._local_start: datetime | None = None
+        self._clock_difference: timedelta | None = None
         # Channels already reported as having no messages at all, so the
         # report is logged once, not every round.
         self._reported_empty: set[int] = set()
@@ -1252,6 +1258,11 @@ class Listener:
                 pointer = seeded
             outcomes: list[HistoryIngest] = []
             for period in channel_state.off_periods(self.reader, channel_id):
+                if self._local_start is not None and period.on_at_utc > self._local_start:
+                    # Switched back on while this watch runs: it kept reading
+                    # the channel all along (it read the list at start), so
+                    # the period is the next start's (final fix FF24).
+                    break
                 caught_up, pointer, read = await self._read_until_switched_off(
                     channel_cfg, period, pointer, source=source, limit=limit,
                     rpc_timeout=rpc_timeout,
@@ -1259,7 +1270,9 @@ class Listener:
                 outcomes.extend(read)
                 if not caught_up:
                     return tuple(outcomes)  # the next read goes on from the pointer
-                pointer = await self._skip_while_off(channel_cfg, period, rpc_timeout=rpc_timeout)
+                pointer = await self._skip_while_off(
+                    channel_cfg, period, pointer, rpc_timeout=rpc_timeout
+                )
             messages = await asyncio.wait_for(
                 self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
                 rpc_timeout,
@@ -1288,7 +1301,7 @@ class Listener:
         batch, or a post that failed): the next read goes on from the
         pointer, and the period waits."""
         channel_id = channel_cfg.channel_id
-        last_read = period.off_at_utc + OFF_PERIOD_MARGIN
+        last_read = self._telegram_time(period.off_at_utc) + OFF_PERIOD_MARGIN
         messages = await asyncio.wait_for(
             self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
             rpc_timeout,
@@ -1312,15 +1325,24 @@ class Listener:
         return caught_up, pointer_now, read
 
     async def _skip_while_off(
-        self, channel_cfg: ChannelCfg, period: channel_state.OffPeriod, *, rpc_timeout: float
+        self,
+        channel_cfg: ChannelCfg,
+        period: channel_state.OffPeriod,
+        pointer_before: int,
+        *,
+        rpc_timeout: float,
     ) -> int:
         """The second range: skip what the channel posted while it was OFF.
         The pointer moves to the newest post dated before the switch-on
         (less `OFF_PERIOD_MARGIN`) -- one RPC, as a seed's anchor -- never
         down, and the period is deleted, in one writer job. Returns the
-        pointer."""
+        pointer. The window is told only when something was skipped: a
+        period whose posts were all read already (a watch was running)
+        skipped nothing (final fix FF24)."""
         channel_id = channel_cfg.channel_id
-        offset = (period.on_at_utc - OFF_PERIOD_MARGIN).replace(microsecond=0)
+        offset = (self._telegram_time(period.on_at_utc) - OFF_PERIOD_MARGIN).replace(
+            microsecond=0
+        )
         before_on = await asyncio.wait_for(
             self.client.get_messages(channel_id, limit=1, offset_date=offset), rpc_timeout
         )
@@ -1332,15 +1354,47 @@ class Listener:
             )
 
         pointer = await self._run_on_writer(finish)
+        if pointer <= pointer_before:
+            logger.info(
+                "Channel %s (%s) was switched off from %s to %s UTC; everything it posted "
+                "in that time had been read already.",
+                channel_id,
+                channel_cfg.name,
+                period.off_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                period.on_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            return pointer
         logger.warning(
             "Channel %s (%s) was switched off from %s to %s UTC: what it posted in between "
-            "was not read. Everything it posted before and since is read.",
+            "was not read. Everything it posted before and since is read.%s",
             channel_id,
             channel_cfg.name,
             period.off_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
             period.on_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
+            self._clock_note(),
         )
         return pointer
+
+    def _telegram_time(self, stamped: datetime) -> datetime:
+        """A time `channels off`/`on` stamped with this computer's clock,
+        on Telegram's clock -- the one the posts carry: less the difference
+        `start()` measured (final fix FF8/FF17), when it did."""
+        if self._clock_difference is None:
+            return stamped
+        return stamped - self._clock_difference
+
+    def _clock_note(self) -> str:
+        """For the OFF-period line: this computer's clock, when it is more
+        than `OFF_PERIOD_MARGIN` off, and that the times were corrected."""
+        difference = self._clock_difference
+        if difference is None or abs(difference) <= OFF_PERIOD_MARGIN:
+            return ""
+        return (
+            f" (Those times are this computer's, whose clock is "
+            f"{int(abs(difference).total_seconds())} seconds "
+            f"{'ahead of' if difference > timedelta(0) else 'behind'} Telegram's; watch "
+            "allowed for that.)"
+        )
 
     async def probe_writer(self) -> None:
         """Run a no-op (`SELECT 1`) on the writer thread and await it.
@@ -1708,6 +1762,7 @@ class Listener:
         if local_start.tzinfo is None or local_start.utcoffset() is None:
             raise ValueError(f"the injected clock returned a naive datetime: {local_start!r}")
         local_start = local_start.astimezone(UTC)
+        self._local_start = local_start
         self._writer_death = asyncio.get_running_loop().create_future()
 
         await self._start_writer_and_wait_for_connection()  # 0
@@ -1946,12 +2001,13 @@ class Listener:
             elapsed = max(answered_at - local_start, timedelta(0))
             telegram_start = telegram_now - elapsed
             difference = local_start - telegram_start
+            self._clock_difference = difference
             if abs(difference) > CLOCK_DIFFERENCE_WARNING:
                 logger.warning(
-                    "This computer's clock is %d seconds %s Telegram's. watch goes by the "
-                    "earlier of the two, so nothing is skipped, but please fix the clock: "
-                    "in Windows Settings > Time & language > Date & time, switch on 'Set "
-                    "time automatically'.",
+                    "This computer's clock is %d seconds %s Telegram's. watch allows for "
+                    "that when it decides where to start reading and when a channel was "
+                    "switched off, but please fix the clock: in Windows Settings > Time & "
+                    "language > Date & time, switch on 'Set time automatically'.",
                     int(abs(difference).total_seconds()),
                     "ahead of" if difference > timedelta(0) else "behind",
                 )

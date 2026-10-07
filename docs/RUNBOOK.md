@@ -246,7 +246,9 @@ Signals can come from more than one Telegram channel, and you choose which.
   it made while it was off are skipped, and everything from the moment you
   switched it on is read. (Give or take a minute at either end: your PC's
   clock and Telegram's are never exactly the same, so a post made within a
-  minute of a switch is read rather than lost.) Switching it off and on
+  minute of a switch is read rather than lost. If your PC's clock is
+  further off than that, `watch` measures by how much when it starts and
+  allows for it — and warns you to fix the clock.) Switching it off and on
   again several times before `watch` runs is fine: each time it was off is
   skipped, and only that.
 - **If it says the time it was switched off could not be saved** (the
@@ -275,7 +277,9 @@ changes, even when you add channels or switch them on and off.
 
 **A change takes effect the next time `watch` starts.** `watch` reads the
 list only when it starts. After switching a channel on or off, stop `watch`
-(**Ctrl+C**, then **Y**) and start it again with `.\xaucopier watch`. Adding a
+(**Ctrl+C**, then **Y**) and start it again with `.\xaucopier watch`. Until
+then, a running `watch` keeps reading a channel you switched off, and records
+what it posts. Adding a
 channel needs `watch` stopped anyway: only one program may use your Telegram
 login at a time.
 

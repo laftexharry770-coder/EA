@@ -392,15 +392,27 @@ def _off_lines(
     what it posted before is still read once it is back on; `problem`:
     that it could not be saved, and why (fix round 2 of F28;
     `_off_not_saved`)."""
-    lines = ["While it is off, this program does not read it at all."]
-    if recorded:
-        lines.append(
+    if session_in_use():
+        # watch read the list when it started: it keeps reading this
+        # channel, and recording what it posts, until restarted (FF24).
+        lines = [
+            "watch is running and keeps reading this channel until you restart it, and "
+            "records what it posts until then. From the restart until you switch it back "
+            "on, this program does not read it at all: what it posts then is skipped for "
+            "good."
+        ]
+    elif recorded:
+        lines = [
+            "While it is off, this program does not read it at all.",
             "What it posts from now until you switch it back on is never read, not even "
             "later. What it posted before now that watch has not read yet is still read "
-            "once it is back on."
-        )
+            "once it is back on.",
+        ]
     else:
-        lines.append("What it posts while it is off is never read, not even later.")
+        lines = [
+            "While it is off, this program does not read it at all.",
+            "What it posts while it is off is never read, not even later.",
+        ]
     if problem is not None:
         lines.append(problem)
     try:
