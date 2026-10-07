@@ -21,6 +21,7 @@ which already carries the call, and a WARNING names it.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -442,3 +443,38 @@ def test_a_repeat_deleted_before_reaches_the_signal_carrying_the_call(conn):  # 
     assert _withdraw(conn, "event").carried_by_signal_id == 2
 
     assert relay_repo.signal_for_post(conn, channel_id=V, message_id=4011) == 2
+
+
+# -- FF16: the promoted post keeps the stop the poster moved ----------------------
+
+
+@pytest.mark.parametrize("bump", [False, True], ids=["by-hand", "forward"])
+def test_the_promoted_repost_is_one_showing_the_calls_current_levels(conn, bump):  # noqa: F811
+    """Final fix FF16: the poster moved signal 1's stop (4470 -> 4460) by
+    an edit. An earlier repost (by hand, or the channel's own forward,
+    which Telegram never updates) still shows 4470; a later one shows
+    4460. Deleting the original promotes the one showing 4460 -- the
+    trade the poster means -- not the earliest; the other repeats it."""
+    _ingest(conn, VIP, CALL, posted=_at(10))
+    _ingest(conn, VIP, REPOST, posted=_at(15), fwd=(V, CALL) if bump else None)
+    _amend_call(conn, SL_EDIT, seconds=20)
+    _ingest(conn, VIP, REPOST_2, SL_EDIT, posted=_at(25))
+    assert (_link(conn, VIP, REPOST), _link(conn, VIP, REPOST_2)) == (1, 1)
+
+    result = _withdraw(conn, "event", seconds=30)
+
+    assert result.promoted_signal_id == 2
+    (row,) = _q(conn, "SELECT message_id, parsed_json FROM signals WHERE signal_id = 2")
+    assert row[0] == REPOST_2
+    assert json.loads(row[1])["sl"] == 4460
+    assert _link(conn, VIP, REPOST) == 2
+
+
+def test_with_no_repost_at_the_current_levels_the_earliest_is_promoted(conn):  # noqa: F811
+    _ingest(conn, VIP, CALL, posted=_at(10))
+    _ingest(conn, VIP, REPOST, posted=_at(15))
+    _ingest(conn, VIP, REPOST_2, posted=_at(25))
+    _amend_call(conn, SL_EDIT, seconds=30)
+
+    assert _withdraw(conn, "event", seconds=40).promoted_signal_id == 2
+    assert _q(conn, "SELECT message_id FROM signals WHERE signal_id = 2") == [(REPOST,)]

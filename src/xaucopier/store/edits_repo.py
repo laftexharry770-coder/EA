@@ -115,8 +115,8 @@ The post that closed one of the chain's signals stays with that signal.
   names the post still showing it, and the call stands. When the post
   that goes is the signal's own message and its channel still shows the
   call in another post: if nothing was executed, the signal is VOIDED
-  (INVALID for a re-aim or a break, with its CRITICAL alert) and the
-  earliest such post is promoted in its place (below); if it was, only
+  (INVALID for a re-aim or a break, with its CRITICAL alert) and
+  one such post is promoted in its place (below); if it was, only
   the WARNING -- the post was replaced, the trade continues. When a
   channel's last post goes, the call is withdrawn entirely, as a change
   of the signal's own message would: deleted or edited away, VOIDED (or
@@ -126,9 +126,10 @@ The post that closed one of the chain's signals stays with that signal.
   more: a later version that still does not show it, or its deletion, is
   only recorded.
 - **A promotion** (final review F04) happens only on the signal's own
-  channel: the earliest standing post of the call there (not deleted,
-  still showing the call, not the post that withdrew it, not deleted in
-  the same report) is re-read with the channel's parser, given its
+  channel: a standing post of the call there (not deleted, still showing
+  the call, not the post that withdrew it, not deleted in the same report)
+  -- the one showing the call's current levels, else the earliest (final
+  fix FF16) -- is re-read with the channel's parser, given its
   `signals` row (`promoted_from_signal_id` naming the signal it
   replaces) and its ENTRY rows in the same writer job, unlinked, and
   announced with a WARNING `SIGNAL_REPOST_PROMOTED` naming both messages;
@@ -1294,7 +1295,7 @@ def _withdraw_post(
 
     - another post of the call still stands on this channel: the signal's
       own message going while nothing was executed voids it and promotes
-      the earliest such post (`_withdraw_signal`); anything else is a
+      one such post (`_withdraw_signal`); anything else is a
       repeat removal -- a WARNING naming the post still showing the call,
       which stands (an executed call's own message included: the post was
       replaced, the trade continues);
@@ -1570,7 +1571,7 @@ def _withdraw_signal(
 ) -> EditResult:
     """A signal the poster withdrew -- by deleting it, or by editing it
     into something that is no signal. Entries not yet taken are skipped
-    either way. Unexecuted: VOIDED, and with `promote` the earliest
+    either way. Unexecuted: VOIDED, and with `promote` a
     standing post of the call on this channel promoted in its place
     (`_promote_repost`). Executed or in flight: flagged with a CRITICAL
     alert and *not* closed; `state` stays NEW so its live legs are still
@@ -1632,8 +1633,10 @@ def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> _Promotion | None:
     executed, while its channel still shows the same call in another
     standing post (`_standing_others`: not deleted, still showing the
     call, not the post that withdrew it, not deleted in the same report;
-    and not carrying a signal of its own). The earliest such
-    post becomes the signal: re-read with the channel's parser, given its
+    and not carrying a signal of its own). Such a post becomes the signal
+    -- the one showing the call's current levels if one does (final fix
+    FF16: an older repost may still show a stop the poster has moved),
+    else the earliest: re-read with the channel's parser, given its
     `signals` row (recording the one it replaces) and its ENTRY rows, in
     this same writer job, unlinked, and announced with a WARNING naming
     both messages. Every other copy of the call now repeats it,
@@ -1652,7 +1655,18 @@ def _promote_repost(ctx: _Ctx, withdrawn: sqlite3.Row) -> _Promotion | None:
     promotable = _promotable(ctx, _standing_others(ctx, withdrawn))
     if not promotable:
         return None
-    repost, routed = promotable[0]
+    # The one showing the call's current levels, if one does (final fix
+    # FF16): a repost made before the poster moved the stop -- or the
+    # channel's own forward of the original, which Telegram never updates
+    # -- would silently put the old stop back. Else the earliest.
+    repost, routed = next(
+        (
+            (post, reread)
+            for post, reread in promotable
+            if reread.signal.content_hash == withdrawn["trade_hash"]
+        ),
+        promotable[0],
+    )
     conn = ctx.conn
     carrier = relay_repo.carrier_of_trade(
         conn,
