@@ -369,11 +369,21 @@ class ListenerStopped(RuntimeError):
 
     `plain` is what the watch window says: why watch stopped, in the
     user's words. The message itself is the technical detail, which goes
-    to the log file only (G2L-2)."""
+    to the log file only (G2L-2). `start_after_utc`: Telegram asked watch
+    to wait, and starting it again before this time only earns a longer
+    wait (final fix FF21, round 2) -- watch's last line and `status` say
+    it instead of "safe to start it again"."""
 
-    def __init__(self, message: str, *, plain: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        plain: str | None = None,
+        start_after_utc: datetime | None = None,
+    ) -> None:
         super().__init__(message)
         self.plain = plain if plain is not None else UNEXPLAINED_STOP
+        self.start_after_utc = start_after_utc
 
 
 class ListenerStartupError(ListenerStopped):
@@ -704,6 +714,9 @@ class Listener:
         # when each ended: only those are this watch's to skip (final fix
         # FF24, round 2). None until start() has looked.
         self._periods_at_start: dict[int, datetime] | None = None
+        #: Set by `run_listener` when Telegram asked watch to wait at start:
+        #: starting it again before this time only earns a longer wait.
+        self.start_after_utc: datetime | None = None
         # Channels already reported as having no messages at all, so the
         # report is logged once, not every round.
         self._reported_empty: set[int] = set()
@@ -1845,8 +1858,9 @@ class Listener:
             # because it was started many times in a row: each start asks
             # for the chat list again. Starting again before the wait is
             # over only earns a longer one.
-            message = _start_wait_words(exc, self._now())
-            raise ListenerStartupError(message, plain=message) from exc
+            after = _start_after(exc, self._now())
+            message = _start_wait_words(exc, after)
+            raise ListenerStartupError(message, plain=message, start_after_utc=after) from exc
         self._name_sources(dialogs)
         self._started_at = self._decide_start(local_start, telegram_clock)
         await self._store_seed_cutoffs()
@@ -2398,26 +2412,43 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _start_wait_words(exc: Exception, now: datetime) -> str:
-    """What watch says when Telegram asked it to wait before starting
-    (final fix FF21): how long, and the minute after which starting it
-    again is fine (rounded up). A wait with no length given is "a few
-    minutes"."""
+#: When Telegram asks watch to wait at start without saying how long:
+#: what "a few minutes" means for the time watch names (FF21, round 2).
+UNSAID_START_WAIT = timedelta(minutes=5)
+
+
+def _wait_seconds(exc: Exception) -> float | None:
+    """How long Telegram asked to wait, when it said."""
     seconds = getattr(exc, "seconds", None)
-    if not isinstance(seconds, int | float) or seconds < 0:
-        return (
-            "Telegram asked watch to wait before starting (it asks this when watch is "
-            "started many times in a row). watch stops now; start it again in a few "
-            "minutes -- starting it sooner only makes Telegram ask for a longer wait."
-        )
-    over = now.astimezone(UTC) + timedelta(seconds=seconds)
+    if isinstance(seconds, bool) or not isinstance(seconds, int | float) or seconds < 0:
+        return None
+    return seconds
+
+
+def _start_after(exc: Exception, now: datetime) -> datetime:
+    """When Telegram's wait asked at start is over: now plus the wait
+    (`UNSAID_START_WAIT` when it gave none), rounded up to the minute
+    (final fix FF21)."""
+    seconds = _wait_seconds(exc)
+    wait = UNSAID_START_WAIT if seconds is None else timedelta(seconds=seconds)
+    over = now.astimezone(UTC) + wait
     if over.second or over.microsecond:
         over += timedelta(seconds=60 - over.second, microseconds=-over.microsecond)
+    return over
+
+
+def _start_wait_words(exc: Exception, after: datetime) -> str:
+    """What watch says when Telegram asked it to wait before starting
+    (final fix FF21): how long, and the minute after which starting it
+    again is fine (`_start_after`). A wait with no length given is "a few
+    minutes"."""
+    seconds = _wait_seconds(exc)
+    how_long = "" if seconds is None else f" {wait_words(seconds)}"
     return (
-        f"Telegram asked watch to wait {wait_words(seconds)} before starting (it asks "
-        "this when watch is started many times in a row). watch stops now; start it "
-        f"again after {over.strftime('%H:%M')} UTC -- starting it sooner only makes "
-        "Telegram ask for a longer wait."
+        f"Telegram asked watch to wait{how_long} before starting (it asks this when "
+        "watch is started many times in a row). watch stops now; start it again after "
+        f"{after.strftime('%H:%M')} UTC -- starting it sooner only makes Telegram ask for "
+        "a longer wait."
     )
 
 
@@ -2450,7 +2481,8 @@ async def run_listener(listener: Listener) -> int:
     session (or the account) is dead and a restart is pointless;
     `EXIT_CONFIG_ERROR` (5) that Telegram rejects the api_id/api_hash,
     which only a new pair can fix; `EXIT_LISTENER_STOPPED` (4) means
-    "stopped, restart me".
+    "stopped, restart me" -- after `listener.start_after_utc`, when it is
+    set: Telegram asked watch to wait until then (final fix FF21).
     """
     # Imported here rather than at module import time so this module
     # stays importable (and testable) without pywin32 being loaded.
@@ -2464,6 +2496,7 @@ async def run_listener(listener: Listener) -> int:
     try:
         await listener.run()
     except ListenerStopped as exc:
+        listener.start_after_utc = exc.start_after_utc
         # The window reads the plain sentence; the log file keeps the
         # technical detail too (G2L-2).
         logger.error(

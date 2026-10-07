@@ -13,6 +13,8 @@ ever differ.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from xaucopier.cli.paths import USER_COMMAND
 from xaucopier.ingest.client import EXIT_CONFIG_ERROR, EXIT_TERMINAL_AUTH
 from xaucopier.ingest.listener import EXIT_LISTENER_STOPPED
@@ -77,6 +79,20 @@ def meaning(code: int) -> str:
         if known == code:
             return text
     return "unknown exit code"
+
+
+def stopped_with(code: int, start_after_utc: datetime | None = None) -> str:
+    """How watch's last line and `status` name a stop: "exit code 4: watch
+    stopped unexpectedly -- safe to start it again" -- or, when Telegram
+    asked watch to wait at start (`start_after_utc`), when to start it
+    again instead (final fix FF21, round 2): starting it sooner only
+    earns a longer wait."""
+    if start_after_utc is not None:
+        return (
+            f"exit code {code}: Telegram asked watch to wait -- start it again after "
+            f"{start_after_utc.astimezone(UTC).strftime('%H:%M')} UTC"
+        )
+    return f"exit code {code}: {meaning(code)}"
 
 
 def help_epilog() -> str:

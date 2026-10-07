@@ -595,3 +595,37 @@ def test_each_alert_the_fix_wave_added_is_listed_with_its_words(tmp_path: Path, 
     assert "ALERTS: 1 unacknowledged (0 CRITICAL, 1 WARNING)" in text
     assert f"[WARNING] #5" in text and code in text
     assert "what happened, in words" in text
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        ("4", "exit code 4: watch stopped unexpectedly -- safe to start it again."),
+        (
+            "4; start after 2026-09-23T16:43:00+00:00",
+            "exit code 4: Telegram asked watch to wait -- start it again after 16:43 UTC.",
+        ),
+        ("4; start after not a time", "exit code 4: watch stopped unexpectedly"),
+        ("4; start after 2026-09-23T16:43:00", "exit code 4: watch stopped unexpectedly"),
+        ("four", "exit code unknown."),
+    ],
+    ids=["plain", "wait-asked", "time-unreadable", "time-without-zone", "code-unreadable"],
+)
+def test_a_stop_after_telegram_asked_watch_to_wait_says_when_to_start_again(
+    tmp_path: Path, detail: str, expected: str
+) -> None:
+    """Final fix round 2 (FF21 residual): `status` repeats the time watch
+    named, never "safe to start it again" after a wait Telegram asked for;
+    a stop it cannot read is said as before."""
+    out = _render(
+        _report(
+            _beat(heartbeats.WATCH_STARTED, timedelta(hours=2)),
+            _beat(heartbeats.WATCH_STOPPED, timedelta(hours=1), detail),
+        ),
+        tmp_path,
+    )
+
+    (stopped,) = [line for line in out.splitlines() if "NOT RUNNING" in line]
+    assert expected in stopped
+    if "Telegram asked" in expected:
+        assert "safe to start it again" not in stopped

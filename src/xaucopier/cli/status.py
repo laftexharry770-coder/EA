@@ -271,12 +271,9 @@ def _watch_lines(rep: report.StatusReport, now: datetime, secrets_path: Path) ->
                 + (f" ({last_round.detail})" if last_round.detail else "")
             )
     else:
-        try:
-            code: int | None = int(stopped.detail) if stopped.detail is not None else None
-        except ValueError:
-            code = None
+        code, start_after = heartbeats.read_stop(stopped.detail)
         how = (
-            f"exit code {code}: {exit_codes.meaning(code)}" if code is not None else "exit code unknown"
+            exit_codes.stopped_with(code, start_after) if code is not None else "exit code unknown"
         )
         lines.append(
             f"  NOT RUNNING: stopped {when(stopped.at_utc)} ({ago(now, stopped.at_utc)}), {how}."

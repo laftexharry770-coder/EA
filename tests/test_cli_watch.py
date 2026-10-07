@@ -181,6 +181,86 @@ def test_telethons_own_lines_reach_watchs_log_file(
     assert "Attempt 2 at connecting failed: a line of Telethon's own" in log
 
 
+class _WaitAtStartClient(ScriptedWatchClient):
+    """Telegram answers watch's chat list at start with "wait 15 minutes"."""
+
+    async def get_dialogs(self, *args, **kwargs):
+        self.calls.append("get_dialogs")
+        raise errors.FloodWaitError(request=None, capture=900)
+
+
+def _minutes_after(start: datetime, end: datetime, seconds: int) -> set[str]:
+    """The HH:MM a wait of `seconds` asked between `start` and `end` is
+    over, rounded up to the minute -- each one it can be."""
+    times = set()
+    moment = start.replace(microsecond=0)
+    while moment <= end + timedelta(seconds=1):
+        over = moment + timedelta(seconds=seconds)
+        times.add(over.strftime("%H:%M"))
+        times.add((over + timedelta(minutes=1)).strftime("%H:%M"))
+        moment += timedelta(seconds=1)
+    return times
+
+
+def test_a_wait_asked_at_start_is_what_watchs_last_line_and_status_say(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final fix round 2 (FF21 residual). Telegram asked watch to wait 15
+    minutes before starting; the window said when to start it again, but
+    watch's own last line and `status` said "exit code 4: watch stopped
+    unexpectedly -- safe to start it again", with no time -- and each
+    early restart lengthens Telegram's wait. Both now say when."""
+    client = _WaitAtStartClient(history=_history())
+    _use_client(rig, monkeypatch, client)
+
+    before = datetime.now(UTC)
+    assert cli_main.main(rig.argv()) == exit_codes.EXIT_LISTENER_STOPPED
+    after = datetime.now(UTC)
+
+    window = capsys.readouterr()
+    last = window.out.strip().splitlines()[-1]
+    candidates = _minutes_after(before, after, 900)
+    assert any(
+        last == f"watch stopped (exit code 4: Telegram asked watch to wait -- start it again "
+        f"after {hhmm} UTC)."
+        for hhmm in candidates
+    ), last
+    assert "safe to start it again" not in window.out
+
+    assert cli_main.main(rig.argv("status")) == exit_codes.EXIT_OK
+    status = capsys.readouterr().out
+    (stopped,) = [line for line in status.splitlines() if "NOT RUNNING" in line]
+    assert any(
+        f"exit code 4: Telegram asked watch to wait -- start it again after {hhmm} UTC."
+        in stopped
+        for hhmm in candidates
+    ), stopped
+    assert "safe to start it again" not in stopped
+
+
+def test_a_wait_named_by_an_earlier_run_is_never_said_for_a_later_stop(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The time Telegram asked an earlier run (in this process) to wait
+    until is that run's: a later run that stops on something else says
+    the plain exit-4 words."""
+    monkeypatch.setattr(
+        watch_module, "_start_after_utc", datetime(2026, 9, 23, 16, 43, tzinfo=UTC)
+    )
+
+    async def broken(client, setup):
+        raise RuntimeError("something this program did not expect")
+
+    monkeypatch.setattr(watch_module, "run_watch", broken)
+    _use_client(rig, monkeypatch, ScriptedWatchClient(history=_history()))
+
+    assert cli_main.main(rig.argv()) == exit_codes.EXIT_LISTENER_STOPPED
+
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert last == "watch stopped (exit code 4: watch stopped unexpectedly -- safe to start it again)."
+    assert _stamps(rig.db_path)[heartbeats.WATCH_STOPPED] == "4"
+
+
 def test_ctrl_c_stops_watch_cleanly_with_exit_130(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

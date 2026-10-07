@@ -624,6 +624,45 @@ def test_telegram_asking_watch_to_wait_at_start_is_said_with_when_to_start_again
         assert wrong not in stop, (wrong, stop)
 
 
+class _WaitUnsaidClient(FakeTelegramClient):
+    """The fake, whose chat list Telegram answers with a wait of no stated
+    length (a FloodError other than FLOOD_WAIT_X)."""
+
+    async def get_dialogs(self, *args: Any, **kwargs: Any) -> Any:
+        from telethon import errors
+
+        raise errors.FloodError(request=None, message="FLOOD")
+
+
+@pytest.mark.parametrize(
+    ("client", "after"),
+    [
+        (_WaitAskedClient(900), NOW + timedelta(seconds=900)),
+        (_WaitUnsaidClient(), NOW + listener_module.UNSAID_START_WAIT),
+    ],
+    ids=["fifteen-minutes", "no-length-given"],
+)
+def test_a_wait_asked_at_start_leaves_when_to_start_again_on_the_listener(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, client: FakeTelegramClient,
+    after: datetime,
+) -> None:
+    """Final fix round 2 (FF21 residual): the time the window names is
+    kept on the listener, for watch's last line and `status` -- a wait of
+    no stated length named as a few minutes from now, never "safe to start
+    it again" at once."""
+    db_path = tmp_path / "store.db"
+    listener = _build_listener(db_path, client)
+
+    with caplog.at_level(logging.ERROR, logger=listener_module.__name__):
+        exit_code = asyncio.run(asyncio.wait_for(run_listener(listener), timeout=10.0))
+
+    over = after + timedelta(seconds=(-after.second) % 60)
+    assert exit_code == EXIT_LISTENER_STOPPED
+    assert listener.start_after_utc == over
+    (stop,) = [r.getMessage() for r in caplog.records if "asked watch to wait" in r.getMessage()]
+    assert f"start it again after {over.strftime('%H:%M')} UTC" in stop
+
+
 def test_the_chat_list_at_start_never_sleeps_through_a_wait_inside_the_call() -> None:
     """With the real Telegram library (no network: its sender is replaced),
     a 90 s wait on the chat list is slept INSIDE the call -- Telethon's

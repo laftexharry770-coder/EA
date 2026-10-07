@@ -228,8 +228,10 @@ def stamp_start(db_path: Path) -> None:
         conn.close()
 
 
-def stamp_stop(db_path: Path, exit_code: int) -> None:
-    """Stamp `watch_stopped` with `exit_code` and, for a permanent Telegram
+def stamp_stop(db_path: Path, exit_code: int, *, start_after_utc: datetime | None = None) -> None:
+    """Stamp `watch_stopped` with `exit_code` -- and, when Telegram asked
+    watch to wait at start, the time to start it again after
+    (`heartbeats.stop_detail`, final fix FF21) -- and, for a permanent Telegram
     stop -- exit 3 (the session is refused) or exit 5 (the only exit 5 a
     *running* watch can return: Telegram rejected the api_id/api_hash;
     every other setup problem exits before the store is opened) --
@@ -242,7 +244,10 @@ def stamp_stop(db_path: Path, exit_code: int) -> None:
         conn = db.connect(db_path, role="writer")
         try:
             heartbeats.beat(
-                conn, name=heartbeats.WATCH_STOPPED, now_utc=now_utc, detail=str(exit_code)
+                conn,
+                name=heartbeats.WATCH_STOPPED,
+                now_utc=now_utc,
+                detail=heartbeats.stop_detail(exit_code, start_after_utc=start_after_utc),
             )
             if exit_code in _TELEGRAM_STOPS:
                 code, detail = _TELEGRAM_STOPS[exit_code]
@@ -263,9 +268,18 @@ def build_poll() -> HistoryPoll:
     return HistoryPoll()
 
 
+#: When the last `run_watch` stopped because Telegram asked watch to wait at
+#: start, the time to start it again after (final fix FF21, round 2): watch's
+#: last line and `status` say it instead of "safe to start it again". None
+#: otherwise. One watch runs per process; `cmd_watch` clears it first.
+_start_after_utc: datetime | None = None
+
+
 async def run_watch(client: object, setup: WatchSetup) -> int:
     """Run the listener, with the poll, until it stops; return its exit
-    code (`run_listener`: 3 or 4 -- never 0)."""
+    code (`run_listener`: 3 or 4 -- never 0). When Telegram asked it to
+    wait at start, `_start_after_utc` says until when."""
+    global _start_after_utc
     listener = Listener(
         client=client,
         channels=setup.channels,
@@ -274,7 +288,9 @@ async def run_watch(client: object, setup: WatchSetup) -> int:
         db_path=setup.db_path,
         poll_hook=build_poll(),
     )
-    return await run_listener(listener)
+    code = await run_listener(listener)
+    _start_after_utc = listener.start_after_utc
+    return code
 
 
 def _for_the_window(record: logging.LogRecord) -> bool:
@@ -387,6 +403,7 @@ def _run(setup: WatchSetup, blob: SecretsBlob) -> int:
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
+    global _start_after_utc
     try:
         setup = check_setup(args.config_dir, args.db)
         blob = load_session(args.secrets)
@@ -421,6 +438,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     log_path = setup.db_path.parent / paths.LOG_FILE_NAME
     stop_logging = start_logging(log_path)
     exit_code: int | None = None
+    start_after: datetime | None = None
     try:
         try:
             stamp_start(setup.db_path)
@@ -436,14 +454,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
             return exit_codes.EXIT_LISTENER_STOPPED
 
         _print_banner(setup, log_path)
+        _start_after_utc = None
         exit_code = _run(setup, blob)
+        start_after = _start_after_utc
     except KeyboardInterrupt:
         exit_code = exit_codes.EXIT_INTERRUPTED
     finally:
         try:
             if exit_code is not None:
-                stamp_stop(setup.db_path, exit_code)
-                print(f"watch stopped (exit code {exit_code}: {exit_codes.meaning(exit_code)}).")
+                stamp_stop(setup.db_path, exit_code, start_after_utc=start_after)
+                print(f"watch stopped ({exit_codes.stopped_with(exit_code, start_after)}).")
                 if exit_code in _TELEGRAM_STOPS:
                     print(_TELEGRAM_STOPS[exit_code][1], file=sys.stderr)
         finally:

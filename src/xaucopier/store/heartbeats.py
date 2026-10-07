@@ -15,7 +15,9 @@ name, overwritten each time (migration 3):
   the round stamp stays fresh is one Telegram has stopped answering for.
 - `watch_started` / `watch_stopped` -- `watch` itself, the stop carrying
   its exit code in `detail`, which is how `status` tells "stopped" from
-  "stopped because Telegram logged this session out".
+  "stopped because Telegram logged this session out" -- and, when
+  Telegram asked watch to wait at start, the time to start it again
+  after (`stop_detail`, `read_stop`).
 
 Like `metrics.bump` and `alerts.record`, `beat()` only executes: it runs
 inside the caller's transaction and never commits.
@@ -40,6 +42,38 @@ class Heartbeat:
     name: str
     at_utc: datetime
     detail: str | None
+
+
+#: How `watch_stopped`'s detail names the time Telegram asked watch to wait
+#: until (final fix FF21, round 2): "4; start after 2026-10-07T16:43:00+00:00".
+_START_AFTER = "; start after "
+
+
+def stop_detail(exit_code: int, *, start_after_utc: datetime | None = None) -> str:
+    """`watch_stopped`'s detail: the exit code, and -- when Telegram asked
+    watch to wait at start -- the time after which it may start again."""
+    if start_after_utc is None:
+        return str(exit_code)
+    return f"{exit_code}{_START_AFTER}{start_after_utc.astimezone(UTC).isoformat()}"
+
+
+def read_stop(detail: str | None) -> tuple[int | None, datetime | None]:
+    """`stop_detail` read back: the exit code (None when unreadable) and
+    the time to start again after (None when none was named)."""
+    if detail is None:
+        return None, None
+    code_text, _, after_text = detail.partition(_START_AFTER)
+    try:
+        code: int | None = int(code_text)
+    except ValueError:
+        return None, None
+    try:
+        after = datetime.fromisoformat(after_text) if after_text else None
+    except ValueError:
+        after = None
+    if after is not None and (after.tzinfo is None or after.utcoffset() is None):
+        after = None
+    return code, after
 
 
 def channel_read_name(channel_id: int) -> str:
