@@ -705,3 +705,91 @@ def test_a_signal_with_an_entry_still_waiting_is_not_switched_off(conn):  # noqa
     conn.execute("UPDATE outbox SET state = 'SKIPPED', reason = 'too old' WHERE signal_id = 1 "
                  "AND account_id = 'acct-2'")
     assert relay_repo.switched_off(conn, row)
+
+
+# -- final fix round 2: which signal carries the call, pinned ---------------------
+
+
+def test_a_signal_of_the_same_trade_outside_the_window_carries_nothing(conn):  # noqa: F811
+    """The re-check's p_carrier_window. Day 1: the call is posted and
+    traded. Day 2: the same call is posted again (signal 2 -- a day is far
+    outside the window), reposted a minute later, and its first post is
+    deleted. Yesterday's traded signal is another call, not the carrier:
+    the standing repost is promoted and queued."""
+    _ingest(conn, VIP, CALL)
+    for account in ACCOUNTS:
+        row = outbox.claim(conn, account_id=account.account_id, pid=7, now_utc=_at(5))
+        outbox.mark(
+            conn, outbox_id=row.outbox_id, state="DONE", claimed_by_pid=7,
+            attempts=row.attempts,
+        )
+        conn.commit()
+    day2 = timedelta(days=1).total_seconds()
+    assert _ingest(conn, VIP, 5001, posted=_at(day2)).signal_id == 2
+    assert _ingest(conn, VIP, 5002, posted=_at(day2 + 60)).relay_of_signal_id == 2
+
+    result = edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=5001, now_utc=_at(day2 + 90), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    conn.commit()
+
+    assert (result.promoted_signal_id, result.carried_by_signal_id) == (3, None)
+    assert _claim_all(conn, day2 + 100) == [("acct-1", "ENTRY", 3), ("acct-2", "ENTRY", 3)]
+
+
+def test_the_carrier_is_the_newest_signal_of_the_call_it_finds(conn):  # noqa: F811
+    """The re-check's p_carrier_newest. 4001 at 0 (signal 1), its repost
+    at +890, the call again at +910 (signal 2, outside 4001's window), its
+    repost at +1800. Deleting +910 promotes +1800 (signal 3). Deleting
+    4001 then finds signal 2 near the +890 repost -- withdrawn, but its
+    call lives on as signal 3, which carries it: one trade, not a fourth
+    signal beside signal 3."""
+    for message_id, seconds in ((CALL, 0), (REPOST, 890), (REPOST_2, 910), (4014, 1800)):
+        _ingest(conn, VIP, message_id, posted=_at(seconds))
+    promoted = edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=REPOST_2, now_utc=_at(1805), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    conn.commit()
+    assert promoted.promoted_signal_id == 3
+
+    result = _withdraw(conn, "event", seconds=1810)
+
+    assert (result.promoted_signal_id, result.carried_by_signal_id) == (None, 3)
+    assert _q(conn, "SELECT COUNT(*) FROM signals") == [(3,)]
+    assert _claim_all(conn, 1820) == [("acct-1", "ENTRY", 3), ("acct-2", "ENTRY", 3)]
+
+
+def test_a_reply_to_a_post_that_re_aimed_its_call_stays_with_that_signal(conn):  # noqa: F811
+    """The re-check's p_carrier_kept. 4001 is re-aimed (BUY -> SELL) while
+    its repost stands: the repost is promoted (signal 2), and 4001 stays
+    signal 1's closer. A reply to 4001 is about signal 1's call as it
+    stood, and stays with the signal the re-aim left it on (as
+    `record_replacement` keeps it) when signal 2 is withdrawn in turn and
+    its call is carried by signal 3 -- never moved to signal 3."""
+    _ingest(conn, VIP, CALL)
+    _ingest(conn, VIP, REPOST, posted=_at(5))
+    reply = _ingest(conn, VIP, 4003, CLOSE_HALF, posted=_at(7), reply_to=CALL)
+    edited = edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=CALL, text=SIGNAL_TEXT.replace("BUY", "SELL"),
+        posted_at_utc=POSTED, edit_date_utc=_at(10), reply_to_message_id=None,
+        now_utc=_at(10), accounts=ACCOUNTS, detected_by="event",
+    )
+    conn.commit()
+    assert edited.promoted_signal_id == 2
+    before = relay_repo.signal_for_followup(conn, followup_id=reply.followup_id)
+    _ingest(conn, VIP, 4004, posted=_at(890))
+    assert _ingest(conn, VIP, 4005, posted=_at(910)).signal_id == 3
+
+    deleted = edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=REPOST, now_utc=_at(920), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    conn.commit()
+
+    assert deleted.carried_by_signal_id == 3
+    assert before == 2
+    assert relay_repo.signal_for_followup(conn, followup_id=reply.followup_id) == 2
+    assert _q(conn, "SELECT target_signal_id FROM followups WHERE followup_id = ?",
+              reply.followup_id) == [(2,)]

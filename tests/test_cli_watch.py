@@ -158,6 +158,29 @@ def test_watch_records_live_and_poll_recovered_messages_and_stops_cleanly_on_dis
     assert "did not arrive as they were posted; they were read a moment later" in log
 
 
+def test_telethons_own_lines_reach_watchs_log_file(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final fix FF10 keeps Telethon's own lines out of a one-shot
+    command's window; `watch` must keep them in its log file, where they
+    help whoever reads it after trouble (the re-check: nothing pinned
+    that, and silencing them in watch too passed every test)."""
+
+    async def script(client: ScriptedWatchClient) -> None:
+        logging.getLogger("telethon.network.mtprotosender").warning(
+            "Attempt 2 at connecting failed: a line of Telethon's own"
+        )
+        await client.disconnect()
+
+    client = ScriptedWatchClient(history=_history(), script=script)
+    _use_client(rig, monkeypatch, client)
+
+    assert cli_main.main(rig.argv()) == exit_codes.EXIT_LISTENER_STOPPED
+
+    log = (rig.db_path.parent / "watch.log").read_text(encoding="utf-8")
+    assert "Attempt 2 at connecting failed: a line of Telethon's own" in log
+
+
 def test_ctrl_c_stops_watch_cleanly_with_exit_130(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
