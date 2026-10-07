@@ -1231,8 +1231,11 @@ class Listener:
         call reading one) -- a 'close all' posted while the channel was
         still ON and watch was stopped is read -- and only then a skip to
         the switch-on (`_skip_while_off`). So OFF skips exactly what the
-        channel posted while it was off, give or take `OFF_PERIOD_MARGIN`
-        on either side. Only then does the ordinary read run.
+        channel posted while it was off, less `_off_allowance` at either
+        end (the margin, widened by how far this computer's clock was off
+        at this start -- never shifted). Only a period already closed when
+        this watch started is skipped, as it was then (`_as_at_start`).
+        Only then does the ordinary read run.
 
         `rpc_timeout` is required: it bounds every `get_messages()` RPC
         this call makes (`asyncio.wait_for`; `TimeoutError` propagates),
@@ -1313,7 +1316,7 @@ class Listener:
     ) -> tuple[bool, int, tuple[HistoryIngest, ...]]:
         """The first of an OFF period's two ranges: one batch after
         `pointer`, ingested up to the first post dated after the switch-off
-        (plus `OFF_PERIOD_MARGIN`). Returns whether the read has caught up
+        (plus `_off_allowance`). Returns whether the read has caught up
         to the switch-off -- a post after it was met, or the batch was the
         last there is, and every post before it is stored or skipped --
         the pointer now, and what was ingested. Not caught up (a full
@@ -1353,7 +1356,7 @@ class Listener:
     ) -> int:
         """The second range: skip what the channel posted while it was OFF.
         The pointer moves to the newest post dated before the switch-on
-        (less `OFF_PERIOD_MARGIN`) -- one RPC, as a seed's anchor -- never
+        (less `_off_allowance`) -- one RPC, as a seed's anchor -- never
         down, and the period is deleted, in one writer job. Returns the
         pointer. The window is told only when something was skipped: a
         period whose posts were all read already (a watch was running)
