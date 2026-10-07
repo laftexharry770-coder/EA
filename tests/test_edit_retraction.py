@@ -598,3 +598,34 @@ def test_a_follow_up_first_read_edited_and_saying_cancel_is_still_queued(conn) -
 
     assert (followup.kind, followup.followup_id) == ("followup", 1)
     assert _q(conn, "SELECT COUNT(*) FROM outbox WHERE kind = 'FOLLOWUP'") == [(2,)]
+
+
+# -- FF7: a copy that itself says CANCELLED ---------------------------------------
+
+
+@pytest.mark.parametrize("bump", [False, True], ids=["hand-copy", "forward"])
+def test_a_copy_that_itself_says_cancelled_is_not_to_be_traded_by_hand(conn, bump) -> None:  # noqa: F811
+    """The VIP appended CANCELLED to its call (signal 1 is withdrawn); the
+    relay copies the cancelled post. The copy is held back, and its alert
+    says the copy itself says CANCELLED -- never "trade it by hand"."""
+    from test_relay import RELAY
+
+    _first_read(conn, SIGNAL_TEXT, edited=False)
+    edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=4001, text=CANCELLED, posted_at_utc=POSTED,
+        edit_date_utc=POSTED + timedelta(seconds=60), reply_to_message_id=None,
+        now_utc=POSTED + timedelta(seconds=61), accounts=ACCOUNTS, detected_by="event",
+    )
+    conn.commit()
+    copy = _first_read(
+        conn, CANCELLED, message_id=7001, edited=False, channel=RELAY,
+        posted=POSTED + timedelta(seconds=90), fwd=(VIP.channel_id, 4001) if bump else None,
+    )
+
+    assert copy.outcome == "relay_duplicate"
+    (detail,) = _q(
+        conn, "SELECT detail FROM alerts WHERE code = ?", "COPY_OF_WITHDRAWN_SIGNAL"
+    )[0]
+    assert "This copy itself says CANCELLED" in detail
+    assert "by hand" not in detail
+    assert _q(conn, "SELECT COUNT(*) FROM outbox WHERE state = 'QUEUED'") == [(0,)]

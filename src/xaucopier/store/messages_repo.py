@@ -159,9 +159,9 @@ from datetime import UTC, datetime
 from collections.abc import Collection
 from typing import Any, Literal, Protocol
 
-from xaucopier.domain.signal import FollowUp
 from xaucopier.parsing.router import RouteResult, route
 from xaucopier.store import alerts, edits_repo, outbox, relay_repo, signals_repo
+from xaucopier.store import words as store_words
 
 logger = logging.getLogger(__name__)
 
@@ -176,16 +176,6 @@ TEMPLATE_CHANGE_STREAK = 3
 #: an open trade. Entry-shaped text is never a follow-up (ruling F07), so
 #: the instruction was NOT queued; the user is told which one it was.
 ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED = "ENTRY_SHAPED_INSTRUCTION_NOT_QUEUED"
-
-#: An instruction in plain words, by its op (`FollowUpOp.value`).
-_INSTRUCTION_WORDS = {
-    "sl_to_be": "move the stop loss to the entry price",
-    "close_half": "close half of the trade",
-    "close_all": "close the whole trade",
-    "cancel_pending": "cancel the orders not filled yet",
-    "amend_sl": "move the stop loss",
-    "amend_tp": "move a take profit",
-}
 
 IngestOutcome = Literal["new", "duplicate", "edited", "relay_duplicate"]
 SenderKind = Literal["user", "channel", "chat"]
@@ -488,7 +478,7 @@ def _cancelled_when_first_read(
 ) -> int:
     """The WARNING CANCELLED_WHEN_FIRST_READ for a post first read already
     edited and carrying a retraction word (`edits_repo.first_read_retraction`)."""
-    words = " / ".join(sorted(edits_repo.retraction_words(text)))
+    words = store_words.said(store_words.retraction_words(text))
     logger.warning(
         "channel %s message %s was first read already edited and saying %s: stored as no "
         "signal, not traded",
@@ -517,15 +507,6 @@ def _named(channel_cfg: _ChannelCfgLike) -> str:
     return f"channel {channel_cfg.channel_id}" + (f" ({name})" if name else "")
 
 
-def _instruction_words(followup: FollowUp) -> str:
-    words = _INSTRUCTION_WORDS.get(followup.op.value, followup.op.value)
-    if followup.op.value == "amend_tp" and followup.tp_index_hint is not None:
-        words = f"move take profit {followup.tp_index_hint}"
-    if followup.op.value in ("amend_sl", "amend_tp") and followup.price_hint is not None:
-        words = f"{words} to {followup.price_hint:g}"
-    return words
-
-
 def _instruction_not_queued(
     conn: sqlite3.Connection,
     channel_cfg: _ChannelCfgLike,
@@ -538,7 +519,7 @@ def _instruction_not_queued(
     trade entry that also reads as an instruction for an open trade: not
     traded, and the instruction not acted on either (ruling F07's cost,
     made loud at once)."""
-    instruction = _instruction_words(route_result.unqueued_followup)
+    instruction = store_words.instruction_words(route_result.unqueued_followup)
     return alerts.record(
         conn,
         now_utc=now_utc,

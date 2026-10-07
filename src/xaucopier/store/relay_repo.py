@@ -237,6 +237,7 @@ from typing import Literal, Protocol
 from xaucopier.domain.signal import Signal
 from xaucopier.parsing.router import RouteResult, route
 from xaucopier.store import alerts, metrics, outbox, signals_repo
+from xaucopier.store import words as store_words
 
 logger = logging.getLogger(__name__)
 
@@ -1319,16 +1320,30 @@ def record_signal_copy(
         # and which call "the call" is -- signal N's (ruling R6-4).
         shown, meant = _describe_both(signal, withdrawn)
         reads = f" This copy itself reads as {shown}, not signal {match.signal_id}'s {meant}."
-    advice = by_hand(
-        conn,
-        advice=(
-            "If the call is still meant, trade it by hand."
-            if meant is None
-            else f"If signal {match.signal_id}'s {meant} is still meant, trade it by hand."
-        ),
-        carrier=carrier,
-        described=meant,
-    )
+    (copy_text,) = conn.execute(
+        "SELECT raw_text FROM messages WHERE channel_id = ? AND message_id = ?",
+        (channel_id, message_id),
+    ).fetchone()
+    cancelled = store_words.retraction_words(copy_text)
+    if cancelled:
+        # The copy carries the withdrawal itself -- a forward or a copy of
+        # the post after "CANCELLED" was added to it: there is nothing to
+        # trade by hand (final fix FF7).
+        advice = (
+            f"This copy itself says {store_words.said(cancelled)}: nothing to do, unless the "
+            "poster still means the call."
+        )
+    else:
+        advice = by_hand(
+            conn,
+            advice=(
+                "If the call is still meant, trade it by hand."
+                if meant is None
+                else f"If signal {match.signal_id}'s {meant} is still meant, trade it by hand."
+            ),
+            carrier=carrier,
+            described=meant,
+        )
     alert_id = alerts.record(
         conn,
         now_utc=now_utc,

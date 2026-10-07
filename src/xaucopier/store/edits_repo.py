@@ -254,7 +254,6 @@ import dataclasses
 import hashlib
 import json
 import logging
-import re
 import sqlite3
 from dataclasses import dataclass
 from collections.abc import Collection
@@ -265,6 +264,7 @@ from xaucopier.domain.signal import FollowUp, FollowUpOp, Signal
 from xaucopier.parsing.normalize import normalize
 from xaucopier.parsing.router import RouteResult, route
 from xaucopier.store import alerts, metrics, outbox, relay_repo, signals_repo
+from xaucopier.store import words as store_words
 
 logger = logging.getLogger(__name__)
 
@@ -346,11 +346,10 @@ EDIT_GRACE_SECONDS = 120
 
 # -- retraction by edit (ledger 161) ------------------------------------------
 #: Words that, ADDED to a signal by an edit, withdraw it: whole words, any
-#: case ("CANCELLATION" and "INVALIDATED" are other words).
-RETRACTION_WORDS = ("CANCELLED", "CANCELED", "CANCEL", "VOID", "INVALID")
-_RETRACTION_WORD = re.compile(
-    r"\b(?:" + "|".join(RETRACTION_WORDS) + r")\b", re.IGNORECASE
-)
+#: case ("CANCELLATION" and "INVALIDATED" are other words) -- `store.words`,
+#: where `relay_repo` and `messages_repo` read them too.
+RETRACTION_WORDS = store_words.RETRACTION_WORDS
+retraction_words = store_words.retraction_words
 #: `RouteResult.detail` of a version read as a retraction starts with this.
 _RETRACTION_DETAIL = "edited to add "
 #: WARNING: a post read for the first time as a trade signal had already
@@ -655,11 +654,6 @@ def reconcile(
             result, alert_ids=(*reversal, *result.alert_ids), reversed_deletion=True
         )
     return result
-
-
-def retraction_words(text: str) -> frozenset[str]:
-    """The retraction words (`RETRACTION_WORDS`) `text` carries, upper-cased."""
-    return frozenset(match.group(0).upper() for match in _RETRACTION_WORD.finditer(normalize(text)))
 
 
 def first_read_retraction(
