@@ -245,3 +245,62 @@ def test_text_missing_a_side_or_a_stop_value_is_not_entry_shaped(text):
 )
 def test_another_instruments_signal_in_the_channels_header_shape_stays_a_skip(text, kind):
     assert _route(text).kind == kind
+
+
+# -- FF3: a number in the header is an instrument only when index-like ----------
+#
+# Controller decision: a symbol with digits names another market only when
+# it is index-like -- at least 2 letters, then at least 2 digits, the
+# letters a known index or market name (US30, GER40, NAS100, SPX500,
+# JP225, UK100, HK50). A timeframe tag (H1, M15, D1) or a numbered tag
+# (VIP1, TOP1, SIGNAL1, SCALP1, VIP2025) over the channel's own body is
+# the header reworded: parse_failed, counted, and loud after three.
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["H1 | BUY SIGNAL", "H4 | BUY SIGNAL", "M5 | BUY SIGNAL", "M15 | BUY SIGNAL",
+     "M30 | BUY SIGNAL", "D1 | BUY SIGNAL", "W1 | BUY SIGNAL", "VIP1 | BUY SIGNAL",
+     "TOP1 | BUY SIGNAL", "VIP2025 | BUY SIGNAL", "SIGNAL1 | BUY SIGNAL",
+     "SCALP1 | BUY SIGNAL", "VIP25 | BUY SIGNAL"],
+)
+def test_a_timeframe_or_numbered_tag_over_the_fixture_body_is_parse_failed(header):
+    r = _route(FIXTURE_TEXT.replace(FIXTURE_HEADER, header))
+    assert r.kind == "parse_failed", r
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["US30 | BUY SIGNAL", "NAS100 | BUY SIGNAL", "GER40 | BUY SIGNAL", "SPX500 | BUY SIGNAL",
+     "JP225 | BUY SIGNAL", "UK100 | BUY SIGNAL", "HK50 | BUY SIGNAL", "US500 | BUY SIGNAL",
+     "NASDAQ100 | BUY SIGNAL"],
+)
+def test_an_index_over_the_fixture_body_is_another_instruments_skip(header):
+    r = _route(FIXTURE_TEXT.replace(FIXTURE_HEADER, header))
+    assert r.kind == "skip", r
+
+
+# -- FF4: the two instrument guards, pinned -------------------------------------
+
+
+@pytest.mark.parametrize("header", ["BTCPRO | BUY SIGNAL", "EURONEWS | BUY SIGNAL"])
+def test_a_word_that_only_starts_with_a_currency_is_no_pair(header):
+    """Both halves must be codes: "BTC" + "PRO" is no pair."""
+    r = _route(FIXTURE_TEXT.replace(FIXTURE_HEADER, header))
+    assert r.kind == "parse_failed", r
+
+
+def test_gold_with_a_number_in_the_header_is_gold(monkeypatch):
+    """A symbol containing a gold alias is never another instrument -- even
+    one the instrument lists would name (here a gold coin added to them)."""
+    from xaucopier.parsing import router
+
+    assert _route(FIXTURE_TEXT.replace(FIXTURE_HEADER, "GOLD1 | BUY SIGNAL")).kind == "parse_failed"
+    monkeypatch.setattr(router, "_PAIR_CODES", router._PAIR_CODES | {"XAUT"})
+    r = _route(FIXTURE_TEXT.replace(FIXTURE_HEADER, "XAUTUSD | BUY SIGNAL"))
+    assert r.kind == "parse_failed", r
+
+
+@pytest.mark.parametrize("header", ["US30CASH | BUY SIGNAL", "NAS100M | BUY SIGNAL"])
+def test_an_index_with_a_brokers_suffix_is_another_instruments_skip(header):
+    assert _route(FIXTURE_TEXT.replace(FIXTURE_HEADER, header)).kind == "skip"
