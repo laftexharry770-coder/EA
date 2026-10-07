@@ -126,3 +126,13 @@ def test_the_runbook_uses_none_of_the_developer_words() -> None:
     client, a listener, an RPC or a flood wait."""
     for word in ("client", "listener", "rpc", "flood"):
         assert word not in RUNBOOK.lower(), word
+
+
+def test_the_exit_4_row_says_to_wait_when_telegram_asked_watch_to_wait() -> None:
+    """Final fix FF21: watch stops with exit 4 when Telegram asks it to wait
+    before starting, and every start sooner earns a longer wait -- so
+    "safe to start it again" needs its exception, in the row the user
+    reads."""
+    (row,) = re.findall(r"^\| 4 \|.*$", RUNBOOK, flags=re.MULTILINE)
+    assert "Telegram asked watch to wait" in row
+    assert "after the time it names" in row
