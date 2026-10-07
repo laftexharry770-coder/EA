@@ -279,3 +279,25 @@ def test_telethons_own_warning_lines_never_reach_the_user(
     assert telethon_lines == []
     err = capsys.readouterr().err
     assert f"Telegram could not do this just now (Telegram error {number})" in err
+
+
+def test_two_commands_at_once_never_leave_telethons_lines_silenced() -> None:
+    """Two commands run at once in one process (the channels tests do):
+    A silences Telethon's lines, B starts and saves the level -- already
+    silenced -- A ends and puts the old level back, then B ends and puts
+    back the silenced one. Telethon's lines then never reached watch's log
+    file again. The silencing is counted: the level the first one found
+    is the one the last one leaves."""
+    import logging
+
+    logger = logging.getLogger("telethon")
+    before = logger.level
+    a = cli_main._telethon_kept_quiet(True)
+    b = cli_main._telethon_kept_quiet(True)
+    a.__enter__()
+    b.__enter__()
+    assert logger.level > logging.CRITICAL
+    a.__exit__(None, None, None)
+    assert logger.level > logging.CRITICAL  # B still runs
+    b.__exit__(None, None, None)
+    assert logger.level == before

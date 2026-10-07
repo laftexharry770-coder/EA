@@ -47,6 +47,7 @@ import getpass
 import io
 import logging
 import sys
+import threading
 from pathlib import Path
 
 from telethon import errors
@@ -619,6 +620,11 @@ def _replace_what_cannot_be_shown() -> None:
             pass
 
 
+_telethon_quiet_lock = threading.Lock()
+_telethon_quiet_depth = 0
+_telethon_level_before = logging.NOTSET
+
+
 @contextlib.contextmanager
 def _telethon_kept_quiet(quiet: bool):
     """Keep Telethon's own log lines out of a one-shot command's window.
@@ -635,13 +641,24 @@ def _telethon_kept_quiet(quiet: bool):
     if not quiet:
         yield
         return
+    global _telethon_quiet_depth, _telethon_level_before
     logger = logging.getLogger("telethon")
-    before = logger.level
-    logger.setLevel(logging.CRITICAL + 1)
+    # Counted, so two commands run at once in one process (the tests do)
+    # never leave the level silenced: with a plain save-and-restore, the
+    # later one saved the earlier one's silenced level and put it back
+    # last, and Telethon's lines then never reached watch's log file.
+    with _telethon_quiet_lock:
+        if _telethon_quiet_depth == 0:
+            _telethon_level_before = logger.level
+            logger.setLevel(logging.CRITICAL + 1)
+        _telethon_quiet_depth += 1
     try:
         yield
     finally:
-        logger.setLevel(before)
+        with _telethon_quiet_lock:
+            _telethon_quiet_depth -= 1
+            if _telethon_quiet_depth == 0:
+                logger.setLevel(_telethon_level_before)
 
 
 def main(argv: list[str] | None = None) -> int:
