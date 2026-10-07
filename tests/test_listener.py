@@ -1752,3 +1752,49 @@ def test_normalise_converts_an_aware_non_utc_datetime_to_utc() -> None:
 
     assert incoming.posted_at_utc == datetime(2026, 9, 5, 10, 45, tzinfo=UTC)
     assert incoming.posted_at_utc.tzinfo is UTC
+
+
+# -- FF4 (R2-F18-live-ignores): a deletion handled before its live message ---------
+
+
+@pytest.mark.parametrize("raced", [True, False], ids=["deletion-first", "reference-order"])
+def test_a_live_message_whose_deletion_was_handled_first_is_stored_deleted(tmp_path, raced):
+    """Telegram's MessageDeleted update for a message is handled before
+    its NewMessage update (final review F18, on the live path): the
+    deletion is applied as that report when the message is stored --
+    VOIDED, its entries SKIPPED, one WARNING -- the same as in the
+    reference order."""
+    from xaucopier.store import edits_repo
+
+    db_path = tmp_path / "store.db"
+    incoming = IncomingMessage(
+        channel_id=CHANNEL.channel_id, message_id=4001, text=SIGNAL_TEXT, posted_at_utc=POSTED,
+        edit_date_utc=None, reply_to_message_id=None,
+    )
+
+    async def delete(listener):
+        return await listener.ingest_deletion(
+            CHANNEL, 4001, detected_by=edits_repo.EVENT_DETECTOR, also_deleted=(4001,),
+            reported_at_utc=POSTED + timedelta(seconds=3),
+        )
+
+    async def scenario():
+        async with _started(db_path, FakeTelegramClient()) as listener:
+            if raced:
+                assert (await delete(listener)).outcome == "unknown"
+            await listener.ingest_message(incoming, channel_cfg=CHANNEL, source="live")
+            if not raced:
+                await delete(listener)
+
+    asyncio.run(scenario())
+
+    conn = db.connect(db_path, role="reader")
+    try:
+        rows = lambda sql: [tuple(r) for r in conn.execute(sql).fetchall()]  # noqa: E731
+        assert rows("SELECT state, withdrawn_at_utc IS NOT NULL FROM signals") == [("VOIDED", 1)]
+        assert rows("SELECT state FROM outbox WHERE kind = 'ENTRY'") == [("SKIPPED",)] * 2
+        assert rows("SELECT level, code FROM alerts") == [
+            ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION)
+        ]
+    finally:
+        conn.close()
