@@ -196,6 +196,11 @@ two backfills every existing row keeps every value it had.
   to ``off_at_utc``, skips to ``on_at_utc`` and deletes the row -- so OFF
   skips exactly what the channel posted while it was off. See
   ``store/channel_state.py``. Empty after the upgrade.
+  ``off_clock_difference_s`` / ``on_clock_difference_s``: how far this
+  computer's clock was off Telegram's, as the latest ``watch`` start
+  measured it, when each switch was stamped (final fix round 3, R3-4;
+  signed whole seconds, NULL when none was measured) -- the read around
+  that switch is widened by it.
 
 ``sender_kind`` and ``is_post`` carry CHECK constraints; NULL (not
 known, or stored before migration 4) always passes.
@@ -339,11 +344,16 @@ _MIGRATION_4: tuple[str, ...] = (
     "ON messages(fwd_from_channel_id, fwd_from_post_id)",
     # Fix round 2 of F28: one row per OFF period of a channel; see the
     # module docstring and store/channel_state.py.
+    # Final fix round 3 (R3-4): with each switch, the difference between
+    # this computer's clock and Telegram's that the latest watch start
+    # measured (signed whole seconds; NULL: none measured).
     "CREATE TABLE IF NOT EXISTS channel_off_periods ("
     "  period_id  INTEGER PRIMARY KEY,"
     "  channel_id INTEGER NOT NULL,"
     "  off_at_utc TEXT    NOT NULL,"
-    "  on_at_utc  TEXT"
+    "  on_at_utc  TEXT,"
+    "  off_clock_difference_s INTEGER,"
+    "  on_clock_difference_s  INTEGER"
     ")",
     "CREATE INDEX IF NOT EXISTS idx_channel_off_periods_channel "
     "ON channel_off_periods(channel_id, off_at_utc)",

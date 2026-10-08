@@ -932,7 +932,12 @@ def test_a_config_that_could_spin_or_read_nothing_is_refused(kwargs: dict) -> No
 def _stamps(db_path: Path) -> dict[str, tuple[datetime, str | None]]:
     conn = db.connect(db_path, role="reader")
     try:
-        return {beat.name: (beat.at_utc, beat.detail) for beat in heartbeats.read_all(conn)}
+        # The poll's stamps; the clock difference start() keeps (R3-4) is not one.
+        return {
+            beat.name: (beat.at_utc, beat.detail)
+            for beat in heartbeats.read_all(conn)
+            if beat.name != heartbeats.CLOCK_DIFFERENCE
+        }
     finally:
         conn.close()
 

@@ -141,7 +141,7 @@ import asyncio
 import collections
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
@@ -185,9 +185,10 @@ FIRST_RUN_SEED_MARGIN = timedelta(seconds=60)
 #: the switch-off, and from this long before the switch-on (fix round 2 of
 #: F28). `channels off`/`on` stamp this computer's clock, the posts carry
 #: Telegram's; a post made just before the switch-off is never lost to a
-#: clock a little behind. A clock further off when watch starts widens
-#: this by the difference `start()` measures, never shifts the stamps
-#: (final fix FF8/FF17, round 2): see `Listener._off_allowance`.
+#: clock a little behind. A clock further off widens this by the larger of
+#: the difference kept with that switch and the one `start()` measures,
+#: never shifts the stamps (final fix FF8/FF17, rounds 2 and 3): see
+#: `Listener._off_allowances`.
 OFF_PERIOD_MARGIN = FIRST_RUN_SEED_MARGIN
 #: How long `start()` waits for Telegram's clock (`updates.GetState`)
 #: before it uses this computer's own (ledger 143).
@@ -708,12 +709,13 @@ class Listener:
         self._started_at: datetime | None = None
         # How far this computer's clock was ahead of Telegram's when
         # start() began (None: Telegram's clock was not read). It widens
-        # what is read around each OFF period (`_off_allowance`, FF8).
+        # what is read around each OFF period (`_off_allowances`, FF8),
+        # and is kept for `channels off`/`on` (R3-4).
         self._clock_difference: timedelta | None = None
-        # The OFF periods already closed when start() began, by id, with
-        # when each ended: only those are this watch's to skip (final fix
-        # FF24, round 2). None until start() has looked.
-        self._periods_at_start: dict[int, datetime] | None = None
+        # The OFF periods already closed when start() began, by id, as they
+        # were then: only those are this watch's to skip (final fix FF24,
+        # round 2). None until start() has looked.
+        self._periods_at_start: dict[int, channel_state.OffPeriod] | None = None
         #: Set by `run_listener` when Telegram asked watch to wait at start:
         #: starting it again before this time only earns a longer wait.
         self.start_after_utc: datetime | None = None
@@ -1231,11 +1233,11 @@ class Listener:
         call reading one) -- a 'close all' posted while the channel was
         still ON and watch was stopped is read -- and only then a skip to
         the switch-on (`_skip_while_off`). So OFF skips exactly what the
-        channel posted while it was off, less `_off_allowance` at either
+        channel posted while it was off, less `_off_allowances` at either
         end (the margin, widened by how far this computer's clock was off
-        at this start -- never shifted). Only a period already closed when
-        this watch started is skipped, as it was then (`_as_at_start`).
-        Only then does the ordinary read run.
+        at that switch or at this start -- never shifted). Only a period
+        already closed when this watch started is skipped, as it was then
+        (`_as_at_start`). Only then does the ordinary read run.
 
         `rpc_timeout` is required: it bounds every `get_messages()` RPC
         this call makes (`asyncio.wait_for`; `TimeoutError` propagates),
@@ -1316,14 +1318,14 @@ class Listener:
     ) -> tuple[bool, int, tuple[HistoryIngest, ...]]:
         """The first of an OFF period's two ranges: one batch after
         `pointer`, ingested up to the first post dated after the switch-off
-        (plus `_off_allowance`). Returns whether the read has caught up
+        (plus its `_off_allowances`). Returns whether the read has caught up
         to the switch-off -- a post after it was met, or the batch was the
         last there is, and every post before it is stored or skipped --
         the pointer now, and what was ingested. Not caught up (a full
         batch, or a post that failed): the next read goes on from the
         pointer, and the period waits."""
         channel_id = channel_cfg.channel_id
-        last_read = period.off_at_utc + self._off_allowance()
+        last_read = period.off_at_utc + self._off_allowances(period)[0]
         messages = await asyncio.wait_for(
             self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
             rpc_timeout,
@@ -1356,13 +1358,14 @@ class Listener:
     ) -> int:
         """The second range: skip what the channel posted while it was OFF.
         The pointer moves to the newest post dated before the switch-on
-        (less `_off_allowance`) -- one RPC, as a seed's anchor -- never
+        (less its `_off_allowances`) -- one RPC, as a seed's anchor -- never
         down, and the period is deleted, in one writer job. Returns the
         pointer. The window is told only when something was skipped: a
         period whose posts were all read already (a watch was running)
         skipped nothing (final fix FF24)."""
         channel_id = channel_cfg.channel_id
-        offset = (period.on_at_utc - self._off_allowance()).replace(microsecond=0)
+        allow_off, allow_on = self._off_allowances(period)
+        offset = (period.on_at_utc - allow_on).replace(microsecond=0)
         before_on = await asyncio.wait_for(
             self.client.get_messages(channel_id, limit=1, offset_date=offset), rpc_timeout
         )
@@ -1384,37 +1387,45 @@ class Listener:
                 period.on_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
             )
             return pointer
-        allowance = int(self._off_allowance().total_seconds())
         logger.warning(
             "Channel %s (%s) was switched off from %s to %s UTC: what it posted in between "
             "was not read. Everything it posted before and since is read, and so is what it "
-            "posted within %s of either switch, in case this computer's clock was off by up "
-            "to that much when you switched.",
+            "posted within %s, in case this computer's clock was off by up to that much "
+            "when you switched.",
             channel_id,
             channel_cfg.name,
             period.off_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
             period.on_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
-            "a minute" if allowance == 60 else f"{allowance} seconds",
+            _around_switches_words(allow_off, allow_on),
         )
         return pointer
 
-    def _off_allowance(self) -> timedelta:
-        """How far around an OFF period's two stamps posts are still read:
-        `OFF_PERIOD_MARGIN`, widened by how far this computer's clock was
-        off Telegram's when `start()` began (final fix FF8/FF17, round 2).
+    def _off_allowances(self, period: channel_state.OffPeriod) -> tuple[timedelta, timedelta]:
+        """How far around `period`'s two stamps posts are still read: after
+        the switch-off, and before the switch-on. Each is
+        `OFF_PERIOD_MARGIN`, widened by the larger of how far this
+        computer's clock was off Telegram's when that switch was stamped
+        (as the latest watch start before it measured, kept with the
+        switch) and when this `start()` began (final fix FF8/FF17, rounds
+        2 and 3).
 
         The stamps are this computer's clock when `channels off`/`on` ran;
-        the posts carry Telegram's. The difference measured at this start
-        was never measured when the stamps were taken -- the clock may have
-        been put right, or gone wrong, in between -- so it never shifts
-        them: shifting lost a post made while the channel was ON whenever
-        the difference had changed. The skipped range only shrinks, by it,
-        at both ends: a post made while ON is read whatever the clock did,
-        as long as it was off by no more than this at the switches; the
-        cost is reading a little of what was posted while OFF."""
-        if self._clock_difference is None:
-            return OFF_PERIOD_MARGIN
-        return OFF_PERIOD_MARGIN + abs(self._clock_difference)
+        the posts carry Telegram's. A difference never shifts them:
+        shifting lost a post made while the channel was ON whenever the
+        difference had changed. The skipped range only shrinks, by it, at
+        each end: a post made while ON is read whatever the clock did, as
+        long as it was off by no more than this at the switch; the cost is
+        reading a little of what was posted while OFF. The difference kept
+        with a switch covers a clock off then and put right since -- what
+        watch's own clock warning advises (R3-4). What is left: a clock
+        that went wrong after the latest watch start measured it, and more
+        than this off at the switch."""
+        now = abs(self._clock_difference) if self._clock_difference is not None else timedelta(0)
+
+        def widened(kept: timedelta | None) -> timedelta:
+            return OFF_PERIOD_MARGIN + max(now, abs(kept) if kept is not None else timedelta(0))
+
+        return widened(period.off_clock_difference), widened(period.on_clock_difference)
 
     def _as_at_start(self, period: channel_state.OffPeriod) -> channel_state.OffPeriod | None:
         """`period` as this watch is to skip it: as it was when `start()`
@@ -1431,10 +1442,7 @@ class Listener:
         directly) skips every closed period as it is."""
         if self._periods_at_start is None:
             return period
-        ended = self._periods_at_start.get(period.period_id)
-        if ended is None:
-            return None
-        return replace(period, on_at_utc=ended)
+        return self._periods_at_start.get(period.period_id)
 
     async def probe_writer(self) -> None:
         """Run a no-op (`SELECT 1`) on the writer thread and await it.
@@ -1827,7 +1835,7 @@ class Listener:
         # The OFF periods closed by now are this watch's to skip; one
         # closed later was switched on while it ran (FF24, round 2).
         self._periods_at_start = {
-            period.period_id: period.on_at_utc
+            period.period_id: period
             for channel in self.channels
             for period in channel_state.off_periods(self._reader, channel.channel_id)
         }
@@ -1867,6 +1875,7 @@ class Listener:
             raise ListenerStartupError(message, plain=message, start_after_utc=after) from exc
         self._name_sources(dialogs)
         self._started_at = self._decide_start(local_start, telegram_clock)
+        await self._keep_clock_difference()
         await self._store_seed_cutoffs()
 
         for channel in self.enabled_channels:  # 3
@@ -1874,6 +1883,28 @@ class Listener:
 
         self._register_handlers()  # 4
         self._start_poll_task()  # 5
+
+    async def _keep_clock_difference(self) -> None:
+        """Keep the difference `_decide_start` measured for `channels off`/
+        `on` to store with the time they stamp (final fix round 3, R3-4): a
+        clock off at a switch and put right before the next start is then
+        still allowed for. Nothing measured (Telegram's clock not read):
+        the last one stays. A write that fails is logged and passed over --
+        it must not keep watch from starting."""
+        difference = self._clock_difference
+        if difference is None:
+            return
+        now_utc = self._now()
+
+        def keep(conn: Connection) -> None:
+            heartbeats.record_clock_difference(conn, difference=difference, now_utc=now_utc)
+
+        try:
+            await self._run_on_writer(keep)
+        except Exception as exc:  # noqa: BLE001 -- the next start measures it again
+            logger.info(
+                "keeping the clock difference failed: %r", exc, extra=db.LOG_FILE_ONLY
+            )
 
     async def _start_writer_and_wait_for_connection(self) -> None:
         self.writer.start()
@@ -2477,6 +2508,25 @@ def wait_words(seconds: float) -> str:
     if minutes < 120:
         return f"about {minutes} minutes"
     return f"about {int(round(seconds / 3600))} hours"
+
+
+def _seconds_words(span: timedelta) -> str:
+    """A read allowance in plain words: "a minute", "240 seconds"."""
+    seconds = int(span.total_seconds())
+    return "a minute" if seconds == 60 else f"{seconds} seconds"
+
+
+def _around_switches_words(after_off: timedelta, before_on: timedelta) -> str:
+    """How far around an OFF period's two switches posts are read, as the
+    window says it: "a minute of either switch", or, when the two differ
+    (a clock difference kept with one switch only), "240 seconds of the
+    switch-off and a minute of the switch-on" (R3-4)."""
+    if after_off == before_on:
+        return f"{_seconds_words(after_off)} of either switch"
+    return (
+        f"{_seconds_words(after_off)} of the switch-off and "
+        f"{_seconds_words(before_on)} of the switch-on"
+    )
 
 
 def _describe_age(age: timedelta) -> str:

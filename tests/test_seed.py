@@ -1136,3 +1136,135 @@ def test_a_period_extended_while_this_watch_runs_is_skipped_as_it_was_at_start(
 
     assert _stored_ids(db_path) == [101, 103, 104]
     assert _periods_left(db_path) == []
+
+
+# -- final fix round 3 (R3-4): the clock difference at the switches is kept ----------------
+
+
+def _measure_clock(db_path: Path, skew: int) -> None:
+    """A watch started (and stopped) with this computer's clock `skew`
+    seconds off Telegram's: it measures the difference and keeps it. Only
+    channel B is read, so channel A is left as `channels off`/`on` will
+    leave it."""
+
+    async def scenario():
+        client = FakeTelegramClient(history={B: []}, server_time=NOW - timedelta(hours=4))
+        clock = {"now": NOW - timedelta(hours=4) + timedelta(seconds=skew)}
+        async with _watching(db_path, client, clock, channels=(CHANNEL_B,)):
+            pass
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("skew", [180, -180], ids=["fast-at-switches", "slow-at-switches"])
+def test_a_clock_off_at_the_switches_and_put_right_since_never_skips_a_post_made_while_on(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, skew: int
+) -> None:
+    """Final fix round 3 (R3-4; the re-check's p_skew_changed +180/0 and
+    -180/0). watch warned the clock was 3 minutes off; the user stopped it,
+    ran `channels off` and `channels on` with the clock still off, then
+    put the clock right, as advised, and started watch. With the clock
+    fast, BUY 105, posted 90 s after the switch-on, was skipped; with it
+    slow, BUY 101, posted 90 s before the switch-off -- silently: this
+    start measured no difference. Each switch now keeps the difference
+    the latest watch start measured, and the read around it is widened by
+    that too."""
+    db_path = tmp_path / "store.db"
+    _measure_clock(db_path, skew)
+    real_off, real_on = _hours_ago(3), _hours_ago(2)
+    clock_off = timedelta(seconds=skew)
+    _stamp_period(db_path, real_off + clock_off, real_on + clock_off)
+
+    async def scenario():
+        client = FakeTelegramClient(
+            history={A: _ten_posts_around(real_off, real_on)}, server_time=NOW
+        )
+        async with _watching(db_path, client, {"now": NOW}):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    stored = _stored_ids(db_path)
+    assert 101 in stored and 105 in stored, stored  # posted while ON
+    assert 103 not in stored  # half an hour into the OFF time
+    assert _periods_left(db_path) == []
+    (skipped,) = [r.getMessage() for r in caplog.records if "was switched off from" in r.getMessage()]
+    assert "within 240 seconds of either switch" in skipped, skipped
+    _assert_plain(skipped)
+
+
+def test_each_switch_is_widened_by_the_difference_kept_with_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The clock was 3 minutes slow at `channels off` and right at `channels
+    on` (a watch start in between measured it right): the read is widened
+    at the switch-off only. 104, posted 90 s before the switch-on while
+    the channel was OFF, is not read."""
+    db_path = tmp_path / "store.db"
+    real_off, real_on = _hours_ago(3), _hours_ago(2)
+    _measure_clock(db_path, -180)
+    conn = db.connect(db_path, role="writer")
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_state (channel_id, last_processed_message_id, "
+            "seeded_at_utc) VALUES (?, 100, '2026-09-01T00:00:00+00:00')",
+            (A,),
+        )
+        channel_state.record_switch_off(conn, channel_id=A, off_at_utc=real_off - timedelta(seconds=180))
+        conn.commit()
+    finally:
+        conn.close()
+    _measure_clock(db_path, 0)
+    conn = db.connect(db_path, role="writer")
+    try:
+        channel_state.record_switch_on(
+            conn, channel_id=A, on_at_utc=real_on, may_replace_first_cutoff=True
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    async def scenario():
+        client = FakeTelegramClient(
+            history={A: _ten_posts_around(real_off, real_on)}, server_time=NOW
+        )
+        async with _watching(db_path, client, {"now": NOW}):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 105]
+    (skipped,) = [r.getMessage() for r in caplog.records if "was switched off from" in r.getMessage()]
+    assert "within 240 seconds of the switch-off and a minute of the switch-on" in skipped, skipped
+    _assert_plain(skipped)
+
+
+def test_each_watch_start_keeps_the_clock_difference_it_measured(tmp_path: Path) -> None:
+    """For `channels off`/`on` to keep with their stamps (R3-4): every start
+    that reads Telegram's clock keeps the difference it measured; one that
+    cannot read it leaves the last one as it was."""
+    from xaucopier.store import heartbeats
+
+    db_path = tmp_path / "store.db"
+    _measure_clock(db_path, 150)
+
+    def kept():
+        conn = db.connect(db_path, role="reader")
+        try:
+            return heartbeats.read_clock_difference(conn)
+        finally:
+            conn.close()
+
+    assert kept() == timedelta(seconds=150)
+    _measure_clock(db_path, -30)
+    assert kept() == timedelta(seconds=-30)
+
+    async def no_clock():
+        client = FakeTelegramClient(history={B: []}, get_state_failure=RuntimeError("no clock"))
+        async with _watching(db_path, client, {"now": NOW}, channels=(CHANNEL_B,)):
+            pass
+
+    asyncio.run(no_clock())
+    assert kept() == timedelta(seconds=-30)

@@ -40,6 +40,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
+from xaucopier.store import heartbeats
+
 #: A stored cutoff older than this, relative to the start that finds it, is
 #: replaced by that start (ruling C1 addendum).
 MAX_CUTOFF_AGE = timedelta(hours=24)
@@ -249,6 +251,12 @@ def request_reseed(conn: sqlite3.Connection, *, channel_id: int, cutoff_utc: dat
 # (`finish_off_period`). One row per period, so two OFF/ON switches
 # between two runs of watch are each skipped exactly, and a first read
 # still pending keeps its own cutoff.
+#
+# The stamps are this computer's clock, the posts Telegram's. Each switch
+# also keeps how far off this computer's clock was, as the latest watch
+# start measured it (`heartbeats.read_clock_difference`; final fix round 3,
+# R3-4): a clock off at the switches and put right since -- what watch's
+# own clock warning advises -- is still allowed for when the period is read.
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +266,11 @@ class OffPeriod:
     period_id: int
     off_at_utc: datetime
     on_at_utc: datetime
+    #: How far this computer's clock was off Telegram's when each switch was
+    #: stamped, as the latest watch start before it measured (positive:
+    #: ahead); None when none was measured (R3-4).
+    off_clock_difference: timedelta | None = None
+    on_clock_difference: timedelta | None = None
 
 
 ReseedOutcome = Literal["reseeded", "never_read", "first_read_kept"]
@@ -293,9 +306,11 @@ def reading_started(state: ChannelState) -> bool:
 
 def record_switch_off(conn: sqlite3.Connection, *, channel_id: int, off_at_utc: datetime) -> bool:
     """`channels off`: open an OFF period for `channel_id` at `off_at_utc`
-    (whole seconds), if its reading has started. An open period already
-    there -- left by an earlier `channels off` whose save failed, so the
-    channel stayed ON -- is replaced. Returns whether a period was opened.
+    (whole seconds), if its reading has started, keeping with it the clock
+    difference the latest watch start measured (`_clock_now`). An open
+    period already there -- left by an earlier `channels off` whose save
+    failed, so the channel stayed ON -- is replaced. Returns whether a
+    period was opened.
     """
     off_raw = format_utc(off_at_utc)
     if not reading_started(read(conn, channel_id)):
@@ -305,10 +320,25 @@ def record_switch_off(conn: sqlite3.Connection, *, channel_id: int, off_at_utc: 
         (channel_id,),
     )
     conn.execute(
-        "INSERT INTO channel_off_periods (channel_id, off_at_utc) VALUES (?, ?)",
-        (channel_id, off_raw),
+        "INSERT INTO channel_off_periods (channel_id, off_at_utc, off_clock_difference_s) "
+        "VALUES (?, ?, ?)",
+        (channel_id, off_raw, _clock_now(conn)),
     )
     return True
+
+
+def _clock_now(conn: sqlite3.Connection) -> int | None:
+    """The clock difference to keep with a switch stamped now: the one the
+    latest watch start measured, in signed whole seconds, or None (R3-4)."""
+    difference = heartbeats.read_clock_difference(conn)
+    return None if difference is None else int(difference.total_seconds())
+
+
+def _seconds(value: object) -> timedelta | None:
+    """A stored clock difference read back; anything unreadable is None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return timedelta(seconds=value)
 
 
 def record_missing_switch_off(
@@ -336,8 +366,9 @@ def record_missing_switch_off(
     ).fetchone() is not None:
         return False
     conn.execute(
-        "INSERT INTO channel_off_periods (channel_id, off_at_utc) VALUES (?, ?)",
-        (channel_id, format_utc(off_at_utc)),
+        "INSERT INTO channel_off_periods (channel_id, off_at_utc, off_clock_difference_s) "
+        "VALUES (?, ?, ?)",
+        (channel_id, format_utc(off_at_utc), _clock_now(conn)),
     )
     return True
 
@@ -350,7 +381,8 @@ def record_switch_on(
     may_replace_first_cutoff: bool,
 ) -> SwitchOn:
     """`channels on`: end `channel_id`'s OFF period at `on_at_utc` (whole
-    seconds; never before the period's own start, whatever the clock did).
+    seconds; never before the period's own start, whatever the clock did),
+    keeping with it the clock difference the latest watch start measured.
 
     - An open period is closed there.
     - None open, but one closed and not yet skipped: that one is extended
@@ -384,8 +416,9 @@ def record_switch_on(
         off_at = _parse(off_raw)
         ends = max(on_at, off_at) if off_at is not None else on_at
         conn.execute(
-            "UPDATE channel_off_periods SET on_at_utc = ? WHERE period_id = ?",
-            (format_utc(ends), period_id),
+            "UPDATE channel_off_periods SET on_at_utc = ?, on_clock_difference_s = ? "
+            "WHERE period_id = ?",
+            (format_utc(ends), _clock_now(conn), period_id),
         )
         return SwitchOn(outcome=outcome, off_at_utc=off_at)
     return SwitchOn(
@@ -435,14 +468,23 @@ def off_periods(conn: sqlite3.Connection, channel_id: int) -> tuple[OffPeriod, .
     Read-only. A period whose times cannot be read is left out (never
     skipped: what it covers is read, not lost)."""
     periods = []
-    for period_id, off_raw, on_raw in conn.execute(
-        "SELECT period_id, off_at_utc, on_at_utc FROM channel_off_periods "
+    for period_id, off_raw, on_raw, off_clock, on_clock in conn.execute(
+        "SELECT period_id, off_at_utc, on_at_utc, off_clock_difference_s, "
+        "on_clock_difference_s FROM channel_off_periods "
         "WHERE channel_id = ? AND on_at_utc IS NOT NULL ORDER BY off_at_utc, period_id",
         (channel_id,),
     ).fetchall():
         off_at, on_at = _parse(off_raw), _parse(on_raw)
         if off_at is not None and on_at is not None:
-            periods.append(OffPeriod(period_id=period_id, off_at_utc=off_at, on_at_utc=on_at))
+            periods.append(
+                OffPeriod(
+                    period_id=period_id,
+                    off_at_utc=off_at,
+                    on_at_utc=on_at,
+                    off_clock_difference=_seconds(off_clock),
+                    on_clock_difference=_seconds(on_clock),
+                )
+            )
     return tuple(periods)
 
 

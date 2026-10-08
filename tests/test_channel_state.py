@@ -480,3 +480,83 @@ def test_open_and_unreadable_periods_are_never_skipped(conn) -> None:
         (A, SEEDED),
     )
     assert channel_state.off_periods(conn, A) == ()
+
+
+# -- final fix round 3 (R3-4): each switch keeps the clock difference last measured ---------
+
+
+def _clock(conn, seconds: int) -> None:
+    """A watch start measured this computer's clock `seconds` off Telegram's."""
+    from xaucopier.store import heartbeats
+
+    heartbeats.record_clock_difference(
+        conn, difference=timedelta(seconds=seconds), now_utc=START - timedelta(days=1)
+    )
+
+
+def _differences(conn, channel_id: int = A) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT off_clock_difference_s, on_clock_difference_s FROM channel_off_periods "
+            "WHERE channel_id = ? ORDER BY period_id",
+            (channel_id,),
+        ).fetchall()
+    ]
+
+
+def test_each_switch_keeps_the_clock_difference_the_latest_watch_start_measured(conn) -> None:
+    """The stamps are this computer's clock; a watch start measured how far
+    off it was. `channels off` keeps the latest measurement with the
+    switch-off, `channels on` with the switch-on: the read around each is
+    widened by it, so a clock put right since never skips a post made
+    while ON."""
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    _clock(conn, 180)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+    assert _differences(conn) == [(180, None)]
+    _clock(conn, -45)
+    channel_state.record_switch_on(conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=True)
+
+    assert _differences(conn) == [(180, -45)]
+    (period,) = channel_state.off_periods(conn, A)
+    assert period.off_clock_difference == timedelta(seconds=180)
+    assert period.on_clock_difference == timedelta(seconds=-45)
+
+
+def test_with_no_difference_measured_yet_the_switches_keep_none(conn) -> None:
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+    channel_state.record_switch_on(conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=True)
+
+    assert _differences(conn) == [(None, None)]
+    (period,) = channel_state.off_periods(conn, A)
+    assert (period.off_clock_difference, period.on_clock_difference) == (None, None)
+
+
+def test_a_switch_off_saved_late_and_an_extended_period_keep_the_latest_difference(conn) -> None:
+    """`channels off` saving a switch-off whose time was never saved, and a
+    `channels on` extending a closed period, each keep the difference
+    measured last."""
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    _clock(conn, 30)
+    assert channel_state.record_missing_switch_off(conn, channel_id=A, off_at_utc=OFF) is True
+    channel_state.record_switch_on(conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=True)
+    _clock(conn, -150)
+    extended = channel_state.record_switch_on(
+        conn, channel_id=A, on_at_utc=ON + timedelta(hours=1), may_replace_first_cutoff=True
+    )
+
+    assert extended.outcome == "period_extended"
+    assert _differences(conn) == [(30, -150)]
+
+
+def test_an_unreadable_difference_is_kept_as_none(conn) -> None:
+    """Whatever is stored, a switch is never refused for it."""
+    conn.execute(
+        "INSERT INTO heartbeats (name, at_utc, detail) VALUES (?, ?, ?)",
+        ("clock_difference", START.isoformat(), "not a number"),
+    )
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+    assert _differences(conn) == [(None, None)]

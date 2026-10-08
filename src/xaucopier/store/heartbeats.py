@@ -18,15 +18,21 @@ name, overwritten each time (migration 3):
   "stopped because Telegram logged this session out" -- and, when
   Telegram asked watch to wait at start, the time to start it again
   after (`stop_detail`, `read_stop`).
+- `clock_difference` -- how far this computer's clock was off Telegram's
+  when `watch` last started and could read Telegram's clock (signed whole
+  seconds in `detail`: positive is ahead). `channels off`/`on` keep it
+  with the time they stamp (final fix round 3, R3-4;
+  `record_clock_difference`, `read_clock_difference`).
 
 Like `metrics.bump` and `alerts.record`, `beat()` only executes: it runs
 inside the caller's transaction and never commits.
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 #: Stamped by the poll at the end of every round.
 POLL_ROUND = "poll_round_completed"
@@ -35,6 +41,8 @@ CHANNEL_READ_PREFIX = "channel_read:"
 #: Stamped by `xaucopier watch` when it starts and when it stops.
 WATCH_STARTED = "watch_started"
 WATCH_STOPPED = "watch_stopped"
+#: Stamped by `xaucopier watch` at each start that reads Telegram's clock.
+CLOCK_DIFFERENCE = "clock_difference"
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +82,32 @@ def read_stop(detail: str | None) -> tuple[int | None, datetime | None]:
     if after is not None and (after.tzinfo is None or after.utcoffset() is None):
         after = None
     return code, after
+
+
+def record_clock_difference(
+    conn: sqlite3.Connection, *, difference: timedelta, now_utc: datetime
+) -> None:
+    """Keep the difference a `watch` start measured between this computer's
+    clock and Telegram's (positive: this computer's is ahead), in whole
+    seconds rounded away from zero -- the read it widens is never
+    narrowed by the rounding. Runs in the caller's transaction."""
+    seconds = difference.total_seconds()
+    whole = math.ceil(abs(seconds))
+    beat(conn, name=CLOCK_DIFFERENCE, now_utc=now_utc, detail=str(-whole if seconds < 0 else whole))
+
+
+def read_clock_difference(conn: sqlite3.Connection) -> timedelta | None:
+    """The difference the latest `watch` start measured (`record_clock_
+    difference`), or None: none measured yet, or unreadable."""
+    row = conn.execute(
+        "SELECT detail FROM heartbeats WHERE name = ?", (CLOCK_DIFFERENCE,)
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    try:
+        return timedelta(seconds=int(row[0]))
+    except (TypeError, ValueError):
+        return None
 
 
 def channel_read_name(channel_id: int) -> str:

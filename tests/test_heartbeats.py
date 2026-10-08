@@ -144,3 +144,42 @@ def test_connect_readonly_sees_what_a_live_writer_has_committed(tmp_path: Path) 
             reader.close()
     finally:
         writer.close()
+
+
+# -- final fix round 3 (R3-4): the clock difference a watch start measured --------------------
+
+
+@pytest.mark.parametrize(
+    ("difference", "kept"),
+    [
+        (timedelta(seconds=150), 150),
+        (timedelta(seconds=-150), -150),
+        (timedelta(seconds=44, milliseconds=200), 45),  # rounded away from zero
+        (timedelta(seconds=-44, milliseconds=-200), -45),
+        (timedelta(0), 0),
+    ],
+)
+def test_the_clock_difference_is_kept_in_whole_seconds_never_rounded_down(
+    tmp_path, difference, kept
+) -> None:
+    conn = db.connect(tmp_path / "store.db", role="writer")
+    try:
+        heartbeats.record_clock_difference(
+            conn, difference=difference, now_utc=datetime(2026, 9, 5, tzinfo=UTC)
+        )
+        assert heartbeats.read_clock_difference(conn) == timedelta(seconds=kept)
+    finally:
+        conn.close()
+
+
+def test_no_clock_difference_measured_reads_as_none(tmp_path) -> None:
+    conn = db.connect(tmp_path / "store.db", role="writer")
+    try:
+        assert heartbeats.read_clock_difference(conn) is None
+        heartbeats.beat(
+            conn, name=heartbeats.CLOCK_DIFFERENCE, now_utc=datetime(2026, 9, 5, tzinfo=UTC),
+            detail="garbled",
+        )
+        assert heartbeats.read_clock_difference(conn) is None
+    finally:
+        conn.close()

@@ -142,3 +142,12 @@ def test_the_exit_4_row_says_to_wait_when_telegram_asked_watch_to_wait() -> None
     # Final fix round 3 (R3-2): the date, and a time that has passed.
     assert "with its date, when that is not today" in row
     assert "Once that time has passed" in row
+
+
+def test_the_runbook_says_a_clock_put_right_after_the_switches_costs_nothing() -> None:
+    """Final fix round 3 (R3-4): each switch keeps the clock difference the
+    last watch start measured, so the old warning that a clock put right
+    before the next start can cost a post is gone; what is left is named."""
+    assert "is put\n  right before `watch` starts again costs nothing" in RUNBOOK
+    assert "Only a clock that went\n  wrong after `watch` last started" in RUNBOOK
+    assert "right again when `watch`\n  starts, can still cost" not in RUNBOOK

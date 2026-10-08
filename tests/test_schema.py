@@ -1123,3 +1123,30 @@ def test_migration_4_leaves_a_signal_without_its_message_alone(tmp_path):
     (after,) = conn.execute("SELECT parsed_json FROM signals WHERE message_id = 400").fetchone()
     assert after == original
     conn.close()
+
+
+#: channel_off_periods as migration 4 creates it (final fix round 3, R3-4:
+#: the clock difference kept with each switch, signed whole seconds).
+_OFF_PERIOD_COLUMNS = [
+    "period_id", "channel_id", "off_at_utc", "on_at_utc",
+    "off_clock_difference_s", "on_clock_difference_s",
+]
+
+
+def test_each_off_period_keeps_the_clock_difference_of_its_two_switches(tmp_path):
+    """Fresh, and upgraded from version 3: the same columns, NULL when no
+    difference was measured."""
+    fresh = _connect(tmp_path)
+    assert _columns(fresh, "channel_off_periods") == _OFF_PERIOD_COLUMNS
+    fresh.execute(
+        "INSERT INTO channel_off_periods (channel_id, off_at_utc) VALUES (1, '2026-09-05T11:00:00+00:00')"
+    )
+    assert fresh.execute(
+        "SELECT off_clock_difference_s, on_clock_difference_s FROM channel_off_periods"
+    ).fetchall() == [(None, None)]
+    fresh.close()
+
+    upgraded = _v3_database(tmp_path / "v3.db")
+    migrate(upgraded)
+    assert _columns(upgraded, "channel_off_periods") == _OFF_PERIOD_COLUMNS
+    upgraded.close()
