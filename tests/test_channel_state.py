@@ -560,3 +560,23 @@ def test_an_unreadable_difference_is_kept_as_none(conn) -> None:
     _insert(conn, pointer=100, seeded_at=SEEDED)
     channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
     assert _differences(conn) == [(None, None)]
+
+
+@pytest.mark.parametrize("stored", ["garbled", 1.5])
+def test_a_difference_stored_unreadable_with_a_period_reads_as_none(conn, stored) -> None:
+    """Final fix round 3 (R3-4): a period whose kept difference cannot be
+    read is still skipped, as one with none kept -- never a failed read."""
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    channel_state.record_switch_off(conn, channel_id=A, off_at_utc=OFF)
+    channel_state.record_switch_on(
+        conn, channel_id=A, on_at_utc=OFF + timedelta(hours=1), may_replace_first_cutoff=True
+    )
+    conn.execute(
+        "UPDATE channel_off_periods SET off_clock_difference_s = ?, on_clock_difference_s = ?",
+        (stored, stored),
+    )
+
+    (period,) = channel_state.off_periods(conn, A)
+
+    assert (period.off_clock_difference, period.on_clock_difference) == (None, None)
+

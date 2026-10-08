@@ -1241,10 +1241,13 @@ def test_each_switch_is_widened_by_the_difference_kept_with_it(
     _assert_plain(skipped)
 
 
-def test_each_watch_start_keeps_the_clock_difference_it_measured(tmp_path: Path) -> None:
+def test_each_watch_start_keeps_the_clock_difference_it_measured(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """For `channels off`/`on` to keep with their stamps (R3-4): every start
     that reads Telegram's clock keeps the difference it measured; one that
-    cannot read it leaves the last one as it was."""
+    cannot read it leaves the last one as it was -- quietly: there was
+    nothing to keep, so nothing failed."""
     from xaucopier.store import heartbeats
 
     db_path = tmp_path / "store.db"
@@ -1266,8 +1269,10 @@ def test_each_watch_start_keeps_the_clock_difference_it_measured(tmp_path: Path)
         async with _watching(db_path, client, {"now": NOW}, channels=(CHANNEL_B,)):
             pass
 
-    asyncio.run(no_clock())
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        asyncio.run(no_clock())
     assert kept() == timedelta(seconds=-30)
+    assert not [r for r in caplog.records if "keeping the clock difference" in r.getMessage()]
 
 
 # -- final fix round 3 (R3-3): the OFF line says what happened -------------------------------
