@@ -1473,7 +1473,7 @@ def test_off_then_on_skips_exactly_the_time_it_was_off(
     assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
     assert _periods(rig.db_path, GOLD) == [("2026-09-23T12:00:00+00:00", None)]
     off_out = capsys.readouterr().out
-    assert "What it posts from now until you switch it back on is never read" in off_out
+    assert "What it posts from now until you switch it back on is not read" in off_out
     assert "What it posted before now that watch has not read yet is still read" in off_out
 
     _at(monkeypatch, NOW + timedelta(hours=2, microseconds=1))
@@ -1492,6 +1492,78 @@ def test_off_then_on_skips_exactly_the_time_it_was_off(
         "(2026-09-23 12:00:00 UTC) that watch had not read yet, skips what it posted while "
         "it was off, and reads everything it posts from now on." in out
     )
+
+
+#: What `channels off` and `channels on` say about the read around each
+#: switch (final fix round 4, R4-1).
+NEAR_A_SWITCH = (
+    "except what it posts within about a minute of either switch, which is read in case "
+    "this computer's clock is a little off. So if you switch it back on within about 2 "
+    "minutes, everything it posted while it was off is read, and a signal in it is traded "
+    "like any other."
+)
+
+
+def test_off_and_on_say_that_a_short_switch_off_is_read_in_full(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Final fix round 4 (R4-1): `channels off 7`, then `channels on 7` 90 s
+    later. watch reads a minute around each switch in case this computer's
+    clock was off, so a BUY posted 45 s into those 90 s is read and traded
+    (tests/test_seed.py). Neither command may promise that what the channel
+    posts while off is never read."""
+    _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+    _at(monkeypatch, NOW)
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+    off_out = capsys.readouterr().out
+    _at(monkeypatch, NOW + timedelta(seconds=90))
+    assert cli_main.main(rig.argv("on", "7")) == exit_codes.EXIT_OK
+    on_out = capsys.readouterr().out
+
+    flat_off = " ".join(off_out.split())
+    assert (
+        "What it posts from now until you switch it back on is not read, not even later -- "
+        + NEAR_A_SWITCH
+    ) in flat_off, flat_off
+    flat_on = " ".join(on_out.split())
+    assert (
+        "Give or take about a minute: what it posted within about a minute of either switch "
+        "is read too, in case this computer's clock was a little off. So if it was off for no "
+        "more than about 2 minutes, everything it posted while it was off is read, and a "
+        "signal in it is traded like any other." in flat_on
+    ), flat_on
+    for out in (off_out, on_out):
+        assert "never read" not in out and "for good" not in out
+
+
+@pytest.mark.parametrize("variant", ["watch running", "switch-off not recorded"])
+def test_no_off_message_promises_that_posts_made_while_off_are_never_read(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variant: str,
+) -> None:
+    """R4-1, the other two ways `channels off` says what it does: with watch
+    running, and for a channel watch never read (no switch-off recorded)."""
+    _at(monkeypatch, NOW)
+    if variant == "watch running":
+        _set_state(rig.db_path, GOLD, 13, "2026-09-01T00:00:00+00:00")
+        rig.watch_running = True
+        expected = "what it posts then is not read, not even later -- " + NEAR_A_SWITCH.replace(
+            "either switch", "switching it back on"
+        )
+    else:
+        expected = (
+            "What it posts while it is off is not read, not even later -- except what it posts "
+            "within about a minute before it is read again, which is read in case this "
+            "computer's clock is a little off."
+        )
+
+    assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
+
+    out = capsys.readouterr().out
+    assert expected in " ".join(out.split()), out
+    assert "never read" not in out and "for good" not in out
 
 
 @pytest.mark.parametrize(
@@ -1517,6 +1589,11 @@ def test_on_of_a_channel_whose_switch_off_was_not_recorded_reads_it_from_now(
     assert (
         "When it was switched off was not recorded, so the next watch reads it from now on: "
         "everything it posted since watch last read it is skipped" in out
+    )
+    # R4-1: the re-read starts a minute back, in case the clock was off.
+    assert (
+        "except what it posted within about a minute before now, which is read in case this "
+        "computer's clock is a little off." in " ".join(out.split())
     )
 
 
@@ -1565,7 +1642,7 @@ def test_off_and_on_of_a_channel_never_read_record_nothing(
 
     assert _periods(rig.db_path, GOLD) == []
     assert _state_row(rig.db_path, GOLD) == before
-    assert "What it posts while it is off is never read, not even later." in off_out
+    assert "What it posts while it is off is not read, not even later" in off_out
     assert "still read" not in off_out
     out = capsys.readouterr().out
     assert "is now ON." in out and "skips" not in out and "from now on:" not in out
@@ -1969,7 +2046,9 @@ def test_off_says_how_many_signals_are_in_play_and_what_off_does_to_them(
     # Final fix round 3 (R3-1): a copy on a channel switched on is traded.
     assert "the same call posted by a channel that is switched on is still traded" in out
     assert "keeps its stop loss and take profit" in out
-    assert "never read, not even later" in out  # M12: posts made while off stay unread
+    # M12 as qualified by R4-1: posts made while off stay unread, give or take a
+    # minute around each switch.
+    assert "not read, not even later" in out and "never read" not in out
 
 
 def test_a_signal_one_account_has_taken_counts_as_traded_and_a_skipped_one_not_at_all(

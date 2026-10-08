@@ -160,6 +160,13 @@ def test_the_runbook_says_a_short_switch_off_may_read_everything_it_posted() -> 
     what it posted while off is read and handled, and watch says so."""
     assert "A channel switched off for only a few minutes" in RUNBOOK
     assert "a signal it posted then is handled like any other" in RUNBOOK
+    # Final fix round 4 (R4-1): the promise that it is ignored for good is
+    # qualified where it is made.
+    assert (
+        "not even after you switch it back on — except\n  what it posts within about a "
+        "minute of either switch" in RUNBOOK
+    )
+    assert "So if you switch it\n  back on within about 2 minutes, everything it posted" in RUNBOOK
 
 
 def test_the_runbook_says_a_call_on_a_channel_on_is_still_traded_after_a_switch_off() -> None:

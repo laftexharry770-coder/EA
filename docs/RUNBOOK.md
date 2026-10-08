@@ -248,7 +248,11 @@ Signals can come from more than one Telegram channel, and you choose which.
   next time `watch` starts — the same call posted by a channel that is
   switched on is still traded; a trade already open keeps its stop loss
   and take profit. **Whatever it posts while it is off is ignored for good** —
-  it is not read later, not even after you switch it back on. Nothing
+  it is not read later, not even after you switch it back on — except
+  what it posts within about a minute of either switch, which is read in
+  case your PC's clock is a little off (see below). So if you switch it
+  back on within about 2 minutes, everything it posted while it was off
+  is read, and a signal in it is traded like any other. Nothing
   already recorded is deleted.
 - **Switch one on:** `.\xaucopier channels on 2`. The next `watch` then
   reads the channel in two parts. First, whatever it posted **before you
