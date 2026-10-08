@@ -108,7 +108,7 @@ def test_the_runbook_says_what_the_user_must_know() -> None:
 
 def test_the_runbook_explains_every_alert_the_fix_wave_added() -> None:
     """Each by its code, in the list of what to do before clearing one."""
-    from xaucopier.store import alerts, edits_repo, messages_repo
+    from xaucopier.store import alerts, edits_repo, messages_repo, relay_repo
 
     clearing = RUNBOOK.split("### Clearing alerts", 1)[1].split("\n## ", 1)[0]
     for code in (
@@ -120,6 +120,7 @@ def test_the_runbook_explains_every_alert_the_fix_wave_added() -> None:
         edits_repo.CANCELLED_WHEN_FIRST_READ,
         alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
         alerts.TELEGRAM_CHANNEL_UNREADABLE,
+        relay_repo.COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED,
     ):
         assert f"- **{code}** — " in clearing, code
 
@@ -159,3 +160,9 @@ def test_the_runbook_says_a_short_switch_off_may_read_everything_it_posted() -> 
     what it posted while off is read and handled, and watch says so."""
     assert "A channel switched off for only a few minutes" in RUNBOOK
     assert "a signal it posted then is handled like any other" in RUNBOOK
+
+
+def test_the_runbook_says_a_call_on_a_channel_on_is_still_traded_after_a_switch_off() -> None:
+    """Final fix round 3 (R3-1): switching a channel off cancels its waiting
+    signals, never the same call standing on a channel switched on."""
+    assert "the same call posted by a channel that is\n  switched on is still traded" in RUNBOOK

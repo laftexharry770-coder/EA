@@ -51,7 +51,12 @@ repeats (`relay_of_signal`), never the signal a promotion defers to
 (`carrier_of_trade`), and never the carrier an alert names when it says
 "do NOT trade it by hand as well" (`carrier_of`): the same call posted on
 a channel switched on is traded instead. A signal whose entries were
-refused for any other reason still carries its call.
+refused for any other reason still carries its call. A post of the call
+on a channel switched on that was stored as its copy *before* the switch
+took effect -- watch reads a channel switched off until it restarts -- is
+run through these rules again by the start-up job that cancels those
+entries (`admit_copies_of_switched_off`, final fix round 3): the newest
+one standing becomes a signal of its own.
 
 **An older post of a call** (ruling R4-1, `old_post`). When a call was
 withdrawn and posted again, the other channel's posts of the withdrawn
@@ -273,6 +278,11 @@ COPY_OF_WITHDRAWN_SIGNAL = "COPY_OF_WITHDRAWN_SIGNAL"
 #: new signal the withdrawing channel posted: that CRITICAL alert is
 #: acknowledged, and this one says the call is queued (ruling R3-P3).
 COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED = "COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED"
+#: WARNING: a post on a channel switched on was stored as a copy of a signal
+#: whose channel was then switched off; its waiting entries were cancelled,
+#: so the post is now a signal of its own, queued (final fix round 3, R3-1;
+#: `admit_copies_of_switched_off`).
+COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED = "COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED"
 
 #: `followups.resolution_path` of a follow-up replying to a signal's own message.
 REPLY_PATH = "reply"
@@ -1325,6 +1335,217 @@ def admit_signal(
             channel_cfg=channel_cfg,
         )
     return Admission(None, signal_id, relay.replaces, queued, raised)
+
+
+def admit_copies_of_switched_off(
+    conn: sqlite3.Connection,
+    *,
+    signal_ids: Iterable[int],
+    channels: Iterable[_ChannelCfgLike],
+    accounts: tuple,
+    now_utc: datetime,
+    relay_window_seconds: int = RELAY_WINDOW_SECONDS,
+) -> tuple[int, ...]:
+    """For `watch`'s start-up job, right after it cancelled the waiting
+    entries of `signal_ids` because their channels are not switched on
+    (`outbox.skip_entries_of_channels_off`; final fix round 3, R3-1).
+
+    `channels off` takes effect only when watch restarts: until then watch
+    reads the channel, so a post of the same call on a channel switched on
+    -- `channels`, every one switched on -- was stored as a copy of such a
+    signal ("a live call wins"), and nothing would ever trade it. So for
+    each of those signals that can no longer trade (`switched_off`; one
+    still being traded keeps its copies), its posts standing on a channel
+    switched on (`_standing_copies`: not deleted, still showing the call
+    read with that channel's parser, no signal of their own) are run
+    through the relay rules again, newest first (`relay_of_signal`, which
+    never matches such a signal):
+
+    - one that another signal can trade repeats that one now (a quiet
+      re-link; the follow-ups replying to it go with it);
+    - else the first such post is admitted (`admit_signal`): a new signal
+      dated by its own post, its entries fanned out, the follow-ups
+      replying to it acting on it (`_move_replies_to`), and a WARNING
+      naming both messages (`COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED`) -- or,
+      by those same rules, held back loudly as a copy of a withdrawn call;
+    - once one is a new signal, any other is only ever re-linked to a
+      signal it repeats -- one call, one signal -- else left as it was.
+
+    Runs in the caller's writer job; returns the ids of the alerts raised."""
+    on = {channel.channel_id: channel for channel in channels}
+    raised: list[int] = []
+    for signal_id in dict.fromkeys(signal_ids):
+        signal = _signal_row(conn, signal_id)
+        if signal is None or not switched_off(conn, signal):
+            continue
+        admitted = False
+        for post, routed, channel_cfg in _standing_copies(conn, signal, on):
+            channel_id, message_id = channel_cfg.channel_id, post["message_id"]
+            posted = datetime.fromisoformat(post["posted_at_utc"])
+            relay = relay_of_signal(
+                conn,
+                channel_id=channel_id,
+                message_id=message_id,
+                trade_hash=routed.signal.content_hash,
+                posted_at_utc=posted,
+                relay_window_seconds=relay_window_seconds,
+                fwd_from_channel_id=post["fwd_from_channel_id"],
+                fwd_from_post_id=post["fwd_from_post_id"],
+                channel_cfg=channel_cfg,
+                signal=routed.signal,
+            )
+            if relay.match is not None and not relay.match.withdrawn_unexecuted:
+                carrier = _signal_row(conn, relay.match.signal_id)
+                conn.execute(
+                    "UPDATE messages SET relay_of_signal_id = ? "
+                    "WHERE channel_id = ? AND message_id = ?",
+                    (carrier["signal_id"], channel_id, message_id),
+                )
+                _move_replies_to(
+                    conn, posts={(channel_id, message_id)}, signal=signal, new=carrier
+                )
+                logger.info(
+                    "channel %s message %s, a copy of signal %s whose channel is switched off, "
+                    "now repeats signal %s (channel %s message %s)",
+                    channel_id,
+                    message_id,
+                    signal_id,
+                    carrier["signal_id"],
+                    carrier["channel_id"],
+                    carrier["message_id"],
+                )
+                continue
+            if admitted:
+                continue  # one call, one signal: it stays as it was
+            conn.execute(
+                "UPDATE messages SET relay_of_signal_id = NULL "
+                "WHERE channel_id = ? AND message_id = ?",
+                (channel_id, message_id),
+            )
+            admission = admit_signal(
+                conn,
+                channel_cfg=channel_cfg,
+                message_id=message_id,
+                signal=routed.signal,
+                posted_at_utc=posted,
+                relay_window_seconds=relay_window_seconds,
+                fwd_from_channel_id=post["fwd_from_channel_id"],
+                fwd_from_post_id=post["fwd_from_post_id"],
+                accounts=accounts,
+                now_utc=now_utc,
+            )
+            raised.extend(admission.alert_ids)
+            if admission.signal_id is None:
+                continue  # held back loudly as a copy of a withdrawn call
+            admitted = True
+            new = _signal_row(conn, admission.signal_id)
+            _move_replies_to(conn, posts={(channel_id, message_id)}, signal=signal, new=new)
+            raised.append(
+                _say_admitted(
+                    conn,
+                    signal=signal,
+                    new=new,
+                    channel_cfg=channel_cfg,
+                    queued=admission.queued,
+                    now_utc=now_utc,
+                )
+            )
+    return tuple(raised)
+
+
+def _standing_copies(
+    conn: sqlite3.Connection, signal: sqlite3.Row, on: dict[int, _ChannelCfgLike]
+) -> list[tuple[sqlite3.Row, RouteResult, _ChannelCfgLike]]:
+    """For `admit_copies_of_switched_off`: the posts of `signal`'s call on
+    the channels switched on (`on`) that still stand -- not deleted, not
+    the post that closed one of its signals (`standing_posts_on`), still
+    showing the call read with their own channel's parser (`read_post`),
+    and holding no signal of their own (one post, one signal) -- each with
+    its parse and its channel. Newest post first."""
+    found = []
+    for channel_id, channel_cfg in on.items():
+        for post in standing_posts_on(conn, signal_id=signal["signal_id"], channel_id=channel_id):
+            own = signals_repo.get_signal_id(
+                conn, channel_id=channel_id, message_id=post["message_id"]
+            )
+            if own is not None:
+                continue
+            routed = read_post(post, channel_cfg=channel_cfg)
+            if routed.kind == "signal" and shows_call(routed.signal, signal):
+                found.append((post, routed, channel_cfg))
+    found.sort(
+        key=lambda item: (
+            datetime.fromisoformat(item[0]["posted_at_utc"]),
+            item[2].channel_id,
+            item[0]["message_id"],
+        ),
+        reverse=True,
+    )
+    return found
+
+
+def _move_replies_to(
+    conn: sqlite3.Connection,
+    *,
+    posts: set[tuple[int, int]],
+    signal: sqlite3.Row,
+    new: sqlite3.Row,
+) -> None:
+    """Every follow-up replying to one of `posts` -- posts of `signal`'s
+    call that hold signal `new` now, or repeat it -- and targeting one of
+    the call's signals targets `new` (path `'reply'` when it replies to
+    `new`'s own message, `'relay-reply'` for any other post), as
+    `_move_followups` moves them: the instruction is about the call that
+    post shows, which `new` carries now."""
+    chain = chain_ids(conn, signal["signal_id"])
+    marks = ", ".join("?" for _ in chain)
+    for followup in conn.execute(
+        "SELECT followup_id, channel_id, reply_to_message_id, resolution_path FROM followups "
+        f"WHERE edit_seq = 0 AND target_signal_id IN ({marks}) ORDER BY followup_id",
+        chain,
+    ).fetchall():
+        replied = (followup["channel_id"], followup["reply_to_message_id"])
+        if replied not in posts:
+            continue
+        path = followup["resolution_path"]
+        if path in (REPLY_PATH, RELAY_REPLY_PATH):
+            own = replied == (new["channel_id"], new["message_id"])
+            path = REPLY_PATH if own else RELAY_REPLY_PATH
+        conn.execute(
+            "UPDATE followups SET target_signal_id = ?, resolution_path = ? WHERE followup_id = ?",
+            (new["signal_id"], path, followup["followup_id"]),
+        )
+
+
+def _say_admitted(
+    conn: sqlite3.Connection,
+    *,
+    signal: sqlite3.Row,
+    new: sqlite3.Row,
+    channel_cfg: _ChannelCfgLike,
+    queued: int,
+    now_utc: datetime,
+) -> int:
+    """The WARNING for `admit_copies_of_switched_off`: post `new` was a copy
+    of `signal`, whose channel is switched off; it is signal `new` now."""
+    return alerts.record(
+        conn,
+        now_utc=now_utc,
+        level="WARNING",
+        code=COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED,
+        channel_id=new["channel_id"],
+        message_id=new["message_id"],
+        signal_id=new["signal_id"],
+        detail=(
+            f"message {new['message_id']} on channel {new['channel_id']} "
+            f"({channel_cfg.name}) repeats the call of signal {signal['signal_id']} "
+            f"(message {signal['message_id']} on channel {signal['channel_id']}). That "
+            f"channel is switched off, so signal {signal['signal_id']}'s waiting trade "
+            "entries were cancelled and it is not traded. The same call still stands here: "
+            f"message {new['message_id']} is now signal {new['signal_id']}, and {queued} "
+            f"trade entr{'y is' if queued == 1 else 'ies are'} queued for it. Nothing to do."
+        ),
+    )
 
 
 def _withdrawn_in_report(

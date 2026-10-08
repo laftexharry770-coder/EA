@@ -1966,6 +1966,8 @@ def test_off_says_how_many_signals_are_in_play_and_what_off_does_to_them(
     assert "2 of its signals are still waiting to be traded, and 1 has already been traded." in out
     assert "edits, deletions and follow-ups (like 'close all') are no longer read" in out
     assert "cancelled the next time `.\\xaucopier watch` starts" in out
+    # Final fix round 3 (R3-1): a copy on a channel switched on is traded.
+    assert "the same call posted by a channel that is switched on is still traded" in out
     assert "keeps its stop loss and take profit" in out
     assert "never read, not even later" in out  # M12: posts made while off stay unread
 

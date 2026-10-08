@@ -569,6 +569,7 @@ def test_the_information_rows_show_zero_before_anything_was_counted(tmp_path: Pa
 def _new_alert_codes() -> list[str]:
     from xaucopier.store import edits_repo as edits
     from xaucopier.store import messages_repo as messages
+    from xaucopier.store import relay_repo as relay
 
     return [
         messages.TEMPLATE_CHANGED_SUSPECTED,
@@ -578,6 +579,7 @@ def _new_alert_codes() -> list[str]:
         edits.SIGNAL_REPOST_ALREADY_LIVE,
         edits.CANCELLED_WHEN_FIRST_READ,
         alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
+        relay.COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED,
     ]
 
 

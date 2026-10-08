@@ -448,8 +448,9 @@ def _off_lines(
         f"{waiting} of its signals {_is_are(waiting)} still waiting to be traded, {old}"
         f"and {traded} {'has' if traded == 1 else 'have'} already been traded. "
         "Their edits, deletions and follow-ups (like 'close all') are no longer read. "
-        f"The waiting ones are cancelled the next time `{_CMD} watch` starts; a trade "
-        "already open keeps its stop loss and take profit."
+        f"The waiting ones are cancelled the next time `{_CMD} watch` starts -- the same "
+        "call posted by a channel that is switched on is still traded; a trade already "
+        "open keeps its stop loss and take profit."
     )
     return lines
 

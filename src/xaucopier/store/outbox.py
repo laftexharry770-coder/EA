@@ -592,6 +592,35 @@ def skip_queued(
 CHANNEL_OFF_REASON = "channel switched off"
 
 
+def _entries_of_channels_off(enabled_channel_ids: tuple[int, ...]) -> tuple[str, tuple[int, ...]]:
+    """The FROM/WHERE of every ``QUEUED`` ENTRY row whose signal's channel is
+    not in `enabled_channel_ids` (`o`: the outbox row, `s`: its signal), and
+    its parameters."""
+    ids = tuple(int(channel_id) for channel_id in enabled_channel_ids)
+    marks = ", ".join("?" for _ in ids)
+    off = f"s.channel_id NOT IN ({marks})" if ids else "1 = 1"
+    return (
+        "FROM outbox o JOIN signals s ON s.signal_id = o.signal_id "
+        f"WHERE o.kind = 'ENTRY' AND o.state = 'QUEUED' AND {off}",
+        ids,
+    )
+
+
+def signals_with_entries_of_channels_off(
+    conn: sqlite3.Connection, *, enabled_channel_ids: tuple[int, ...]
+) -> tuple[int, ...]:
+    """The signals `skip_entries_of_channels_off` would SKIP an entry of,
+    oldest first -- asked just before it, in the same writer job, so that
+    `relay_repo.admit_copies_of_switched_off` can trade from a channel
+    switched on a call those signals can no longer trade (final fix round
+    3, R3-1). Read-only."""
+    where, ids = _entries_of_channels_off(enabled_channel_ids)
+    rows = conn.execute(
+        f"SELECT DISTINCT o.signal_id {where} ORDER BY o.signal_id", ids
+    ).fetchall()
+    return tuple(row[0] for row in rows)
+
+
 def skip_entries_of_channels_off(
     conn: sqlite3.Connection, *, enabled_channel_ids: tuple[int, ...]
 ) -> dict[int, int]:
@@ -604,15 +633,8 @@ def skip_entries_of_channels_off(
     close a signal still waiting to be traded. A ``CLAIMED`` row is left
     to its worker, as in `skip_queued`; follow-ups are left alone. Never
     commits."""
-    ids = tuple(int(channel_id) for channel_id in enabled_channel_ids)
-    marks = ", ".join("?" for _ in ids)
-    off = f"s.channel_id NOT IN ({marks})" if ids else "1 = 1"
-    rows = conn.execute(
-        "SELECT o.outbox_id, s.channel_id FROM outbox o "
-        "JOIN signals s ON s.signal_id = o.signal_id "
-        f"WHERE o.kind = 'ENTRY' AND o.state = 'QUEUED' AND {off}",
-        ids,
-    ).fetchall()
+    where, ids = _entries_of_channels_off(enabled_channel_ids)
+    rows = conn.execute(f"SELECT o.outbox_id, s.channel_id {where}", ids).fetchall()
     skipped: dict[int, int] = {}
     for outbox_id, channel_id in rows:
         conn.execute(

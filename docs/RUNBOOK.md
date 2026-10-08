@@ -224,6 +224,10 @@ missed. Once you have dealt with one, clear it:
   off that still had signals waiting to be traded; they were cancelled, not
   traded. That is what switching a channel off does (see below). Nothing to
   do.
+- **COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED** — one of those cancelled signals
+  had also been posted by a channel that is switched on (the alert names
+  both messages). That post is now the signal, and it is traded instead.
+  Nothing to do.
 - **Any other alert** — copy its two lines and send them to whoever looks
   after xaucopier, then clear it.
 
@@ -241,8 +245,9 @@ Signals can come from more than one Telegram channel, and you choose which.
   you how many of its signals are still waiting to be traded, how many are
   too old to be traded (a signal posted more than 2 minutes ago never is),
   and how many were already traded. The waiting ones are cancelled the
-  next time `watch` starts; a trade already open keeps its stop loss and
-  take profit. **Whatever it posts while it is off is ignored for good** —
+  next time `watch` starts — the same call posted by a channel that is
+  switched on is still traded; a trade already open keeps its stop loss
+  and take profit. **Whatever it posts while it is off is ignored for good** —
   it is not read later, not even after you switch it back on. Nothing
   already recorded is deleted.
 - **Switch one on:** `.\xaucopier channels on 2`. The next `watch` then

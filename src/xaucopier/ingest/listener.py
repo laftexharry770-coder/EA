@@ -162,6 +162,7 @@ from xaucopier.store import (
     messages_repo,
     metrics,
     outbox,
+    relay_repo,
 )
 from xaucopier.store.edits_repo import DeletionResult, EditResult
 from xaucopier.store.messages_repo import IngestResult
@@ -2034,7 +2035,11 @@ class Listener:
         writer job SKIPs every trade entry still QUEUED for a signal whose
         channel is not switched on (`outbox.skip_entries_of_channels_off`,
         reason 'channel switched off') and, if there were any, records one
-        WARNING alert, `CHANNEL_OFF_ENTRIES_SKIPPED`, naming how many.
+        WARNING alert, `CHANNEL_OFF_ENTRIES_SKIPPED`, naming how many. In
+        the same job, a post of such a signal's call standing on a channel
+        switched on -- stored as its copy while this watch still read the
+        channel switched off -- is traded instead
+        (`relay_repo.admit_copies_of_switched_off`, final fix round 3).
 
         OFF means the channel is not read at all -- neither its new posts
         nor the edits, deletions and follow-ups of the signals it already
@@ -2042,10 +2047,15 @@ class Listener:
         signal before it was traded. A job that fails is logged and left
         for the next start: it must not keep watch from starting."""
         enabled_ids = tuple(self._channels_by_id)
+        enabled = self.enabled_channels
         names = {channel.channel_id: channel.name for channel in self.channels}
         now_utc = self._now()
+        accounts = self.accounts
 
         def job(conn: Connection) -> int:
+            signal_ids = outbox.signals_with_entries_of_channels_off(
+                conn, enabled_channel_ids=enabled_ids
+            )
             skipped = outbox.skip_entries_of_channels_off(conn, enabled_channel_ids=enabled_ids)
             total = sum(skipped.values())
             if total:
@@ -2069,6 +2079,9 @@ class Listener:
                         "withdraw, change or close those signals."
                     ),
                 )
+            relay_repo.admit_copies_of_switched_off(
+                conn, signal_ids=signal_ids, channels=enabled, accounts=accounts, now_utc=now_utc
+            )
             return total
 
         try:
