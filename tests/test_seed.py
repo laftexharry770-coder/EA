@@ -1268,3 +1268,313 @@ def test_each_watch_start_keeps_the_clock_difference_it_measured(tmp_path: Path)
 
     asyncio.run(no_clock())
     assert kept() == timedelta(seconds=-30)
+
+
+# -- final fix round 3 (R3-3): the OFF line says what happened -------------------------------
+
+
+def _off_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "was switched off from" in r.getMessage()]
+
+
+@pytest.mark.parametrize("start_skew", [0, 150], ids=["clock-right", "clock-150-s-fast"])
+def test_a_short_off_period_says_what_it_posted_while_off_was_read_and_is_handled(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, start_skew: int
+) -> None:
+    """Final fix round 3 (R3-3; the re-check's p_short_off). The channel was
+    OFF for 5 minutes; a BUY posted while OFF, 60 s before the switch-on,
+    falls inside what watch reads around the switches. It was read now and
+    queued, but the window said 'everything it posted in that time had
+    been read already'. It now says it was read and is handled like any
+    other post: as the period was no longer than what watch reads around
+    its two switches (clock 150 s fast: 210 s each), or, clock right, as
+    the post came within the minute read before the switch-on."""
+    db_path = tmp_path / "store.db"
+    real_on = NOW - timedelta(seconds=30)
+    real_off = real_on - timedelta(minutes=5)
+    _stamp_period(db_path, real_off, real_on)
+    history = [FakeMessage(id=101, message=SIGNAL_TEXT, date=real_on - timedelta(seconds=60))]
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
+        async with _watching(db_path, client, {"now": NOW + timedelta(seconds=start_skew)}):
+            pass
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101]
+    assert _rows(db_path, "SELECT state FROM outbox WHERE kind = 'ENTRY'") == [
+        ("QUEUED",), ("QUEUED",)
+    ]
+    (line,) = _off_lines(caplog)
+    assert "had been read already" not in line
+    assert "so what it posted while off was read and is handled like any other post" in line, line
+    if start_skew:
+        assert (
+            "It was off for no longer than the 420 seconds watch reads around the two "
+            "switches (within 210 seconds of either switch, in case this computer's clock "
+            "was off)" in line
+        ), line
+    else:
+        assert (
+            "It posted only within a minute of either switch, which watch reads in case this "
+            "computer's clock was off" in line
+        ), line
+    _assert_plain(line)
+
+
+def test_a_post_read_just_after_the_switch_off_is_said_to_be_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An hour OFF; the channel posted only 30 s after the switch-off --
+    within the minute read after it -- and nothing else until it was on
+    again. Nothing is skipped, and the line says that post was read, not
+    that it had been read already."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    history = _history((101, 3 - 30 / 3600), (102, 1))
+
+    async def scenario():
+        async with _watching(db_path, FakeTelegramClient(history={A: history}, server_time=NOW), {"now": NOW}):
+            pass
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 102]
+    (line,) = _off_lines(caplog)
+    assert "had been read already" not in line
+    assert (
+        "It posted only within a minute of either switch, which watch reads in case this "
+        "computer's clock was off, so what it posted while off was read and is handled like "
+        "any other post." in line
+    ), line
+
+
+def test_a_period_whose_posts_a_running_watch_read_says_they_had_been_read_already(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The one case for 'had been read already': switched off and on while
+    a watch ran (it kept reading the channel), so at the next start the
+    pointer is already past the switch-on and nothing is read again."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path)
+    history = _history((101, 4))
+    clock = {"now": NOW}
+
+    async def first_run():
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
+        async with _watching(db_path, client, clock) as (listener, _time):
+            _stamp_period(db_path, NOW + timedelta(seconds=5), NOW + timedelta(minutes=10))
+            client.history[A].append(
+                FakeMessage(id=102, message=SIGNAL_TEXT, date=NOW + timedelta(minutes=3))
+            )
+            clock["now"] = NOW + timedelta(minutes=11)
+            client.server_time = clock["now"]
+            await listener.read_history(CHANNEL_A, source="poll", limit=100,
+                                        rpc_timeout=RPC_TIMEOUT)
+
+    asyncio.run(first_run())
+
+    async def second_run():
+        client = FakeTelegramClient(history={A: history}, server_time=clock["now"])
+        async with _watching(db_path, client, clock):
+            pass
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        asyncio.run(second_run())
+
+    assert _stored_ids(db_path) == [101, 102]
+    (line,) = _off_lines(caplog)
+    assert line.endswith("everything it posted in that time had been read already."), line
+
+
+def test_a_period_in_which_the_channel_posted_nothing_says_so(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R3-3: 'had been read already' only when posts made while OFF had
+    been read before. OFF for an hour and nothing posted in it: nothing is
+    skipped, nothing read, and the line says it posted nothing."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    history = _history((101, 4), (102, 1))
+
+    async def scenario():
+        async with _watching(db_path, FakeTelegramClient(history={A: history}, server_time=NOW), {"now": NOW}):
+            pass
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 102]
+    (line,) = _off_lines(caplog)
+    assert line == (
+        f"Channel {A} ({CHANNEL_A.name}) was switched off from 2026-09-05 08:00:00 to "
+        "2026-09-05 09:00:00 UTC; it posted nothing in that time."
+    ), line
+
+
+@dataclass
+class _FailsOnceAfterClient(FakeTelegramClient):
+    """Fails the first ordinary read from `fail_min_id` (oldest first) once."""
+
+    fail_min_id: int = 0
+    failed: int = 0
+
+    async def get_messages(self, *args, **kwargs):
+        if kwargs.get("reverse") and kwargs.get("min_id") == self.fail_min_id and not self.failed:
+            self.failed += 1
+            raise ConnectionError("simulated dropped read")
+        return await super().get_messages(*args, **kwargs)
+
+
+def test_what_a_skip_did_not_read_is_said_at_once_though_the_read_after_it_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R3-3: the line waits for the read after a skip only when it has to.
+    A skip that moved the pointer is said at once: a watch stopped before
+    the next read must still say what was not read."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    history = _history((101, 4), (102, 2.5), (103, 1))
+
+    async def scenario():
+        client = _FailsOnceAfterClient(history={A: history}, server_time=NOW, fail_min_id=102)
+        async with _watching(db_path, client, {"now": NOW}):
+            return client.failed
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        failed = asyncio.run(scenario())
+
+    assert failed == 1
+    assert _stored_ids(db_path) == [101]  # 103: the next read's
+    (line,) = _off_lines(caplog)
+    assert "what it posted in between was not read" in line, line
+
+
+def test_a_period_that_skipped_nothing_is_said_after_the_next_clean_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R3-3: a skip that moved nothing cannot tell yet what was read: the
+    read after it takes what was posted within the minute before the
+    switch-on. That read failed, so the line waits -- never 'posted
+    nothing' -- for the next read, which reads the post and says so."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    history = _history((101, 4), (102, 2 + 0.5 / 60), (103, 1))
+
+    async def scenario():
+        client = _FailsOnceAfterClient(history={A: history}, server_time=NOW, fail_min_id=101)
+        async with _watching(db_path, client, {"now": NOW}) as (listener, _time):
+            before = (_off_lines(caplog), _stored_ids(db_path))
+            await listener.read_history(CHANNEL_A, source="poll", limit=100,
+                                        rpc_timeout=RPC_TIMEOUT)
+            return client.failed, before
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        failed, before = asyncio.run(scenario())
+
+    assert failed == 1
+    assert before == ([], [101])
+    assert _stored_ids(db_path) == [101, 102, 103]
+    (line,) = _off_lines(caplog)
+    assert (
+        "It posted only within a minute of either switch, which watch reads in case this "
+        "computer's clock was off, so what it posted while off was read and is handled like "
+        "any other post." in line
+    ), line
+
+
+def test_a_post_read_while_off_before_the_skip_is_said_at_once_though_the_read_after_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R3-3: a post made 30 s after the switch-off was read before the skip,
+    so what the line says is known then: it is said at once, not held for
+    a read after the skip that fails."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    history = _history((101, 3 - 30 / 3600), (102, 1))
+
+    async def scenario():
+        client = _FailsOnceAfterClient(history={A: history}, server_time=NOW, fail_min_id=101)
+        async with _watching(db_path, client, {"now": NOW}):
+            return client.failed
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        failed = asyncio.run(scenario())
+
+    assert failed == 1
+    assert _stored_ids(db_path) == [101]
+    (line,) = _off_lines(caplog)
+    assert "so what it posted while off was read and is handled like any other post." in line
+
+
+def test_two_periods_are_said_in_order_each_by_what_was_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R3-3: the first period skipped nothing, and its post 30 s before its
+    switch-on is read by the read up to the second period's switch-off --
+    which must count it for the first period. The second skipped a post.
+    The lines come oldest period first."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (5, 4), (3, 2))
+    history = _history((101, 6), (102, 4 + 0.5 / 60), (103, 2.5), (104, 1))
+
+    async def scenario():
+        async with _watching(db_path, FakeTelegramClient(history={A: history}, server_time=NOW), {"now": NOW}):
+            pass
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 102, 104]
+    first, second = _off_lines(caplog)
+    assert first.startswith(
+        f"Channel {A} ({CHANNEL_A.name}) was switched off from 2026-09-05 06:00:00 to "
+        "2026-09-05 07:00:00 UTC. It posted only within a minute of either switch"
+    ), first
+    assert second.startswith(
+        f"Channel {A} ({CHANNEL_A.name}) was switched off from 2026-09-05 08:00:00 to "
+        "2026-09-05 09:00:00 UTC: what it posted in between was not read."
+    ), second
+
+
+def test_a_period_waits_for_a_read_after_its_skip_in_which_no_post_failed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3-3: the read after the skip got its posts, but the one made 30 s
+    before the switch-on could not be stored: the batch stops there, so
+    what was read while off is not known yet. The line waits for the read
+    that stores it."""
+    from xaucopier.store import messages_repo
+
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    history = _history((101, 4), (102, 2 + 0.5 / 60), (103, 1))
+    real_ingest = messages_repo.ingest
+    fail = {102}
+
+    def flaky_ingest(conn, **kwargs):
+        if kwargs["message_id"] in fail:
+            raise RuntimeError("simulated write failure")
+        return real_ingest(conn, **kwargs)
+
+    monkeypatch.setattr(messages_repo, "ingest", flaky_ingest)
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
+        async with _watching(db_path, client, {"now": NOW}) as (listener, _time):
+            before = (_off_lines(caplog), _stored_ids(db_path))
+            fail.clear()
+            await listener.read_history(CHANNEL_A, source="poll", limit=100,
+                                        rpc_timeout=RPC_TIMEOUT)
+            return before
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        before = asyncio.run(scenario())
+
+    assert before == ([], [101])
+    assert _stored_ids(db_path) == [101, 102, 103]
+    (line,) = _off_lines(caplog)
+    assert "It posted only within a minute of either switch" in line, line

@@ -716,6 +716,13 @@ class Listener:
         # were then: only those are this watch's to skip (final fix FF24,
         # round 2). None until start() has looked.
         self._periods_at_start: dict[int, channel_state.OffPeriod] | None = None
+        # OFF periods some of whose posts made while OFF this watch read --
+        # within what is read around the switches -- so the window says
+        # they were read, not "had been read already" (R3-3).
+        self._read_while_off: set[int] = set()
+        # Per channel, the OFF periods that skipped nothing whose line is not
+        # said yet: no read after the skip has finished cleanly (R3-3).
+        self._unsaid_off_periods: dict[int, list[channel_state.OffPeriod]] = {}
         #: Set by `run_listener` when Telegram asked watch to wait at start:
         #: starting it again before this time only earns a longer wait.
         self.start_after_utc: datetime | None = None
@@ -1280,31 +1287,60 @@ class Listener:
                     return ()  # no messages at all yet: seeded by a later read
                 pointer = seeded
             outcomes: list[HistoryIngest] = []
-            for current in channel_state.off_periods(self.reader, channel_id):
-                period = self._as_at_start(current)
-                if period is None:
-                    # Switched back on while this watch runs: it kept reading
-                    # the channel all along (it read the list at start), so
-                    # the period is the next start's (final fix FF24).
-                    break
-                caught_up, pointer, read = await self._read_until_switched_off(
-                    channel_cfg, period, pointer, source=source, limit=limit,
-                    rpc_timeout=rpc_timeout,
+            # A period whose skip moved the pointer, or some of whose posts
+            # made while OFF were read already, is said at once. One that
+            # skipped nothing and read nothing yet is said once a read after
+            # its skip has finished cleanly: that read takes what it posted
+            # within the allowance before its switch-on (R3-3) -- before the
+            # next period's skip, so the lines keep their order. Until then
+            # (a read failed), kept for the next read of this channel.
+            unsaid = self._unsaid_off_periods.pop(channel_id, [])
+            read_since_skip = False
+            try:
+                for current in channel_state.off_periods(self.reader, channel_id):
+                    period = self._as_at_start(current)
+                    if period is None:
+                        # Switched back on while this watch runs: it kept
+                        # reading the channel all along (it read the list at
+                        # start), so the period is the next start's (FF24).
+                        break
+                    caught_up, pointer, read = await self._read_until_switched_off(
+                        channel_cfg, period, pointer, source=source, limit=limit,
+                        rpc_timeout=rpc_timeout,
+                    )
+                    outcomes.extend(read)
+                    self._note_read_while_off([*unsaid, period], read)
+                    read_since_skip = _read_cleanly(read)
+                    if not caught_up:
+                        return tuple(outcomes)  # the next read goes on from the pointer
+                    if read_since_skip:
+                        self._say_unsaid(channel_cfg, unsaid)
+                    pointer, skipped = await self._skip_while_off(
+                        channel_cfg, period, pointer, rpc_timeout=rpc_timeout
+                    )
+                    if skipped or period.period_id in self._read_while_off:
+                        self._say_off_period(channel_cfg, period, skipped=skipped)
+                    else:
+                        unsaid.append(period)
+                        read_since_skip = False
+                messages = await asyncio.wait_for(
+                    self.client.get_messages(
+                        channel_id, limit=limit, min_id=pointer, reverse=True
+                    ),
+                    rpc_timeout,
+                )
+                read = await self.ingest_history(
+                    channel_cfg, messages, min_id=pointer, source=source
                 )
                 outcomes.extend(read)
-                if not caught_up:
-                    return tuple(outcomes)  # the next read goes on from the pointer
-                pointer = await self._skip_while_off(
-                    channel_cfg, period, pointer, rpc_timeout=rpc_timeout
-                )
-            messages = await asyncio.wait_for(
-                self.client.get_messages(channel_id, limit=limit, min_id=pointer, reverse=True),
-                rpc_timeout,
-            )
-            outcomes.extend(
-                await self.ingest_history(channel_cfg, messages, min_id=pointer, source=source)
-            )
-            return tuple(outcomes)
+                self._note_read_while_off(unsaid, read)
+                read_since_skip = _read_cleanly(read)
+                return tuple(outcomes)
+            finally:
+                if read_since_skip:
+                    self._say_unsaid(channel_cfg, unsaid)
+                elif unsaid:
+                    self._unsaid_off_periods[channel_id] = unsaid
 
     async def _read_until_switched_off(
         self,
@@ -1355,16 +1391,15 @@ class Listener:
         pointer_before: int,
         *,
         rpc_timeout: float,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """The second range: skip what the channel posted while it was OFF.
         The pointer moves to the newest post dated before the switch-on
         (less its `_off_allowances`) -- one RPC, as a seed's anchor -- never
         down, and the period is deleted, in one writer job. Returns the
-        pointer. The window is told only when something was skipped: a
-        period whose posts were all read already (a watch was running)
-        skipped nothing (final fix FF24)."""
+        pointer, and whether it moved: whether anything was skipped (what
+        the window is told: `_say_off_period`)."""
         channel_id = channel_cfg.channel_id
-        allow_off, allow_on = self._off_allowances(period)
+        allow_on = self._off_allowances(period)[1]
         offset = (period.on_at_utc - allow_on).replace(microsecond=0)
         before_on = await asyncio.wait_for(
             self.client.get_messages(channel_id, limit=1, offset_date=offset), rpc_timeout
@@ -1377,28 +1412,84 @@ class Listener:
             )
 
         pointer = await self._run_on_writer(finish)
-        if pointer <= pointer_before:
-            logger.info(
-                "Channel %s (%s) was switched off from %s to %s UTC; everything it posted "
-                "in that time had been read already.",
-                channel_id,
-                channel_cfg.name,
-                period.off_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
-                period.on_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
-            )
-            return pointer
-        logger.warning(
-            "Channel %s (%s) was switched off from %s to %s UTC: what it posted in between "
-            "was not read. Everything it posted before and since is read, and so is what it "
-            "posted within %s, in case this computer's clock was off by up to that much "
-            "when you switched.",
-            channel_id,
-            channel_cfg.name,
-            period.off_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
-            period.on_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
-            _around_switches_words(allow_off, allow_on),
+        return pointer, pointer > pointer_before
+
+    def _note_read_while_off(
+        self, periods: Iterable[channel_state.OffPeriod], read: Iterable[HistoryIngest]
+    ) -> None:
+        """Remember each of `periods` for which `read` holds a post dated
+        while the channel was OFF -- one within what is read around its
+        switches (R3-3)."""
+        dates = [o.posted_at_utc for o in read if o.posted_at_utc is not None]
+        for period in periods:
+            if any(period.off_at_utc < date < period.on_at_utc for date in dates):
+                self._read_while_off.add(period.period_id)
+
+    def _say_unsaid(
+        self, channel_cfg: ChannelCfg, unsaid: list[channel_state.OffPeriod]
+    ) -> None:
+        """Say each OFF period in `unsaid` -- skipped nothing, and a read
+        after its skip has finished cleanly (R3-3) -- and empty the list."""
+        for period in unsaid:
+            self._say_off_period(channel_cfg, period, skipped=False)
+        unsaid.clear()
+
+    def _say_off_period(
+        self, channel_cfg: ChannelCfg, period: channel_state.OffPeriod, *, skipped: bool
+    ) -> None:
+        """Tell the window what became of what a channel posted while it was
+        OFF, by what happened (final fix round 3, R3-3):
+
+        - something was skipped: a WARNING that it was not read, and how
+          far around the switches posts were read anyway;
+        - nothing was skipped, and posts made while OFF were read now (they
+          came within what is read around the switches, or the period was
+          no longer than that): a WARNING that they were read and are
+          handled like any other post -- a signal among them is traded,
+          although the channel had been switched off;
+        - nothing was skipped and nothing made while OFF was read now, but
+          posts it made then are stored: everything it posted then had been
+          read already -- by a watch that kept reading the channel while it
+          was switched off (FF24), so the pointer was past them;
+        - none of that: it posted nothing while it was off."""
+        allow_off, allow_on = self._off_allowances(period)
+        read_now = period.period_id in self._read_while_off
+        self._read_while_off.discard(period.period_id)
+        where = (
+            f"Channel {channel_cfg.channel_id} ({channel_cfg.name}) was switched off from "
+            f"{period.off_at_utc:%Y-%m-%d %H:%M:%S} to {period.on_at_utc:%Y-%m-%d %H:%M:%S} UTC"
         )
-        return pointer
+        around = _around_switches_words(allow_off, allow_on)
+        handled = "so what it posted while off was read and is handled like any other post."
+        if skipped:
+            logger.warning(
+                "%s: what it posted in between was not read. Everything it posted before and "
+                "since is read, and so is what it posted within %s, in case this computer's "
+                "clock was off by up to that much when you switched.",
+                where,
+                around,
+            )
+        elif read_now and period.on_at_utc - period.off_at_utc <= allow_off + allow_on:
+            logger.warning(
+                "%s. It was off for no longer than the %d seconds watch reads around the two "
+                "switches (within %s, in case this computer's clock was off), %s",
+                where,
+                int((allow_off + allow_on).total_seconds()),
+                around,
+                handled,
+            )
+        elif read_now:
+            logger.warning(
+                "%s. It posted only within %s, which watch reads in case this computer's "
+                "clock was off, %s",
+                where,
+                around,
+                handled,
+            )
+        elif _stored_post_while_off(self.reader, channel_cfg.channel_id, period):
+            logger.info("%s; everything it posted in that time had been read already.", where)
+        else:
+            logger.info("%s; it posted nothing in that time.", where)
 
     def _off_allowances(self, period: channel_state.OffPeriod) -> tuple[timedelta, timedelta]:
         """How far around `period`'s two stamps posts are still read: after
@@ -2508,6 +2599,30 @@ def wait_words(seconds: float) -> str:
     if minutes < 120:
         return f"about {minutes} minutes"
     return f"about {int(round(seconds / 3600))} hours"
+
+
+def _stored_post_while_off(
+    conn: Connection, channel_id: int, period: channel_state.OffPeriod
+) -> bool:
+    """Whether a post `channel_id` made while it was OFF in `period` is
+    stored (R3-3). The dates are ISO-8601 UTC, which sort as text."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM messages WHERE channel_id = ? AND posted_at_utc > ? "
+            "AND posted_at_utc < ? LIMIT 1",
+            (
+                channel_id,
+                channel_state.format_utc(period.off_at_utc),
+                channel_state.format_utc(period.on_at_utc),
+            ),
+        ).fetchone()
+        is not None
+    )
+
+
+def _read_cleanly(read: Iterable[HistoryIngest]) -> bool:
+    """Whether a history batch was ingested with no message failing."""
+    return all(outcome.result is not None for outcome in read)
 
 
 def _seconds_words(span: timedelta) -> str:

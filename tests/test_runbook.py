@@ -151,3 +151,11 @@ def test_the_runbook_says_a_clock_put_right_after_the_switches_costs_nothing() -
     assert "is put\n  right before `watch` starts again costs nothing" in RUNBOOK
     assert "Only a clock that went\n  wrong after `watch` last started" in RUNBOOK
     assert "right again when `watch`\n  starts, can still cost" not in RUNBOOK
+
+
+def test_the_runbook_says_a_short_switch_off_may_read_everything_it_posted() -> None:
+    """Final fix round 3 (R3-3): a channel off for only a few minutes may
+    have posted nothing outside the margin read around the switches; then
+    what it posted while off is read and handled, and watch says so."""
+    assert "A channel switched off for only a few minutes" in RUNBOOK
+    assert "a signal it posted then is handled like any other" in RUNBOOK

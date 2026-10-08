@@ -262,7 +262,10 @@ Signals can come from more than one Telegram channel, and you choose which.
   switch, can still cost a post made close to a switch: keep **Set time
   automatically** on.) Switching it off and on
   again several times before `watch` runs is fine: each time it was off is
-  skipped, and only that.
+  skipped, and only that. A channel switched off for only a few minutes
+  may have posted nothing outside that margin: then everything it posted
+  while off is read, and a signal it posted then is handled like any other —
+  `watch` says so when it reads the channel.
 - **If it says the time it was switched off could not be saved** (the
   database was busy or could not be used), the channel is still switched
   off. If the database was busy, run the same `.\xaucopier channels off 2`
