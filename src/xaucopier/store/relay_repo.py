@@ -235,6 +235,9 @@ two watched channels carrying the same calls, unless it says otherwise):
   config, as the other channel's parser is not at hand. With channels on
   different parsers, a post that does not read as the call that way
   counts as not standing -- the safe side: the removal withdraws the call.
+  So is another channel's held-back copy re-read when a new signal is
+  stored (`_held_back_near`, `_ReadAs`): one that does not read as a
+  signal that way stays held back, its alert standing -- the loud side.
 - One channel suffices: of several posts of the call deleted in one
   report, only the lowest id is recorded as the post that withdrew it
   (`edits_repo._closing_post`), so a reply to another of them follows the
@@ -248,6 +251,22 @@ two watched channels carrying the same calls, unless it says otherwise):
   deleted its copy, the relay posted the call again, and the relay is then
   switched off: the VIP's post holds the withdrawn signal, so it is not
   admitted again, and the call is not traded.
+- A follow-up stored as a copy of one that was moved to another live
+  signal -- not the one a start admitted -- or that has no target, is left
+  a copy by that start (final fix round 4): it repeats an instruction
+  about another call, or about none. Reaching it takes four channels, or a
+  reply stored before the post it replies to.
+- A copy held back that a new signal does not repeat by the relay window
+  keeps its CRITICAL "trade it by hand": by the relay rules it is another
+  call -- though the same call posted 900 s or more away may be queued.
+- The follow-up copies of a copy re-linked at a start to a signal that was
+  live already (not admitted at that start) are not looked at again: only
+  the copies replying to, or forwarding the instruction about, a signal
+  admitted then are (final fix rounds 4 and 5).
+- A forward of a switched-off channel's follow-up whose own post was never
+  stored -- the channel was switched off before watch read it -- says
+  nothing of what it is about: a follow-up with no target, as any forward
+  of a post never read (final fix round 5, R5-2).
 - The posts of one report are told apart by their deletion time: the
   listener stamps every job of one report with the report's moment. A
   post of the report whose job failed and was marked deleted later, by
@@ -1426,14 +1445,14 @@ def _supersede_held_back_by(
         carrier = _live_carrier(conn, copy, relay_window_seconds=relay_window_seconds)
         if carrier is None or carrier["signal_id"] != new["signal_id"]:
             continue
-        _relink(conn, copy, carrier, why="held back as a copy of withdrawn signal")
+        _relink(conn, copy, carrier, why="held back as a copy of withdrawn signal %s")
         raised.extend(
             _supersede_all(
                 conn,
                 alert_ids,
                 new=carrier,
                 stands=(
-                    "The same call has been posted since, as message "
+                    "The same call stands as message "
                     f"{carrier['message_id']} on channel {carrier['channel_id']}: it is signal "
                     f"{carrier['signal_id']}, with {queued} trade "
                     f"entr{'y' if queued == 1 else 'ies'} queued, and the copy now repeats it."
@@ -1729,13 +1748,12 @@ def _how_gone(
 ) -> str | None:
     """How `signal`'s own post no longer stands, in words -- or None while it
     stands: not deleted and, re-read with its channel's parser, still
-    showing the call (`post_shows_call`)."""
+    showing the call (`post_shows_call`). (A signal's own message is always
+    stored: `signals` references it.)"""
     post = conn.execute(
         "SELECT * FROM messages WHERE channel_id = ? AND message_id = ?",
         (signal["channel_id"], signal["message_id"]),
     ).fetchone()
-    if post is None:
-        return None  # never stored: nothing to judge it by
     if post["deleted_at_utc"] is not None:
         return "was deleted"
     if not post_shows_call(post, signal, channel_cfg=channel_cfg):

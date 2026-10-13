@@ -766,15 +766,20 @@ def _unacked_by_hand(conn) -> list[tuple]:  # noqa: F811
     )
 
 
-def test_a_held_back_copy_repeats_the_same_call_posted_afresh(conn):  # noqa: F811
+def test_a_held_back_copy_repeats_the_same_call_posted_afresh(conn, caplog):  # noqa: F811
     """Final fix round 5, R5-4, at ingest: by the relay rules the VIP's post
     repeats signal 2 now -- the live call within its window -- so it is
     linked to it, its CRITICAL is cleared, and a WARNING says not to trade
     the call by hand: following the CRITICAL would open signal 2's trade
     twice."""
-    _held_back_then_the_call_posted_afresh(conn)
+    with caplog.at_level(logging.INFO, logger="xaucopier.store.relay_repo"):
+        _held_back_then_the_call_posted_afresh(conn)
 
     assert _link(conn, VIP, 4002) == 2
+    assert (
+        f"channel {V} message 4002, held back as a copy of withdrawn signal 1, now repeats "
+        f"signal 2 (channel {R} message {RELAY_CALL})"
+    ) in [record.getMessage() for record in caplog.records]
     assert _queued(conn) == [(2, "acct-1"), (2, "acct-2")]
     assert _unacked_by_hand(conn) == []
     rows = _q(
@@ -791,7 +796,7 @@ def test_a_held_back_copy_repeats_the_same_call_posted_afresh(conn):  # noqa: F8
     assert detail == (
         f"alert #{held_id} no longer applies. It said that message 4002 on channel {V} copies "
         "a call that had been withdrawn, was not traded, and that the call should be traded by "
-        f"hand if it was still meant. The same call has been posted since, as message "
+        f"hand if it was still meant. The same call stands as message "
         f"{RELAY_CALL} on channel {R}: it is signal 2, with 2 trade entries queued, and the "
         f"copy now repeats it. Alert #{held_id} is cleared. Do not trade this call by hand as "
         "well: that would open the trade twice. If you already did, check your open positions."
@@ -1661,6 +1666,28 @@ def test_a_call_partly_traded_is_withdrawn_loudly_and_left_open(conn):  # noqa: 
     assert alert[0] == "CRITICAL"
     detail = " ".join(alert[5].split())
     assert "But it is already traded: its open trades were NOT closed -- review them by hand. "         "1 queued trade entry was cancelled." in detail, detail
+
+def test_a_waiting_signal_no_post_shows_is_withdrawn_at_start_too(conn):  # noqa: F811
+    """Should a signal still wait to be traded with its own post gone and
+    no other post of its call standing anywhere -- marked deleted with
+    nothing else done, say -- the start withdraws it as well, and says no
+    post shows the call (INV-1: a call no post shows is never traded)."""
+    assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
+    conn.execute(
+        "UPDATE messages SET deleted_at_utc = ? WHERE channel_id = ? AND message_id = ?",
+        (_at(20).isoformat(), R, RELAY_CALL),
+    )
+    conn.commit()
+
+    _restart(conn, on=(RELAY,), seconds=30)
+
+    assert _claimable(conn) == []
+    (alert,) = [a for a in _alerts(conn) if a[1] == SHOWN_OFF]
+    assert (
+        f"its own post, message {RELAY_CALL} on channel {R} (Relay), was deleted, and no other "
+        "post on a channel that is switched on shows the call, so it is not traded"
+    ) in " ".join(alert[5].split())
+
 
 def test_the_withdrawal_at_start_looks_only_at_signals_of_channels_switched_on(
     conn,  # noqa: F811
