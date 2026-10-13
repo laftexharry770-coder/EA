@@ -97,7 +97,9 @@ promoted signal: the call never stopped, so none of them is an older post.
 
 **The call's last standing post is never an echo, nor an older post**
 (ruling R5-6, INV-1). Whatever a removal echoes, when no other post of
-the call still stands on any channel (`_call_stands_elsewhere`), it is a
+the call still stands on any channel this watch reads
+(`_call_stands_elsewhere`; a post on a channel switched off counts for
+nothing, final fix round 4), it is a
 removal like any other and withdraws the call: a call no post shows is
 never left to trade. Echoes can otherwise chain -- each channel's last
 post judged an echo of the other's -- and no rule about one pair of
@@ -622,6 +624,7 @@ def old_post(
     channel_id: int,
     message_id: int,
     channel_cfg: _ChannelCfgLike | None = None,
+    read_channels: Collection[int] | None = None,
 ) -> OldPost | None:
     """How stored post (`channel_id`, `message_id`) stands to the newest
     signal of its call, for a removal of it -- deleted, edited away,
@@ -645,7 +648,11 @@ def old_post(
       replaced, that another post withdrew, with no forward linking the
       two: it may be a retraction or only the other channel removing its
       old copy. The removal still reaches the newest signal -- doing
-      nothing is the safe side -- but loudly (`edits_repo`)."""
+      nothing is the safe side -- but loudly (`edits_repo`).
+
+    `read_channels`: the channels this watch reads, for the check that the
+    post is not the call's last standing one (`_call_stands_elsewhere`;
+    final fix round 4, R4-5). None: every channel counts."""
     message = conn.execute(
         "SELECT * FROM messages WHERE channel_id = ? AND message_id = ?", (channel_id, message_id)
     ).fetchone()
@@ -658,7 +665,11 @@ def old_post(
         return None
     found = _old_post_kind(conn, message, start, channel_cfg)
     if found is not None and not _call_stands_elsewhere(
-        conn, signal_id=start, post=(channel_id, message_id), channel_cfg=channel_cfg
+        conn,
+        signal_id=start,
+        post=(channel_id, message_id),
+        channel_cfg=channel_cfg,
+        read_channels=read_channels,
     ):
         # The call's last standing post, on every channel: its removal is a
         # removal like any other, whatever it echoes -- a call no post shows
@@ -2416,15 +2427,23 @@ def _call_stands_elsewhere(
     signal_id: int,
     post: tuple[int, int],
     channel_cfg: _ChannelCfgLike | None,
+    read_channels: Collection[int] | None = None,
 ) -> bool:
     """Whether a post of `signal_id`'s call other than `post` still stands,
-    on any channel: not deleted, still stored as a signal, not the post
+    on any channel this watch reads (`read_channels`; None: on any
+    channel): not deleted, still stored as a signal, not the post
     that closed one of the call's signals (`standing_posts_on`) and -- with
     `channel_cfg`, the changed post's channel config -- re-read still
     showing the call of its newest signal. A post of another channel is
     re-read with that config too (its own is not at hand here): one that
     does not read as the call with it counts as not standing, which only
-    makes a removal withdraw the call -- the safe side."""
+    makes a removal withdraw the call -- the safe side.
+
+    A post on a channel switched off counts for nothing (final fix round
+    4, R4-5): watch does not read it, so nothing would see it deleted or
+    edited away, and a call standing only there would be left to trade
+    with no post this watch reads showing it (INV-1, "a channel this watch
+    reads")."""
     newest = _signal_row(conn, live_signal_for(conn, signal_id))
     chain = chain_ids(conn, signal_id)
     marks = ", ".join("?" for _ in chain)
@@ -2440,6 +2459,8 @@ def _call_stands_elsewhere(
         "     AND s.closed_by_message_id = m.message_id)",
         (*post, *chain, *chain, *chain),
     ).fetchall():
+        if read_channels is not None and other["channel_id"] not in read_channels:
+            continue  # on a channel switched off: not read (R4-5)
         if channel_cfg is None or post_shows_call(other, newest, channel_cfg=channel_cfg):
             return True
     return False

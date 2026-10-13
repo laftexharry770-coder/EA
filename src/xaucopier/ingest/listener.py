@@ -776,6 +776,14 @@ class Listener:
         return tuple(self._channels_by_id.values())
 
     @property
+    def read_channel_ids(self) -> frozenset[int]:
+        """The ids of the channels this watch reads -- the switched-on
+        ones. Every edit and deletion job passes them on: a post on any
+        other channel is not read, so it never keeps a call standing
+        (`relay_repo.old_post`, final fix round 4, R4-5)."""
+        return frozenset(self._channels_by_id)
+
+    @property
     def started_at(self) -> datetime | None:
         """When this `watch` started, as `start()` decided it: the earlier
         of this computer's clock and Telegram's at the moment `start()`
@@ -869,6 +877,7 @@ class Listener:
         now_utc = self._now()
         accounts = self.accounts
         tombstones = self._deleted_before_stored
+        read_channels = self.read_channel_ids
 
         def job(conn: Connection) -> IngestResult:
             deletion = None
@@ -899,6 +908,7 @@ class Listener:
                 fwd_from_date_utc=incoming.fwd_from_date_utc,
                 deleted_by_event_at_utc=None if deletion is None else deletion[0],
                 deleted_by_event_with=() if deletion is None else deletion[1],
+                read_channels=read_channels,
             )
             if advances_pointer:
                 _advance_last_processed(
@@ -926,6 +936,7 @@ class Listener:
         touches the pointer."""
         now_utc = self._now()
         accounts = self.accounts
+        read_channels = self.read_channel_ids
 
         def job(conn: Connection) -> EditResult:
             return edits_repo.apply_edit(
@@ -939,6 +950,7 @@ class Listener:
                 now_utc=now_utc,
                 accounts=accounts,
                 detected_by=detected_by,
+                read_channels=read_channels,
             )
 
         return await self._run_on_writer(job)
@@ -974,6 +986,7 @@ class Listener:
         accounts = self.accounts
         others = frozenset(also_deleted)
         tombstones = self._deleted_before_stored
+        read_channels = self.read_channel_ids
 
         def job(conn: Connection) -> DeletionResult:
             result = edits_repo.apply_deletion(
@@ -984,6 +997,7 @@ class Listener:
                 accounts=accounts,
                 detected_by=detected_by,
                 also_deleted=others,
+                read_channels=read_channels,
             )
             if result.outcome == "unknown" and detected_by == edits_repo.EVENT_DETECTOR:
                 # Not stored yet -- perhaps a history read holds it right now

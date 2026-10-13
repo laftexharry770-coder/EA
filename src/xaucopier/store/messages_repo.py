@@ -349,6 +349,7 @@ def ingest(
     fwd_from_date_utc: datetime | None = None,
     deleted_by_event_at_utc: datetime | None = None,
     deleted_by_event_with: Collection[int] = (),
+    read_channels: Collection[int] | None = None,
 ) -> IngestResult:
     channel_id = channel_cfg.channel_id
     provenance = _provenance_columns(
@@ -413,6 +414,7 @@ def ingest(
                 accounts=accounts,
                 detected_by=edits_repo.EVENT_DETECTOR,
                 also_deleted=deleted_by_event_with,
+                read_channels=read_channels,
             )
             logger.info(
                 "channel %s message %s (%s) was deleted before it was stored: stored, and the "
@@ -436,6 +438,7 @@ def ingest(
         now_utc=now_utc,
         accounts=accounts,
         detected_by=source,
+        read_channels=read_channels,
     )
     return IngestResult(
         outcome="edited" if edit.changed else "duplicate",

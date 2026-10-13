@@ -585,6 +585,7 @@ def apply_edit(
     now_utc: datetime,
     accounts: tuple[_AccountCfgLike, ...],
     detected_by: str,
+    read_channels: Collection[int] | None = None,
 ) -> EditResult:
     """The current version of a message, from an edit path (the event, or
     the window re-read). A message never stored is left alone
@@ -627,6 +628,7 @@ def apply_edit(
         now_utc=now_utc,
         accounts=accounts,
         detected_by=detected_by,
+        read_channels=read_channels,
     )
 
 
@@ -643,12 +645,16 @@ def reconcile(
     now_utc: datetime,
     accounts: tuple[_AccountCfgLike, ...],
     detected_by: str,
+    read_channels: Collection[int] | None = None,
 ) -> EditResult:
     """Decide what a version of an already-stored message means, and do
     it. `existing` is its `messages` row. See the module docstring for
     the whole policy; `messages_repo.ingest()` and `apply_edit()` both
     end here. `channel_cfg` is the message's channel (its parser re-reads
-    a withdrawn call's standing repost, which may be promoted)."""
+    a withdrawn call's standing repost, which may be promoted).
+    `read_channels`: the channels this watch reads -- only a post on one of
+    them keeps a call standing (`relay_repo.old_post`, final fix round 4,
+    R4-5); None, every channel."""
     _check_detector(detected_by)
     retraction = _as_retraction(existing, text, route_result, channel_cfg=channel_cfg)
     if retraction is not None:
@@ -671,6 +677,7 @@ def reconcile(
         ),
         relay_of_signal_id=existing["relay_of_signal_id"],
         relay_of_followup_id=existing["relay_of_followup_id"],
+        read_channels=None if read_channels is None else frozenset(read_channels),
     )
 
     reversal: tuple[int, ...] = ()
@@ -982,6 +989,7 @@ def _edit_of_signal(ctx: _Ctx, route_result: RouteResult) -> EditResult:
                 channel_id=ctx.channel_id,
                 message_id=ctx.message_id,
                 channel_cfg=ctx.channel_cfg,
+                read_channels=ctx.read_channels,
             ),
         )
         if row["signal_id"] == ctx.signal_id:
@@ -1466,6 +1474,7 @@ def _holder_speaks(ctx: _Ctx, row: sqlite3.Row) -> bool:
         channel_id=row["channel_id"],
         message_id=row["message_id"],
         channel_cfg=ctx.channel_cfg,
+        read_channels=ctx.read_channels,
     )
     return old is None or old.kind != "echo"
 
@@ -2499,6 +2508,7 @@ def apply_deletion(
     accounts: tuple[_AccountCfgLike, ...],
     detected_by: str,
     also_deleted: Collection[int] = (),
+    read_channels: Collection[int] | None = None,
 ) -> DeletionResult:
     """A message is gone from its channel (the event said so, or the
     window re-read found `None` where it used to be). Marks it deleted --
@@ -2510,7 +2520,8 @@ def apply_deletion(
     `channel_cfg` and `accounts` are what promoting a withdrawn call's
     standing repost needs (its parser; its ENTRY fan-out): required, like
     `ingest()`'s `accounts`, so a caller cannot silently promote a repost
-    to no account."""
+    to no account. `read_channels`: the channels this watch reads, as
+    for `reconcile`."""
     _check_detector(detected_by)
     channel_id = channel_cfg.channel_id
     existing = _get_message(conn, channel_id=channel_id, message_id=message_id)
@@ -2553,6 +2564,7 @@ def apply_deletion(
         relay_of_signal_id=existing["relay_of_signal_id"],
         relay_of_followup_id=existing["relay_of_followup_id"],
         also_deleted=frozenset(also_deleted) - {message_id},
+        read_channels=None if read_channels is None else frozenset(read_channels),
     )
 
     # Decided on the signals row, not on `kind`: a signal an earlier edit
@@ -2567,7 +2579,11 @@ def apply_deletion(
         ctx = dataclasses.replace(
             ctx,
             old_post=relay_repo.old_post(
-                conn, channel_id=channel_id, message_id=message_id, channel_cfg=channel_cfg
+                conn,
+                channel_id=channel_id,
+                message_id=message_id,
+                channel_cfg=channel_cfg,
+                read_channels=ctx.read_channels,
             ),
         )
         post_ctx = ctx if own else _as_copy(ctx, row)
@@ -2725,6 +2741,9 @@ class _Ctx:
     #: its removal would reach that signal though the post echoes or
     #: predates it (`relay_repo.old_post`, ruling R4-1).
     old_post: relay_repo.OldPost | None = None
+    #: The channels this watch reads; None, every channel. Only a post on
+    #: one of them keeps a call standing (final fix round 4, R4-5).
+    read_channels: frozenset[int] | None = None
 
     @property
     def channel_id(self) -> int:

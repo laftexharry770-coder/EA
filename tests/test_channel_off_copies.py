@@ -885,3 +885,210 @@ def test_a_copy_of_a_close_half_that_moved_to_the_new_signal_stays_a_copy(
     assert _q(conn, "SELECT relay_of_followup_id FROM messages WHERE message_id = ?", VIP_CLOSE) == [
         (other.followup_id,)
     ]
+
+
+# -- a post on a channel switched off keeps no call standing (R4-5) ---------
+
+
+def _claimable(conn) -> list[int]:  # noqa: F811
+    return [
+        row[0]
+        for row in _q(
+            conn,
+            "SELECT DISTINCT o.signal_id FROM outbox o JOIN signals s USING (signal_id) "
+            "WHERE o.kind = 'ENTRY' AND o.state = 'QUEUED' AND s.state = 'NEW' "
+            "AND s.withdrawn_at_utc IS NULL ORDER BY 1",
+        )
+    ]
+
+
+def _the_relays_held_back_forward(conn) -> None:  # noqa: F811
+    """Seed 98259 reduced (the re-check's p_off_support2): the VIP's call
+    (signal 1), deleted; the relay posts it (held back, a copy of the
+    withdrawn call) and forwards its own post; it deletes the post, keeping
+    the forward. The relay is switched off and watch restarts."""
+    assert _ingest(conn, VIP, VIP_COPY).signal_id == 1
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=VIP_COPY, now_utc=_at(10), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    conn.commit()
+    assert _ingest(conn, RELAY, 7006, posted=_at(20)).relay_of_signal_id == 1
+    assert _ingest(conn, RELAY, 7007, posted=_at(25), fwd=(R, 7006)).relay_of_signal_id == 1
+    edits_repo.apply_deletion(
+        conn, channel_cfg=RELAY, message_id=7006, now_utc=_at(30), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    conn.commit()
+    _restart(conn, on=(VIP,), seconds=35)
+
+
+@pytest.mark.parametrize("by", ["event", "window"])
+@pytest.mark.parametrize(
+    ("read", "withdrawn"),
+    [((V,), True), ((V, R), False), (None, False)],
+    ids=["the relay switched off", "the relay read", "no channel set given"],
+)
+def test_a_forward_on_a_channel_switched_off_keeps_no_call_standing(
+    conn, by, read, withdrawn  # noqa: F811
+):
+    """After the restart the VIP forwards the relay's deleted post: the call
+    posted again, signal 2, which the relay's forward repeats. The VIP then
+    deletes its forward. It echoes the relay's deleted post -- but its
+    removal withdraws the call unless another post of it still stands, and
+    the relay's forward, on a channel watch no longer reads, counts for
+    nothing: nothing would see it go (INV-1, "a channel this watch reads").
+    Signal 2 is withdrawn, not left to trade. With the relay read (or no
+    channel set given, as the store's own callers do) the relay's forward
+    still shows the call, and signal 2 stands."""
+    _the_relays_held_back_forward(conn)
+    again = _ingest(conn, VIP, 4009, posted=_at(40), fwd=(R, 7006))
+    assert again.signal_id == 2, again
+    assert _link(conn, RELAY, 7007) == 2
+
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4009, now_utc=_at(50), accounts=ACCOUNTS,
+        detected_by=by, read_channels=read,
+    )
+    conn.commit()
+
+    assert _claimable(conn) == ([] if withdrawn else [2])
+    (state,) = _q(conn, "SELECT state, withdrawn_at_utc IS NOT NULL FROM signals WHERE signal_id = 2")
+    assert (state[0] != "NEW" or bool(state[1])) is withdrawn, state
+
+
+def test_an_edit_away_on_a_channel_read_counts_only_the_channels_read(conn):  # noqa: F811
+    """The same through an edit: the VIP edits its forward into chatter."""
+    _the_relays_held_back_forward(conn)
+    assert _ingest(conn, VIP, 4009, posted=_at(40), fwd=(R, 7006)).signal_id == 2
+
+    edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=4009, text="good morning traders",
+        posted_at_utc=_at(40), edit_date_utc=_at(50), reply_to_message_id=None,
+        now_utc=_at(50), accounts=ACCOUNTS, detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+    assert _claimable(conn) == []
+
+
+@pytest.mark.parametrize(
+    ("read", "says"), [((V,), 4009), ((V, R), 4010)], ids=["the relay switched off", "the relay read"]
+)
+def test_a_repeat_deleted_with_the_signals_post_leaves_the_saying_to_it_when_it_withdraws(
+    conn, read, says  # noqa: F811
+):
+    """The VIP's forward (signal 2) and its own repeat of the call, deleted
+    in one report, the repeat's job first. The repeat leaves the saying to
+    the signal's own post when that post's removal will withdraw the call
+    (`edits_repo._holder_speaks`): with the relay switched off it will --
+    the relay's forward keeps nothing standing -- so the WARNING names the
+    signal's own message. With the relay read, the forward's removal is an
+    echo of the relay's, and the repeat says it."""
+    _the_relays_held_back_forward(conn)
+    assert _ingest(conn, VIP, 4009, posted=_at(40), fwd=(R, 7006)).signal_id == 2
+    assert _ingest(conn, VIP, 4010, posted=_at(45)).relay_of_signal_id == 2
+
+    for message_id in (4010, 4009):
+        edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=message_id, now_utc=_at(50), accounts=ACCOUNTS,
+            detected_by="event", also_deleted={4009, 4010} - {message_id}, read_channels=read,
+        )
+        conn.commit()
+
+    assert _claimable(conn) == []
+    assert _q(
+        conn, "SELECT message_id FROM alerts WHERE code = ?", edits_repo.SIGNAL_VOIDED_BY_DELETION
+    )[-1] == (says,)
+
+
+GONE_WAYS = ["deleted", "edited away", "edited, read again", "deleted before it was stored"]
+
+
+@pytest.mark.parametrize("how", GONE_WAYS)
+@pytest.mark.parametrize("relay_on", [False, True], ids=["relay off", "relay on"])
+def test_watch_counts_only_the_channels_it_reads_when_a_post_goes(
+    tmp_path: Path, relay_on: bool, how: str
+) -> None:
+    """Seed 98259 through the listener: watch reads only the VIP. The VIP's
+    forward of the relay's deleted post is the call posted again (signal 2)
+    and goes -- deleted, edited into chatter (the event, or a history read
+    finding the new version), or deleted before watch stored it: signal 2
+    is withdrawn. The relay's forward still shows the call, but watch does
+    not read that channel. With the relay switched on, its forward still
+    stands and signal 2 is kept."""
+    from test_listener import ACCOUNTS as LISTENER_ACCOUNTS
+    from test_listener import _build_listener
+    from xaucopier.ingest.listener import IncomingMessage
+
+    db_path = tmp_path / "store.db"
+    relay = ChannelCfg(
+        channel_id=R, name=RELAY.name, parser="mmh", ordinal=RELAY.ordinal, enabled=relay_on
+    )
+    writer = db.connect(db_path, role="writer")
+    try:
+        for channel, message_id, seconds, fwd in (
+            (VIP, VIP_COPY, 0, None),
+            (RELAY, 7006, 20, None),
+            (RELAY, 7007, 25, (R, 7006)),
+        ):
+            messages_repo.ingest(
+                writer, channel_cfg=channel, message_id=message_id, text=SIGNAL_TEXT,
+                posted_at_utc=_at(seconds), edit_date_utc=None, reply_to_message_id=None,
+                source="live", now_utc=_at(seconds + 1), accounts=LISTENER_ACCOUNTS,
+                fwd_from_channel_id=None if fwd is None else fwd[0],
+                fwd_from_post_id=None if fwd is None else fwd[1],
+                fwd_from_date_utc=None if fwd is None else _at(20),
+            )
+            if message_id == VIP_COPY:
+                edits_repo.apply_deletion(
+                    writer, channel_cfg=VIP, message_id=VIP_COPY, now_utc=_at(10),
+                    accounts=LISTENER_ACCOUNTS, detected_by="event",
+                )
+        edits_repo.apply_deletion(
+            writer, channel_cfg=RELAY, message_id=7006, now_utc=_at(30),
+            accounts=LISTENER_ACCOUNTS, detected_by="event",
+        )
+        writer.commit()
+    finally:
+        writer.close()
+
+    def forward(text: str = SIGNAL_TEXT, edited: bool = False) -> IncomingMessage:
+        return IncomingMessage(
+            channel_id=V, message_id=4009, text=text, posted_at_utc=_at(40),
+            edit_date_utc=_at(50) if edited else None, reply_to_message_id=None,
+            fwd_from_channel_id=R, fwd_from_post_id=7006, fwd_from_date_utc=_at(20),
+        )
+
+    async def scenario():
+        listener = _build_listener(
+            db_path, FakeTelegramClient(), channels=(VIP, relay), accounts=LISTENER_ACCOUNTS,
+        )
+        await listener.start()
+        try:
+            if how == "deleted before it was stored":
+                await listener.ingest_deletion(VIP, 4009, detected_by="event")
+            again = await listener.ingest_message(forward(), channel_cfg=VIP, source="live")
+            assert again.signal_id == 2, again
+            if how == "deleted":
+                await listener.ingest_deletion(VIP, 4009, detected_by="event")
+            elif how == "edited away":
+                await listener.ingest_edit(
+                    forward("good morning traders", edited=True), channel_cfg=VIP,
+                    detected_by="event",
+                )
+            elif how == "edited, read again":
+                await listener.ingest_message(
+                    forward("good morning traders", edited=True), channel_cfg=VIP, source="poll"
+                )
+        finally:
+            await listener.aclose()
+
+    asyncio.run(scenario())
+
+    check = db.connect(db_path, role="reader")
+    try:
+        claimable = _claimable(check)
+    finally:
+        check.close()
+    assert claimable == ([2] if relay_on else [])
