@@ -310,6 +310,17 @@ def test_the_withdrawing_channel_posting_the_call_again_takes_over_the_copy_held
     assert f"message {COPY + 2} on channel {R}" in detail
     assert f"message 4012 on channel {V}" in detail
     assert f"signal {again.signal_id}" in detail and "twice" in detail
+    # Final fix round 4 (R4-3) shares these words with the start-up job's
+    # re-link of a held-back copy (`relay_repo._supersede`): pinned whole.
+    assert detail == (
+        f"alert #{critical[0]} no longer applies. It said that message {COPY + 2} on channel "
+        f"{R} copies a call that had been withdrawn, was not traded, and that the call should "
+        "be traded by hand if it was still meant. The channel that withdrew the call has now "
+        f"posted it again, as message 4012 on channel {V}: it is signal {again.signal_id}, "
+        f"with 2 trade entries queued, and the copy now repeats it. Alert #{critical[0]} is "
+        "cleared. Do not trade this call by hand as well: that would open the trade twice. If "
+        "you already did, check your open positions."
+    ), detail
     assert _queued_entries(conn) == [(again.signal_id, "acct-1"), (again.signal_id, "acct-2")]
 
 

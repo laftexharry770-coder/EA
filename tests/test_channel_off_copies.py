@@ -581,3 +581,118 @@ def test_watch_admits_only_a_copy_young_enough_for_its_age_gate(
         assert signals == [(1, R, RELAY_CALL, "NEW"), (2, V, VIP_COPY, "NEW")]
         assert queued == [(2, "acct-a"), (2, "acct-b")]
         assert codes[1:] == [CODE]
+
+
+# -- a copy held back while an older one is traded (final fix round 4, R4-3) --
+
+HELD = relay_repo.COPY_OF_WITHDRAWN_SIGNAL
+SUPERSEDED = relay_repo.COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED
+#: policy.toml's gate in these tests: long enough that the VIP's older copy,
+#: 1070 s before the restart, may still be traded (R4-2).
+LONG_GATE = 1200
+
+
+def _two_vip_copies_and_a_withdrawn_repost(conn, *, reposted_by) -> None:  # noqa: F811
+    """The re-check's p_r31_heldback2 (`reposted_by` RELAY) and
+    p_r31_heldback (OTHER): the relay's call (signal 1); the VIP copies it
+    at +30 s and again at +850 s; at +1000 s -- 1000 s after signal 1, so a
+    signal of its own -- the same call is posted (signal 2) and deleted at
+    +1010 s (VOIDED). The VIP's +850 s copy is within the window of both."""
+    assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
+    assert _ingest(conn, VIP, VIP_COPY, posted=_at(30)).relay_of_signal_id == 1
+    assert _ingest(conn, VIP, VIP_REPOST, posted=_at(850)).relay_of_signal_id == 1
+    repost = 7002 if reposted_by is RELAY else OTHER_COPY
+    assert _ingest(conn, reposted_by, repost, posted=_at(1000)).signal_id == 2
+    edits_repo.apply_deletion(
+        conn, channel_cfg=reposted_by, message_id=repost, now_utc=_at(1010), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    conn.commit()
+
+
+@pytest.mark.parametrize(
+    "reposted_by", [RELAY, OTHER], ids=["p_r31_heldback2: the relay", "p_r31_heldback: another"]
+)
+def test_a_copy_held_back_then_repeats_the_older_copy_traded_instead(
+    conn, reposted_by  # noqa: F811
+):
+    """Newest first, the VIP's +850 s copy is tried first: it is within the
+    window of the withdrawn signal 2, so it is held back (CRITICAL, "trade
+    it by hand"). Its +30 s copy is then traded, as signal 3. Run through
+    the relay rules again, the held-back copy now repeats signal 3: it is
+    linked to it, the CRITICAL is cleared, and a WARNING says not to trade
+    the call by hand -- as when the call is posted again
+    (`record_replacement`). No "trade it by hand" stands while it is queued:
+    following it would open the trade twice."""
+    _two_vip_copies_and_a_withdrawn_repost(conn, reposted_by=reposted_by)
+    on = (VIP,) if reposted_by is RELAY else (VIP, OTHER)
+
+    _, raised = _restart(conn, on=on, seconds=1100, max_age_seconds=LONG_GATE)
+
+    assert _signals(conn)[2:] == [(3, V, VIP_COPY, "NEW")]
+    assert _link(conn, VIP, VIP_REPOST) == 3
+    assert _queued(conn) == [(3, "acct-1"), (3, "acct-2")]
+    rows = _q(
+        conn,
+        "SELECT alert_id, level, code, message_id, signal_id, acked, detail FROM alerts "
+        "WHERE code IN (?, ?, ?) ORDER BY alert_id",
+        HELD, CODE, SUPERSEDED,
+    )
+    assert [row[1:6] for row in rows] == [
+        ("CRITICAL", HELD, VIP_REPOST, 2, 1),  # cleared
+        ("WARNING", CODE, VIP_COPY, 3, 0),
+        ("WARNING", SUPERSEDED, VIP_REPOST, 3, 0),
+    ]
+    assert set(raised) == {row[0] for row in rows}
+    held_id, detail = rows[0][0], " ".join(rows[2][6].split())
+    assert detail == (
+        f"alert #{held_id} no longer applies. It said that message {VIP_REPOST} on channel {V} "
+        "copies a call that had been withdrawn, was not traded, and that the call should be "
+        "traded by hand if it was still meant. The same call stands on a channel that is "
+        f"switched on: message {VIP_COPY} on channel {V} is signal 3, with 2 trade entries "
+        f"queued, and the copy now repeats it. Alert #{held_id} is cleared. Do not trade this "
+        "call by hand as well: that would open the trade twice. If you already did, check "
+        "your open positions."
+    ), detail
+    unacked_by_hand = _q(
+        conn, "SELECT detail FROM alerts WHERE acked = 0 AND detail LIKE '%trade it by hand.%'"
+    )
+    assert unacked_by_hand == []
+
+
+def test_a_held_back_copy_the_traded_call_does_not_repeat_stays_held_back(
+    conn,  # noqa: F811
+):
+    """The VIP's copies are 950 s apart: the +900 s one, held back against
+    the withdrawn signal 2, is outside the window of signal 3 (the -50 s
+    copy), so by the relay rules it is another call -- it stays held back,
+    its alert standing."""
+    assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
+    assert _ingest(conn, VIP, VIP_COPY, posted=_at(-50)).relay_of_signal_id == 1
+    assert _ingest(conn, VIP, VIP_REPOST, posted=_at(900)).relay_of_signal_id == 1
+    assert _ingest(conn, RELAY, 7002, posted=_at(1000)).signal_id == 2
+    edits_repo.apply_deletion(
+        conn, channel_cfg=RELAY, message_id=7002, now_utc=_at(1010), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    conn.commit()
+
+    _restart(conn, on=(VIP,), seconds=1100, max_age_seconds=LONG_GATE)
+
+    assert _signals(conn)[2:] == [(3, V, VIP_COPY, "NEW")]
+    assert _link(conn, VIP, VIP_REPOST) == 2
+    assert _q(conn, "SELECT code, acked FROM alerts WHERE code IN (?, ?)", HELD, SUPERSEDED) == [
+        (HELD, 0)
+    ]
+
+
+def test_a_reply_to_a_held_back_copy_moves_with_it_to_the_traded_call(conn):  # noqa: F811
+    """The VIP's "close half", replying to its +850 s copy, acts on the call
+    that copy repeats once it is linked to signal 3."""
+    _two_vip_copies_and_a_withdrawn_repost(conn, reposted_by=RELAY)
+    _ingest(conn, VIP, 4020, CLOSE_HALF, posted=_at(1020), reply_to=VIP_REPOST)
+
+    _restart(conn, on=(VIP,), seconds=1100, max_age_seconds=LONG_GATE)
+
+    (followup_id,) = _q(conn, "SELECT followup_id FROM followups WHERE message_id = 4020")[0]
+    assert relay_repo.signal_for_followup(conn, followup_id=followup_id) == 3
