@@ -76,7 +76,11 @@ ruling R5-3) and is itself a
 counted, but no followups row and no outbox row -- when it repeats a
 stored follow-up (F08); a target it resolves is given to the follow-up
 it repeats when that one has none (a forward stored first: path
-`'copy-reply'`). `UNIQUE(channel_id,
+`'copy-reply'`). A forward repeating a follow-up about a signal whose
+channel is switched off, when another signal trades that call instead,
+is a follow-up of its own about that signal (`relay_repo.traded_instead`,
+final fix round 5, R5-2) -- unless another post already said it about
+that one. `UNIQUE(channel_id,
 message_id)` cannot express "the other channel relayed the same call":
 the user's own channel is itself a relay of a VIP channel, so the
 identical trade legitimately shows up twice. See `relay_repo` for the
@@ -659,6 +663,41 @@ def _ingest_new(
             fwd_from_channel_id=provenance["fwd_from_channel_id"],
             fwd_from_post_id=provenance["fwd_from_post_id"],
         )
+        if relay is not None and followup.reply_to_message_id is None:
+            # It replies to nothing -- a forward (of the post `relay` holds):
+            instead = relay_repo.traded_instead(
+                conn,
+                match=relay,
+                posted_at_utc=posted_at_utc,
+                relay_window_seconds=relay_window_seconds,
+            )
+            if instead is not None:
+                # an instruction about a call whose channel is switched off,
+                # traded instead by another signal: it is about that one
+                # (final fix round 5, R5-2) -- unless another post already
+                # said it about that one.
+                logger.info(
+                    "channel %s message %s forwards follow-up %s, about a signal whose channel "
+                    "is switched off: it is about signal %s, which trades that call instead",
+                    channel_id,
+                    message_id,
+                    relay.followup_id,
+                    instead["signal_id"],
+                )
+                target_signal_id = instead["signal_id"]
+                resolution_path = relay_repo.RELAY_REPLY_PATH
+                relay = relay_repo.find_followup_relay(
+                    conn,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    op=followup.op.value,
+                    content_hash=new_hash,
+                    target_signal_id=target_signal_id,
+                    posted_at_utc=posted_at_utc,
+                    relay_window_seconds=relay_window_seconds,
+                    fwd_from_channel_id=None,
+                    fwd_from_post_id=None,
+                )
         if relay is not None:
             relay_repo.record_followup_copy(
                 conn,
