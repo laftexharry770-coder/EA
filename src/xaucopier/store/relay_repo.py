@@ -147,7 +147,10 @@ anyone acts on:
   later posts the call again, those held-back copies repeat the new
   signal, their CRITICAL alerts are acknowledged and a WARNING says so
   (`COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED`): no "trade it by hand" is left
-  standing while the call is queued. Nor is one ever raised while it is:
+  standing while the call is queued -- nor when the same call is posted
+  afresh, as a new signal within the relay window of a held-back copy
+  that the relay rules now take for a copy of it (`admit_signal`, final
+  fix round 5, R5-4). Nor is one ever raised while it is:
   every alert that would tell the user to trade a call by hand first
   looks for another signal carrying it -- through `live_signal_for`, else
   a live signal showing the same call posted within the relay window of
@@ -257,7 +260,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from collections.abc import Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
@@ -1284,6 +1287,7 @@ def admit_signal(
     accounts: tuple,
     now_utc: datetime,
     deleted_in_report: tuple[datetime, Collection[int]] | None = None,
+    supersede_held_back: bool = True,
 ) -> Admission:
     """A message of `channel_cfg`'s channel -- already on `messages` --
     read as signal `signal` for the first time, admitted by the relay
@@ -1303,7 +1307,21 @@ def admit_signal(
     this one would replace -- a double post deleted together, one of them
     raced -- it is no call posted again but a copy of the call that report
     withdrew (`_withdrawn_in_report`, final fix FF5): linked quietly,
-    exactly as the report handled after both were stored leaves it."""
+    exactly as the report handled after both were stored leaves it.
+
+    A new signal -- the call posted afresh -- may be what a copy held back
+    as a copy of a withdrawn call repeats now, by the relay rules: a post
+    near both, still held back, its "trade it by hand" standing while the
+    same call is queued (final fix round 5, R5-4). So the copies held back
+    within the relay window of its post are run through the relay rules
+    again (`_held_back_near`, `_live_carrier`); each that repeats it now is
+    linked to it, and its CRITICAL is acknowledged and superseded by a
+    WARNING (`_supersede`), as `record_replacement` does for the copies held
+    back against the call it replaces -- and after it, for the copies held
+    back against another withdrawn call (a post delivered late can replace
+    one call and be near a copy held back against the other).
+    `supersede_held_back` False leaves that to the caller
+    (`admit_copies_of_switched_off`, which says it in its own words)."""
     channel_id = channel_cfg.channel_id
     relay = relay_of_signal(
         conn,
@@ -1367,7 +1385,116 @@ def admit_signal(
             now_utc=now_utc,
             channel_cfg=channel_cfg,
         )
+    if supersede_held_back:
+        # Copies held back against another withdrawn call, too: the relay
+        # rules may take them for copies of this one now (R5-4).
+        raised += tuple(
+            _supersede_held_back_by(
+                conn,
+                _signal_row(conn, signal_id),
+                channel_cfg=channel_cfg,
+                relay_window_seconds=relay_window_seconds,
+                now_utc=now_utc,
+            )
+        )
     return Admission(None, signal_id, relay.replaces, queued, raised)
+
+
+def _supersede_held_back_by(
+    conn: sqlite3.Connection,
+    new: sqlite3.Row,
+    *,
+    channel_cfg: _ChannelCfgLike,
+    relay_window_seconds: int,
+    now_utc: datetime,
+) -> list[int]:
+    """For `admit_signal` (final fix round 5, R5-4): every copy held back
+    within the relay window of new signal `new`'s post (`_held_back_near`)
+    that repeats `new` now by the relay rules (`_live_carrier`) is linked to
+    it (`_relink`), and its `COPY_OF_WITHDRAWN_SIGNAL` alert acknowledged and
+    superseded (`_supersede`). Returns the ids of the WARNINGs."""
+    raised: list[int] = []
+    queued = _queued_entries(conn, new["signal_id"])
+    for copy, alert_ids in _held_back_near(
+        conn,
+        new,
+        relay_window_seconds=relay_window_seconds,
+        # Another channel's config is not at hand here: its posts are read
+        # with this channel's parser (`_ReadAs`).
+        read_as=lambda channel_id: channel_cfg if channel_id == channel_cfg.channel_id else None,
+    ):
+        carrier = _live_carrier(conn, copy, relay_window_seconds=relay_window_seconds)
+        if carrier is None or carrier["signal_id"] != new["signal_id"]:
+            continue
+        _relink(conn, copy, carrier, why="held back as a copy of withdrawn signal")
+        raised.extend(
+            _supersede_all(
+                conn,
+                alert_ids,
+                new=carrier,
+                stands=(
+                    "The same call has been posted since, as message "
+                    f"{carrier['message_id']} on channel {carrier['channel_id']}: it is signal "
+                    f"{carrier['signal_id']}, with {queued} trade "
+                    f"entr{'y' if queued == 1 else 'ies'} queued, and the copy now repeats it."
+                ),
+                now_utc=now_utc,
+            )
+        )
+    return raised
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadAs:
+    """A channel whose own config is not at hand, read with another
+    channel's parser (see "Known limitations")."""
+
+    channel_id: int
+    parser: str
+
+
+def _held_back_near(
+    conn: sqlite3.Connection,
+    new: sqlite3.Row,
+    *,
+    relay_window_seconds: int,
+    read_as: Callable[[int], _ChannelCfgLike | None],
+) -> list[tuple[_Copy, tuple[int, ...]]]:
+    """The copies held back -- with an unacknowledged `COPY_OF_WITHDRAWN_SIGNAL`
+    alert -- that were posted within `relay_window_seconds` of new signal
+    `new`'s own post (both ends included) and still read as a signal (an
+    edit away reads as none: `read_post`): each as a `_Copy` of the signal
+    its alert names, read with `read_as(channel_id)` (another channel's
+    parser when it gives None: `_ReadAs`), with its alerts' ids. Oldest
+    alert first (final fix round 5, R5-4). For a NEW signal that replaces
+    nothing, the window is the relay rules' own: no withdrawn call of the
+    same trade is within the window of its post, or it would replace it or
+    be held back itself (`relay_of_signal`), so a copy held back posted
+    further from it -- a forward included -- repeats something else."""
+    around = _posted_at(conn, new)
+    limit = timedelta(seconds=relay_window_seconds)
+    found: dict[tuple[int, int], tuple[_Copy, list[int]]] = {}
+    for alert in conn.execute(
+        "SELECT a.alert_id, a.signal_id, m.* FROM alerts a JOIN messages m "
+        "  ON m.channel_id = a.channel_id AND m.message_id = a.message_id "
+        "WHERE a.code = ? AND a.acked = 0 ORDER BY a.alert_id",
+        (COPY_OF_WITHDRAWN_SIGNAL,),
+    ).fetchall():
+        key = (alert["channel_id"], alert["message_id"])
+        if abs(datetime.fromisoformat(alert["posted_at_utc"]) - around) > limit:
+            continue
+        if key in found:
+            found[key][1].append(alert["alert_id"])
+            continue
+        channel_cfg = read_as(alert["channel_id"])
+        if channel_cfg is None:
+            channel_cfg = _ReadAs(alert["channel_id"], read_as(new["channel_id"]).parser)
+        routed = read_post(alert, channel_cfg=channel_cfg)
+        if routed.kind != "signal":
+            continue
+        copy = _Copy(alert, routed, channel_cfg, _signal_row(conn, alert["signal_id"]))
+        found[key] = (copy, [alert["alert_id"]])
+    return [(copy, tuple(ids)) for copy, ids in found.values()]
 
 
 def admit_copies_of_switched_off(
@@ -1411,11 +1538,14 @@ def admit_copies_of_switched_off(
       of its own about the new signal (`_adopt_followup_copies`, final fix
       round 4, R4-4): the VIP's "close half", stored as a copy of the
       relay's, would otherwise act on the cancelled signal only;
-    - and once one is a new signal, the copies this job held back are run
-      through the relay rules again (`_relink_held_back`, final fix round
-      4, R4-3): one that repeats it now -- going newest first, a copy near
-      a withdrawn call was held back before an older one of the same call
-      was admitted -- is linked to it, its CRITICAL "trade it by hand" is
+    - and once one is a new signal, the copies this job held back, and
+      those held back when they were read that were posted within the
+      relay window of the new signal's post (`_with_held_back_near`, final
+      fix round 5, R5-4), are run through the relay rules again
+      (`_relink_held_back`, final fix round 4, R4-3): one that repeats it
+      now -- going newest first, a copy near a withdrawn call was held back
+      before an older one of the same call was admitted -- is linked to it,
+      its CRITICAL "trade it by hand" is
       acknowledged and a WARNING (`COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED`)
       says not to, as `record_replacement` does: following it would open
       the trade twice;
@@ -1481,6 +1611,7 @@ def admit_copies_of_switched_off(
                 fwd_from_post_id=post["fwd_from_post_id"],
                 accounts=accounts,
                 now_utc=now_utc,
+                supersede_held_back=False,  # said below, in this job's words
             )
             raised.extend(admission.alert_ids)
             if admission.signal_id is None:
@@ -1502,9 +1633,13 @@ def admit_copies_of_switched_off(
                     now_utc=now_utc,
                 )
             )
+            # The copies held back -- by this job, or when they were read,
+            # near the new signal (R5-4) -- tried again.
             held = _relink_held_back(
                 conn,
-                held,
+                _with_held_back_near(
+                    conn, held, new, on=on, relay_window_seconds=relay_window_seconds
+                ),
                 raised=raised,
                 relay_window_seconds=relay_window_seconds,
                 now_utc=now_utc,
@@ -1710,9 +1845,16 @@ def _live_carrier(
     return _signal_row(conn, relay.match.signal_id)
 
 
-def _relink(conn: sqlite3.Connection, copy: _Copy, carrier: sqlite3.Row) -> None:
+def _relink(
+    conn: sqlite3.Connection,
+    copy: _Copy,
+    carrier: sqlite3.Row,
+    *,
+    why: str = "a copy of signal %s whose channel is switched off",
+) -> None:
     """`copy` repeats `carrier` now: the link, and the follow-ups replying
-    to it go with it (`_move_replies_to`)."""
+    to it go with it (`_move_replies_to`). `why`: what the copy was, for the
+    log (the signal it repeated fills its `%s`)."""
     channel_id, message_id = copy.key
     conn.execute(
         "UPDATE messages SET relay_of_signal_id = ? WHERE channel_id = ? AND message_id = ?",
@@ -1720,8 +1862,7 @@ def _relink(conn: sqlite3.Connection, copy: _Copy, carrier: sqlite3.Row) -> None
     )
     _move_replies_to(conn, posts={copy.key}, signal=copy.signal, new=carrier)
     logger.info(
-        "channel %s message %s, a copy of signal %s whose channel is switched off, "
-        "now repeats signal %s (channel %s message %s)",
+        "channel %s message %s, " + why + ", now repeats signal %s (channel %s message %s)",
         channel_id,
         message_id,
         copy.signal["signal_id"],
@@ -1755,28 +1896,67 @@ def _relink_held_back(
             continue
         _relink(conn, copy, carrier)
         queued = _queued_entries(conn, carrier["signal_id"])
-        marks = ", ".join("?" for _ in alert_ids)
+        raised.extend(
+            _supersede_all(
+                conn,
+                alert_ids,
+                new=carrier,
+                stands=(
+                    "The same call stands on a channel that is switched on: message "
+                    f"{carrier['message_id']} on channel {carrier['channel_id']} is signal "
+                    f"{carrier['signal_id']}, with {queued} trade "
+                    f"entr{'y' if queued == 1 else 'ies'} queued, and the copy now repeats it."
+                ),
+                now_utc=now_utc,
+            )
+        )
+    return kept
+
+
+def _supersede_all(
+    conn: sqlite3.Connection,
+    alert_ids: tuple[int, ...],
+    *,
+    new: sqlite3.Row,
+    stands: str,
+    now_utc: datetime,
+) -> list[int]:
+    """`_supersede` each `COPY_OF_WITHDRAWN_SIGNAL` alert of `alert_ids`,
+    oldest first: its copy repeats signal `new` now. Returns the ids of the
+    WARNINGs."""
+    marks = ", ".join("?" for _ in alert_ids)
+    return [
+        _supersede(conn, alert=alert, new=new, stands=stands, now_utc=now_utc)
         for alert in conn.execute(
             "SELECT alert_id, channel_id, message_id, acked FROM alerts "
             f"WHERE code = ? AND alert_id IN ({marks}) ORDER BY alert_id",
             (COPY_OF_WITHDRAWN_SIGNAL, *alert_ids),
-        ).fetchall():
-            raised.append(
-                _supersede(
-                    conn,
-                    alert=alert,
-                    new=carrier,
-                    stands=(
-                        "The same call stands on a channel that is switched on: message "
-                        f"{carrier['message_id']} on channel {carrier['channel_id']} is signal "
-                        f"{carrier['signal_id']}, with {queued} trade "
-                        f"entr{'y' if queued == 1 else 'ies'} queued, and the copy now repeats "
-                        "it."
-                    ),
-                    now_utc=now_utc,
-                )
-            )
-    return kept
+        ).fetchall()
+    ]
+
+
+def _with_held_back_near(
+    conn: sqlite3.Connection,
+    held: list[tuple[_Copy, tuple[int, ...]]],
+    new: sqlite3.Row,
+    *,
+    on: dict[int, _ChannelCfgLike],
+    relay_window_seconds: int,
+) -> list[tuple[_Copy, tuple[int, ...]]]:
+    """For `admit_copies_of_switched_off`, right after it admitted signal
+    `new` (final fix round 5, R5-4): the copies it held back (`held`), and
+    every other copy held back -- when it was read -- within the relay window
+    of `new`'s post (`_held_back_near`), each once, with all its alerts."""
+    merged = {copy.key: (copy, alert_ids) for copy, alert_ids in held}
+    for copy, alert_ids in _held_back_near(
+        conn, new, relay_window_seconds=relay_window_seconds, read_as=on.get
+    ):
+        if copy.key in merged:
+            kept, ids = merged[copy.key]
+            merged[copy.key] = (kept, tuple(dict.fromkeys((*ids, *alert_ids))))
+        else:
+            merged[copy.key] = (copy, alert_ids)
+    return list(merged.values())
 
 
 def _queued_entries(conn: sqlite3.Connection, signal_id: int) -> int:
