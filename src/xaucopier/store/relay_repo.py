@@ -742,7 +742,10 @@ def record_replacement(
     now, and that CRITICAL alert -- which told the user to trade the call
     by hand -- is acknowledged and superseded by a WARNING
     (`COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED`) naming both posts: the call is
-    queued, and trading it by hand as well would open it twice (R3-P3).
+    queued, and trading it by hand as well would open it twice (R3-P3) --
+    unless the copy repeats another call by now (linked to a call traded
+    instead at a start, `_relink_held_back`): it is left as it was, and no
+    WARNING says it repeats this one (final fix round 5, R5-3).
     Returns the ids of the alerts raised."""
     new = conn.execute("SELECT * FROM signals WHERE signal_id = ?", (new_signal_id,)).fetchone()
     if new["promoted_from_signal_id"] != replaced_signal_id:
@@ -783,6 +786,12 @@ def record_replacement(
             f"  AND relay_of_signal_id IN ({marks})",
             (new_signal_id, alert["channel_id"], alert["message_id"], *earlier),
         )
+        if _link_of(conn, alert["channel_id"], alert["message_id"]) != new_signal_id:
+            # Not re-linked: the copy repeats another call already -- one
+            # traded instead at a start, say (`_relink_held_back`). It does
+            # not repeat this one, and no WARNING may say it does (final fix
+            # round 5, R5-3).
+            continue
         logger.info(
             "channel %s message %s, held back as a copy of withdrawn signal %s, now repeats "
             "signal %s (channel %s message %s)",
@@ -2468,6 +2477,16 @@ def _call_stands_elsewhere(
 
 def _signal_row(conn: sqlite3.Connection, signal_id: int) -> sqlite3.Row:
     return conn.execute("SELECT * FROM signals WHERE signal_id = ?", (signal_id,)).fetchone()
+
+
+def _link_of(conn: sqlite3.Connection, channel_id: int, message_id: int) -> int | None:
+    """The signal stored post (`channel_id`, `message_id`) is a copy of
+    (`messages.relay_of_signal_id`), or None."""
+    row = conn.execute(
+        "SELECT relay_of_signal_id FROM messages WHERE channel_id = ? AND message_id = ?",
+        (channel_id, message_id),
+    ).fetchone()
+    return None if row is None else row[0]
 
 
 def _same_post(

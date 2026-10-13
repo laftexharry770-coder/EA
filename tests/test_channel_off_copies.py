@@ -505,6 +505,27 @@ def test_the_age_gate_is_the_policys(conn):  # noqa: F811
     assert [a[1] for a in _alerts(conn)] == [CODE]
 
 
+def test_an_old_copy_of_a_call_traded_from_a_young_one_is_not_said_to_be_too_old(
+    conn,  # noqa: F811
+):
+    """The re-check's r42_order (final fix round 5, R5-6). The VIP copied the
+    relay's call by hand 30 s after it, and forwarded the relay's post
+    2000 s later -- a forward is the same post however late. Newest first,
+    the young forward is traded (signal 2). The old hand copy is outside
+    signal 2's window, so it is left as it was -- the call IS traded, so no
+    line may say that this post is not traded because it is too old."""
+    assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
+    assert _ingest(conn, VIP, 4002, posted=_at(30)).relay_of_signal_id == 1
+    forward = _ingest(conn, VIP, VIP_COPY, posted=_at(2000), fwd=(R, RELAY_CALL))
+    assert forward.relay_of_signal_id == 1, forward
+
+    _restart(conn, on=(VIP,), seconds=2050)
+
+    assert _signals(conn)[1:] == [(2, V, VIP_COPY, "NEW")]
+    assert _link(conn, VIP, 4002) == 1
+    assert [a[1] for a in _alerts(conn)] == [CODE]
+
+
 def test_an_old_copy_the_relay_rules_would_hold_back_raises_no_trade_it_by_hand(
     conn,  # noqa: F811
 ):
@@ -696,6 +717,29 @@ def test_a_reply_to_a_held_back_copy_moves_with_it_to_the_traded_call(conn):  # 
 
     (followup_id,) = _q(conn, "SELECT followup_id FROM followups WHERE message_id = 4020")[0]
     assert relay_repo.signal_for_followup(conn, followup_id=followup_id) == 3
+
+
+def test_a_copy_linked_to_the_call_traded_at_start_gets_no_second_warning_later(
+    conn,  # noqa: F811
+):
+    """The re-check's r43_rerep (final fix round 5, R5-3). After the start of
+    p_r31_heldback, the VIP's +850 s copy repeats signal 3 and its CRITICAL is
+    cleared. At +1800 s the other channel posts the call again: outside
+    signal 3's window, inside withdrawn signal 2's, so it is signal 4 in
+    signal 2's place. The copy is NOT linked to signal 4 -- it still repeats
+    signal 3 -- so no second WARNING may say that it does."""
+    _two_vip_copies_and_a_withdrawn_repost(conn, reposted_by=OTHER)
+    _restart(conn, on=(VIP, OTHER), seconds=1100, max_age_seconds=LONG_GATE)
+    before = _q(conn, "SELECT alert_id FROM alerts WHERE code = ?", SUPERSEDED)
+    assert len(before) == 1
+
+    again = _ingest(conn, OTHER, 9002, posted=_at(1800))
+
+    assert again.signal_id == 4
+    assert _q(conn, "SELECT promoted_from_signal_id FROM signals WHERE signal_id = 4") == [(2,)]
+    assert _link(conn, VIP, VIP_REPOST) == 3
+    assert _q(conn, "SELECT alert_id FROM alerts WHERE code = ?", SUPERSEDED) == before
+    assert _q(conn, "SELECT COUNT(*) FROM alerts WHERE signal_id = 4") == [(0,)]
 
 
 # -- a follow-up copy of the switched-off channel's (final fix round 4, R4-4) -
