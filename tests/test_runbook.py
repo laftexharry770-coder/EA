@@ -70,7 +70,7 @@ def test_the_runbook_says_what_the_user_must_know() -> None:
         "5–10 of its real messages",
         # The final fix wave. F15 / F28 (ruling M12): what OFF does.
         'follow-ups (like "close all") of the signals it already posted',
-        "posts while it is off is ignored for good",
+        "What it posts while it is off is **not read**",
         # Fix round 2 of F28: OFF skips exactly the time it was off.
         "whatever it posted **before you\n  switched it off** that `watch` had not read yet",
         "it made while it was off are skipped, and everything from the moment you\n  switched it on is read",
@@ -162,13 +162,22 @@ def test_the_runbook_says_a_short_switch_off_may_read_everything_it_posted() -> 
     what it posted while off is read and handled, and watch says so."""
     assert "A channel switched off for only a few minutes" in RUNBOOK
     assert "a signal it posted then is handled like any other" in RUNBOOK
-    # Final fix round 4 (R4-1): the promise that it is ignored for good is
-    # qualified where it is made.
+    # Final fix round 4 (R4-1): the promise that it is not read is
+    # qualified where it is made -- and round 5 (R5-5): the read around each
+    # switch grows with how far the PC's clock is off, and no bold headline
+    # says it is ignored for good.
+    flat = " ".join(RUNBOOK.split())
+    assert "ignored for good" not in flat
     assert (
-        "not even after you switch it back on — except\n  what it posts within about a "
-        "minute of either switch" in RUNBOOK
+        "not even after you switch it back on — except what it posts close to either switch: "
+        "within about a minute of each, and more if your PC's clock is off, by as much again "
+        "as it is off" in flat
     )
-    assert "So if you switch it\n  back on within about 2 minutes, everything it posted" in RUNBOOK
+    assert (
+        "So if you switch it back on within about 2 minutes — plus twice as much as your PC's "
+        "clock is off — everything it posted while it was off is read" in flat
+    )
+    assert "If your PC's clock is off when `watch` starts, `watch` reads that much more" in flat
 
 
 def test_the_runbook_says_a_call_on_a_channel_on_is_still_traded_after_a_switch_off() -> None:

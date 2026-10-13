@@ -22,9 +22,11 @@
   reads on from the switch-on -- give or take about a minute around each
   switch, read in case this computer's clock was off, which both commands
   say (final fix round 4, R4-1): a channel switched back on within about
-  2 minutes has everything it posted read. `channels add` and `resolve-channels` of a
-  channel read before, removed and added back, have it read from now on
-  (G2L-3).
+  2 minutes has everything it posted read. The minute grows by as much
+  again as the clock is off, and both commands say that too (round 5,
+  R5-5): with the clock 30 s off, 170 s off is read in full. `channels
+  add` and `resolve-channels` of a channel read before, removed and added
+  back, have it read from now on (G2L-3).
 - `channels add` adds a NEW channel: the only command here that contacts
   Telegram, once, to look the channel up -- by the same paste-a-link or
   pick-from-the-channels-you-joined flow `resolve-channels` uses. It takes
@@ -349,16 +351,17 @@ def _on_lines(result: channel_state.SwitchOn | None) -> list[str]:
             "everything it posts from now on.",
             # Final fix round 4 (R4-1): watch reads around each switch.
             "Give or take about a minute: what it posted within about a minute of either "
-            "switch is read too, in case this computer's clock was a little off. So if it was "
-            "off for no more than about 2 minutes, everything it posted while it was off is "
-            "read, and a signal in it is traded like any other.",
+            "switch is read too (more if this computer's clock was off, by as much again as it "
+            "was off), in case the clock was off. So if it was off for no more than about 2 "
+            "minutes (plus twice as much as this computer's clock was off), everything it "
+            "posted while it was off is read, and a signal in it is traded like any other.",
         ]
     if result.outcome == "reseeded":
         return [
             "When it was switched off was not recorded, so the next watch reads it from now "
             "on: everything it posted since watch last read it is skipped, not only what it "
-            "posted while it was off -- except what it posted within about a minute before "
-            "now, which is read in case this computer's clock is a little off."
+            f"posted while it was off -- except what it posted within about a minute before "
+            f"now {_BEHIND}"
         ]
     # "first_read_kept"
     return [
@@ -371,15 +374,27 @@ def _on_lines(result: channel_state.SwitchOn | None) -> list[str]:
 def _near_a_switch(switch: str) -> str:
     """What `channels off` says watch reads although the channel was off
     (final fix round 4, R4-1): watch reads about a minute around each
-    switch -- more when this computer's clock was further off Telegram's
-    (`Listener._off_allowances`) -- so a channel switched back on within
-    about 2 minutes has everything it posted read, and traded."""
+    switch, widened by as much as this computer's clock is off Telegram's
+    (`Listener._off_allowances`; final fix round 5, R5-5: also under the
+    minute that earns a clock warning) -- so a channel switched back on
+    within about 2 minutes, plus twice that, has everything it posted read,
+    and traded."""
     return (
-        f"except what it posts within about a minute of {switch}, which is read in case "
-        "this computer's clock is a little off. So if you switch it back on within about 2 "
-        "minutes, everything it posted while it was off is read, and a signal in it is "
-        "traded like any other."
+        f"except what it posts within about a minute of {switch} (more if this computer's "
+        "clock is off, by as much again as it is off), which is read in case the clock is "
+        "off. So if you switch it back on within about 2 minutes (plus twice as much as this "
+        "computer's clock is off), everything it posted while it was off is read, and a "
+        "signal in it is traded like any other."
     )
+
+
+#: The read from a moment on (a switch-off never recorded): it starts a
+#: minute before it, by this computer's clock -- further back by as much as
+#: that clock is behind Telegram's (final fix round 5, R5-5).
+_BEHIND = (
+    "(more if this computer's clock is behind, by as much as it is behind), which is read "
+    "in case the clock is off."
+)
 
 
 def _is_are(count: int) -> str:
@@ -421,8 +436,7 @@ def _off_lines(
         lines = [
             "While it is off, this program does not read it at all.",
             "What it posts while it is off is not read, not even later -- except what it "
-            "posts within about a minute before it is read again, which is read in case this "
-            "computer's clock is a little off.",
+            f"posts within about a minute before it is read again {_BEHIND}",
         ]
     if problem is not None:
         lines.append(problem)

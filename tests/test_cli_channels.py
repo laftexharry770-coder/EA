@@ -1495,12 +1495,20 @@ def test_off_then_on_skips_exactly_the_time_it_was_off(
 
 
 #: What `channels off` and `channels on` say about the read around each
-#: switch (final fix round 4, R4-1).
+#: switch (final fix round 4, R4-1): it grows with how far this computer's
+#: clock is off (round 5, R5-5) -- a channel off for 170 s, the clock 30 s
+#: off, has everything read (tests/test_seed.py).
 NEAR_A_SWITCH = (
-    "except what it posts within about a minute of either switch, which is read in case "
-    "this computer's clock is a little off. So if you switch it back on within about 2 "
-    "minutes, everything it posted while it was off is read, and a signal in it is traded "
-    "like any other."
+    "except what it posts within about a minute of either switch (more if this computer's "
+    "clock is off, by as much again as it is off), which is read in case the clock is off. "
+    "So if you switch it back on within about 2 minutes (plus twice as much as this "
+    "computer's clock is off), everything it posted while it was off is read, and a signal "
+    "in it is traded like any other."
+)
+#: ... and about the read from now on, when the switch-off was not recorded.
+BEFORE_NOW = (
+    "(more if this computer's clock is behind, by as much as it is behind), which is read "
+    "in case the clock is off."
 )
 
 
@@ -1528,12 +1536,15 @@ def test_off_and_on_say_that_a_short_switch_off_is_read_in_full(
     flat_on = " ".join(on_out.split())
     assert (
         "Give or take about a minute: what it posted within about a minute of either switch "
-        "is read too, in case this computer's clock was a little off. So if it was off for no "
-        "more than about 2 minutes, everything it posted while it was off is read, and a "
-        "signal in it is traded like any other." in flat_on
+        "is read too (more if this computer's clock was off, by as much again as it was off), "
+        "in case the clock was off. So if it was off for no more than about 2 minutes (plus "
+        "twice as much as this computer's clock was off), everything it posted while it was "
+        "off is read, and a signal in it is traded like any other." in flat_on
     ), flat_on
     for out in (off_out, on_out):
         assert "never read" not in out and "for good" not in out
+        # Final fix round 5 (R5-5): never "a little off" -- the minute grows.
+        assert "a little off" not in out
 
 
 @pytest.mark.parametrize("variant", ["watch running", "switch-off not recorded"])
@@ -1555,8 +1566,7 @@ def test_no_off_message_promises_that_posts_made_while_off_are_never_read(
     else:
         expected = (
             "What it posts while it is off is not read, not even later -- except what it posts "
-            "within about a minute before it is read again, which is read in case this "
-            "computer's clock is a little off."
+            "within about a minute before it is read again " + BEFORE_NOW
         )
 
     assert cli_main.main(rig.argv("off", "7")) == exit_codes.EXIT_OK
@@ -1592,8 +1602,8 @@ def test_on_of_a_channel_whose_switch_off_was_not_recorded_reads_it_from_now(
     )
     # R4-1: the re-read starts a minute back, in case the clock was off.
     assert (
-        "except what it posted within about a minute before now, which is read in case this "
-        "computer's clock is a little off." in " ".join(out.split())
+        "except what it posted within about a minute before now " + BEFORE_NOW
+        in " ".join(out.split())
     )
 
 

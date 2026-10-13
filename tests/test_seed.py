@@ -1330,6 +1330,38 @@ def test_a_short_off_period_says_what_it_posted_while_off_was_read_and_is_handle
     _assert_plain(line)
 
 
+@pytest.mark.parametrize("start_skew", [30, -30], ids=["30-s-fast", "30-s-slow"])
+def test_a_channel_off_for_170_s_is_read_in_full_with_the_clock_30_s_off(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, start_skew: int
+) -> None:
+    """Final fix round 5 (R5-5; the re-check's r41_skew_off). The clock was
+    right at `channels off` and `on`, 170 s apart, and 30 s off when watch
+    starts -- under the minute that earns a clock warning. watch reads 90 s
+    around each switch, so a BUY posted in the middle of those 170 s is read
+    and traded: what `channels off`/`on` now say ("about 2 minutes, plus
+    twice as much as this computer's clock is off"), not "about 2 minutes"
+    flat."""
+    db_path = tmp_path / "store.db"
+    real_on = NOW - timedelta(seconds=30)
+    real_off = real_on - timedelta(seconds=170)
+    _stamp_period(db_path, real_off, real_on)
+    history = [FakeMessage(id=101, message=SIGNAL_TEXT, date=real_off + timedelta(seconds=85))]
+
+    async def scenario():
+        client = FakeTelegramClient(history={A: history}, server_time=NOW)
+        async with _watching(db_path, client, {"now": NOW + timedelta(seconds=start_skew)}):
+            pass
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101]
+    assert _rows(db_path, "SELECT state FROM outbox WHERE kind = 'ENTRY'") == [
+        ("QUEUED",), ("QUEUED",)
+    ]
+    (line,) = _off_lines(caplog)
+    assert "within 90 seconds of either switch" in line, line
+
 def test_a_post_read_just_after_the_switch_off_is_said_to_be_read(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -259,13 +259,14 @@ Signals can come from more than one Telegram channel, and you choose which.
   and how many were already traded. The waiting ones are cancelled the
   next time `watch` starts — the same call posted by a channel that is
   switched on is still traded; a trade already open keeps its stop loss
-  and take profit. **Whatever it posts while it is off is ignored for good** —
-  it is not read later, not even after you switch it back on — except
-  what it posts within about a minute of either switch, which is read in
-  case your PC's clock is a little off (see below). So if you switch it
-  back on within about 2 minutes, everything it posted while it was off
-  is read, and a signal in it is traded like any other. Nothing
-  already recorded is deleted.
+  and take profit. What it posts while it is off is **not read** — not
+  later either, not even after you switch it back on — except what it
+  posts close to either switch: within about a minute of each, and more if
+  your PC's clock is off, by as much again as it is off (see below). So if
+  you switch it back on within about 2 minutes — plus twice as much as
+  your PC's clock is off — everything it posted while it was off is read,
+  and a signal in it is traded like any other. Nothing already recorded is
+  deleted.
 - **Switch one on:** `.\xaucopier channels on 2`. The next `watch` then
   reads the channel in two parts. First, whatever it posted **before you
   switched it off** that `watch` had not read yet — for example a "close
@@ -274,8 +275,9 @@ Signals can come from more than one Telegram channel, and you choose which.
   switched it on is read. (Give or take a minute at either end: your PC's
   clock and Telegram's are never exactly the same, so a post made within a
   minute of a switch is read rather than lost. If your PC's clock is
-  further off than that when `watch` starts, `watch` reads that much more
-  around each switch — and warns you to fix the clock. Switching a
+  off when `watch` starts, `watch` reads that much more around each
+  switch — and, when it is more than a minute off, warns you to fix the
+  clock. Switching a
   channel off or on also keeps how far off the clock was the last time
   `watch` started, so a clock that was wrong when you switched and is put
   right before `watch` starts again costs nothing. Only a clock that went
