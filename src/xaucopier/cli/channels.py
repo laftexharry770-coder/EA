@@ -508,7 +508,8 @@ def _already_off(args: argparse.Namespace, cfg: ChannelCfg, number: int, name: s
         f"Channel {number} ({name}) is already OFF.",
         "When it was switched off had not been saved; it is saved now, as now. So when you "
         "switch it back on, what it posted before now that watch has not read yet is still "
-        "read, and only what it posts from now until then is skipped.",
+        "read, and only what it posts from now until then is skipped -- "
+        f"{_near_a_switch('either switch')}",
     )
     return exit_codes.EXIT_OK
 

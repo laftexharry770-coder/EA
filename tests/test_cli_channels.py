@@ -1776,6 +1776,11 @@ def test_off_again_after_a_busy_database_saves_when_it_was_switched_off(
     out = capsys.readouterr().out
     assert "is already OFF" in out
     assert "When it was switched off had not been saved; it is saved now" in out
+    # R4-1: no promise that what it posts while off is never read.
+    assert (
+        "only what it posts from now until then is skipped -- " + NEAR_A_SWITCH
+        in " ".join(out.split())
+    ), out
     assert _periods(rig.db_path, GOLD) == [("2026-09-23T12:05:00+00:00", None)]
     before = rig.channels_path.read_bytes()
 
