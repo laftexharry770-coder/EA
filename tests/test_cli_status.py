@@ -580,6 +580,7 @@ def _new_alert_codes() -> list[str]:
         edits.CANCELLED_WHEN_FIRST_READ,
         alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
         relay.COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED,
+        relay.OLD_COPIES_OF_CHANNEL_OFF_SIGNALS,
     ]
 
 

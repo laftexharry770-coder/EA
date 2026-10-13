@@ -58,14 +58,15 @@ def _at(seconds: float) -> datetime:
     return POSTED + timedelta(seconds=seconds)
 
 
-def _restart(conn, *, on=(VIP, OTHER), seconds: float = 120):  # noqa: F811
+def _restart(conn, *, on=(VIP, OTHER), seconds: float = 120, **kwargs):  # noqa: F811
     """`watch` starts with only `on` switched on: the start-up job, as the
     listener runs it."""
     enabled = tuple(channel.channel_id for channel in on)
     signal_ids = outbox.signals_with_entries_of_channels_off(conn, enabled_channel_ids=enabled)
     skipped = outbox.skip_entries_of_channels_off(conn, enabled_channel_ids=enabled)
     raised = relay_repo.admit_copies_of_switched_off(
-        conn, signal_ids=signal_ids, channels=on, accounts=ACCOUNTS, now_utc=_at(seconds)
+        conn, signal_ids=signal_ids, channels=on, accounts=ACCOUNTS, now_utc=_at(seconds),
+        **kwargs,
     )
     conn.commit()
     return skipped, raised
@@ -318,10 +319,12 @@ def test_watch_starting_with_the_relay_off_trades_the_vips_call_in_either_order(
 
         asyncio.run(scenario())
 
-    store(RELAY, RELAY_CALL, 0)
+    # test_listener's clock stands at POSTED + 900 s: the VIP's copy is 70 s
+    # old when watch starts, young enough to be traded (R4-2).
+    store(RELAY, RELAY_CALL, 800)
     if restart == "between-the-posts":
         start()
-    store(VIP, VIP_COPY, 30)
+    store(VIP, VIP_COPY, 830)
     start()
 
     check = db.connect(db_path, role="reader")
@@ -338,22 +341,23 @@ def test_watch_starting_with_the_relay_off_trades_the_vips_call_in_either_order(
 
 
 def test_a_copy_the_relay_rules_hold_back_is_held_back_loudly(conn):  # noqa: F811
-    """The VIP's copy (+800 s) is also within the window of the other
-    channel's own signal of the same call (+1000 s; 1000 s after signal 1,
+    """The VIP's copy (+890 s) is also within the window of the other
+    channel's own signal of the same call (+950 s; 950 s after signal 1,
     so a signal of its own), which that channel then withdrew. Run through
     the relay rules again, the VIP's copy repeats that withdrawn call:
     held back, CRITICAL, as when it is first read -- never linked quietly,
-    and never a signal."""
+    and never a signal. (Restarted at +970 s: the copy is 80 s old, still
+    young enough to be traded, R4-2.)"""
     assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
-    assert _ingest(conn, VIP, VIP_COPY, posted=_at(800)).relay_of_signal_id == 1
-    assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(1000)).signal_id == 2
+    assert _ingest(conn, VIP, VIP_COPY, posted=_at(890)).relay_of_signal_id == 1
+    assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(950)).signal_id == 2
     edits_repo.apply_deletion(
-        conn, channel_cfg=OTHER, message_id=OTHER_COPY, now_utc=_at(1010), accounts=ACCOUNTS,
+        conn, channel_cfg=OTHER, message_id=OTHER_COPY, now_utc=_at(960), accounts=ACCOUNTS,
         detected_by="event",
     )
     conn.commit()
 
-    _restart(conn, seconds=1100)
+    _restart(conn, seconds=970)
 
     assert [row[0] for row in _signals(conn)] == [1, 2]
     assert _link(conn, VIP, VIP_COPY) == 2
@@ -401,3 +405,179 @@ def test_a_copy_on_a_channel_off_at_that_start_is_not_traded_when_switched_on_la
     assert _signals(conn) == [(1, R, RELAY_CALL, "NEW")]
     assert _link(conn, VIP, VIP_COPY) == 1
     assert _queued(conn) == []
+
+
+# -- only a copy young enough to be traded (final fix round 4, R4-2) --------
+
+OLD_CODE = relay_repo.OLD_COPIES_OF_CHANNEL_OFF_SIGNALS
+
+
+def _ten_days_of_the_relay_and_the_vip(conn) -> None:  # noqa: F811
+    """The re-check's p_r31_old: each day the relay posts a call (another SL
+    each day, so another call) and the VIP repeats it 30 s later."""
+    for day in range(10):
+        text = SIGNAL_TEXT.replace("4470", str(4460 - day))
+        assert _ingest(conn, RELAY, 7000 + day, text, posted=_at(day * 86400)).signal_id == day + 1
+        copy = _ingest(conn, VIP, 4000 + day, text, posted=_at(day * 86400 + 30))
+        assert copy.relay_of_signal_id == day + 1, copy
+
+
+def test_old_copies_of_a_channel_switched_off_are_not_traded_and_said_once(conn):  # noqa: F811
+    """p_r31_old: the relay is switched off after ten days, and watch
+    restarts an hour after the last call. Every copy on the VIP's channel
+    was posted far longer ago than the age gate allows: none is a signal,
+    nothing is queued, and ONE line says why -- not ten WARNINGs saying
+    "2 trade entries are queued for it"."""
+    _ten_days_of_the_relay_and_the_vip(conn)
+
+    skipped, raised = _restart(conn, seconds=9 * 86400 + 3600)
+
+    assert skipped == {R: 10 * len(ACCOUNTS)}
+    assert [row[0] for row in _signals(conn)] == list(range(1, 11))
+    assert _queued(conn) == []
+    assert [_link(conn, VIP, 4000 + day) for day in range(10)] == list(range(1, 11))
+    (alert,) = _alerts(conn)
+    assert alert[:5] == ("WARNING", OLD_CODE, None, None, None)
+    assert len(raised) == 1
+    detail = " ".join(alert[5].split())
+    assert detail == (
+        "10 posts on channels that are switched on repeat the calls of signals whose channel "
+        "is now switched off (signals 1, 2, 3, 4, 5, 6, 7, 8, 9, 10). Those signals' waiting "
+        "trade entries were cancelled, and these posts are not traded instead: each was "
+        "posted more than 120 seconds ago, too old to be traded. Nothing to do."
+    ), detail
+    for jargon in ("client", "listener", "rpc", "flood", "outbox", "queued for it"):
+        assert jargon not in detail.lower(), (jargon, detail)
+
+
+def test_a_young_copy_is_traded_while_the_old_ones_are_said_in_one_line(conn):  # noqa: F811
+    """Ten old calls, and an eleventh the VIP copied 30 s before the
+    restart: that one is a signal, queued, with its own WARNING; the ten
+    old ones get the one line."""
+    _ten_days_of_the_relay_and_the_vip(conn)
+    late = 9 * 86400 + 3600
+    assert _ingest(conn, RELAY, 7100, posted=_at(late - 60)).signal_id == 11
+    assert _ingest(conn, VIP, 4100, posted=_at(late - 30)).relay_of_signal_id == 11
+
+    _restart(conn, seconds=late)
+
+    assert _signals(conn)[-1] == (12, V, 4100, "NEW")
+    assert _queued(conn) == [(12, "acct-1"), (12, "acct-2")]
+    codes = [a[:2] for a in _alerts(conn)]
+    assert sorted(codes) == [("WARNING", CODE), ("WARNING", OLD_CODE)]
+    (old,) = [a[5] for a in _alerts(conn) if a[1] == OLD_CODE]
+    assert old.startswith("10 posts on channels"), old
+
+
+@pytest.mark.parametrize(
+    ("age", "admitted"), [(120, True), (121, False)], ids=["exactly the gate", "a second older"]
+)
+def test_the_age_gate_is_the_one_channels_off_counts_by(conn, age, admitted):  # noqa: F811
+    """A copy exactly `max_signal_age_seconds` old is still young enough --
+    `channels off` counts it as waiting (`report.signals_in_play`); one a
+    second older is too old."""
+    _relay_call_then_vip_copy(conn)
+
+    _restart(conn, seconds=30 + age)
+
+    if admitted:
+        assert _signals(conn)[1:] == [(2, V, VIP_COPY, "NEW")]
+        assert [a[1] for a in _alerts(conn)] == [CODE]
+    else:
+        assert _signals(conn)[1:] == []
+        assert [a[1] for a in _alerts(conn)] == [OLD_CODE]
+        assert _alerts(conn)[0][5].startswith(
+            "1 post on a channel that is switched on repeats the call of a signal whose "
+            "channel is now switched off (signal 1). That signal's waiting trade entries were "
+            "cancelled, and this post is not traded instead: it was posted more than 120 "
+            "seconds ago, too old to be traded."
+        ), _alerts(conn)[0][5]
+
+
+def test_the_age_gate_is_the_policys(conn):  # noqa: F811
+    """A longer `max_signal_age_seconds` (policy.toml) lets an older copy be
+    traded: the gate given is the one used."""
+    _relay_call_then_vip_copy(conn)
+
+    _restart(conn, seconds=1000, max_age_seconds=1200)
+
+    assert _signals(conn)[1:] == [(2, V, VIP_COPY, "NEW")]
+    assert [a[1] for a in _alerts(conn)] == [CODE]
+
+
+def test_an_old_copy_the_relay_rules_would_hold_back_raises_no_trade_it_by_hand(
+    conn,  # noqa: F811
+):
+    """The held-back case, restarted long after: the VIP's copy is too old
+    to be traded, so it is never run through the relay rules again -- no
+    CRITICAL telling the user to trade a call hours old by hand."""
+    assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
+    assert _ingest(conn, VIP, VIP_COPY, posted=_at(890)).relay_of_signal_id == 1
+    assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(950)).signal_id == 2
+    edits_repo.apply_deletion(
+        conn, channel_cfg=OTHER, message_id=OTHER_COPY, now_utc=_at(960), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    conn.commit()
+
+    _restart(conn, seconds=4 * 3600)
+
+    assert _link(conn, VIP, VIP_COPY) == 1
+    assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL not in [a[1] for a in _alerts(conn)]
+    assert OLD_CODE in [a[1] for a in _alerts(conn)]
+
+
+@pytest.mark.parametrize("gate", [None, 1200], ids=["the default gate", "policy.toml's gate"])
+def test_watch_admits_only_a_copy_young_enough_for_its_age_gate(
+    tmp_path: Path, gate: int | None
+) -> None:
+    """Through `Listener.start()`: test_listener's clock stands 870 s after
+    the VIP's copy. With the default gate (120 s) it is too old -- one line,
+    nothing queued; with `max_signal_age_seconds = 1200` given to watch, it
+    is traded."""
+    from test_listener import ACCOUNTS as LISTENER_ACCOUNTS
+    from test_listener import _build_listener
+
+    db_path = tmp_path / "store.db"
+    relay_off = ChannelCfg(
+        channel_id=R, name=RELAY.name, parser="mmh", ordinal=RELAY.ordinal, enabled=False
+    )
+    writer = db.connect(db_path, role="writer")
+    try:
+        for channel, message_id, seconds in ((RELAY, RELAY_CALL, 0), (VIP, VIP_COPY, 30)):
+            messages_repo.ingest(
+                writer, channel_cfg=channel, message_id=message_id, text=SIGNAL_TEXT,
+                posted_at_utc=_at(seconds), edit_date_utc=None, reply_to_message_id=None,
+                source="live", now_utc=_at(seconds + 1), accounts=LISTENER_ACCOUNTS,
+            )
+        writer.commit()
+    finally:
+        writer.close()
+
+    async def scenario():
+        extra = {} if gate is None else {"max_signal_age_seconds": gate}
+        listener = _build_listener(
+            db_path, FakeTelegramClient(), channels=(VIP, relay_off),
+            accounts=LISTENER_ACCOUNTS, **extra,
+        )
+        await listener.start()
+        await listener.aclose()
+
+    asyncio.run(scenario())
+
+    check = db.connect(db_path, role="reader")
+    try:
+        signals = _signals(check)
+        queued = _queued(check)
+        codes = [row[1] for row in _alerts(check)]
+    finally:
+        check.close()
+    assert codes[0] == "CHANNEL_OFF_ENTRIES_SKIPPED"
+    if gate is None:
+        assert signals == [(1, R, RELAY_CALL, "NEW")]
+        assert queued == []
+        assert codes[1:] == [OLD_CODE]
+    else:
+        assert signals == [(1, R, RELAY_CALL, "NEW"), (2, V, VIP_COPY, "NEW")]
+        assert queued == [(2, "acct-a"), (2, "acct-b")]
+        assert codes[1:] == [CODE]

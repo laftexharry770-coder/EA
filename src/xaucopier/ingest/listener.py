@@ -692,6 +692,7 @@ class Listener:
         writer_stop_timeout: float = DEFAULT_WRITER_STOP_TIMEOUT,
         writer_ready_timeout: float = DEFAULT_WRITER_READY_TIMEOUT,
         telegram_timeout: float | None = None,
+        max_signal_age_seconds: int = relay_repo.DEFAULT_MAX_SIGNAL_AGE_SECONDS,
     ) -> None:
         self.client = client
         self.channels = tuple(channels)
@@ -704,6 +705,10 @@ class Listener:
         self._now = now if now is not None else _utcnow
         self._backfill_limit = backfill_limit
         self._backfill_rpc_timeout = backfill_rpc_timeout
+        # How old a signal may be and still be traded (policy.toml's
+        # `max_signal_age_seconds`): a post of a call on a channel switched
+        # on is admitted at start only while it is that young (R4-2).
+        self._max_signal_age_seconds = max_signal_age_seconds
         # When start() began: min(the injected clock, Telegram's), whole
         # seconds. The seed cutoff start() stores for a channel that needs
         # one; see `started_at`.
@@ -2039,7 +2044,8 @@ class Listener:
         the same job, a post of such a signal's call standing on a channel
         switched on -- stored as its copy while this watch still read the
         channel switched off -- is traded instead
-        (`relay_repo.admit_copies_of_switched_off`, final fix round 3).
+        (`relay_repo.admit_copies_of_switched_off`, final fix round 3), if
+        it was posted no longer ago than `max_signal_age_seconds` (R4-2).
 
         OFF means the channel is not read at all -- neither its new posts
         nor the edits, deletions and follow-ups of the signals it already
@@ -2051,6 +2057,7 @@ class Listener:
         names = {channel.channel_id: channel.name for channel in self.channels}
         now_utc = self._now()
         accounts = self.accounts
+        max_age = self._max_signal_age_seconds
 
         def job(conn: Connection) -> int:
             signal_ids = outbox.signals_with_entries_of_channels_off(
@@ -2080,7 +2087,12 @@ class Listener:
                     ),
                 )
             relay_repo.admit_copies_of_switched_off(
-                conn, signal_ids=signal_ids, channels=enabled, accounts=accounts, now_utc=now_utc
+                conn,
+                signal_ids=signal_ids,
+                channels=enabled,
+                accounts=accounts,
+                now_utc=now_utc,
+                max_age_seconds=max_age,
             )
             return total
 

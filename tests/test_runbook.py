@@ -121,6 +121,7 @@ def test_the_runbook_explains_every_alert_the_fix_wave_added() -> None:
         alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
         alerts.TELEGRAM_CHANNEL_UNREADABLE,
         relay_repo.COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED,
+        relay_repo.OLD_COPIES_OF_CHANNEL_OFF_SIGNALS,
     ):
         assert f"- **{code}** — " in clearing, code
 

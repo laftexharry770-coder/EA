@@ -94,11 +94,10 @@ from xaucopier.cli.watch import (
     SetupError,
     load_channels_config,
     load_session,
+    max_signal_age_seconds,
 )
 from xaucopier.config.loader import read_while_replaced
 from xaucopier.config.channels import ChannelCfg
-from xaucopier.config.loader import ConfigError, load_policy_dict
-from xaucopier.domain.market import Policy
 from xaucopier.ingest.client import (
     PERMANENT_TELEGRAM_ERRORS,
     AlreadyRunningError,
@@ -367,20 +366,6 @@ def _on_lines(result: channel_state.SwitchOn | None) -> list[str]:
         "finished its first read of this channel, so what it posted while it was off may "
         "still be read."
     ]
-
-
-def max_signal_age_seconds(config_dir: Path) -> int:
-    """`max_signal_age_seconds` from `policy.toml` beside channels.toml: how
-    old a signal may be and still be traded. The built-in default (120 s,
-    `domain.market.Policy`) when the file is missing, unreadable, or does
-    not hold a whole number above 0 there."""
-    try:
-        value = load_policy_dict(config_dir / paths.POLICY_FILE).get("max_signal_age_seconds")
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ConfigError):
-        value = None
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    return Policy().max_signal_age_seconds
 
 
 def _near_a_switch(switch: str) -> str:

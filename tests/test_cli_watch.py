@@ -693,3 +693,48 @@ def test_a_channels_file_another_command_keeps_open_is_no_setup_problem(
     assert "exit code 5" not in err and "PermissionError" not in err
     # Final fix round 2: a file that stays unopenable is a real problem.
     assert "If this keeps happening, check that the file can be opened." in err
+
+
+# -- the age gate a start-up admits a post by (final fix round 4, R4-2) ------------------
+
+
+@pytest.mark.parametrize(
+    ("policy", "gate"),
+    [
+        (None, 120),
+        ("max_signal_age_seconds = 1200\n", 1200),
+        ("max_signal_age_seconds = 0\n", 120),
+    ],
+    ids=["no policy.toml", "policy.toml's gate", "a gate that is no gate"],
+)
+def test_watch_admits_a_post_at_start_by_the_age_gate_in_policy_toml(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, policy: str | None, gate: int
+) -> None:
+    """watch's start-up trades a post of a call on a channel switched on,
+    stored as a copy of a signal whose channel is now switched off, only
+    while it is young enough to be traded: policy.toml's
+    `max_signal_age_seconds`, the bound `channels off` counts a waiting
+    signal by -- read the same way, with the same default."""
+    if policy is not None:
+        (rig.config_dir / "policy.toml").write_text(policy, encoding="utf-8")
+    setup = watch_module.check_setup(rig.config_dir, rig.db_path)
+    assert setup.max_signal_age_seconds == gate
+
+    built: list[dict] = []
+
+    class Recorded:
+        start_after_utc = None
+
+        def __init__(self, **kwargs) -> None:
+            built.append(kwargs)
+
+    async def no_run(listener) -> int:
+        return 4
+
+    monkeypatch.setattr(watch_module, "Listener", Recorded)
+    monkeypatch.setattr(watch_module, "run_listener", no_run)
+    monkeypatch.setattr(watch_module.db, "Writer", lambda path: object())
+    asyncio.run(watch_module.run_watch(object(), setup))
+
+    (kwargs,) = built
+    assert kwargs["max_signal_age_seconds"] == gate

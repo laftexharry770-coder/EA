@@ -46,7 +46,8 @@ from xaucopier.cli import exit_codes, paths
 from xaucopier.cli.database_words import after_colon, database_problem
 from xaucopier.config.accounts import AccountCfg, load_accounts
 from xaucopier.config.channels import ChannelCfg, load_channels
-from xaucopier.config.loader import ConfigError
+from xaucopier.config.loader import ConfigError, load_policy_dict
+from xaucopier.domain.market import Policy
 from xaucopier.ingest.client import (
     EXIT_CONFIG_ERROR,
     EXIT_TERMINAL_AUTH,
@@ -126,6 +127,9 @@ class WatchSetup:
     channels: tuple[ChannelCfg, ...]
     accounts: tuple[AccountCfg, ...]
     db_path: Path
+    #: policy.toml's `max_signal_age_seconds` (`max_signal_age_seconds`):
+    #: a post a start-up admits as a signal is at most this old (R4-2).
+    max_signal_age_seconds: int = Policy().max_signal_age_seconds
 
     @property
     def enabled_channels(self) -> tuple[ChannelCfg, ...]:
@@ -145,6 +149,22 @@ def _load(loader: Callable[[Path], tuple], path: Path) -> tuple:
         # A structurally odd file (e.g. `channels = "x"`) fails deep in the
         # loader; it is still the file's fault, not a reason to restart.
         raise SetupError(f"{path} could not be read: {type(exc).__name__}: {exc}") from None
+
+
+def max_signal_age_seconds(config_dir: Path) -> int:
+    """`max_signal_age_seconds` from `policy.toml` beside channels.toml: how
+    old a signal may be and still be traded -- what `channels off` counts a
+    waiting signal by, and how old a post `watch`'s start may admit as a
+    signal (R4-2). The built-in default (120 s,
+    `domain.market.Policy`) when the file is missing, unreadable, or does
+    not hold a whole number above 0 there."""
+    try:
+        value = load_policy_dict(config_dir / paths.POLICY_FILE).get("max_signal_age_seconds")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ConfigError):
+        value = None
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return Policy().max_signal_age_seconds
 
 
 def load_channels_config(config_dir: Path) -> tuple[ChannelCfg, ...]:
@@ -193,7 +213,12 @@ def check_setup(config_dir: Path, db_path: Path) -> WatchSetup:
         )
     if db_path.exists() and not db_path.is_file():
         raise SetupError(f"{db_path} exists but is not a file.")
-    return WatchSetup(channels=channels, accounts=accounts, db_path=db_path)
+    return WatchSetup(
+        channels=channels,
+        accounts=accounts,
+        db_path=db_path,
+        max_signal_age_seconds=max_signal_age_seconds(config_dir),
+    )
 
 
 def load_session(secrets_path: Path) -> SecretsBlob:
@@ -292,6 +317,7 @@ async def run_watch(client: object, setup: WatchSetup) -> int:
         writer=db.Writer(setup.db_path),
         db_path=setup.db_path,
         poll_hook=build_poll(),
+        max_signal_age_seconds=setup.max_signal_age_seconds,
     )
     code = await run_listener(listener)
     _start_after_utc = listener.start_after_utc

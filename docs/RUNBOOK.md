@@ -228,6 +228,10 @@ missed. Once you have dealt with one, clear it:
   had also been posted by a channel that is switched on (the alert names
   both messages). That post is now the signal, and it is traded instead.
   Nothing to do.
+- **OLD_COPIES_OF_CHANNEL_OFF_SIGNALS** — as above, but those posts were
+  made longer ago than a signal may be and still be traded
+  (`max_signal_age_seconds` in policy.toml), so they are not traded. One
+  alert says how many there were. Nothing to do.
 - **Any other alert** — copy its two lines and send them to whoever looks
   after xaucopier, then clear it.
 

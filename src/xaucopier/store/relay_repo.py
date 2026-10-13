@@ -56,7 +56,9 @@ on a channel switched on that was stored as its copy *before* the switch
 took effect -- watch reads a channel switched off until it restarts -- is
 run through these rules again by the start-up job that cancels those
 entries (`admit_copies_of_switched_off`, final fix round 3): the newest
-one standing becomes a signal of its own.
+one standing becomes a signal of its own -- if it was posted recently
+enough to be traded (the policy's `max_signal_age_seconds`, final fix
+round 4); one line says how many older ones are not.
 
 **An older post of a call** (ruling R4-1, `old_post`). When a call was
 withdrawn and posted again, the other channel's posts of the withdrawn
@@ -231,6 +233,12 @@ two watched channels carrying the same calls, unless it says otherwise):
   the withdrawal does. The same in either storage order (INV-2). A
   forward of any of them removed later is an echo all the same
   (`_deleted_with_closer`, ruling R6-3): only the replies differ.
+- A call whose channel was switched off is never traded from a post that
+  already holds an earlier signal of its chain (final fix round 3; one
+  post, one signal). Example: the VIP's call was withdrawn when the relay
+  deleted its copy, the relay posted the call again, and the relay is then
+  switched off: the VIP's post holds the withdrawn signal, so it is not
+  admitted again, and the call is not traded.
 - The posts of one report are told apart by their deletion time: the
   listener stamps every job of one report with the report's moment. A
   post of the report whose job failed and was marked deleted later, by
@@ -248,6 +256,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
+from xaucopier.domain.market import Policy
 from xaucopier.domain.signal import Signal
 from xaucopier.parsing.router import RouteResult, route
 from xaucopier.store import alerts, metrics, outbox, signals_repo
@@ -283,6 +292,15 @@ COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED = "COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED"
 #: so the post is now a signal of its own, queued (final fix round 3, R3-1;
 #: `admit_copies_of_switched_off`).
 COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED = "COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED"
+#: WARNING, at most one per start: such posts that were posted longer ago
+#: than the age gate allows are not admitted -- too old to be traded --
+#: and this one line says how many, and of which signals (final fix round
+#: 4, R4-2; `admit_copies_of_switched_off`).
+OLD_COPIES_OF_CHANNEL_OFF_SIGNALS = "OLD_COPIES_OF_CHANNEL_OFF_SIGNALS"
+
+#: How old a signal may be and still be traded when the caller gives no
+#: `max_signal_age_seconds` (`domain.market.Policy`'s default, 120 s).
+DEFAULT_MAX_SIGNAL_AGE_SECONDS = Policy().max_signal_age_seconds
 
 #: `followups.resolution_path` of a follow-up replying to a signal's own message.
 REPLY_PATH = "reply"
@@ -1345,6 +1363,7 @@ def admit_copies_of_switched_off(
     accounts: tuple,
     now_utc: datetime,
     relay_window_seconds: int = RELAY_WINDOW_SECONDS,
+    max_age_seconds: int = DEFAULT_MAX_SIGNAL_AGE_SECONDS,
 ) -> tuple[int, ...]:
     """For `watch`'s start-up job, right after it cancelled the waiting
     entries of `signal_ids` because their channels are not switched on
@@ -1371,9 +1390,21 @@ def admit_copies_of_switched_off(
     - once one is a new signal, any other is only ever re-linked to a
       signal it repeats -- one call, one signal -- else left as it was.
 
+    Only a post still young enough to be traded is admitted (final fix
+    round 4, R4-2): posted no longer than `max_age_seconds` (the policy's
+    `max_signal_age_seconds`) before `now_utc` -- the bound `channels off`
+    counts a waiting signal by (`report.signals_in_play`). An older one is
+    left as it was, never run through the relay rules again (a "trade it by
+    hand" for a call hours old helps no one), and ONE WARNING for the whole
+    job says how many there were (`OLD_COPIES_OF_CHANNEL_OFF_SIGNALS`):
+    switching off the faster channel of a pair after weeks must not raise a
+    WARNING per old call saying its entries are queued.
+
     Runs in the caller's writer job; returns the ids of the alerts raised."""
     on = {channel.channel_id: channel for channel in channels}
     raised: list[int] = []
+    # Posts too old to be traded, per signal they repeat (R4-2).
+    too_old: dict[int, int] = {}
     for signal_id in dict.fromkeys(signal_ids):
         signal = _signal_row(conn, signal_id)
         if signal is None or not switched_off(conn, signal):
@@ -1417,6 +1448,10 @@ def admit_copies_of_switched_off(
                 continue
             if admitted:
                 continue  # one call, one signal: it stays as it was
+            if (now_utc - posted).total_seconds() > max_age_seconds:
+                # Too old to be traded (R4-2): it stays as it was.
+                too_old[signal_id] = too_old.get(signal_id, 0) + 1
+                continue
             conn.execute(
                 "UPDATE messages SET relay_of_signal_id = NULL "
                 "WHERE channel_id = ? AND message_id = ?",
@@ -1450,7 +1485,50 @@ def admit_copies_of_switched_off(
                     now_utc=now_utc,
                 )
             )
+    if too_old:
+        raised.append(_say_too_old(conn, too_old, max_age_seconds=max_age_seconds, now_utc=now_utc))
     return tuple(raised)
+
+
+def _say_too_old(
+    conn: sqlite3.Connection, too_old: dict[int, int], *, max_age_seconds: int, now_utc: datetime
+) -> int:
+    """The one WARNING for `admit_copies_of_switched_off` about the posts it
+    left as they were because they are too old to be traded (R4-2):
+    `too_old` counts them per signal they repeat."""
+    posts = sum(too_old.values())
+    ids = sorted(too_old)
+    shown = ", ".join(str(signal_id) for signal_id in ids[:10])
+    if len(ids) > 10:
+        shown += f" and {len(ids) - 10} more"
+    one_post, one_signal = posts == 1, len(ids) == 1
+    detail = (
+        (
+            "1 post on a channel that is switched on repeats"
+            if one_post
+            else f"{posts} posts on channels that are switched on repeat"
+        )
+        + (
+            f" the call of a signal whose channel is now switched off (signal {shown}). That "
+            "signal's"
+            if one_signal
+            else f" the calls of signals whose channel is now switched off (signals {shown}). "
+            "Those signals'"
+        )
+        + " waiting trade entries were cancelled, and "
+        + ("this post is not traded instead: it was" if one_post else
+           "these posts are not traded instead: each was")
+        + f" posted more than {max_age_seconds} seconds ago, too old to be traded. "
+        "Nothing to do."
+    )
+    logger.info("%s", detail)
+    return alerts.record(
+        conn,
+        now_utc=now_utc,
+        level="WARNING",
+        code=OLD_COPIES_OF_CHANNEL_OFF_SIGNALS,
+        detail=detail,
+    )
 
 
 def _standing_copies(
