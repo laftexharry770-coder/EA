@@ -304,13 +304,14 @@ def _insert_message(
     posted_at_utc: datetime,
     source: str,
     provenance: dict[str, Any],
+    reply_to_message_id: int | None = None,
 ) -> None:
     extra_columns = "".join(f", {name}" for name in provenance)
     conn.execute(
         "INSERT INTO messages "
         "(channel_id, message_id, kind, content_hash, raw_text, edit_date_utc, "
-        f" received_at_utc, posted_at_utc, source{extra_columns}) "
-        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{', ?' * len(provenance)})",
+        f" received_at_utc, posted_at_utc, source, reply_to_message_id{extra_columns}) "
+        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?{', ?' * len(provenance)})",
         (
             channel_id,
             message_id,
@@ -321,6 +322,7 @@ def _insert_message(
             received_at_utc.isoformat(),
             posted_at_utc.isoformat(),
             source,
+            reply_to_message_id,
             *provenance.values(),
         ),
     )
@@ -392,6 +394,7 @@ def ingest(
             accounts=accounts,
             relay_window_seconds=relay_window_seconds,
             provenance=provenance,
+            reply_to_message_id=reply_to_message_id,
             deleted_in_report=None
             if deleted_by_event_at_utc is None
             else (deleted_by_event_at_utc, frozenset(deleted_by_event_with)),
@@ -559,6 +562,7 @@ def _ingest_new(
     accounts: tuple[_AccountCfgLike, ...],
     relay_window_seconds: int,
     provenance: dict[str, Any],
+    reply_to_message_id: int | None = None,
     deleted_in_report: tuple[datetime, frozenset[int]] | None = None,
 ) -> IngestResult:
     kind = route_result.kind
@@ -577,6 +581,9 @@ def _ingest_new(
         posted_at_utc=posted_at_utc,
         source=source,
         provenance=provenance,
+        # Kept for a copy of a follow-up above all (R4-4): it has no
+        # `followups` row to hold it.
+        reply_to_message_id=reply_to_message_id,
     )
 
     if kind == "parse_failed":

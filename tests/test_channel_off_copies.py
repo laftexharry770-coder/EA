@@ -696,3 +696,192 @@ def test_a_reply_to_a_held_back_copy_moves_with_it_to_the_traded_call(conn):  # 
 
     (followup_id,) = _q(conn, "SELECT followup_id FROM followups WHERE message_id = 4020")[0]
     assert relay_repo.signal_for_followup(conn, followup_id=followup_id) == 3
+
+
+# -- a follow-up copy of the switched-off channel's (final fix round 4, R4-4) -
+
+VIP_CLOSE = 4005
+RELAY_CLOSE = 7005
+
+
+def _followups(conn) -> list[tuple]:  # noqa: F811
+    return _q(
+        conn,
+        "SELECT followup_id, channel_id, message_id, target_signal_id, resolution_path "
+        "FROM followups ORDER BY followup_id",
+    )
+
+
+def _followup_rows(conn, followup_id: int) -> list[tuple]:  # noqa: F811
+    return _q(
+        conn,
+        "SELECT account_id, state FROM outbox WHERE kind = 'FOLLOWUP' AND followup_id = ? "
+        "ORDER BY outbox_id",
+        followup_id,
+    )
+
+
+def _acting_on(conn, signal_id: int) -> list[tuple]:  # noqa: F811
+    """The follow-ups that act on `signal_id` (`signal_for_followup`), as
+    (channel, message)."""
+    return [
+        (row[1], row[2])
+        for row in _followups(conn)
+        if relay_repo.signal_for_followup(conn, followup_id=row[0]) == signal_id
+    ]
+
+
+@pytest.mark.parametrize("order", ["the relay first", "the VIP first", "a restart between"])
+def test_the_vips_close_half_acts_on_its_call_in_every_order(conn, order):  # noqa: F811
+    """The re-check's p_r31_followups. The relay posts the call, the VIP
+    copies it 30 s later; each then says "close half", replying to its own
+    post, 10 s apart. The relay is switched off and watch restarts: the
+    VIP's post is signal 2. Whichever said it first -- or with a restart
+    between the calls and the instructions, when the relay's is never read
+    -- the VIP's "close half" is an instruction of its own about signal 2,
+    with its entries for both accounts: never lost as a copy of the relay's
+    instruction, which acts on signal 1, cancelled."""
+    _relay_call_then_vip_copy(conn)
+    if order == "a restart between":
+        _restart(conn, on=(VIP,), seconds=50)
+        _ingest(conn, VIP, VIP_CLOSE, CLOSE_HALF, posted=_at(60), reply_to=VIP_COPY)
+    else:
+        first, second = (
+            [(RELAY, RELAY_CLOSE, RELAY_CALL), (VIP, VIP_CLOSE, VIP_COPY)]
+            if order == "the relay first"
+            else [(VIP, VIP_CLOSE, VIP_COPY), (RELAY, RELAY_CLOSE, RELAY_CALL)]
+        )
+        assert _ingest(conn, *first[:2], CLOSE_HALF, posted=_at(60), reply_to=first[2]).followup_id
+        copy = _ingest(conn, *second[:2], CLOSE_HALF, posted=_at(70), reply_to=second[2])
+        assert copy.outcome == "relay_duplicate", copy
+        _restart(conn, on=(VIP,), seconds=100)
+
+    assert _signals(conn)[1:] == [(2, V, VIP_COPY, "NEW")]
+    assert _acting_on(conn, 2) == [(V, VIP_CLOSE)]
+    (vip,) = [row for row in _followups(conn) if row[1:3] == (V, VIP_CLOSE)]
+    assert vip[3:] == (2, relay_repo.REPLY_PATH)
+    assert _followup_rows(conn, vip[0]) == [("acct-1", "QUEUED"), ("acct-2", "QUEUED")]
+    assert _q(conn, "SELECT relay_of_followup_id FROM messages WHERE message_id = ?", VIP_CLOSE) == [
+        (None,)
+    ]
+
+
+def test_a_follow_up_copy_is_stored_with_the_message_it_replies_to(conn):  # noqa: F811
+    """What R4-4 reads: the post a copy of a follow-up replied to."""
+    _relay_call_then_vip_copy(conn)
+    _ingest(conn, RELAY, RELAY_CLOSE, CLOSE_HALF, posted=_at(60), reply_to=RELAY_CALL)
+    _ingest(conn, VIP, VIP_CLOSE, CLOSE_HALF, posted=_at(70), reply_to=VIP_COPY)
+
+    assert _q(
+        conn,
+        "SELECT message_id, reply_to_message_id FROM messages WHERE message_id IN (?, ?, ?) "
+        "ORDER BY message_id",
+        VIP_COPY, VIP_CLOSE, RELAY_CLOSE,
+    ) == [(VIP_COPY, None), (VIP_CLOSE, VIP_COPY), (RELAY_CLOSE, RELAY_CALL)]
+
+
+def test_two_channels_repeating_the_relays_close_half_give_one_instruction(
+    conn,  # noqa: F811
+):
+    """The VIP and another channel both copied the relay's call and its
+    "close half". The other channel's copy is the newest: signal 2; the
+    VIP's repeats it. Each one's "close half" was a copy of the relay's.
+    Now one of them is the instruction about signal 2 and the other repeats
+    it -- never two, which would close half twice."""
+    _relay_call_then_vip_copy(conn)
+    assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(40)).relay_of_signal_id == 1
+    _ingest(conn, RELAY, RELAY_CLOSE, CLOSE_HALF, posted=_at(60), reply_to=RELAY_CALL)
+    _ingest(conn, VIP, VIP_CLOSE, CLOSE_HALF, posted=_at(70), reply_to=VIP_COPY)
+    _ingest(conn, OTHER, 9005, CLOSE_HALF, posted=_at(75), reply_to=OTHER_COPY)
+
+    _restart(conn, seconds=100)
+
+    assert _signals(conn)[1:] == [(2, OTHER.channel_id, OTHER_COPY, "NEW")]
+    acting = _acting_on(conn, 2)
+    assert len(acting) == 1, acting
+    (own,) = [row for row in _followups(conn) if (row[1], row[2]) == acting[0]]
+    links = _q(
+        conn,
+        "SELECT channel_id, message_id, relay_of_followup_id FROM messages "
+        "WHERE message_id IN (?, ?) ORDER BY message_id",
+        VIP_CLOSE, 9005,
+    )
+    assert {link[2] for link in links} == {None, own[0]}, links
+    assert acting[0] in {(V, VIP_CLOSE), (OTHER.channel_id, 9005)}
+    # The VIP's replies to its copy, which repeats signal 2: 'relay-reply';
+    # the other channel's to signal 2's own message: 'reply'.
+    assert own[4] == (
+        relay_repo.RELAY_REPLY_PATH if acting[0] == (V, VIP_CLOSE) else relay_repo.REPLY_PATH
+    )
+
+
+def test_a_deleted_or_edited_away_follow_up_copy_gives_no_instruction(conn):  # noqa: F811
+    """The VIP deleted its "close half", or edited it into chatter, before
+    the restart: nothing of it is an instruction about signal 2."""
+    _relay_call_then_vip_copy(conn)
+    _ingest(conn, RELAY, RELAY_CLOSE, CLOSE_HALF, posted=_at(60), reply_to=RELAY_CALL)
+    _ingest(conn, VIP, VIP_CLOSE, CLOSE_HALF, posted=_at(70), reply_to=VIP_COPY)
+    _ingest(conn, VIP, VIP_CLOSE + 1, CLOSE_HALF, posted=_at(72), reply_to=VIP_COPY)
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=VIP_CLOSE, now_utc=_at(80), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=VIP_CLOSE + 1, text="good morning traders",
+        posted_at_utc=_at(72), edit_date_utc=_at(82), reply_to_message_id=VIP_COPY,
+        now_utc=_at(82), accounts=ACCOUNTS, detected_by="event",
+    )
+    conn.commit()
+
+    _restart(conn, on=(VIP,), seconds=100)
+
+    assert _signals(conn)[1:] == [(2, V, VIP_COPY, "NEW")]
+    assert _acting_on(conn, 2) == []
+
+
+def test_a_follow_up_copy_replying_to_a_post_the_new_signal_does_not_carry_stays_a_copy(
+    conn,  # noqa: F811
+):
+    """The VIP copied the relay's call 800 s before it was posted, the other
+    channel 800 s after: the other channel's post is signal 2, and the
+    VIP's, 1600 s away from it, stays a copy of signal 1 -- another call by
+    the relay rules. The VIP's "close half" replying to that post is about
+    signal 1's call, not signal 2's: it is left as it was."""
+    assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
+    assert _ingest(conn, VIP, VIP_COPY, posted=_at(-800)).relay_of_signal_id == 1
+    assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(800)).relay_of_signal_id == 1
+    _ingest(conn, RELAY, RELAY_CLOSE, CLOSE_HALF, posted=_at(810), reply_to=RELAY_CALL)
+    copy = _ingest(conn, VIP, VIP_CLOSE, CLOSE_HALF, posted=_at(820), reply_to=VIP_COPY)
+    assert copy.relay_of_followup_id == 1, copy
+
+    _restart(conn, seconds=900)
+
+    assert _signals(conn)[1:] == [(2, OTHER.channel_id, OTHER_COPY, "NEW")]
+    assert _link(conn, VIP, VIP_COPY) == 1
+    assert _acting_on(conn, 2) == []
+    assert _q(conn, "SELECT relay_of_followup_id FROM messages WHERE message_id = ?", VIP_CLOSE) == [
+        (1,)
+    ]
+
+
+def test_a_copy_of_a_close_half_that_moved_to_the_new_signal_stays_a_copy(
+    conn,  # noqa: F811
+):
+    """The other channel said "close half" first, replying to its copy of
+    the call; the VIP's, 10 s later, is stored as a copy of it. The other
+    channel's post becomes signal 2, and its "close half" moves with it.
+    The VIP's copy repeats an instruction about signal 2 already: it stays
+    a copy -- two would close half twice."""
+    _relay_call_then_vip_copy(conn)
+    assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(40)).relay_of_signal_id == 1
+    other = _ingest(conn, OTHER, 9005, CLOSE_HALF, posted=_at(60), reply_to=OTHER_COPY)
+    copy = _ingest(conn, VIP, VIP_CLOSE, CLOSE_HALF, posted=_at(70), reply_to=VIP_COPY)
+    assert copy.relay_of_followup_id == other.followup_id, copy
+
+    _restart(conn, seconds=100)
+
+    assert _signals(conn)[1:] == [(2, OTHER.channel_id, OTHER_COPY, "NEW")]
+    assert _acting_on(conn, 2) == [(OTHER.channel_id, 9005)]
+    assert _q(conn, "SELECT relay_of_followup_id FROM messages WHERE message_id = ?", VIP_CLOSE) == [
+        (other.followup_id,)
+    ]

@@ -186,6 +186,12 @@ two backfills every existing row keeps every value it had.
   forwarded message came from, so a relay of an already-stored post is
   recognised exactly, however late it arrives (F09), with the index
   ``idx_messages_fwd_from`` for that lookup.
+- ``messages.reply_to_message_id``: the message of the same channel a
+  message replies to, as first stored (final fix round 4, R4-4) -- a copy
+  of a follow-up has no ``followups`` row to hold it, and watch's start
+  needs it to give the copy's instruction to the call its post carries
+  now (``relay_repo.admit_copies_of_switched_off``). NULL when it replies
+  to nothing, or was stored before migration 4.
 
 - ``channel_off_periods(period_id, channel_id, off_at_utc, on_at_utc)``,
   with the indexes ``idx_channel_off_periods_channel`` and
@@ -335,6 +341,8 @@ _MIGRATION_4: tuple[str, ...] = (
     "ALTER TABLE messages ADD COLUMN fwd_from_channel_id INTEGER",
     "ALTER TABLE messages ADD COLUMN fwd_from_post_id INTEGER",
     "ALTER TABLE messages ADD COLUMN fwd_from_date_utc TEXT",
+    # Final fix round 4 (R4-4): the message a message replies to.
+    "ALTER TABLE messages ADD COLUMN reply_to_message_id INTEGER",
     "ALTER TABLE signals ADD COLUMN closed_by_channel_id INTEGER",
     "ALTER TABLE signals ADD COLUMN closed_by_message_id INTEGER",
     "ALTER TABLE signals ADD COLUMN promoted_from_signal_id INTEGER",

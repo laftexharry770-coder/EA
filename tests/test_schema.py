@@ -800,6 +800,8 @@ _V4_COLUMNS = {
         "fwd_from_channel_id",
         "fwd_from_post_id",
         "fwd_from_date_utc",
+        # Final fix round 4 (R4-4): the message a message replies to.
+        "reply_to_message_id",
     ),
     "signals": (
         "closed_by_channel_id",

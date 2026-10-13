@@ -1375,6 +1375,13 @@ def admit_copies_of_switched_off(
       by those same rules, held back loudly as a copy of a withdrawn call;
     - once one is a new signal, any other is only ever re-linked to a
       signal it repeats -- one call, one signal -- else left as it was;
+    - a follow-up stored as a copy of another (`messages.relay_of_followup_id`)
+      replying to a post that acts on a signal admitted here -- its own
+      message, or a post re-linked to it -- while the follow-up it repeats
+      targets one of the switched-off signals' chains, is an instruction
+      of its own about the new signal (`_adopt_followup_copies`, final fix
+      round 4, R4-4): the VIP's "close half", stored as a copy of the
+      relay's, would otherwise act on the cancelled signal only;
     - and once one is a new signal, the copies this job held back are run
       through the relay rules again (`_relink_held_back`, final fix round
       4, R4-3): one that repeats it now -- going newest first, a copy near
@@ -1402,6 +1409,8 @@ def admit_copies_of_switched_off(
     # The copies this job held back, with the alerts it raised for them,
     # not yet linked to a call traded instead (R4-3).
     held: list[tuple[_Copy, tuple[int, ...]]] = []
+    # Each signal admitted, with the switched-off signal it repeated (R4-4).
+    admissions: list[tuple[int, int]] = []
     for signal_id in dict.fromkeys(signal_ids):
         signal = _signal_row(conn, signal_id)
         if signal is None or not switched_off(conn, signal):
@@ -1445,6 +1454,7 @@ def admit_copies_of_switched_off(
                 held.append((copy, admission.alert_ids))
                 continue
             admitted = True
+            admissions.append((admission.signal_id, signal_id))
             new = _signal_row(conn, admission.signal_id)
             _move_replies_to(conn, posts={(channel_id, message_id)}, signal=signal, new=new)
             raised.append(
@@ -1466,6 +1476,18 @@ def admit_copies_of_switched_off(
             )
     if too_old:
         raised.append(_say_too_old(conn, too_old, max_age_seconds=max_age_seconds, now_utc=now_utc))
+    # Once every post is where it stays: the follow-up copies (R4-4).
+    old_chains = {sid for _, old in admissions for sid in chain_ids(conn, old)}
+    for new_id, _ in admissions:
+        _adopt_followup_copies(
+            conn,
+            new=_signal_row(conn, new_id),
+            old_chains=old_chains,
+            on=on,
+            accounts=accounts,
+            now_utc=now_utc,
+            relay_window_seconds=relay_window_seconds,
+        )
     return tuple(raised)
 
 
@@ -1619,6 +1641,126 @@ def _supersede(
             "you already did, check your open positions."
         ),
     )
+
+
+def _adopt_followup_copies(
+    conn: sqlite3.Connection,
+    *,
+    new: sqlite3.Row,
+    old_chains: set[int],
+    on: dict[int, _ChannelCfgLike],
+    accounts: tuple,
+    now_utc: datetime,
+    relay_window_seconds: int,
+) -> None:
+    """For `admit_copies_of_switched_off`, at the end of its job (final fix
+    round 4, R4-4): every follow-up stored as a copy of another
+    (`messages.relay_of_followup_id`) on a channel switched on (`on`), not
+    deleted, still reading as a follow-up, replying to a post that acts on
+    signal `new` -- its own message, or a post stored as its copy -- while
+    the follow-up it repeats targets a signal of `old_chains` (the
+    switched-off signals' chains that the job admitted a copy of): it was
+    stored as a copy of an instruction about the call that is cancelled
+    now, and is about `new`. It is matched again by the follow-up relay
+    rules against `new` (`find_followup_relay`): repeating a follow-up
+    about `new` already -- another channel's copy adopted first -- it is
+    linked to that one; else it is a follow-up of its own targeting `new`
+    (path `'reply'` when it replies to `new`'s own message, `'relay-reply'`
+    otherwise), its FOLLOWUP rows fanned out. Every order of the posts ends
+    the same: the instruction acts on the call it was given about."""
+    posts = {(new["channel_id"], new["message_id"])} | {
+        (row["channel_id"], row["message_id"])
+        for row in conn.execute(
+            "SELECT channel_id, message_id FROM messages WHERE relay_of_signal_id = ?",
+            (new["signal_id"],),
+        ).fetchall()
+    }
+    for copy in conn.execute(
+        "SELECT m.*, f.followup_id AS held_id, f.target_signal_id AS held_target "
+        "FROM messages m JOIN followups f ON f.followup_id = m.relay_of_followup_id "
+        "WHERE m.deleted_at_utc IS NULL "
+        "ORDER BY m.posted_at_utc, m.channel_id, m.message_id"
+    ).fetchall():
+        channel_cfg = on.get(copy["channel_id"])
+        if channel_cfg is None or (copy["channel_id"], copy["reply_to_message_id"]) not in posts:
+            continue
+        if copy["held_target"] not in old_chains:
+            # The instruction it repeats is not about the cancelled call --
+            # it acts on `new` already, moved with its post: one instruction.
+            continue
+        posted = datetime.fromisoformat(copy["posted_at_utc"])
+        routed = route(
+            copy["raw_text"],
+            channel_cfg=channel_cfg,
+            message_id=copy["message_id"],
+            posted_at_utc=posted,
+            reply_to_message_id=copy["reply_to_message_id"],
+        )
+        if routed.kind != "followup":
+            continue
+        followup = routed.followup
+        key = (copy["channel_id"], copy["message_id"])
+        match = find_followup_relay(
+            conn,
+            channel_id=copy["channel_id"],
+            message_id=copy["message_id"],
+            op=followup.op.value,
+            content_hash=copy["content_hash"],
+            target_signal_id=new["signal_id"],
+            posted_at_utc=posted,
+            relay_window_seconds=relay_window_seconds,
+            fwd_from_channel_id=copy["fwd_from_channel_id"],
+            fwd_from_post_id=copy["fwd_from_post_id"],
+        )
+        if match is not None and match.followup_id != copy["held_id"]:
+            conn.execute(
+                "UPDATE messages SET relay_of_followup_id = ? "
+                "WHERE channel_id = ? AND message_id = ?",
+                (match.followup_id, *key),
+            )
+            logger.info(
+                "channel %s message %s, a copy of follow-up %s about a signal whose channel is "
+                "switched off, now repeats follow-up %s (channel %s message %s) about signal %s",
+                *key,
+                copy["held_id"],
+                match.followup_id,
+                match.channel_id,
+                match.message_id,
+                new["signal_id"],
+            )
+            continue
+        conn.execute(
+            "UPDATE messages SET relay_of_followup_id = NULL WHERE channel_id = ? AND message_id = ?",
+            key,
+        )
+        own = (copy["channel_id"], copy["reply_to_message_id"]) == (
+            new["channel_id"],
+            new["message_id"],
+        )
+        followup_id = signals_repo.insert_followup(
+            conn,
+            channel_id=copy["channel_id"],
+            message_id=copy["message_id"],
+            followup=followup,
+            target_signal_id=new["signal_id"],
+            resolution_path=REPLY_PATH if own else RELAY_REPLY_PATH,
+        )
+        outbox.fan_out_checked(
+            conn,
+            kind="FOLLOWUP",
+            signal_id=None,
+            followup_id=followup_id,
+            accounts=accounts,
+            now_utc=now_utc,
+        )
+        logger.info(
+            "channel %s message %s, a copy of follow-up %s about a signal whose channel is "
+            "switched off, is follow-up %s now, about signal %s",
+            *key,
+            copy["held_id"],
+            followup_id,
+            new["signal_id"],
+        )
 
 
 def _say_too_old(
