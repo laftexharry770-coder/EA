@@ -48,6 +48,7 @@ from xaucopier.ingest import listener as listener_module
 from xaucopier.ingest.listener import FIRST_RUN_SEED_MARGIN, Listener
 from xaucopier.ingest.poll import HistoryPoll
 from xaucopier.store import channel_state, db
+from xaucopier.store.messages_repo import ingest
 
 #: Every history request's bound in these tests: small, so a hung read
 #: fails fast.
@@ -1418,6 +1419,66 @@ def test_a_period_in_which_the_channel_posted_nothing_says_so(
         f"Channel {A} ({CHANNEL_A.name}) was switched off from 2026-09-05 08:00:00 to "
         "2026-09-05 09:00:00 UTC; it posted nothing in that time."
     ), line
+
+
+def test_a_post_read_just_before_the_switch_off_is_no_post_made_while_off(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Final fix round 4 (R4-6; the re-check's p_r33_gap): the channel
+    posted 30 s BEFORE it was switched off -- while it was on -- and then
+    nothing until it was on again. That post is read like any other, and
+    the line says the channel posted nothing while it was off: not that
+    what it posted while off was read."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    history = _history((101, 3 + 30 / 3600), (102, 1))
+
+    async def scenario():
+        async with _watching(db_path, FakeTelegramClient(history={A: history}, server_time=NOW), {"now": NOW}):
+            pass
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 102]
+    (line,) = _off_lines(caplog)
+    assert line == (
+        f"Channel {A} ({CHANNEL_A.name}) was switched off from 2026-09-05 08:00:00 to "
+        "2026-09-05 09:00:00 UTC; it posted nothing in that time."
+    ), line
+
+
+def test_another_channels_post_made_while_this_one_was_off_is_not_its_own(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R4-6: channel A was OFF for an hour and posted nothing in it; channel
+    B, read all along, posted in that hour. B's post is not A's: A's line
+    says it posted nothing, not that what it posted had been read
+    already."""
+    db_path = tmp_path / "store.db"
+    _read_before(db_path, (3, 2))
+    writer = db.connect(db_path, role="writer")
+    try:
+        ingest(
+            writer, channel_cfg=CHANNEL_B, message_id=55, text=CHATTER_TEXT,
+            posted_at_utc=_hours_ago(2.5), edit_date_utc=None, reply_to_message_id=None,
+            source="live", now_utc=_hours_ago(2.5), accounts=ACCOUNTS,
+        )
+        writer.commit()
+    finally:
+        writer.close()
+    history = _history((101, 4), (102, 1))
+
+    async def scenario():
+        async with _watching(db_path, FakeTelegramClient(history={A: history}, server_time=NOW), {"now": NOW}):
+            pass
+
+    with caplog.at_level(logging.INFO, logger="xaucopier.ingest.listener"):
+        asyncio.run(scenario())
+
+    assert _stored_ids(db_path) == [101, 102]
+    (line,) = _off_lines(caplog)
+    assert line.endswith("it posted nothing in that time."), line
 
 
 @dataclass

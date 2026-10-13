@@ -1092,3 +1092,54 @@ def test_watch_counts_only_the_channels_it_reads_when_a_post_goes(
     finally:
         check.close()
     assert claimable == ([2] if relay_on else [])
+
+
+def test_watch_trades_no_copy_on_a_channel_switched_off_too(tmp_path: Path) -> None:
+    """Final fix round 4 (R4-6; the re-check's p_r31_listener_channels):
+    through `Listener.start()`, the relay AND the VIP switched off, another
+    channel on. The VIP's copy of the relay's call is young enough to be
+    traded, but its channel is off as well: nothing is a signal, nothing is
+    queued -- the start-up job looks only at the channels switched on."""
+    from test_listener import ACCOUNTS as LISTENER_ACCOUNTS
+    from test_listener import _build_listener
+
+    db_path = tmp_path / "store.db"
+
+    def off(channel: ChannelCfg) -> ChannelCfg:
+        return ChannelCfg(
+            channel_id=channel.channel_id, name=channel.name, parser="mmh",
+            ordinal=channel.ordinal, enabled=False,
+        )
+
+    writer = db.connect(db_path, role="writer")
+    try:
+        # test_listener's clock stands at POSTED + 900 s: the copy is 70 s old.
+        for channel, message_id, seconds in ((RELAY, RELAY_CALL, 800), (VIP, VIP_COPY, 830)):
+            messages_repo.ingest(
+                writer, channel_cfg=channel, message_id=message_id, text=SIGNAL_TEXT,
+                posted_at_utc=_at(seconds), edit_date_utc=None, reply_to_message_id=None,
+                source="live", now_utc=_at(seconds + 1), accounts=LISTENER_ACCOUNTS,
+            )
+        writer.commit()
+    finally:
+        writer.close()
+
+    async def scenario():
+        listener = _build_listener(
+            db_path, FakeTelegramClient(), channels=(off(VIP), off(RELAY), OTHER),
+            accounts=LISTENER_ACCOUNTS,
+        )
+        await listener.start()
+        await listener.aclose()
+
+    asyncio.run(scenario())
+
+    check = db.connect(db_path, role="reader")
+    try:
+        signals, queued = _signals(check), _queued(check)
+        codes = [row[1] for row in _alerts(check)]
+    finally:
+        check.close()
+    assert signals == [(1, R, RELAY_CALL, "NEW")]
+    assert queued == []
+    assert codes == ["CHANNEL_OFF_ENTRIES_SKIPPED"]
