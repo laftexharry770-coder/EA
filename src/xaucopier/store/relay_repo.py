@@ -58,7 +58,11 @@ run through these rules again by the start-up job that cancels those
 entries (`admit_copies_of_switched_off`, final fix round 3): the newest
 one standing becomes a signal of its own -- if it was posted recently
 enough to be traded (the policy's `max_signal_age_seconds`, final fix
-round 4); one line says how many older ones are not.
+round 4); one line says how many older ones are not. The same job
+withdraws a signal of a channel switched on that only a post on a channel
+switched off still showed (final fix round 5, R5-1): its own post went
+while watch read both channels, so its removal was an echo or a repeat,
+and nothing would see that other post go now.
 
 **An older post of a call** (ruling R4-1, `old_post`). When a call was
 withdrawn and posted again, the other channel's posts of the withdrawn
@@ -253,7 +257,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
@@ -299,6 +303,11 @@ COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED = "COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED"
 #: and this one line says how many, and of which signals (final fix round
 #: 4, R4-2; `admit_copies_of_switched_off`).
 OLD_COPIES_OF_CHANNEL_OFF_SIGNALS = "OLD_COPIES_OF_CHANNEL_OFF_SIGNALS"
+#: WARNING -- CRITICAL when some of it was executed: at a start, a signal of
+#: a channel switched on whose own post no longer stands, kept standing only
+#: by a post on a channel switched off now, which watch no longer reads: it
+#: is withdrawn (final fix round 5, R5-1; `admit_copies_of_switched_off`).
+SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF = "SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF"
 
 #: How old a signal may be and still be traded when the caller gives no
 #: `max_signal_age_seconds` (`domain.market.Policy`'s default, 120 s).
@@ -1409,7 +1418,13 @@ def admit_copies_of_switched_off(
       was admitted -- is linked to it, its CRITICAL "trade it by hand" is
       acknowledged and a WARNING (`COPY_OF_WITHDRAWN_SIGNAL_SUPERSEDED`)
       says not to, as `record_replacement` does: following it would open
-      the trade twice.
+      the trade twice;
+    - last, a signal of a channel switched on whose own post no longer
+      stands, kept tradable only because another post of the call stood --
+      one on a channel switched off now, which watch no longer reads -- is
+      withdrawn, loudly (`_withdraw_calls_shown_only_off`, final fix round
+      5, R5-1): whether watch saw its post go before the restart or after it
+      must not decide whether the call is traded.
 
     Only a post still young enough to be traded is admitted (final fix
     round 4, R4-2): posted no longer than `max_age_seconds` (the policy's
@@ -1508,7 +1523,150 @@ def admit_copies_of_switched_off(
             now_utc=now_utc,
             relay_window_seconds=relay_window_seconds,
         )
+    # And a call no post on a channel switched on shows any more (R5-1).
+    raised.extend(_withdraw_calls_shown_only_off(conn, on=on, now_utc=now_utc))
     return tuple(raised)
+
+
+def _withdraw_calls_shown_only_off(
+    conn: sqlite3.Connection, *, on: dict[int, _ChannelCfgLike], now_utc: datetime
+) -> list[int]:
+    """For `admit_copies_of_switched_off`, at the end of its job (final fix
+    round 5, R5-1): every signal of a channel switched on (`on`) that still
+    has trade entries waiting while its own post no longer stands --
+    deleted, or edited so that it no longer shows the call -- is looked at
+    again. Its post's removal kept it standing because another post of the
+    call still stood (an echo, or a repeat); if no such post stands on a
+    channel switched on now (`_call_stands_elsewhere` with those channels),
+    it stood only on a channel switched off since, which watch no longer
+    reads: nothing would see that post go, and a call no post watch reads
+    shows is never left to trade (INV-1). It is withdrawn as `edits_repo`
+    withdraws a call at its last post's removal -- the same as when that
+    removal is seen after the restart: VOIDED (flagged, when some of it was
+    executed), its waiting entries cancelled, its own post the one that
+    withdrew it -- with an alert naming the post on the channel switched off
+    (`SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF`). Returns the ids of the alerts."""
+    read = frozenset(on)
+    raised: list[int] = []
+    for signal in conn.execute(
+        "SELECT s.* FROM signals s WHERE EXISTS (SELECT 1 FROM outbox o WHERE o.kind = 'ENTRY' "
+        "    AND o.signal_id = s.signal_id AND o.state = 'QUEUED') "
+        "ORDER BY s.signal_id"
+    ).fetchall():
+        channel_cfg = on.get(signal["channel_id"])
+        if channel_cfg is None:
+            continue  # its channel is off: its entries were cancelled already
+        own = (signal["channel_id"], signal["message_id"])
+        how = _how_gone(conn, signal, channel_cfg)
+        if how is None:
+            continue  # its own post still stands
+        if _call_stands_elsewhere(
+            conn, signal_id=signal["signal_id"], post=own, channel_cfg=channel_cfg,
+            read_channels=read,
+        ):
+            continue
+        # Some post of the call still stands, then -- on a channel switched off.
+        kept_by = next(
+            _posts_showing_call(
+                conn, signal_id=signal["signal_id"], post=own, channel_cfg=channel_cfg
+            ),
+            None,
+        )
+        raised.append(
+            _withdraw_shown_only_off(
+                conn, signal=signal, channel_cfg=channel_cfg, how=how, kept_by=kept_by,
+                now_utc=now_utc,
+            )
+        )
+    return raised
+
+
+def _how_gone(
+    conn: sqlite3.Connection, signal: sqlite3.Row, channel_cfg: _ChannelCfgLike
+) -> str | None:
+    """How `signal`'s own post no longer stands, in words -- or None while it
+    stands: not deleted and, re-read with its channel's parser, still
+    showing the call (`post_shows_call`)."""
+    post = conn.execute(
+        "SELECT * FROM messages WHERE channel_id = ? AND message_id = ?",
+        (signal["channel_id"], signal["message_id"]),
+    ).fetchone()
+    if post is None:
+        return None  # never stored: nothing to judge it by
+    if post["deleted_at_utc"] is not None:
+        return "was deleted"
+    if not post_shows_call(post, signal, channel_cfg=channel_cfg):
+        return "was edited and no longer shows the call"
+    return None
+
+
+def _withdraw_shown_only_off(
+    conn: sqlite3.Connection,
+    *,
+    signal: sqlite3.Row,
+    channel_cfg: _ChannelCfgLike,
+    how: str,
+    kept_by: sqlite3.Row | None,
+    now_utc: datetime,
+) -> int:
+    """`_withdraw_calls_shown_only_off`'s withdrawal of `signal`, whose own
+    post `how`, kept standing only by post `kept_by` on a channel switched
+    off (None: by none at all), as `edits_repo._withdraw_signal` withdraws a
+    call; returns the alert's id."""
+    signal_id = signal["signal_id"]
+    status = signals_repo.trade_status(conn, signal_id=signal_id)
+    signals_repo.mark_withdrawn(conn, signal_id=signal_id, now_utc=now_utc)
+    signals_repo.record_closed_by(
+        conn, signal_id=signal_id, channel_id=signal["channel_id"],
+        message_id=signal["message_id"],
+    )
+    skipped = outbox.skip_queued(
+        conn,
+        kind="ENTRY",
+        signal_id=signal_id,
+        reason=f"signal withdrawn: its post {how}, and no post on a channel switched on shows it",
+    )
+    name = getattr(channel_cfg, "name", None)
+    where = (
+        f"its own post, message {signal['message_id']} on channel {signal['channel_id']}"
+        + (f" ({name})" if name else "")
+        + f", {how}, and "
+    )
+    if kept_by is not None:
+        where += (
+            f"the call stood only in message {kept_by['message_id']} on channel "
+            f"{kept_by['channel_id']}, which is switched off now: this program no longer reads "
+            "that channel, so it could not see that post withdrawn too. No post on a channel "
+            "that is switched on shows the call any more"
+        )
+    else:
+        where += "no other post on a channel that is switched on shows the call"
+    entries = f"{skipped} queued trade entr{'y was' if skipped == 1 else 'ies were'} cancelled"
+    if status == "pending":
+        signals_repo.set_signal_state(conn, signal_id=signal_id, state="VOIDED")
+        level: alerts.AlertLevel = "WARNING"
+        detail = (
+            f"signal {signal_id} VOIDED: {where}, so it is not traded: {entries}. Nothing had "
+            "been executed. Nothing to do."
+        )
+    else:
+        level = "CRITICAL"
+        traded = "already traded" if status == "executed" else "being traded right now"
+        detail = (
+            f"signal {signal_id} is withdrawn: {where}. But it is {traded}: its open trades "
+            f"were NOT closed -- review them by hand. {entries}."
+        )
+    logger.info("%s", detail)
+    return alerts.record(
+        conn,
+        now_utc=now_utc,
+        level=level,
+        code=SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF,
+        channel_id=signal["channel_id"],
+        message_id=signal["message_id"],
+        signal_id=signal_id,
+        detail=detail,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2453,6 +2611,27 @@ def _call_stands_elsewhere(
     edited away, and a call standing only there would be left to trade
     with no post this watch reads showing it (INV-1, "a channel this watch
     reads")."""
+    for other in _posts_showing_call(
+        conn, signal_id=signal_id, post=post, channel_cfg=channel_cfg
+    ):
+        if read_channels is not None and other["channel_id"] not in read_channels:
+            continue  # on a channel switched off: not read (R4-5)
+        return True
+    return False
+
+
+def _posts_showing_call(
+    conn: sqlite3.Connection,
+    *,
+    signal_id: int,
+    post: tuple[int, int],
+    channel_cfg: _ChannelCfgLike | None,
+) -> Iterator[sqlite3.Row]:
+    """For `_call_stands_elsewhere`: the posts of `signal_id`'s call other
+    than `post` that still stand, on any channel -- not deleted, still
+    stored as a signal, not the post that closed one of the call's signals
+    and, with `channel_cfg`, re-read showing the call of its newest
+    signal."""
     newest = _signal_row(conn, live_signal_for(conn, signal_id))
     chain = chain_ids(conn, signal_id)
     marks = ", ".join("?" for _ in chain)
@@ -2465,14 +2644,12 @@ def _call_stands_elsewhere(
         f"     AND s.message_id = m.message_id AND s.signal_id IN ({marks}))) "
         "  AND NOT EXISTS (SELECT 1 FROM signals s "
         f"    WHERE s.signal_id IN ({marks}) AND s.closed_by_channel_id = m.channel_id "
-        "     AND s.closed_by_message_id = m.message_id)",
+        "     AND s.closed_by_message_id = m.message_id) "
+        "ORDER BY m.posted_at_utc, m.channel_id, m.message_id",
         (*post, *chain, *chain, *chain),
     ).fetchall():
-        if read_channels is not None and other["channel_id"] not in read_channels:
-            continue  # on a channel switched off: not read (R4-5)
         if channel_cfg is None or post_shows_call(other, newest, channel_cfg=channel_cfg):
-            return True
-    return False
+            yield other
 
 
 def _signal_row(conn: sqlite3.Connection, signal_id: int) -> sqlite3.Row:

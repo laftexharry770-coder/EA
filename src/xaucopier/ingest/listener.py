@@ -2059,7 +2059,10 @@ class Listener:
         switched on -- stored as its copy while this watch still read the
         channel switched off -- is traded instead
         (`relay_repo.admit_copies_of_switched_off`, final fix round 3), if
-        it was posted no longer ago than `max_signal_age_seconds` (R4-2).
+        it was posted no longer ago than `max_signal_age_seconds` (R4-2);
+        and a signal of a channel switched on whose own post is gone, kept
+        tradable only by a post on a channel switched off, is withdrawn
+        (final fix round 5, R5-1): no post this watch reads shows it.
 
         OFF means the channel is not read at all -- neither its new posts
         nor the edits, deletions and follow-ups of the signals it already

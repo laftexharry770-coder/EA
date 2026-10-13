@@ -581,6 +581,7 @@ def _new_alert_codes() -> list[str]:
         alerts.CHANNEL_OFF_ENTRIES_SKIPPED,
         relay.COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED,
         relay.OLD_COPIES_OF_CHANNEL_OFF_SIGNALS,
+        relay.SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF,
     ]
 
 

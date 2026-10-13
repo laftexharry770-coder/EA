@@ -1138,6 +1138,260 @@ def test_watch_counts_only_the_channels_it_reads_when_a_post_goes(
     assert claimable == ([2] if relay_on else [])
 
 
+# -- a call no post on a channel switched on shows (final fix round 5, R5-1) -
+
+SHOWN_OFF = relay_repo.SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF
+CANCELLED_TEXT = SIGNAL_TEXT + "\nCANCELLED"
+
+
+def _the_relays_call_kept_only_by_the_vips_forward(  # noqa: F811
+    conn, *, delete_before_restart: bool, on=(RELAY,), before_restart=None, gone="deleted"
+):
+    """Seed 102253 reduced (the re-check's p_102253): the relay's call
+    (signal 1) is CANCELLED; the VIP posts the call (held back, a copy of
+    the withdrawn call); the relay forwards the VIP's post: the call posted
+    again, signal 2; the VIP forwards its own post and edits that post into
+    chatter -- its forward still shows the call. Then the relay deletes its
+    forward, signal 2's own post (or edits it into chatter, `gone`): with
+    both channels read that is an echo, the VIP's forward still standing --
+    before the restart, or after it."""
+    assert _ingest(conn, RELAY, 5002).signal_id == 1
+    edits_repo.apply_edit(
+        conn, channel_cfg=RELAY, message_id=5002, text=CANCELLED_TEXT, posted_at_utc=POSTED,
+        edit_date_utc=_at(10), reply_to_message_id=None, now_utc=_at(10), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    conn.commit()
+    assert _ingest(conn, VIP, 1002, posted=_at(20)).relay_of_signal_id == 1
+    assert _ingest(conn, RELAY, 5005, posted=_at(30), fwd=(V, 1002)).signal_id == 2
+    assert _ingest(conn, VIP, 1005, posted=_at(40), fwd=(V, 1002)).relay_of_signal_id == 2
+    edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=1002, text="Good morning traders",
+        posted_at_utc=_at(20), edit_date_utc=_at(50), reply_to_message_id=None,
+        now_utc=_at(50), accounts=ACCOUNTS, detected_by="event",
+    )
+    conn.commit()
+
+    def delete(seconds: float, read) -> None:
+        if gone == "deleted":
+            edits_repo.apply_deletion(
+                conn, channel_cfg=RELAY, message_id=5005, now_utc=_at(seconds),
+                accounts=ACCOUNTS, detected_by="window", read_channels=read,
+            )
+        else:
+            edits_repo.apply_edit(
+                conn, channel_cfg=RELAY, message_id=5005, text="Good morning traders",
+                posted_at_utc=_at(30), edit_date_utc=_at(seconds), reply_to_message_id=None,
+                now_utc=_at(seconds), accounts=ACCOUNTS, detected_by="event",
+                read_channels=read,
+            )
+        conn.commit()
+
+    if delete_before_restart:
+        delete(60, (V, R))
+        assert _claimable(conn) == [2]  # an echo: the VIP's forward stands
+    if before_restart is not None:
+        before_restart(conn)
+    _restart(conn, on=on, seconds=100)
+    if not delete_before_restart:
+        delete(110, (R,))
+
+
+@pytest.mark.parametrize("gone", ["deleted", "edited away"])
+@pytest.mark.parametrize(
+    "delete_before_restart", [True, False], ids=["p_102253", "p_102253_after"]
+)
+def test_a_call_only_a_switched_off_channels_post_shows_is_not_traded_in_either_order(
+    conn, delete_before_restart, gone  # noqa: F811
+):
+    """Only the relay is switched on at the restart. The one post still
+    showing signal 2's call is the VIP's forward, on a channel watch no
+    longer reads: nothing would see it go. Signal 2 is withdrawn -- VOIDED,
+    its entries cancelled, the relay's deletion the post that withdrew it --
+    whether watch saw that deletion before the restart or after it."""
+    _the_relays_call_kept_only_by_the_vips_forward(
+        conn, delete_before_restart=delete_before_restart, gone=gone
+    )
+
+    assert _claimable(conn) == []
+    assert _q(
+        conn,
+        "SELECT state, withdrawn_at_utc IS NOT NULL, closed_by_channel_id, closed_by_message_id "
+        "FROM signals WHERE signal_id = 2",
+    ) == [("VOIDED", 1, R, 5005)]
+    assert _q(
+        conn, "SELECT DISTINCT state FROM outbox WHERE kind = 'ENTRY' AND signal_id = 2"
+    ) == [("SKIPPED",)]
+    codes = [a[1] for a in _alerts(conn)]
+    if delete_before_restart:
+        (alert,) = [a for a in _alerts(conn) if a[1] == SHOWN_OFF]
+        assert alert[:5] == ("WARNING", SHOWN_OFF, R, 5005, 2)
+        detail = " ".join(alert[5].split())
+        how = "was deleted" if gone == "deleted" else "was edited and no longer shows the call"
+        assert detail == (
+            f"signal 2 VOIDED: its own post, message 5005 on channel {R} (Relay), {how}, "
+            f"and the call stood only in message 1005 on channel {V}, which is switched off "
+            "now: this program no longer reads that channel, so it could not see that post "
+            "withdrawn too. No post on a channel that is switched on shows the call any more, "
+            "so it is not traded: 2 queued trade entries were cancelled. Nothing had been "
+            "executed. Nothing to do."
+        ), detail
+        for jargon in ("client", "listener", "rpc", "flood", "outbox"):
+            assert jargon not in detail.lower(), (jargon, detail)
+    else:
+        assert SHOWN_OFF not in codes
+        assert (
+            edits_repo.SIGNAL_VOIDED_BY_DELETION
+            if gone == "deleted"
+            else edits_repo.SIGNAL_RETRACTED_BY_EDIT
+        ) in codes
+
+
+def test_a_call_partly_traded_is_withdrawn_loudly_and_left_open(conn):  # noqa: F811
+    """The same, but one account had already traded signal 2: it is
+    withdrawn -- the other account's entry cancelled -- yet left NEW, its
+    open trade not closed, and the alert is CRITICAL, as when its last post
+    is removed while watch reads it (`edits_repo`)."""
+    def done_first(conn):  # noqa: F811
+        conn.execute(
+            "UPDATE outbox SET state = 'DONE' WHERE outbox_id = (SELECT MIN(outbox_id) "
+            "FROM outbox WHERE kind = 'ENTRY' AND signal_id = 2)"
+        )
+        conn.commit()
+
+    _the_relays_call_kept_only_by_the_vips_forward(
+        conn, delete_before_restart=True, before_restart=done_first
+    )
+
+    assert _claimable(conn) == []
+    assert _q(conn, "SELECT state, withdrawn_at_utc IS NOT NULL FROM signals WHERE signal_id = 2") == [
+        ("NEW", 1)
+    ]
+    assert _q(
+        conn, "SELECT state FROM outbox WHERE kind = 'ENTRY' AND signal_id = 2 ORDER BY outbox_id"
+    ) == [("DONE",), ("SKIPPED",)]
+    (alert,) = [a for a in _alerts(conn) if a[1] == SHOWN_OFF]
+    assert alert[0] == "CRITICAL"
+    detail = " ".join(alert[5].split())
+    assert "But it is already traded: its open trades were NOT closed -- review them by hand. "         "1 queued trade entry was cancelled." in detail, detail
+
+def test_the_withdrawal_at_start_looks_only_at_signals_of_channels_switched_on(
+    conn,  # noqa: F811
+):
+    """Called before the cancelling (as no start does), a signal of a channel
+    switched off whose post is gone is passed over, not withdrawn as if its
+    channel were read: cancelling its entries is the other half of the job's
+    work, with its own alert."""
+    assert _ingest(conn, VIP, VIP_COPY).signal_id == 1
+    conn.execute(
+        "UPDATE messages SET deleted_at_utc = ? WHERE channel_id = ? AND message_id = ?",
+        (_at(20).isoformat(), V, VIP_COPY),
+    )
+    conn.commit()
+
+    raised = relay_repo.admit_copies_of_switched_off(
+        conn, signal_ids=(), channels=(RELAY,), accounts=ACCOUNTS, now_utc=_at(30)
+    )
+
+    assert raised == ()
+    assert _claimable(conn) == [1]
+
+def test_a_call_still_shown_on_a_channel_switched_on_is_kept(conn):  # noqa: F811
+    """The control: the VIP is switched on at the restart too. Its forward
+    is read, still shows the call, and signal 2 stands."""
+    _the_relays_call_kept_only_by_the_vips_forward(
+        conn, delete_before_restart=True, on=(RELAY, VIP)
+    )
+
+    assert _claimable(conn) == [2]
+    assert SHOWN_OFF not in [a[1] for a in _alerts(conn)]
+
+
+@pytest.mark.parametrize("seen", ["before the restart", "after the restart"])
+def test_watch_trades_no_call_only_a_switched_off_channels_post_shows(
+    tmp_path: Path, seen: str
+) -> None:
+    """Seed 102253 through the listener: the first watch reads both
+    channels, the second only the relay. Whether the relay's deletion of
+    signal 2's own post was seen before the restart or after it, signal 2
+    is withdrawn: the one post still showing its call is on the VIP's
+    channel, which the second watch does not read."""
+    from test_listener import ACCOUNTS as LISTENER_ACCOUNTS
+    from test_listener import _build_listener
+    from xaucopier.ingest.listener import IncomingMessage
+
+    db_path = tmp_path / "store.db"
+    vip_off = ChannelCfg(
+        channel_id=V, name=VIP.name, parser="mmh", ordinal=VIP.ordinal, enabled=False
+    )
+
+    def post(channel, message_id, seconds, text=SIGNAL_TEXT, fwd=None, edited=None):
+        return IncomingMessage(
+            channel_id=channel.channel_id, message_id=message_id, text=text,
+            posted_at_utc=_at(seconds), edit_date_utc=None if edited is None else _at(edited),
+            reply_to_message_id=None,
+            fwd_from_channel_id=None if fwd is None else fwd[0],
+            fwd_from_post_id=None if fwd is None else fwd[1],
+            fwd_from_date_utc=None if fwd is None else _at(20),
+        )
+
+    async def first_watch():
+        listener = _build_listener(
+            db_path, FakeTelegramClient(), channels=(VIP, RELAY), accounts=LISTENER_ACCOUNTS
+        )
+        await listener.start()
+        try:
+            await listener.ingest_message(post(RELAY, 5002, 0), channel_cfg=RELAY, source="live")
+            await listener.ingest_edit(
+                post(RELAY, 5002, 0, CANCELLED_TEXT, edited=10), channel_cfg=RELAY,
+                detected_by="event",
+            )
+            await listener.ingest_message(post(VIP, 1002, 20), channel_cfg=VIP, source="live")
+            again = await listener.ingest_message(
+                post(RELAY, 5005, 30, fwd=(V, 1002)), channel_cfg=RELAY, source="live"
+            )
+            assert again.signal_id == 2, again
+            await listener.ingest_message(
+                post(VIP, 1005, 40, fwd=(V, 1002)), channel_cfg=VIP, source="live"
+            )
+            await listener.ingest_edit(
+                post(VIP, 1002, 20, "Good morning traders", edited=50), channel_cfg=VIP,
+                detected_by="event",
+            )
+            if seen == "before the restart":
+                await listener.ingest_deletion(RELAY, 5005, detected_by="event")
+        finally:
+            await listener.aclose()
+
+    async def second_watch():
+        listener = _build_listener(
+            db_path, FakeTelegramClient(), channels=(vip_off, RELAY), accounts=LISTENER_ACCOUNTS
+        )
+        await listener.start()
+        try:
+            if seen == "after the restart":
+                await listener.ingest_deletion(RELAY, 5005, detected_by="event")
+        finally:
+            await listener.aclose()
+
+    asyncio.run(first_watch())
+    check = db.connect(db_path, role="reader")
+    try:
+        assert _claimable(check) == [2]  # an echo while the VIP's forward is read
+    finally:
+        check.close()
+    asyncio.run(second_watch())
+
+    check = db.connect(db_path, role="reader")
+    try:
+        claimable = _claimable(check)
+        (state,) = _q(check, "SELECT state FROM signals WHERE signal_id = 2")
+    finally:
+        check.close()
+    assert claimable == []
+    assert state == ("VOIDED",)
+
+
 def test_watch_trades_no_copy_on_a_channel_switched_off_too(tmp_path: Path) -> None:
     """Final fix round 4 (R4-6; the re-check's p_r31_listener_channels):
     through `Listener.start()`, the relay AND the VIP switched off, another

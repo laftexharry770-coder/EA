@@ -232,6 +232,14 @@ missed. Once you have dealt with one, clear it:
   made longer ago than a signal may be and still be traded
   (`max_signal_age_seconds` in policy.toml), so they are not traded. One
   alert says how many there were. Nothing to do.
+- **SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF** — when `watch` started, a signal
+  waiting to be traded had lost its own post (deleted, or edited so that it
+  no longer shows the call), and the only post still showing the same call
+  was on a channel that is now switched off. `watch` does not read that
+  channel, so it could not see that post withdrawn too: the signal was
+  cancelled, not traded (the alert names the posts). Nothing to do. If part
+  of it had already been traded, the alert is CRITICAL: that trade was not
+  closed — check it by hand.
 - **Any other alert** — copy its two lines and send them to whoever looks
   after xaucopier, then clear it.
 
