@@ -58,6 +58,20 @@ which now follows the latest classification -- and then:
 - **Follow-up -> follow-up** -- updated in place (a worker reads it when it
   claims); WARNING if it had already been dispatched.
 - **Follow-up -> anything else** -- withdrawn: its queued rows are skipped.
+- **An instruction another follow-up stands in for** -- one about a call
+  whose channel watch's start found switched off, repeated on a channel
+  switched on and acting on the signal traded instead
+  (`followups.instead_of_followup_id`, `relay_repo` R6-1): once its
+  channel is back on, its poster's edit or deletion reaches the ones
+  standing in for it as it reaches the instruction with both channels
+  read -- an edit into another instruction restates them, a withdrawal
+  withdraws them, and the alert names the signal traded (final fix round
+  8, R8-2). One standing in that its own poster withdraws or changes while
+  the instruction it stood in for still stands in its own post, on a
+  channel read, hands the instruction back to that one: it acts on the
+  signal traded now (R8-3, `relay_repo.hand_back`). An instruction handed
+  to the user to carry out by hand that its poster changes or withdraws
+  says to review what was done (`relay_repo.handed_over`).
 - **A relay copy of a follow-up** (no followups row of its own; see
   `relay_repo`) edited or deleted -- a WARNING naming both posts; the
   follow-up acted on is the other post's and is not changed by guess.
@@ -2112,20 +2126,65 @@ def _edit_of_followup(ctx: _Ctx, route_result: RouteResult, new_hash: str) -> Ed
     counts = outbox.state_counts(ctx.conn, kind="FOLLOWUP", followup_id=followup_id)
     dispatched = counts.get("CLAIMED", 0) + counts.get("DONE", 0)
     if new_kind == "followup":
+        handed = _stand_in_edited(ctx, followup_id, route_result)
+        if handed is not None:
+            return ctx.result(
+                "withdrawn", new_kind, "a follow-up standing in for another edited",
+                alert_ids=handed.alert_ids, skipped=handed.skipped,
+            )
         signals_repo.update_followup_on_edit(
             ctx.conn,
             channel_id=ctx.channel_id,
             message_id=ctx.message_id,
             followup=route_result.followup,
         )
-        raised: tuple[int, ...] = ()
+        parts: list[str] = []
         if dispatched:
+            parts.append(
+                f"follow-up {followup_id} was edited to {_describe(route_result)} after "
+                f"{dispatched} worker(s) had taken it; what they did is not undone."
+            )
+        signal_id = None
+        for other in relay_repo.stand_ins_of(ctx.conn, followup_id):
+            # The same instruction about the signal traded instead: with both
+            # channels read only a copy of this one, so it says what this one
+            # says now (final fix round 8, R8-2).
+            other_counts = outbox.state_counts(ctx.conn, kind="FOLLOWUP", followup_id=other)
+            if set(other_counts) <= {"SKIPPED"}:
+                continue  # withdrawn already
+            signals_repo.restate_followup(
+                ctx.conn, followup_id=other, followup=route_result.followup
+            )
+            about = relay_repo.signal_for_followup(ctx.conn, followup_id=other)
+            logger.info(
+                "follow-up %s, standing in for follow-up %s about signal %s, restated as %s",
+                other,
+                followup_id,
+                about,
+                route_result.followup.op.value,
+            )
+            taken = other_counts.get("CLAIMED", 0) + other_counts.get("DONE", 0)
+            if taken:
+                parts.append(
+                    f"Follow-up {other}, the same instruction about signal {about}, which "
+                    f"trades that call instead, was changed with it after {taken} worker(s) had "
+                    "taken it; what they did is not undone."
+                )
+                signal_id = signal_id or about
+        asked = relay_repo.handed_over(ctx.conn, followup_id)
+        if asked is not None:
+            parts.append(
+                f"Follow-up {followup_id} was edited; {_now_says(route_result)}. It was handed "
+                f"to you to apply by hand on signal {asked.signal_id} (alert #{asked.alert_id}): "
+                "if you applied it, review that."
+            )
+            signal_id = signal_id or asked.signal_id
+        raised: tuple[int, ...] = ()
+        if parts:
             raised = (
                 ctx.alert(
-                    "WARNING",
-                    FOLLOWUP_EDITED_AFTER_DISPATCH,
-                    f"follow-up {followup_id} was edited to {_describe(route_result)} after "
-                    f"{dispatched} worker(s) had taken it; what they did is not undone.",
+                    "WARNING", FOLLOWUP_EDITED_AFTER_DISPATCH, " ".join(parts),
+                    signal_id=signal_id,
                 ),
             )
         return ctx.result("followup_edited", new_kind, _describe(route_result), alert_ids=raised)
@@ -2316,16 +2375,114 @@ def _unqueued_instruction(route_result: RouteResult) -> str:
 def _withdraw_followup(
     ctx: _Ctx, followup_id: int, *, code: str, via: str, then: str = ""
 ) -> _Partial:
+    """Follow-up `followup_id` withdrawn by its poster (`via`): its queued
+    instructions skipped, with one WARNING (`code`). And (final fix round 8):
+
+    - the follow-ups standing in for it about the signal traded in place of
+      its call (`relay_repo.stand_ins_of`, R8-2) are withdrawn with it --
+      with both channels read they were only its copies; the alert names
+      them and that signal;
+    - when it stood in for another one whose own post still gives the
+      instruction on a channel this watch reads, that one acts in its
+      place now (`relay_repo.hand_back`, R8-3), and the alert says so;
+    - when its instruction was handed to the user to carry out by hand
+      (`relay_repo.handed_over`), the alert says to review that."""
+    conn = ctx.conn
+    asked = relay_repo.handed_over(conn, followup_id)
     skipped = outbox.skip_queued(
-        ctx.conn, kind="FOLLOWUP", followup_id=followup_id, reason=f"follow-up withdrawn: {via}"
+        conn, kind="FOLLOWUP", followup_id=followup_id, reason=f"follow-up withdrawn: {via}"
     )
-    counts = outbox.state_counts(ctx.conn, kind="FOLLOWUP", followup_id=followup_id)
+    counts = outbox.state_counts(conn, kind="FOLLOWUP", followup_id=followup_id)
     dispatched = counts.get("CLAIMED", 0) + counts.get("DONE", 0)
+    detail = (
+        f"follow-up {followup_id} withdrawn ({via}): {skipped} queued instruction(s) "
+        f"skipped; {dispatched} already taken by a worker, which is not undone."
+    )
+    signal_id = None
+    total = skipped
+    for other in relay_repo.stand_ins_of(conn, followup_id):
+        other_skipped = outbox.skip_queued(
+            conn, kind="FOLLOWUP", followup_id=other,
+            reason=f"follow-up withdrawn: it stood in for follow-up {followup_id}, {via}",
+        )
+        other_counts = outbox.state_counts(conn, kind="FOLLOWUP", followup_id=other)
+        other_taken = other_counts.get("CLAIMED", 0) + other_counts.get("DONE", 0)
+        if not other_skipped and not other_taken:
+            continue  # withdrawn already
+        channel_id, message_id = conn.execute(
+            "SELECT channel_id, message_id FROM followups WHERE followup_id = ?", (other,)
+        ).fetchone()
+        about = relay_repo.signal_for_followup(conn, followup_id=other)
+        row = conn.execute("SELECT * FROM signals WHERE signal_id = ?", (about,)).fetchone()
+        traded = row is not None and relay_repo.carries(conn, row)
+        detail += (
+            f" Follow-up {other} (message {message_id} on channel {channel_id}) gives the same "
+            f"instruction about signal {about}"
+            + (", which trades that call instead" if traded else "")
+            + f": it is withdrawn with it, {other_skipped} queued instruction(s) skipped; "
+            f"{other_taken} already taken by a worker, which is not undone."
+        )
+        total += other_skipped
+        if traded or signal_id is None:
+            signal_id = about  # the signal traded, when one is
+    handed = relay_repo.hand_back(conn, followup_id=followup_id, read_channels=ctx.read_channels)
+    if handed is not None:
+        detail += _handed_back(handed)
+        signal_id = handed.signal_id
+    if asked is not None:
+        detail += (
+            f" It was handed to you to apply by hand on signal {asked.signal_id} (alert "
+            f"#{asked.alert_id}), and its poster withdrew it: if you applied it, review that."
+        )
+        signal_id = signal_id or asked.signal_id
+    alert = ctx.alert("WARNING", code, f"{detail}{then}", signal_id=signal_id)
+    return _Partial(alert_ids=(alert,), skipped=total)
+
+
+def _handed_back(handed: relay_repo.HandBack) -> str:
+    """The sentence saying `relay_repo.hand_back` gave the instruction back
+    to the post that still gives it (final fix round 8, R8-3)."""
+    return (
+        f" The same instruction still stands in message {handed.message_id} on channel "
+        f"{handed.channel_id} (follow-up {handed.followup_id}), on a channel this program "
+        f"reads: it acts on signal {handed.signal_id} in this one's place now, "
+        f"{handed.queued} instruction(s) queued."
+    )
+
+
+def _stand_in_edited(
+    ctx: _Ctx, followup_id: int, route_result: RouteResult
+) -> _Partial | None:
+    """Follow-up `followup_id`'s post was edited into another instruction.
+    When it stands in for another one whose own post still gives the
+    instruction on a channel read (`relay_repo.hand_back`), with both
+    channels read this post was only a copy of that one, whose instruction
+    is NOT changed by guess: that one acts on the signal traded now, this
+    one's instructions are skipped, and a `FOLLOWUP_COPY_CHANGED` WARNING
+    says so (final fix round 8, R8-3). None otherwise, changing nothing."""
+    handed = relay_repo.hand_back(
+        ctx.conn, followup_id=followup_id, read_channels=ctx.read_channels
+    )
+    if handed is None:
+        return None
+    skipped = outbox.skip_queued(
+        ctx.conn, kind="FOLLOWUP", followup_id=followup_id,
+        reason="follow-up withdrawn: edited, while the one it stood in for still stands",
+    )
+    signals_repo.update_followup_on_edit(
+        ctx.conn, channel_id=ctx.channel_id, message_id=ctx.message_id,
+        followup=route_result.followup,
+    )
     alert = ctx.alert(
         "WARNING",
-        code,
-        f"follow-up {followup_id} withdrawn ({via}): {skipped} queued instruction(s) "
-        f"skipped; {dispatched} already taken by a worker, which is not undone.{then}",
+        FOLLOWUP_COPY_CHANGED,
+        f"message {ctx.message_id} on channel {ctx.channel_id}, follow-up {followup_id}, was "
+        f"edited; {_now_says(route_result)}. It stood in for follow-up {handed.followup_id}, "
+        f"and was NOT applied as edited: its {skipped} queued instruction(s) were skipped."
+        + _handed_back(handed)
+        + f" Follow-up {handed.followup_id} was NOT changed. If the poster changed or "
+        "withdrew the instruction, review it by hand.",
+        signal_id=handed.signal_id,
     )
     return _Partial(alert_ids=(alert,), skipped=skipped)
 

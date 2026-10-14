@@ -384,6 +384,10 @@ OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF = "OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF"
 #: (final fix round 6, R6-1; `followup_after_channel_off`).
 FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL = "FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL"
 
+#: The words of a `FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL` WARNING that hand an
+#: instruction to the user to carry out by hand (`handed_over` looks for them).
+BY_HAND = "apply it by hand"
+
 #: How old a signal may be and still be traded when the caller gives no
 #: `max_signal_age_seconds` (`domain.market.Policy`'s default, 120 s).
 DEFAULT_MAX_SIGNAL_AGE_SECONDS = Policy().max_signal_age_seconds
@@ -3099,6 +3103,8 @@ class _Reported:
     alert_id: int
     channel_id: int
     message_id: int
+    #: The signal the alert names (`handed_over` only).
+    signal_id: int | None = None
 
 
 def _reported(
@@ -3255,7 +3261,16 @@ def _say_about_channel_off(
         {} if stand_in is None
         else outbox.state_counts(conn, kind="FOLLOWUP", followup_id=stand_in.followup_id)
     )
-    if stand_in is not None and set(counts) == {"SKIPPED"}:
+    withdrawn = withdrawn_by_poster(conn, held.followup_id)
+    if withdrawn is not None:
+        # Its poster withdrew it -- before the switch-off, or since: with both
+        # channels read the message is a copy of an instruction withdrawn
+        # (final fix round 8, R8-4). Never "apply it by hand".
+        detail += (
+            f" Message {held.message_id} was withdrawn by its poster (alert #{withdrawn}). "
+            "Nothing to do."
+        )
+    elif stand_in is not None and set(counts) == {"SKIPPED"}:
         # The one about the call traded instead was withdrawn since -- its
         # post deleted or edited away: nothing acts on it now. A copy of it,
         # or of the held one, reported already is the same instruction: by
@@ -3270,7 +3285,7 @@ def _say_about_channel_off(
             f" Signal {admitted} trades that call instead; the same instruction was given "
             f"about it as follow-up {stand_in.followup_id} (message {stand_in.message_id} on "
             f"channel {stand_in.channel_id}), which was withdrawn since. If the instruction is "
-            f"still meant for signal {admitted}, apply it by hand"
+            f"still meant for signal {admitted}, {BY_HAND}"
             + (" -- once, not once for each message." if first is not None else ".")
         )
     elif stand_in is not None:
@@ -3288,7 +3303,7 @@ def _say_about_channel_off(
         if admitted is not None:
             detail += (
                 f" Signal {admitted} trades that call instead: if the instruction was meant "
-                f"for signal {admitted}, apply it by hand"
+                f"for signal {admitted}, {BY_HAND}"
                 + (" -- once, not once for each message." if reported is not None else ".")
             )
         else:
@@ -3300,9 +3315,174 @@ def _say_about_channel_off(
         code=FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL,
         channel_id=channel_cfg.channel_id,
         message_id=message_id,
-        signal_id=admitted if admitted is not None else signal_id,
+        signal_id=admitted if admitted is not None and withdrawn is None else signal_id,
         detail=detail,
     )
+
+
+def withdrawn_by_poster(conn: sqlite3.Connection, followup_id: int) -> int | None:
+    """The alert that said follow-up `followup_id` was withdrawn by its
+    poster -- its own post deleted or edited into no instruction, and every
+    instruction of it skipped by that (`edits_repo`'s `FOLLOWUP_DELETED` or
+    `FOLLOWUP_RETRACTED_BY_EDIT`) -- or None (final fix round 8, R8-4)."""
+    from xaucopier.store import edits_repo  # edits_repo imports this module
+
+    post = conn.execute(
+        "SELECT f.channel_id, f.message_id, m.deleted_at_utc, m.kind FROM followups f "
+        "JOIN messages m ON m.channel_id = f.channel_id AND m.message_id = f.message_id "
+        "WHERE f.followup_id = ?",
+        (followup_id,),
+    ).fetchone()
+    if post is None or (post["deleted_at_utc"] is None and post["kind"] == "followup"):
+        return None
+    if set(outbox.state_counts(conn, kind="FOLLOWUP", followup_id=followup_id)) != {"SKIPPED"}:
+        return None
+    row = conn.execute(
+        "SELECT alert_id FROM alerts WHERE code IN (?, ?) AND channel_id = ? AND message_id = ? "
+        "ORDER BY alert_id LIMIT 1",
+        (
+            edits_repo.FOLLOWUP_DELETED,
+            edits_repo.FOLLOWUP_RETRACTED_BY_EDIT,
+            post["channel_id"],
+            post["message_id"],
+        ),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def stand_ins_of(conn: sqlite3.Connection, followup_id: int) -> list[int]:
+    """The follow-ups standing in for follow-up `followup_id`
+    (`followups.instead_of_followup_id`, R6-1) -- each stored as the same
+    instruction about the signal a start admitted in place of the call it
+    is about -- and, after another admission, the ones standing in for
+    those in turn; oldest first (final fix round 8, R8-2). With both
+    channels read each of them is only a copy of `followup_id`'s
+    instruction: when its poster changes or withdraws that, `edits_repo`
+    changes or withdraws them with it."""
+    found: list[int] = []
+    todo = [followup_id]
+    while todo:
+        held = todo.pop(0)
+        for (other,) in conn.execute(
+            "SELECT followup_id FROM followups WHERE edit_seq = 0 AND instead_of_followup_id = ? "
+            "ORDER BY followup_id",
+            (held,),
+        ).fetchall():
+            if other != followup_id and other not in found:
+                found.append(other)
+                todo.append(other)
+    return found
+
+
+@dataclass(frozen=True, slots=True)
+class HandBack:
+    """`hand_back`'s answer: the follow-up that acts on `signal_id` now."""
+
+    followup_id: int
+    channel_id: int
+    message_id: int
+    signal_id: int
+    #: Its instructions waiting.
+    queued: int
+
+
+def hand_back(
+    conn: sqlite3.Connection, *, followup_id: int, read_channels: Collection[int] | None
+) -> HandBack | None:
+    """Follow-up `followup_id`, standing in for a held one about a call whose
+    channel was switched off (`followups.instead_of_followup_id`, R6-1), no
+    longer gives its instruction -- its own post deleted, edited away, or
+    edited into another instruction -- while the instruction it stood in
+    for still stands in its own post, on a channel this watch reads (the
+    channel switched back on: `read_channels`; None, not known: never), not
+    withdrawn (instructions waiting, none taken). With both channels read
+    `followup_id`'s post was only a copy of that one, which still acts: so
+    that one acts on the signal `followup_id` acted on now -- its target
+    moved there, as a start moves a forward's (`_adopt_followup_copies`)
+    (final fix round 8, R8-3). After two admissions the one it stands in
+    for may be on a channel switched off; then the one THAT stands in for,
+    and so on. None, changing nothing, when there is none such or when
+    `followup_id` acted on no signal still traded."""
+    row = conn.execute(
+        "SELECT instead_of_followup_id FROM followups WHERE followup_id = ?", (followup_id,)
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    signal_id = signal_for_followup(conn, followup_id=followup_id)
+    if signal_id is None or not carries(conn, _signal_row(conn, signal_id)):
+        return None
+    signal = _signal_row(conn, signal_id)
+    held_id, seen = row[0], {followup_id}
+    while held_id is not None and held_id not in seen:
+        seen.add(held_id)
+        held = conn.execute(
+            "SELECT f.*, m.deleted_at_utc, m.kind FROM followups f "
+            "JOIN messages m ON m.channel_id = f.channel_id AND m.message_id = f.message_id "
+            "WHERE f.followup_id = ?",
+            (held_id,),
+        ).fetchone()
+        if held is None:
+            return None
+        counts = outbox.state_counts(conn, kind="FOLLOWUP", followup_id=held_id)
+        about = signal_for_followup(conn, followup_id=held_id)
+        if (
+            held["deleted_at_utc"] is None
+            and held["kind"] == "followup"
+            and read_channels is not None
+            and held["channel_id"] in read_channels
+            and counts.get("QUEUED")
+            and not counts.get("CLAIMED")
+            and not counts.get("DONE")
+            and about is not None
+            and switched_off(conn, _signal_row(conn, about))
+        ):
+            own = (held["channel_id"], held["reply_to_message_id"]) == (
+                signal["channel_id"],
+                signal["message_id"],
+            )
+            path = (
+                REPLY_PATH if own
+                else COPY_REPLY_PATH if held["resolution_path"] == COPY_REPLY_PATH
+                else RELAY_REPLY_PATH
+            )
+            conn.execute(
+                "UPDATE followups SET target_signal_id = ?, resolution_path = ? "
+                "WHERE followup_id = ?",
+                (signal_id, path, held_id),
+            )
+            logger.info(
+                "follow-up %s no longer gives the instruction it stood in for; follow-up %s "
+                "(channel %s message %s) still does, on a channel read: it acts on signal %s now",
+                followup_id,
+                held_id,
+                held["channel_id"],
+                held["message_id"],
+                signal_id,
+            )
+            return HandBack(
+                held_id, held["channel_id"], held["message_id"], signal_id, counts["QUEUED"]
+            )
+        held_id = held["instead_of_followup_id"]
+    return None
+
+
+def handed_over(conn: sqlite3.Connection, followup_id: int) -> _Reported | None:
+    """The first `FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL` WARNING that handed
+    follow-up `followup_id`'s instruction -- read in a copy of it, or of one
+    standing in for it -- to the user to carry out by hand (`BY_HAND`), with
+    the signal it named; or None. When its poster later changes or withdraws
+    it, `edits_repo` says to review what was done by hand (final fix round
+    8, R8-2)."""
+    ids = (followup_id, *stand_ins_of(conn, followup_id))
+    marks = ", ".join("?" for _ in ids)
+    row = conn.execute(
+        "SELECT a.alert_id, a.channel_id, a.message_id, a.signal_id FROM alerts a "
+        "JOIN messages m ON m.channel_id = a.channel_id AND m.message_id = a.message_id "
+        f"WHERE a.code = ? AND m.relay_of_followup_id IN ({marks}) AND a.detail LIKE ? "
+        "ORDER BY a.alert_id LIMIT 1",
+        (FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL, *ids, f"%{BY_HAND}%"),
+    ).fetchone()
+    return None if row is None else _Reported(row[0], row[1], row[2], row[3])
 
 
 # -- helpers -------------------------------------------------------------------

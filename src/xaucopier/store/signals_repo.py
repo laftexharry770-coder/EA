@@ -325,6 +325,25 @@ def update_followup_on_edit(
     )
 
 
+def restate_followup(conn: sqlite3.Connection, *, followup_id: int, followup: FollowUp) -> None:
+    """Give follow-up `followup_id` the instruction of `followup` -- another
+    post's, edited by its poster -- keeping its own message, reply and time:
+    the one standing in for that post's follow-up (final fix round 8, R8-2;
+    `edits_repo`)."""
+    row = conn.execute(
+        "SELECT parsed_json FROM followups WHERE followup_id = ?", (followup_id,)
+    ).fetchone()
+    stated = json.loads(followup_to_json(followup))
+    if row is not None and row["parsed_json"]:
+        own = json.loads(row["parsed_json"])
+        stated["posted_at_utc"] = own.get("posted_at_utc", stated["posted_at_utc"])
+        stated["reply_to_message_id"] = own.get("reply_to_message_id")
+    conn.execute(
+        "UPDATE followups SET op = ?, parsed_json = ? WHERE followup_id = ?",
+        (followup.op.value, json.dumps(stated), followup_id),
+    )
+
+
 def get_followup_id(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> int | None:
     row = conn.execute(
         "SELECT followup_id FROM followups "

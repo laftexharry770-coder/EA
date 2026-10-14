@@ -3481,3 +3481,284 @@ def test_a_reply_after_two_admissions_stands_in_for_the_one_switched_off_last(
     assert _q(conn, "SELECT instead_of_followup_id FROM followups WHERE followup_id = 3") == [(2,)]
     assert _acting_on(conn, 3) == [(V, 4005)]
 
+def _instructions(conn, signal_id: int) -> list[tuple]:  # noqa: F811
+    """The instructions waiting on `signal_id`: (follow-up, op, QUEUED rows)
+    of every follow-up acting on it with one queued."""
+    found = []
+    for followup_id, op in _q(conn, "SELECT followup_id, op FROM followups ORDER BY 1"):
+        queued = sum(1 for _, state in _followup_rows(conn, followup_id) if state == "QUEUED")
+        if queued and relay_repo.signal_for_followup(conn, followup_id=followup_id) == signal_id:
+            found.append((followup_id, op, queued))
+    return found
+
+
+def _the_relay_changes_its_close_half(conn, how: str, *, seconds: float = 100) -> None:  # noqa: F811
+    if how == "deleted":
+        edits_repo.apply_deletion(
+            conn, channel_cfg=RELAY, message_id=RELAY_CLOSE, now_utc=_at(seconds),
+            accounts=ACCOUNTS, detected_by="event", read_channels=(V, R),
+        )
+    else:
+        edits_repo.apply_edit(
+            conn, channel_cfg=RELAY, message_id=RELAY_CLOSE,
+            text="Close all now" if how == "close all" else "good morning traders",
+            posted_at_utc=_at(60), edit_date_utc=_at(seconds), reply_to_message_id=RELAY_CALL,
+            now_utc=_at(seconds), accounts=ACCOUNTS, detected_by="event", read_channels=(V, R),
+        )
+    conn.commit()
+
+
+@SWITCHED
+def test_the_relays_edit_of_an_instruction_from_before_the_switch_off_reaches_its_stand_in(
+    conn, switched  # noqa: F811
+):
+    """The re-check's p3, edit (final fix round 8, R8-2). The relay's "close
+    half" (follow-up 1) and the VIP's forward of it; the start with the
+    relay switched off adopts the forward as follow-up 2, the instruction
+    about signal 2 in follow-up 1's place. The relay, back on, edits its
+    post into "close all": with both channels read that is ONE instruction,
+    "close all", on the call -- and so it is on signal 2, the call traded:
+    follow-up 2 takes the corrected instruction, never two."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _fwd(conn)
+    if switched:
+        _relay_off_then_back_on(conn, off_at=80, on_at=90)
+    traded = 2 if switched else 1
+
+    _the_relay_changes_its_close_half(conn, "close all")
+
+    assert _claimable(conn) == [traded]
+    assert _instructions(conn, traded) == [(2 if switched else 1, "close_all", 2)]
+    if switched:
+        (json_,) = _q(conn, "SELECT parsed_json FROM followups WHERE followup_id = 2")
+        assert '"op": "close_all"' in json_[0] and '"reply_to_message_id": null' in json_[0]
+
+
+@SWITCHED
+@pytest.mark.parametrize("how", ["deleted", "edited away"])
+def test_the_relays_withdrawal_of_an_instruction_from_before_the_switch_off_withdraws_its_stand_in(
+    conn, switched, how  # noqa: F811
+):
+    """The re-check's p3, delete (R8-2). As above, but the relay, back on,
+    deletes its "close half" or edits it into chatter: with both channels
+    read the instruction is withdrawn -- and so is follow-up 2, the one
+    acting on signal 2 in its place. The alert says so, naming signal 2."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _fwd(conn)
+    if switched:
+        _relay_off_then_back_on(conn, off_at=80, on_at=90)
+    traded = 2 if switched else 1
+
+    _the_relay_changes_its_close_half(conn, how)
+
+    assert _claimable(conn) == [traded]
+    assert _instructions(conn, traded) == []
+    code = "FOLLOWUP_DELETED" if how == "deleted" else "FOLLOWUP_RETRACTED_BY_EDIT"
+    (alert,) = [a for a in _alerts(conn) if a[1] == code]
+    flat = " ".join(alert[5].split())
+    assert flat.startswith("follow-up 1 withdrawn"), flat
+    if switched:
+        assert alert[4] == 2, alert
+        assert (
+            f"Follow-up 2 (message {FWD} on channel {V}) gives the same instruction about "
+            f"signal 2, which trades that call instead: it is withdrawn with it, 2 queued "
+            f"instruction(s) skipped; 0 already taken by a worker, which is not undone."
+        ) in flat, flat
+        assert _followup_rows(conn, 2) == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+
+
+def test_the_relays_withdrawal_reaches_the_stand_in_of_its_stand_in(conn):  # noqa: F811
+    """R8-2 after two admissions: the other channel's "close half" stands in
+    for the relay's about signal 2, and the VIP's for the other channel's
+    about signal 3, the call traded. The relay, back on, deletes its post:
+    with every channel read the one instruction is withdrawn, so both
+    stand-ins are, and nothing closes half on signal 3."""
+    _two_admissions_with_instructions(conn)
+    vip = _ingest(conn, VIP, 4005, CLOSE_HALF, posted=_at(70), reply_to=VIP_COPY)
+    assert vip.followup_id == 3, vip
+
+    _the_relay_changes_its_close_half(conn, "deleted")
+
+    assert _claimable(conn) == [3]
+    assert _instructions(conn, 3) == []
+    (alert,) = [a for a in _alerts(conn) if a[1] == "FOLLOWUP_DELETED"]
+    assert alert[4] == 3, alert
+    assert "Follow-up 3 (message 4005 on channel" in alert[5], alert
+
+
+def test_the_relays_edit_reaches_the_stand_in_of_its_stand_in(conn):  # noqa: F811
+    """R8-2 after two admissions, the edit: the VIP's stand-in acting on
+    signal 3 takes the relay's corrected instruction."""
+    _two_admissions_with_instructions(conn)
+    assert _ingest(conn, VIP, 4005, CLOSE_HALF, posted=_at(70), reply_to=VIP_COPY).followup_id == 3
+
+    _the_relay_changes_its_close_half(conn, "close all")
+
+    assert _instructions(conn, 3) == [(3, "close_all", 2)]
+
+
+def _the_vip_changes_its_forward(conn, how: str, *, read, seconds: float = 100) -> None:  # noqa: F811
+    if how == "deleted":
+        edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=FWD, now_utc=_at(seconds), accounts=ACCOUNTS,
+            detected_by="event", read_channels=read,
+        )
+    else:
+        edits_repo.apply_edit(
+            conn, channel_cfg=VIP, message_id=FWD,
+            text="Close all now" if how == "close all" else "good morning traders",
+            posted_at_utc=_at(70), edit_date_utc=_at(seconds), reply_to_message_id=None,
+            now_utc=_at(seconds), accounts=ACCOUNTS, detected_by="event", read_channels=read,
+        )
+    conn.commit()
+
+
+@SWITCHED
+@pytest.mark.parametrize("how", ["deleted", "edited away", "close all"])
+def test_the_vips_stand_in_withdrawn_hands_the_instruction_back_to_the_relays_post(
+    conn, switched, how  # noqa: F811
+):
+    """The re-check's p3b (final fix round 8, R8-3). The VIP's forward of
+    the relay's "close half" stands in for it about signal 2; the relay is
+    switched back on. The VIP then deletes its forward, edits it into
+    chatter or into "close all", while the relay's post still says "close
+    half": with both channels read the forward was only a copy of it, and
+    "close half" still acts on the call. So it does on signal 2 -- the
+    relay's own follow-up 1 acts on it now -- and the alert says so."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _fwd(conn)
+    if switched:
+        _relay_off_then_back_on(conn, off_at=80, on_at=90)
+    traded = 2 if switched else 1
+
+    _the_vip_changes_its_forward(conn, how, read=(V, R))
+
+    assert _claimable(conn) == [traded]
+    assert _instructions(conn, traded) == [(1, "close_half", 2)]
+    if switched:
+        assert relay_repo.signal_for_followup(conn, followup_id=1) == 2
+        assert _followup_rows(conn, 2) == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+        (alert,) = [
+            a for a in _alerts(conn)
+            if a[1] in ("FOLLOWUP_DELETED", "FOLLOWUP_RETRACTED_BY_EDIT", "FOLLOWUP_COPY_CHANGED")
+        ]
+        assert alert[4] == 2, alert
+        flat = " ".join(alert[5].split())
+        assert (
+            f"The same instruction still stands in message {RELAY_CLOSE} on channel {R} "
+            f"(follow-up 1), on a channel this program reads: it acts on signal 2 in this one's "
+            f"place now, 2 instruction(s) queued."
+        ) in flat, flat
+
+
+@pytest.mark.parametrize("how", ["deleted", "edited away"])
+def test_the_vips_stand_in_withdrawn_while_the_relay_is_off_is_withdrawn(
+    conn, how  # noqa: F811
+):
+    """R8-3's other side: while the relay is still switched off its post
+    counts for nothing, so the VIP withdrawing its forward withdraws the
+    instruction about signal 2 -- nothing is handed back."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _fwd(conn)
+    _restart(conn, on=(VIP,), seconds=80)
+
+    _the_vip_changes_its_forward(conn, how, read=(V,))
+
+    assert _claimable(conn) == [2]
+    assert _instructions(conn, 2) == []
+    assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
+    assert not any("The same instruction still stands" in a[5] for a in _alerts(conn))
+
+
+@pytest.mark.parametrize("how", ["deleted", "edited away"])
+def test_a_forward_of_an_instruction_its_poster_withdrew_is_nothing_to_do(
+    conn, how  # noqa: F811
+):
+    """The re-check's p5 and fuzz seed 70665 (final fix round 8, R8-4). The
+    relay says "close half" and withdraws it -- deletes it, or edits it into
+    chatter -- while both channels are read. A start with the relay switched
+    off admits the VIP's copy as signal 2; the VIP then forwards the relay's
+    post. With both channels read that is a copy of an instruction
+    withdrawn: the WARNING says so and ends "Nothing to do" -- never "apply
+    it by hand"."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _the_relay_changes_its_close_half(
+        conn, "deleted" if how == "deleted" else "chatter", seconds=62
+    )
+    (withdrawal,) = _q(
+        conn, "SELECT alert_id FROM alerts WHERE code IN "
+        "('FOLLOWUP_DELETED', 'FOLLOWUP_RETRACTED_BY_EDIT')",
+    )
+    _restart(conn, on=(VIP,), seconds=65)
+
+    copy = _fwd(conn)
+
+    assert copy.relay_of_followup_id == 1, copy
+    assert _instructions(conn, 2) == []
+    (alert,) = [a for a in _alerts(conn) if a[1] == ABOUT_OFF]
+    flat = " ".join(alert[5].split())
+    assert flat.endswith(
+        f"Message {RELAY_CLOSE} was withdrawn by its poster (alert #{withdrawal[0]}). "
+        "Nothing to do."
+    ), flat
+    assert relay_repo.BY_HAND not in flat
+    assert alert[4] == 1, alert
+
+
+def test_a_forward_of_an_instruction_withdrawn_once_back_on_is_nothing_to_do(
+    conn,  # noqa: F811
+):
+    """R8-4 with R8-2: the VIP's forward stood in for the relay's "close
+    half" about signal 2; the relay, back on, deletes its post -- the
+    forward is withdrawn with it. The VIP forwarding the relay's post again
+    is a copy of an instruction its poster withdrew: nothing to do."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _fwd(conn)
+    _relay_off_then_back_on(conn, off_at=80, on_at=90)
+    _the_relay_changes_its_close_half(conn, "deleted")
+
+    copy = _fwd(conn, message_id=FWD2, seconds=110)
+
+    assert copy.followup_id is None, copy
+    assert _instructions(conn, 2) == []
+    (alert,) = [a for a in _alerts(conn) if a[1] == ABOUT_OFF]
+    assert " ".join(alert[5].split()).endswith("was withdrawn by its poster (alert #2). Nothing to do.")
+
+
+@pytest.mark.parametrize("how", ["deleted", "close all"])
+def test_a_change_to_an_instruction_handed_over_by_hand_says_to_review_it(
+    conn, how  # noqa: F811
+):
+    """The by-hand side of R8-2 (round 7's open item, fuzz seed 70802). The
+    relay's "close half" was read before the start that switched it off;
+    the VIP's forward of it, read after that start, was not applied and the
+    user was told to apply it by hand on signal 2. The relay, back on, then
+    deletes its post or edits it into "close all": the alert names that
+    request and says to review what was done by hand on signal 2."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _restart(conn, on=(VIP,), seconds=65)
+    assert _fwd(conn).relay_of_followup_id == 1
+    (asked,) = [a for a in _alerts(conn) if a[1] == ABOUT_OFF]
+    assert relay_repo.BY_HAND in asked[5]
+    (asked_id,) = _q(conn, "SELECT alert_id FROM alerts WHERE code = ?", ABOUT_OFF)[0]
+    _restart(conn, on=(VIP, RELAY), seconds=80)
+
+    _the_relay_changes_its_close_half(conn, how)
+
+    code = "FOLLOWUP_DELETED" if how == "deleted" else "FOLLOWUP_EDITED_AFTER_DISPATCH"
+    (alert,) = [a for a in _alerts(conn) if a[1] == code]
+    flat = " ".join(alert[5].split())
+    assert alert[4] == 2, alert
+    assert (
+        f"It was handed to you to apply by hand on signal 2 (alert #{asked_id})"
+    ) in flat, flat
+    assert "review that" in flat, flat
+    if how == "close all":
+        assert "it now says 'close the whole trade'" in flat, flat
