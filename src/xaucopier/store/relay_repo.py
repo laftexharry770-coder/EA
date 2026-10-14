@@ -3447,6 +3447,10 @@ class HandBack:
     signal_id: int
     #: Its instructions waiting.
     queued: int
+    #: It is on the channel of the follow-up it was handed back from, which
+    #: stood in for it: two posts of one channel a start took for one
+    #: instruction, not a copy of it (`hand_back`).
+    merged: bool = False
 
 
 def hand_back(
@@ -3454,7 +3458,7 @@ def hand_back(
     *,
     followup_id: int,
     read_channels: Collection[int] | None,
-    own_channel: bool = True,
+    edited_into: FollowUp | None = None,
 ) -> HandBack | None:
     """Follow-up `followup_id`, standing in for a held one about a call whose
     channel was switched off (`followups.instead_of_followup_id`, R6-1), no
@@ -3470,14 +3474,20 @@ def hand_back(
     moved there, as a start moves a forward's (`_adopt_followup_copies`)
     (final fix round 8, R8-3). After two admissions the one it stands in
     for may be on a channel switched off; then the one THAT stands in for,
-    and so on. One it stands in for on its own channel -- two of one
-    channel's instructions a start merged ("never two", final fix round 6)
-    -- is no copy relation: with both channels read the other one still
-    acts when this one is withdrawn, so it is handed back to all the same;
-    but not for an edit into another instruction (`own_channel` False),
-    which with both channels read changes only this one. None, changing
-    nothing, when there is none such or when `followup_id` acted on no
-    signal still traded."""
+    and so on.
+
+    One it stands in for on its own channel -- two posts of one channel a
+    start took for one instruction ("never two", final fix round 6) -- is
+    no copy of it: with both channels read they are two instructions
+    (`HandBack.merged`). When `followup_id` is withdrawn the other one still
+    acts, so it is handed back all the same; when `followup_id`'s post is
+    edited into another instruction (`edited_into`) the other one, still
+    saying its own, acts again too -- beside `followup_id`, which says the
+    new one: the caller keeps it. Edited into the same instruction in other
+    words, the two stay the one the start took them for: None.
+
+    None, changing nothing, when there is none such or when `followup_id`
+    acted on no signal still traded."""
     row = conn.execute(
         "SELECT instead_of_followup_id FROM followups WHERE followup_id = ?", (followup_id,)
     ).fetchone()
@@ -3487,17 +3497,23 @@ def hand_back(
     if signal_id is None or not carries(conn, _signal_row(conn, signal_id)):
         return None
     signal = _signal_row(conn, signal_id)
-    held_id, seen = row[0], {followup_id}
-    follower = conn.execute(
+    first = conn.execute("SELECT * FROM followups WHERE followup_id = ?", (row[0],)).fetchone()
+    (own_channel,) = conn.execute(
         "SELECT channel_id FROM followups WHERE followup_id = ?", (followup_id,)
     ).fetchone()
+    merged = first is not None and first["channel_id"] == own_channel
+    if merged and edited_into is not None and not _other_instruction(
+        edited_into.op.value, json.loads(signals_repo.followup_to_json(edited_into)), first
+    ):
+        return None  # the same instruction still: the two stay one
+    held_id, seen = row[0], {followup_id}
     while held_id is not None and held_id not in seen:
         seen.add(held_id)
         held = conn.execute(
             "SELECT * FROM followups WHERE followup_id = ?", (held_id,)
         ).fetchone()
-        if held is None or (not own_channel and held["channel_id"] == follower["channel_id"]):
-            return None  # its own channel's: no copy of it (`stand_ins_of`)
+        if held is None:
+            return None
         counts = outbox.state_counts(conn, kind="FOLLOWUP", followup_id=held_id)
         about = signal_for_followup(conn, followup_id=held_id)
         if (
@@ -3518,9 +3534,10 @@ def hand_back(
                 signal_id,
             )
             return HandBack(
-                held_id, held["channel_id"], held["message_id"], signal_id, counts["QUEUED"]
+                held_id, held["channel_id"], held["message_id"], signal_id, counts["QUEUED"],
+                merged,
             )
-        held_id, follower = held["instead_of_followup_id"], held
+        held_id = held["instead_of_followup_id"]
     return None
 
 
@@ -3550,10 +3567,17 @@ def _says_other(conn: sqlite3.Connection, followup_id: int, held: sqlite3.Row) -
     (op, parsed) = conn.execute(
         "SELECT op, parsed_json FROM followups WHERE followup_id = ?", (followup_id,)
     ).fetchone()
+    return _other_instruction(op, json.loads(parsed or "{}"), held)
+
+
+def _other_instruction(op: str, parsed: dict, held: sqlite3.Row) -> bool:
+    """Whether the instruction `op` with stored parse `parsed` is another
+    than follow-up `held`'s (a `followups` row): another op, or the same
+    with another price or take profit (R8-3)."""
     if op != held["op"]:
         return True
-    mine, theirs = json.loads(parsed or "{}"), json.loads(held["parsed_json"] or "{}")
-    return any(mine.get(key) != theirs.get(key) for key in ("price_hint", "tp_index_hint"))
+    theirs = json.loads(held["parsed_json"] or "{}")
+    return any(parsed.get(key) != theirs.get(key) for key in ("price_hint", "tp_index_hint"))
 
 
 def _taken(conn: sqlite3.Connection, followup_id: int) -> bool:

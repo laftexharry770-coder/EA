@@ -4115,3 +4115,50 @@ def test_a_channels_own_instruction_a_start_merged_acts_again_when_the_other_is_
             "on a channel this program reads: it acts on signal 2 in this one's place now, 2 "
             "instruction(s) queued."
         ) in " ".join(alert[5].split()), alert
+
+
+@pytest.mark.parametrize("switched", [False, True], ids=["both channels read", "relay switched off"])
+@pytest.mark.parametrize(
+    "text, says",
+    [("Close all now", "close_all"), ("Move SL to entry", "sl_to_be"), ("CLOSE HALF NOW", "close_half")],
+)
+def test_a_channels_own_instruction_a_start_merged_acts_again_when_the_other_says_another(
+    conn, switched, text, says  # noqa: F811
+):
+    """INV-3h seed 132612's edit (final fix round 8). As above, but the VIP
+    edits its reply into another instruction. With both channels read the
+    forward still says "close half" and the reply says the new one: two
+    instructions. So it is after the start: the reply says the new one, and
+    the forward acts on signal 2 again beside it -- never "close half" lost
+    unseen -- with a WARNING naming both. Edited into the same instruction
+    in other words, the two stay the one the start took them for."""
+    _the_vips_forward_read_first_and_its_own_reply(conn)
+    if switched:
+        _restart(conn, on=(VIP,), seconds=100)
+    traded = 2 if switched else 1
+
+    edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=REP, text=text, posted_at_utc=_at(72),
+        edit_date_utc=_at(105), reply_to_message_id=VIP_COPY, now_utc=_at(105),
+        accounts=ACCOUNTS, detected_by="event", read_channels=(V,) if switched else (V, R),
+    )
+    conn.commit()
+
+    merged = switched and says == "close_half"
+    assert _instructions(conn, traded) == (
+        [(2, "close_half", 2)] if merged else [(1, "close_half", 2), (2, says, 2)]
+    )
+    warned = [a for a in _alerts(conn) if a[1] == "FOLLOWUP_EDITED_AFTER_DISPATCH"]
+    if not switched or merged:
+        assert warned == []
+        return
+    (alert,) = warned
+    assert alert[2:5] == (V, REP, 2), alert
+    assert " ".join(alert[5].split()) == (
+        f"Follow-up 2 (message {REP} on channel {V}) was edited; it now says "
+        f"'{'close the whole trade' if says == 'close_all' else 'move the stop loss to the entry price'}'. "
+        f"When this program started it took it for the same instruction as follow-up 1 (message "
+        f"{FWD} on channel {V}), which still says 'close half of the trade': two posts of one "
+        "channel are two instructions, so follow-up 1 acts on signal 2 too now, 2 "
+        "instruction(s) queued. [found by event]"
+    ), alert
