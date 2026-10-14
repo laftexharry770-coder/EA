@@ -244,6 +244,14 @@ missed. Once you have dealt with one, clear it:
   were posted longer ago than a signal may be and still be traded
   (`max_signal_age_seconds` in policy.toml), so they could not have been
   traded anyway. One alert says how many there were. Nothing to do.
+- **FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL** — an instruction (for example
+  "close half") was read that repeats one given about a signal whose
+  channel is switched off, and nothing ties it safely to a trade, so it
+  was **not** carried out. If the alert names the signal traded instead
+  and says the instruction may be meant for it, look at the message: if
+  it is, **apply it by hand** — once, even when several alerts name the
+  same instruction. If the alert says it already acts on that signal,
+  nothing to do.
 - **Any other alert** — copy its two lines and send them to whoever looks
   after xaucopier, then clear it.
 

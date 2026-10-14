@@ -192,6 +192,15 @@ two backfills every existing row keeps every value it had.
   needs it to give the copy's instruction to the call its post carries
   now (``relay_repo.admit_copies_of_switched_off``). NULL when it replies
   to nothing, or was stored before migration 4.
+- ``signals.admitted_from_signal_id``: for a signal watch's start admitted
+  from a post stored as a copy of a signal whose channel is switched off
+  now, that signal (final fix round 6, R6-1) -- the call it trades
+  instead. ``followups.instead_of_followup_id``: for a follow-up that is
+  the instruction about such a signal in place of a held follow-up about
+  the switched-off one (a copy of it adopted at the start, or a reply read
+  later), that held follow-up -- so one held instruction never becomes two
+  about the call traded instead (``relay_repo``). Both NULL otherwise, and
+  on rows stored before migration 4.
 
 - ``channel_off_periods(period_id, channel_id, off_at_utc, on_at_utc)``,
   with the indexes ``idx_channel_off_periods_channel`` and
@@ -348,6 +357,11 @@ _MIGRATION_4: tuple[str, ...] = (
     "ALTER TABLE signals ADD COLUMN promoted_from_signal_id INTEGER",
     "ALTER TABLE signals ADD COLUMN replacement_kind TEXT "
     "CHECK (replacement_kind IN ('promoted', 'posted_again'))",
+    # Final fix round 6 (R6-1): the switched-off signal a signal was admitted
+    # in place of at watch's start, and the held follow-up a follow-up stands
+    # in for about it.
+    "ALTER TABLE signals ADD COLUMN admitted_from_signal_id INTEGER",
+    "ALTER TABLE followups ADD COLUMN instead_of_followup_id INTEGER",
     "CREATE INDEX IF NOT EXISTS idx_messages_fwd_from "
     "ON messages(fwd_from_channel_id, fwd_from_post_id)",
     # Fix round 2 of F28: one row per OFF period of a channel; see the

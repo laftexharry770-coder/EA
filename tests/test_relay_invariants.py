@@ -21,6 +21,15 @@ moves, executed entries and replies:
   closed one), whichever post holds the signal.
 - **INV-3, no double trade.** At every step, no account has more than one
   entry of the call executed, in flight or claimable.
+- **INV-3f, no instruction applied twice** (final fix round 6, R6-1). The
+  relay switched off at a restart never makes more instructions act on
+  the call traded -- with an instruction waiting -- than reading both
+  channels does: the relay's call, the VIP's copy of it and the relay's
+  "close half", then the VIP's forwards of it and its own "close half"
+  replies, near it or long after, stored in any order, with watch
+  restarted at any point with the relay switched off (the relay's posts
+  after that are never read), against the same posts read with no
+  channel switched off. Seeds 110000 + n.
 
 Every scenario uses one call (the same BUY), so "the call" is every
 signal the scenario creates. The seeds are fixed: the suite is
@@ -82,7 +91,7 @@ import pytest
 
 from test_edits import CHATTER_TEXT, DIRECTION_EDIT, SL_EDIT, UNPARSEABLE_EDIT
 from test_relay import ACCOUNTS, CLOSE_HALF, POSTED, RELAY, SIGNAL_TEXT, VIP
-from xaucopier.store import edits_repo, relay_repo
+from xaucopier.store import edits_repo, outbox, relay_repo
 from xaucopier.store.migrations import migrate
 from xaucopier.store.messages_repo import ingest
 
@@ -879,4 +888,143 @@ def test_posts_on_either_side_of_the_window_then_the_first_withdrawn_trade_once(
             small = _shrink(lambda e: bool(_pattern_run(base, e)[0]), events)
             problems, log = _pattern_run(base, small)
             failures.append(_report(f"window pattern ({channels} channel(s))", base, problems, log))
+    assert not failures, "\n\n".join(failures)
+
+
+# -- the relay switched off around its follow-ups (final fix round 6, R6-1) ---
+
+
+def _switch_off_events(rng: random.Random) -> list[tuple]:
+    """The relay's call at +0 s, the VIP's copy at +30 s (by hand or a
+    forward), the relay's "close half" replying to its call, and one to
+    four VIP posts -- a forward of that "close half", or a "close half"
+    replying to its copy -- near it or long after; stored in a random
+    order, with a restart (the relay switched off) at a random place."""
+    relay_close = rng.randint(40, 100)
+    events: list[tuple] = [("relay close", relay_close)]
+    for _ in range(rng.randint(1, 4)):
+        at = relay_close + (rng.randint(-20, 120) if rng.random() < 0.8 else rng.randint(900, 2500))
+        events.append((rng.choice(["vip forward", "vip reply"]), max(at, 31)))
+    rng.shuffle(events)
+    events.insert(rng.randint(0, len(events)), ("restart", rng.choice([0, 10, 60, 2000])))
+    return events
+
+
+def _instructions_on_traded(conn) -> int:
+    """How many follow-ups act on a signal still traded (entries waiting or
+    taken, the signal NEW and not withdrawn) with an instruction waiting."""
+    traded = {row[0] for row in _q(
+        conn,
+        "SELECT DISTINCT s.signal_id FROM signals s JOIN outbox o ON o.signal_id = s.signal_id "
+        "WHERE o.kind = 'ENTRY' AND o.state IN ('QUEUED', 'CLAIMED', 'DONE') "
+        "AND s.state = 'NEW' AND s.withdrawn_at_utc IS NULL",
+    )}
+    count = 0
+    for (followup_id,) in _q(conn, "SELECT followup_id FROM followups WHERE edit_seq = 0"):
+        if relay_repo.signal_for_followup(conn, followup_id=followup_id) in traded and _q(
+            conn, "SELECT 1 FROM outbox WHERE kind = 'FOLLOWUP' AND followup_id = ? "
+            "AND state = 'QUEUED' LIMIT 1", followup_id,
+        ):
+            count += 1
+    return count
+
+
+def _switch_off_run(
+    seed: int, events: list[tuple], *, restart: bool, vip_forwards_call: bool
+) -> tuple[int | list[str], list[str]]:
+    """One switch-off scenario: returns the instructions acting on the call
+    traded at the end (or the problems, when it raised), and the log. With
+    `restart` False the start-up job is skipped -- the same posts are read,
+    with no channel switched off."""
+    world = _World(_fresh())
+    vip, relay = CHANNELS
+    relay_on = True
+    try:
+        world.store(_Post(1, 7001, SIGNAL_TEXT, POSTED))
+        world.store(_Post(
+            0, 4001, SIGNAL_TEXT, POSTED + timedelta(seconds=30),
+            (1, 7001) if vip_forwards_call else None,
+        ))
+        world.next_id = {0: 4005, 1: 7005}
+        world.log.append(
+            f"post Relay/7001 at +0 s, VIP/4001 at +30 s "
+            f"({'a forward of it' if vip_forwards_call else 'by hand'})"
+        )
+        latest = POSTED + timedelta(seconds=30)
+        for event in events:
+            op, at = event
+            if op == "restart":
+                # Without the restart, the same posts are read: the relay's
+                # after this point never are.
+                relay_on = False
+                if not restart:
+                    continue
+                now = latest + timedelta(seconds=at + 1)
+                ids = outbox.signals_with_entries_of_channels_off(
+                    world.conn, enabled_channel_ids=(vip.channel_id,)
+                )
+                outbox.skip_entries_of_channels_off(
+                    world.conn, enabled_channel_ids=(vip.channel_id,)
+                )
+                relay_repo.admit_copies_of_switched_off(
+                    world.conn, signal_ids=ids, channels=(vip,), accounts=ACCOUNTS, now_utc=now
+                )
+                world.conn.commit()
+                world.log.append(f"restart at +{int((now - POSTED).total_seconds())} s, relay off")
+                continue
+            posted = POSTED + timedelta(seconds=at)
+            latest = max(latest, posted)
+            if op == "relay close":
+                if not relay_on:
+                    world.log.append(f"(the relay's close half at +{at} s is never read)")
+                    continue
+                world.store(_Post(1, 7005, CLOSE_HALF, posted, reply_to=7001))
+                world.log.append(f"Relay/7005 close half at +{at} s, replying to Relay/7001")
+            elif op == "vip forward":
+                post = _Post(0, world.new_id(0), CLOSE_HALF, posted, (1, 7005))
+                world.store(post)
+                world.log.append(f"VIP/{post.message_id} forwards Relay/7005 at +{at} s")
+            else:
+                post = _Post(0, world.new_id(0), CLOSE_HALF, posted, reply_to=4001)
+                world.store(post)
+                world.log.append(f"VIP/{post.message_id} close half at +{at} s, replying to VIP/4001")
+        return _instructions_on_traded(world.conn), world.log
+    except Exception as exc:  # noqa: BLE001 -- reported with the seed and the events
+        return [_crash(exc)], world.log
+    finally:
+        world.conn.close()
+
+
+def _switch_off_problems(seed: int, events: list[tuple], vip_forwards_call: bool):
+    off, log = _switch_off_run(seed, events, restart=True, vip_forwards_call=vip_forwards_call)
+    on, _ = _switch_off_run(seed, events, restart=False, vip_forwards_call=vip_forwards_call)
+    for outcome in (off, on):
+        if isinstance(outcome, list):
+            return outcome, log
+    if off > on:
+        return [
+            f"INV-3f: {off} instruction(s) act on the call traded with the relay switched off, "
+            f"{on} with both channels read"
+        ], log
+    return [], log
+
+
+@pytest.mark.parametrize("seeds", _blocks(), ids=lambda r: f"seeds{r.start}-{r.stop - 1}")
+def test_switching_the_relay_off_never_applies_its_instruction_twice(seeds):
+    """INV-3f: the relay's one "close half" and the VIP's repeats of it,
+    with watch restarted at any point with the relay switched off, never
+    act more often on the call traded than with both channels read."""
+    failures = []
+    for seed in seeds:
+        base = 110000 + seed
+        rng = random.Random(base)
+        events = _switch_off_events(rng)
+        vip_forwards_call = rng.random() < 0.3
+        problems, log = _switch_off_problems(base, events, vip_forwards_call)
+        if problems:
+            small = _shrink(
+                lambda e: bool(_switch_off_problems(base, e, vip_forwards_call)[0]), events
+            )
+            problems, log = _switch_off_problems(base, small, vip_forwards_call)
+            failures.append(_report("relay switched off", base, problems, log))
     assert not failures, "\n\n".join(failures)

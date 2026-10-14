@@ -245,18 +245,23 @@ def insert_followup(
     followup: FollowUp,
     target_signal_id: int | None = None,
     resolution_path: str | None = None,
+    instead_of_followup_id: int | None = None,
 ) -> int:
     """A message's own follow-up (`edit_seq` 0). `target_signal_id` /
     `resolution_path` are the signal it replies to, when ingest could
     resolve it (`relay_repo.resolve_reply_target`: `'reply'` or
     `'relay-reply'`); NULL when it replies to nothing stored. The target
     moves to the new signal when the call is replaced
-    (`relay_repo.record_replacement`)."""
+    (`relay_repo.record_replacement`). `instead_of_followup_id`: the held
+    follow-up about a signal whose channel is switched off that this one
+    stands in for, about the signal traded instead (final fix round 6,
+    R6-1; `relay_repo`)."""
     if (target_signal_id is None) != (resolution_path is None):
         raise ValueError("target_signal_id and resolution_path go together")
     cursor = conn.execute(
         "INSERT INTO followups (channel_id, message_id, op, parsed_json, reply_to_message_id, "
-        "target_signal_id, resolution_path, edit_seq) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+        "target_signal_id, resolution_path, edit_seq, instead_of_followup_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
         (
             channel_id,
             message_id,
@@ -265,6 +270,7 @@ def insert_followup(
             followup.reply_to_message_id,
             target_signal_id,
             resolution_path,
+            instead_of_followup_id,
         ),
     )
     return cursor.lastrowid

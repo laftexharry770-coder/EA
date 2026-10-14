@@ -124,6 +124,7 @@ def test_the_runbook_explains_every_alert_the_fix_wave_added() -> None:
         relay_repo.OLD_COPIES_OF_CHANNEL_OFF_SIGNALS,
         relay_repo.SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF,
         relay_repo.OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF,
+        relay_repo.FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL,
     ):
         assert f"- **{code}** — " in clearing, code
 

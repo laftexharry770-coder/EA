@@ -808,7 +808,11 @@ _V4_COLUMNS = {
         "closed_by_message_id",
         "promoted_from_signal_id",
         "replacement_kind",
+        # Final fix round 6 (R6-1): the signal admitted in place of.
+        "admitted_from_signal_id",
     ),
+    # Final fix round 6 (R6-1): the held follow-up stood in for.
+    "followups": ("instead_of_followup_id",),
 }
 
 

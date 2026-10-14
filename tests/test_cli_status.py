@@ -583,6 +583,7 @@ def _new_alert_codes() -> list[str]:
         relay.OLD_COPIES_OF_CHANNEL_OFF_SIGNALS,
         relay.SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF,
         relay.OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF,
+        relay.FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL,
     ]
 
 
