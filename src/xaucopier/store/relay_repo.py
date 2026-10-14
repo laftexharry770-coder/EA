@@ -2923,7 +2923,8 @@ def _posts_showing_call(
     than `post` that still stand, on any channel -- not deleted, still
     stored as a signal, not the post that closed one of the call's signals
     and, with `channel_cfg`, re-read showing the call of its newest
-    signal."""
+    signal. Oldest post first: the start's withdrawal names the oldest
+    (`_withdraw_calls_shown_only_off`; final fix round 6, R6-3)."""
     newest = _signal_row(conn, live_signal_for(conn, signal_id))
     chain = chain_ids(conn, signal_id)
     marks = ", ".join("?" for _ in chain)

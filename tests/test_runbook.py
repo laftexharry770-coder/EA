@@ -178,6 +178,12 @@ def test_the_runbook_says_a_short_switch_off_may_read_everything_it_posted() -> 
         "clock is off — everything it posted while it was off is read" in flat
     )
     assert "If your PC's clock is off when `watch` starts, `watch` reads that much more" in flat
+    # Final fix round 6 (R6-4): it reads more for any difference, but warns
+    # only past a minute.
+    assert (
+        "`watch` reads that much more around each switch — and, when it is more than a minute "
+        "off, warns you to fix the clock." in flat
+    )
 
 
 def test_the_runbook_says_a_call_on_a_channel_on_is_still_traded_after_a_switch_off() -> None:

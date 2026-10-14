@@ -1537,7 +1537,8 @@ CANCELLED_TEXT = SIGNAL_TEXT + "\nCANCELLED"
 
 
 def _the_relays_call_kept_only_by_the_vips_forward(  # noqa: F811
-    conn, *, delete_before_restart: bool, on=(RELAY,), before_restart=None, gone="deleted"
+    conn, *, delete_before_restart: bool, on=(RELAY,), before_restart=None, gone="deleted",
+    second_forward: bool = False,
 ):
     """Seed 102253 reduced (the re-check's p_102253): the relay's call
     (signal 1) is CANCELLED; the VIP posts the call (held back, a copy of
@@ -1557,6 +1558,8 @@ def _the_relays_call_kept_only_by_the_vips_forward(  # noqa: F811
     assert _ingest(conn, VIP, 1002, posted=_at(20)).relay_of_signal_id == 1
     assert _ingest(conn, RELAY, 5005, posted=_at(30), fwd=(V, 1002)).signal_id == 2
     assert _ingest(conn, VIP, 1005, posted=_at(40), fwd=(V, 1002)).relay_of_signal_id == 2
+    if second_forward:
+        assert _ingest(conn, VIP, 1006, posted=_at(45), fwd=(V, 1002)).relay_of_signal_id == 2
     edits_repo.apply_edit(
         conn, channel_cfg=VIP, message_id=1002, text="Good morning traders",
         posted_at_utc=_at(20), edit_date_utc=_at(50), reply_to_message_id=None,
@@ -1637,6 +1640,23 @@ def test_a_call_only_a_switched_off_channels_post_shows_is_not_traded_in_either_
             if gone == "deleted"
             else edits_repo.SIGNAL_RETRACTED_BY_EDIT
         ) in codes
+
+
+def test_the_withdrawal_at_start_names_the_oldest_post_on_the_channel_switched_off(
+    conn,  # noqa: F811
+):
+    """Final fix round 6 (R6-3): with two posts of the call still standing
+    on the channel switched off -- the VIP forwarded its post twice -- the
+    alert names the older one, whichever was stored first."""
+    _the_relays_call_kept_only_by_the_vips_forward(
+        conn, delete_before_restart=True, second_forward=True
+    )
+
+    assert _claimable(conn) == []
+    (alert,) = [a for a in _alerts(conn) if a[1] == SHOWN_OFF]
+    detail = " ".join(alert[5].split())
+    assert f"the call stood only in message 1005 on channel {V}, which is switched off" in detail
+    assert "1006" not in detail, detail
 
 
 def test_a_call_partly_traded_is_withdrawn_loudly_and_left_open(conn):  # noqa: F811
