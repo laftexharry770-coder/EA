@@ -294,6 +294,10 @@ class SwitchOn:
     #: The switch-off the skipped period starts at, for the two period
     #: outcomes; None otherwise.
     off_at_utc: datetime | None = None
+    #: For "reseeded": whether a watch start had measured this computer's
+    #: clock, so the read from now on allows for it being ahead (`reseed`;
+    #: final fix round 6, R6-5). True for every other outcome.
+    clock_measured: bool = True
 
 
 def reading_started(state: ChannelState) -> bool:
@@ -421,13 +425,15 @@ def record_switch_on(
             (format_utc(ends), _clock_now(conn), period_id),
         )
         return SwitchOn(outcome=outcome, off_at_utc=off_at)
+    outcome = reseed(
+        conn,
+        channel_id=channel_id,
+        cutoff_utc=on_at_utc,
+        may_replace_first_cutoff=may_replace_first_cutoff,
+    )
     return SwitchOn(
-        outcome=reseed(
-            conn,
-            channel_id=channel_id,
-            cutoff_utc=on_at_utc,
-            may_replace_first_cutoff=may_replace_first_cutoff,
-        )
+        outcome=outcome,
+        clock_measured=outcome != "reseeded" or heartbeats.read_clock_difference(conn) is not None,
     )
 
 
@@ -450,7 +456,16 @@ def reseed(
     running one may still be seeding it at the old one (fix round 2, the
     reviewer's open (b)); otherwise it is left as it is
     ("first_read_kept"). A channel never read is left alone
-    ("never_read"): its first read starts at that watch's start anyway."""
+    ("never_read"): its first read starts at that watch's start anyway.
+
+    `cutoff_utc` is this computer's clock, and the read starts a minute
+    before it by Telegram's (`Listener._seed_pointer`): with this
+    computer's clock ahead, that would be less than a minute before now.
+    So the cutoff moves back by as much as the latest watch start measured
+    it ahead (`heartbeats.read_clock_difference`; final fix round 6, R6-5):
+    about a minute before now is read, as `channels on` says. A clock
+    behind already reads more, by as much as it is behind; with none
+    measured, a clock ahead reads less (`SwitchOn.clock_measured`)."""
     format_utc(cutoff_utc)  # an aware time, before anything is decided
     state = read(conn, channel_id)
     if not reading_started(state):
@@ -458,6 +473,9 @@ def reseed(
         return "never_read"
     if not (state.pointer > 0 or state.seeded) and not may_replace_first_cutoff:
         return "first_read_kept"
+    ahead = heartbeats.read_clock_difference(conn)
+    if ahead is not None and ahead > timedelta(0):
+        cutoff_utc -= ahead
     request_reseed(conn, channel_id=channel_id, cutoff_utc=cutoff_utc)
     conn.execute("DELETE FROM channel_off_periods WHERE channel_id = ?", (channel_id,))
     return "reseeded"

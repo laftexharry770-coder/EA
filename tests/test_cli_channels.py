@@ -42,7 +42,7 @@ from xaucopier.config.channels import ChannelCfg, load_channels
 from xaucopier.config.loader import ConfigError
 from xaucopier.ingest.client import AlreadyRunningError
 from xaucopier.ingest.secrets import SecretsBlob
-from xaucopier.store import db, messages_repo
+from xaucopier.store import db, heartbeats, messages_repo
 
 REPO = Path(__file__).resolve().parents[1]
 REAL_CHANNELS = REPO / "config" / "channels.toml"
@@ -1510,6 +1510,12 @@ BEFORE_NOW = (
     "(more if this computer's clock is behind, by as much as it is behind), which is read "
     "in case the clock is off."
 )
+#: ... the same, when no watch start has measured this computer's clock, so
+#: the read cannot allow for it being ahead (final fix round 6, R6-5).
+BEFORE_NOW_UNMEASURED = (
+    "(more if this computer's clock is behind, by as much as it is behind, and less if it is "
+    "ahead), which is read in case the clock is off."
+)
 
 
 def test_off_and_on_say_that_a_short_switch_off_is_read_in_full(
@@ -1581,19 +1587,37 @@ def test_no_off_message_promises_that_posts_made_while_off_are_never_read(
     [(5, "2026-09-01T00:00:00+00:00"), (0, "2026-09-01T00:00:00+00:00"), (5, None)],
     ids=["seeded", "seeded at 0: every post was newer", "a pointer from before the marker"],
 )
+@pytest.mark.parametrize("clock", [None, 40], ids=["clock never measured", "clock 40 s ahead"])
 def test_on_of_a_channel_whose_switch_off_was_not_recorded_reads_it_from_now(
-    on_rig: Rig, capsys: pytest.CaptureFixture[str], pointer: int, seeded: str | None
+    on_rig: Rig,
+    capsys: pytest.CaptureFixture[str],
+    pointer: int,
+    seeded: str | None,
+    clock: int | None,
 ) -> None:
     """Quiet Signals is OFF in the file with no switch-off recorded (the
     database could not be written then, or the file was edited by hand):
-    ruling M12 as round 1 had it -- the next watch reads it from now on."""
+    ruling M12 as round 1 had it -- the next watch reads it from now on.
+    Final fix round 6 (R6-5): from a minute before now by Telegram's clock
+    when a watch start measured this computer's -- the cutoff moves back by
+    as much as it is ahead -- and the words say less when none did."""
     _set_state(on_rig.db_path, QUIET, pointer, seeded)
+    if clock is not None:
+        conn = db.connect(on_rig.db_path, role="writer")
+        try:
+            heartbeats.record_clock_difference(
+                conn, difference=timedelta(seconds=clock), now_utc=SWITCHED_AT - timedelta(hours=1)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     assert cli_main.main(on_rig.argv("on", "3")) == exit_codes.EXIT_OK
 
     assert _switches(on_rig.channels_path)[3] is True
     # Whole seconds, UTC; the pointer is kept (a re-seed never moves it back).
-    assert _state_row(on_rig.db_path, QUIET) == (pointer, seeded, "2026-09-23T12:00:00+00:00")
+    cutoff = "2026-09-23T12:00:00+00:00" if clock is None else "2026-09-23T11:59:20+00:00"
+    assert _state_row(on_rig.db_path, QUIET) == (pointer, seeded, cutoff)
     out = capsys.readouterr().out
     assert "Channel 3 (Quiet Signals) is now ON." in out
     assert (
@@ -1602,9 +1626,10 @@ def test_on_of_a_channel_whose_switch_off_was_not_recorded_reads_it_from_now(
     )
     # R4-1: the re-read starts a minute back, in case the clock was off.
     assert (
-        "except what it posted within about a minute before now " + BEFORE_NOW
+        "except what it posted within about a minute before now "
+        + (BEFORE_NOW_UNMEASURED if clock is None else BEFORE_NOW)
         in " ".join(out.split())
-    )
+    ), out
 
 
 @pytest.mark.parametrize("watch_running", [False, True], ids=["no watch", "watch running"])

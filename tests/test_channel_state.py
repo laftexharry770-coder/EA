@@ -392,8 +392,35 @@ def test_a_switch_on_with_no_switch_off_recorded_re_seeds_from_now(conn) -> None
         conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=False
     )
 
-    assert done == channel_state.SwitchOn("reseeded")
+    # No watch start has measured this computer's clock (R6-5).
+    assert done == channel_state.SwitchOn("reseeded", clock_measured=False)
     assert _row(conn) == (100, SEEDED, "2026-09-05T13:00:00+00:00")
+
+
+@pytest.mark.parametrize(
+    ("seconds", "cutoff"),
+    [(45, "2026-09-05T12:59:15+00:00"), (0, "2026-09-05T13:00:00+00:00"),
+     (-30, "2026-09-05T13:00:00+00:00")],
+    ids=["clock 45 s ahead", "clock right", "clock 30 s behind"],
+)
+def test_a_re_seed_from_now_allows_for_this_computers_clock_being_ahead(
+    conn, seconds, cutoff
+) -> None:
+    """Final fix round 6 (R6-5): the cutoff is this computer's clock, and the
+    re-read starts a minute before it by Telegram's. With the clock 45 s
+    ahead (as the latest watch start measured it) that would be only 15 s
+    before the switch-on, so the cutoff moves back by as much: about a
+    minute before now is read, as `channels on` says. A clock behind
+    already reads more, by as much as it is behind, and is left as it is."""
+    _insert(conn, pointer=100, seeded_at=SEEDED)
+    _clock(conn, seconds)
+
+    done = channel_state.record_switch_on(
+        conn, channel_id=A, on_at_utc=ON, may_replace_first_cutoff=False
+    )
+
+    assert done == channel_state.SwitchOn("reseeded", clock_measured=True)
+    assert _row(conn) == (100, SEEDED, cutoff)
 
 
 @pytest.mark.parametrize("row", [False, True], ids=["no row", "a counter's row at 0"])

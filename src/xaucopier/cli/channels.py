@@ -361,7 +361,7 @@ def _on_lines(result: channel_state.SwitchOn | None) -> list[str]:
             "When it was switched off was not recorded, so the next watch reads it from now "
             "on: everything it posted since watch last read it is skipped, not only what it "
             f"posted while it was off -- except what it posted within about a minute before "
-            f"now {_BEHIND}"
+            f"now {_BEHIND if result.clock_measured else _BEHIND_OR_AHEAD}"
         ]
     # "first_read_kept"
     return [
@@ -389,11 +389,20 @@ def _near_a_switch(switch: str) -> str:
 
 
 #: The read from a moment on (a switch-off never recorded): it starts a
-#: minute before it, by this computer's clock -- further back by as much as
-#: that clock is behind Telegram's (final fix round 5, R5-5).
+#: minute before it, by Telegram's clock when a watch start measured this
+#: computer's as ahead (`channel_state.reseed`, final fix round 6, R6-5) --
+#: further back by as much as this computer's clock is behind Telegram's
+#: (final fix round 5, R5-5).
 _BEHIND = (
     "(more if this computer's clock is behind, by as much as it is behind), which is read "
     "in case the clock is off."
+)
+#: ... and when `channels on` re-reads from now with no watch start having
+#: measured this computer's clock: then it cannot allow for the clock being
+#: ahead (`channel_state.reseed`; final fix round 6, R6-5).
+_BEHIND_OR_AHEAD = (
+    "(more if this computer's clock is behind, by as much as it is behind, and less if it is "
+    "ahead), which is read in case the clock is off."
 )
 
 
