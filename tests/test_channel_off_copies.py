@@ -1486,6 +1486,39 @@ def test_a_forward_read_after_the_restart_is_not_applied_and_said_so(conn):  # n
     ), detail
 
 
+def test_a_repeat_of_an_instruction_withdrawn_since_is_not_applied_and_said_so(
+    conn,  # noqa: F811
+):
+    """The VIP's forward of the relay's "close half" was adopted at the
+    restart as the instruction about signal 2, then the VIP deleted it: it
+    is withdrawn. The VIP's "close half" read after that, repeating the
+    relay's instruction, is not applied either -- and the WARNING says the
+    one about signal 2 was withdrawn, never that it still acts."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _fwd(conn)
+    _restart(conn, on=(VIP,), seconds=71)
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=FWD, now_utc=_at(72), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    conn.commit()
+
+    _rep(conn, seconds=73)
+
+    assert _followup_rows(conn, 2) == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+    assert [row[1:3] for row in _followups(conn)] == [(R, RELAY_CLOSE), (V, FWD)]
+    ((message_id, signal_id, _level, detail),) = _about_off(conn)
+    assert (message_id, signal_id) == (REP, 2)
+    flat = " ".join(detail.split())
+    assert ALREADY not in flat, flat
+    assert flat.endswith(
+        f"Signal 2 trades that call instead; the same instruction was given about it as "
+        f"follow-up 2 (message {FWD} on channel {V}), which was withdrawn since. If the "
+        "instruction is still meant for signal 2, apply it by hand."
+    ), flat
+
+
 def test_a_close_half_given_long_after_is_an_instruction_of_its_own(conn):  # noqa: F811
     """After the restart the VIP forwards the relay's "close half" -- NOT
     applied, handed over by hand -- and half an hour later says "close

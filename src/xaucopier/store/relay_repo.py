@@ -2894,7 +2894,8 @@ def followup_after_channel_off(
       channel switched on later is another call.
 
     Every copy of a held instruction about a switched-off call raises that
-    WARNING -- with "Nothing to do" when another one acts in its place."""
+    WARNING -- with "Nothing to do" when another one acts in its place, or
+    saying that one was withdrawn since, when it was."""
     if match is not None:
         held = match
     elif target_signal_id is not None:
@@ -3143,7 +3144,20 @@ def _say_about_channel_off(
         f"{about['message_id']} on channel {about['channel_id']}), whose channel is switched "
         f"off: signal {signal_id} is not traded, and this message was NOT applied."
     )
-    if stand_in is not None:
+    counts = (
+        {} if stand_in is None
+        else outbox.state_counts(conn, kind="FOLLOWUP", followup_id=stand_in.followup_id)
+    )
+    if stand_in is not None and set(counts) == {"SKIPPED"}:
+        # The one about the call traded instead was withdrawn since -- its
+        # post deleted or edited away: nothing acts on it now.
+        detail += (
+            f" Signal {admitted} trades that call instead; the same instruction was given "
+            f"about it as follow-up {stand_in.followup_id} (message {stand_in.message_id} on "
+            f"channel {stand_in.channel_id}), which was withdrawn since. If the instruction is "
+            f"still meant for signal {admitted}, apply it by hand."
+        )
+    elif stand_in is not None:
         detail += (
             f" Signal {admitted} trades that call instead, and the same instruction already "
             f"acts on it as follow-up {stand_in.followup_id} (message {stand_in.message_id} on "
