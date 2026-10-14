@@ -1537,6 +1537,55 @@ def test_a_repeat_of_an_instruction_withdrawn_since_is_not_applied_and_said_so(
     ), flat
 
 
+@pytest.mark.parametrize("order", ["forward, reply", "reply, forward"])
+def test_repeats_of_an_instruction_withdrawn_since_ask_for_it_by_hand_once(
+    conn, order  # noqa: F811
+):
+    """The re-check's r61_withdrawn_standin (fuzz seed 42417; final fix
+    round 7, R7-3). After the start the VIP's "close half" replying to its
+    copy is the instruction about signal 2, in place of the relay's; then
+    the VIP deletes it. Then it forwards the relay's post and says "close
+    half" again, in either order: neither is applied. The first WARNING asks
+    for it by hand if it is still meant; the second says it is the same
+    instruction as the first message, names that alert, and asks for it
+    once, not once for each message -- never two by-hand requests."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _restart(conn, on=(VIP,), seconds=65)
+    assert _rep(conn, message_id=REP, seconds=70).followup_id == 2
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=REP, now_utc=_at(75), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+    if order == "forward, reply":
+        first, second = _fwd(conn, seconds=80), _rep(conn, message_id=4007, seconds=85)
+        ids = (FWD, 4007)
+    else:
+        first, second = _rep(conn, message_id=4007, seconds=80), _fwd(conn, seconds=85)
+        ids = (4007, FWD)
+
+    assert (first.outcome, second.outcome) == ("relay_duplicate", "relay_duplicate")
+    assert _followup_rows(conn, 2) == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+    alerts = _q(
+        conn, "SELECT alert_id, message_id, detail FROM alerts WHERE code = ? ORDER BY alert_id",
+        ABOUT_OFF,
+    )
+    assert [a[1] for a in alerts] == list(ids)
+    withdrawn = (
+        f"Signal 2 trades that call instead; the same instruction was given about it as "
+        f"follow-up 2 (message {REP} on channel {V}), which was withdrawn since. If the "
+        "instruction is still meant for signal 2, apply it by hand"
+    )
+    one, two = (" ".join(a[2].split()) for a in alerts)
+    assert one.endswith("this message was NOT applied. " + withdrawn + "."), one
+    assert two.endswith(
+        f"this message was NOT applied. It is the same instruction as message {ids[0]} on "
+        f"channel {V} (alert #{alerts[0][0]}). {withdrawn} -- once, not once for each message."
+    ), two
+
+
 @pytest.mark.parametrize("again", ["the relay's post", "its own forward"])
 def test_a_repeat_read_after_the_start_of_an_instruction_one_acts_on_is_nothing_to_do(
     conn, again  # noqa: F811

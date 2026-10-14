@@ -3076,15 +3076,20 @@ class _Reported:
     message_id: int
 
 
-def _reported(conn: sqlite3.Connection, *, held_id: int) -> _Reported | None:
+def _reported(
+    conn: sqlite3.Connection, *, held_id: int, also: tuple[int, ...] = ()
+) -> _Reported | None:
     """The first FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL WARNING raised for a copy
     of held follow-up `held_id` -- the instruction handed to the user (R6-1)
-    -- or None."""
+    -- or of any follow-up of `also` (the one standing in for it, final fix
+    round 7, R7-3); or None."""
+    ids = (held_id, *also)
+    marks = ", ".join("?" for _ in ids)
     row = conn.execute(
         "SELECT a.alert_id, a.channel_id, a.message_id FROM alerts a "
         "JOIN messages m ON m.channel_id = a.channel_id AND m.message_id = a.message_id "
-        "WHERE a.code = ? AND m.relay_of_followup_id = ? ORDER BY a.alert_id LIMIT 1",
-        (FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL, held_id),
+        f"WHERE a.code = ? AND m.relay_of_followup_id IN ({marks}) ORDER BY a.alert_id LIMIT 1",
+        (FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL, *ids),
     ).fetchone()
     return None if row is None else _Reported(row[0], row[1], row[2])
 
@@ -3227,12 +3232,21 @@ def _say_about_channel_off(
     )
     if stand_in is not None and set(counts) == {"SKIPPED"}:
         # The one about the call traded instead was withdrawn since -- its
-        # post deleted or edited away: nothing acts on it now.
+        # post deleted or edited away: nothing acts on it now. A copy of it,
+        # or of the held one, reported already is the same instruction: by
+        # hand once, never once for each message (R7-3).
+        first = _reported(conn, held_id=held.followup_id, also=(stand_in.followup_id,))
+        if first is not None:
+            detail += (
+                f" It is the same instruction as message {first.message_id} on channel "
+                f"{first.channel_id} (alert #{first.alert_id})."
+            )
         detail += (
             f" Signal {admitted} trades that call instead; the same instruction was given "
             f"about it as follow-up {stand_in.followup_id} (message {stand_in.message_id} on "
             f"channel {stand_in.channel_id}), which was withdrawn since. If the instruction is "
-            f"still meant for signal {admitted}, apply it by hand."
+            f"still meant for signal {admitted}, apply it by hand"
+            + (" -- once, not once for each message." if first is not None else ".")
         )
     elif stand_in is not None:
         detail += (
