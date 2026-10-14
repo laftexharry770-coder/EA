@@ -1775,8 +1775,12 @@ def _withdraw_calls_shown_only_off(
     Plan 2 their entries wait for ever -- so only a signal whose own post
     may no longer stand is looked at (final fix round 6, R6-2): deleted, no
     longer stored as a signal, or edited (every edit stamps
-    `edit_date_utc`). A post never edited still shows the call it was read
-    as. And a signal posted more than `max_age_seconds` before `now_utc`,
+    `edit_date_utc`) since a start last re-read it and found it still
+    showing the call (`signals.reread_edit_date_utc`, final fix round 7,
+    R7-6: a channel that adds "TP1 hit" to its posts would otherwise have
+    every one re-read at every start). A post never edited still shows the
+    call it was read as, and so does one not edited since it was re-read
+    so. And a signal posted more than `max_age_seconds` before `now_utc`,
     too old to be traded anyway, of which nothing was executed, is
     withdrawn without an alert of its own: ONE WARNING for the whole start
     says how many (`OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF`), as
@@ -1785,10 +1789,11 @@ def _withdraw_calls_shown_only_off(
     raised: list[int] = []
     too_old: list[tuple[int, int]] = []  # (signal, entries cancelled)
     for signal in conn.execute(
-        "SELECT s.*, m.posted_at_utc AS own_posted_at_utc FROM signals s "
+        "SELECT s.*, m.posted_at_utc AS own_posted_at_utc, m.edit_date_utc AS own_edit_date_utc "
+        "FROM signals s "
         "JOIN messages m ON m.channel_id = s.channel_id AND m.message_id = s.message_id "
         "WHERE m.deleted_at_utc IS NOT NULL OR m.kind <> 'signal' "
-        "  OR m.edit_date_utc IS NOT NULL "
+        "  OR (m.edit_date_utc IS NOT NULL AND m.edit_date_utc IS NOT s.reread_edit_date_utc) "
         "ORDER BY s.signal_id"
     ).fetchall():
         channel_cfg = on.get(signal["channel_id"])
@@ -1801,7 +1806,12 @@ def _withdraw_calls_shown_only_off(
         own = (signal["channel_id"], signal["message_id"])
         how = _how_gone(conn, signal, channel_cfg)
         if how is None:
-            continue  # its own post still stands
+            # Its own post still stands: not re-read again until edited (R7-6).
+            conn.execute(
+                "UPDATE signals SET reread_edit_date_utc = ? WHERE signal_id = ?",
+                (signal["own_edit_date_utc"], signal["signal_id"]),
+            )
+            continue
         if _call_stands_elsewhere(
             conn, signal_id=signal["signal_id"], post=own, channel_cfg=channel_cfg,
             read_channels=read,

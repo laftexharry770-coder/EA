@@ -201,6 +201,10 @@ two backfills every existing row keeps every value it had.
   later), that held follow-up -- so one held instruction never becomes two
   about the call traded instead (``relay_repo``). Both NULL otherwise, and
   on rows stored before migration 4.
+- ``signals.reread_edit_date_utc``: the ``messages.edit_date_utc`` of the
+  signal's own post when watch's start last re-read it and found it still
+  showing the call (final fix round 7, R7-6), so a later start re-reads
+  only a post edited since. NULL until then.
 
 - ``channel_off_periods(period_id, channel_id, off_at_utc, on_at_utc)``,
   with the indexes ``idx_channel_off_periods_channel`` and
@@ -362,6 +366,9 @@ _MIGRATION_4: tuple[str, ...] = (
     # in for about it.
     "ALTER TABLE signals ADD COLUMN admitted_from_signal_id INTEGER",
     "ALTER TABLE followups ADD COLUMN instead_of_followup_id INTEGER",
+    # Final fix round 7 (R7-6): the edit of a signal's own post that watch's
+    # start last re-read and found still showing the call.
+    "ALTER TABLE signals ADD COLUMN reread_edit_date_utc TEXT",
     "CREATE INDEX IF NOT EXISTS idx_messages_fwd_from "
     "ON messages(fwd_from_channel_id, fwd_from_post_id)",
     # Fix round 2 of F28: one row per OFF period of a channel; see the

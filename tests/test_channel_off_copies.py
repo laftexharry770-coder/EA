@@ -1960,7 +1960,7 @@ CANCELLED_TEXT = SIGNAL_TEXT + "\nCANCELLED"
 
 def _the_relays_call_kept_only_by_the_vips_forward(  # noqa: F811
     conn, *, delete_before_restart: bool, on=(RELAY,), before_restart=None, gone="deleted",
-    second_forward: bool | str = False, restart_at: float = 100,
+    second_forward: bool | str = False, restart_at: float = 100, before_gone=None,
 ):
     """Seed 102253 reduced (the re-check's p_102253): the relay's call
     (signal 1) is CANCELLED; the VIP posts the call (held back, a copy of
@@ -2001,13 +2001,16 @@ def _the_relays_call_kept_only_by_the_vips_forward(  # noqa: F811
             )
         else:
             edits_repo.apply_edit(
-                conn, channel_cfg=RELAY, message_id=5005, text="Good morning traders",
+                conn, channel_cfg=RELAY, message_id=5005,
+                text=REAIMED if gone == "re-aimed" else "Good morning traders",
                 posted_at_utc=_at(30), edit_date_utc=_at(seconds), reply_to_message_id=None,
                 now_utc=_at(seconds), accounts=ACCOUNTS, detected_by="event",
                 read_channels=read,
             )
         conn.commit()
 
+    if before_gone is not None:
+        before_gone(conn)
     if delete_before_restart:
         delete(60, (V, R))
         assert _claimable(conn) == [2]  # an echo: the VIP's forward stands
@@ -2351,6 +2354,83 @@ def test_the_withdrawal_at_start_re_reads_no_post_left_as_it_was(conn):  # noqa:
 
     assert raised == []
     assert took < 0.2, took
+
+
+def test_the_withdrawal_at_start_re_reads_an_edited_post_once_per_edit(conn):  # noqa: F811
+    """Final fix round 7 (R7-6), the re-check's r62_perf_edited: 2000 calls
+    of one channel whose posts were edited -- "TP1 hit" added -- but still
+    show the call. The first start re-reads each one; a later start skips
+    every post not edited since, so its look stays well under 0.2 s."""
+    import time
+
+    assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
+    for n in range(2, 2001):
+        conn.execute(
+            "INSERT INTO messages (channel_id, message_id, kind, content_hash, raw_text, "
+            "  edit_date_utc, received_at_utc, posted_at_utc, source) "
+            "SELECT channel_id, ?, kind, content_hash, raw_text, edit_date_utc, "
+            "  received_at_utc, ?, source FROM messages WHERE message_id = ?",
+            (RELAY_CALL + n, _at(n * 1000).isoformat(), RELAY_CALL),
+        )
+        conn.execute(
+            "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, state) "
+            "SELECT channel_id, ?, parsed_json, trade_hash, state FROM signals WHERE signal_id = 1",
+            (RELAY_CALL + n,),
+        )
+        conn.execute(
+            "INSERT INTO outbox (account_id, kind, signal_id, state) "
+            "SELECT account_id, kind, ?, state FROM outbox WHERE signal_id = 1",
+            (n,),
+        )
+    conn.execute(
+        "UPDATE messages SET raw_text = raw_text || ?, edit_date_utc = ?",
+        ("\nTP1 hit", _at(3000 * 1000).isoformat()),
+    )
+    conn.commit()
+    now = _at(2001 * 1000)
+    assert relay_repo._withdraw_calls_shown_only_off(conn, on={R: RELAY}, now_utc=now) == []
+    conn.commit()
+
+    started = time.perf_counter()
+    raised = relay_repo._withdraw_calls_shown_only_off(conn, on={R: RELAY}, now_utc=now)
+    took = time.perf_counter() - started
+
+    assert raised == []
+    assert took < 0.2, took
+    assert _claimable(conn) == list(range(1, 2001))
+
+
+@pytest.mark.parametrize("gone", ["edited away", "re-aimed"])
+def test_a_post_re_read_at_one_start_is_re_read_again_once_edited_since(
+    conn, gone  # noqa: F811
+):
+    """R7-6: what a start remembers is the edit it re-read. Signal 2's own
+    post was edited -- still showing the call -- and a start (both channels
+    read) re-read it; then it was edited away, or re-aimed to another call
+    (still stored as a signal), while the VIP's forward still showed the
+    call (an echo, so signal 2 stood). At the next start, with the VIP
+    switched off, that newer edit is re-read and signal 2 withdrawn -- as
+    with no start in between."""
+    def tp1_hit_and_a_start(conn):  # noqa: F811
+        edits_repo.apply_edit(
+            conn, channel_cfg=RELAY, message_id=5005, text=SIGNAL_TEXT + "\nTP1 hit",
+            posted_at_utc=_at(30), edit_date_utc=_at(55), reply_to_message_id=None,
+            now_utc=_at(55), accounts=ACCOUNTS, detected_by="event", read_channels=(V, R),
+        )
+        conn.commit()
+        _restart(conn, on=(RELAY, VIP), seconds=56)
+        assert _claimable(conn) == [2]
+
+    _the_relays_call_kept_only_by_the_vips_forward(
+        conn, delete_before_restart=True, gone=gone, before_gone=tp1_hit_and_a_start
+    )
+    assert _q(conn, "SELECT kind FROM messages WHERE channel_id = ? AND message_id = 5005", R) == [
+        ("signal" if gone == "re-aimed" else "skip",)
+    ]
+
+    assert _claimable(conn) == []
+    (alert,) = [a for a in _alerts(conn) if a[1] == SHOWN_OFF]
+    assert alert[:5] == ("WARNING", SHOWN_OFF, R, 5005, 2)
 
 
 def test_the_withdrawal_at_start_looks_only_at_signals_of_channels_switched_on(

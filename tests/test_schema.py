@@ -810,6 +810,8 @@ _V4_COLUMNS = {
         "replacement_kind",
         # Final fix round 6 (R6-1): the signal admitted in place of.
         "admitted_from_signal_id",
+        # Final fix round 7 (R7-6): the own post's edit last re-read at start.
+        "reread_edit_date_utc",
     ),
     # Final fix round 6 (R6-1): the held follow-up stood in for.
     "followups": ("instead_of_followup_id",),
