@@ -2381,6 +2381,11 @@ def _adopt_followup_copies(
             # `new`'s place -- one about `new` already, moved with its post,
             # or about another call: it stays a copy of it.
             continue
+        if _acts_no_more(conn, copy["held_id"]):
+            # Its poster withdrew the instruction it repeats: with both
+            # channels read nothing acts on it, so it stays a copy of it
+            # (final fix round 8).
+            continue
         posted = datetime.fromisoformat(copy["posted_at_utc"])
         routed = route(
             copy["raw_text"],
@@ -3044,7 +3049,13 @@ def followup_after_channel_off(
     reported = _reported(conn, held_id=held.followup_id)
     # A reply matched only by `_repeated_about_admitted` replies to a post of
     # the call `admitted` carries (one admission per switched-off call).
-    if stand_in is None and match is None and admitted is not None and reported is None:
+    if (
+        stand_in is None
+        and match is None
+        and admitted is not None
+        and reported is None
+        and not _acts_no_more(conn, held.followup_id)
+    ):
         logger.info(
             "channel %s message %s replies to signal %s, admitted in place of signal %s whose "
             "channel is switched off, with the instruction of follow-up %s: it is that "
@@ -3322,20 +3333,17 @@ def _say_about_channel_off(
 
 def withdrawn_by_poster(conn: sqlite3.Connection, followup_id: int) -> int | None:
     """The alert that said follow-up `followup_id` was withdrawn by its
-    poster -- its own post deleted or edited into no instruction, and every
+    poster -- its own post deleted or edited into no instruction, every
     instruction of it skipped by that (`edits_repo`'s `FOLLOWUP_DELETED` or
-    `FOLLOWUP_RETRACTED_BY_EDIT`) -- or None (final fix round 8, R8-4)."""
+    `FOLLOWUP_RETRACTED_BY_EDIT`), none waiting since (`_acts_no_more`: an
+    edit back into an instruction queues nothing) -- or None (final fix
+    round 8, R8-4)."""
     from xaucopier.store import edits_repo  # edits_repo imports this module
 
     post = conn.execute(
-        "SELECT f.channel_id, f.message_id, m.deleted_at_utc, m.kind FROM followups f "
-        "JOIN messages m ON m.channel_id = f.channel_id AND m.message_id = f.message_id "
-        "WHERE f.followup_id = ?",
-        (followup_id,),
+        "SELECT channel_id, message_id FROM followups WHERE followup_id = ?", (followup_id,)
     ).fetchone()
-    if post is None or (post["deleted_at_utc"] is None and post["kind"] == "followup"):
-        return None
-    if set(outbox.state_counts(conn, kind="FOLLOWUP", followup_id=followup_id)) != {"SKIPPED"}:
+    if post is None or not _acts_no_more(conn, followup_id):
         return None
     row = conn.execute(
         "SELECT alert_id FROM alerts WHERE code IN (?, ?) AND channel_id = ? AND message_id = ? "
@@ -3348,6 +3356,15 @@ def withdrawn_by_poster(conn: sqlite3.Connection, followup_id: int) -> int | Non
         ),
     ).fetchone()
     return None if row is None else row[0]
+
+
+def _acts_no_more(conn: sqlite3.Connection, followup_id: int) -> bool:
+    """Whether follow-up `followup_id` gives no instruction any more: every
+    one of its instructions skipped -- withdrawn by its poster, or with the
+    one it stood in for -- none waiting or taken. Nothing stands in for
+    such a one (final fix round 8): with both channels read a repeat of it
+    is a copy of an instruction withdrawn, which acts on nothing."""
+    return set(outbox.state_counts(conn, kind="FOLLOWUP", followup_id=followup_id)) == {"SKIPPED"}
 
 
 def stand_ins_of(conn: sqlite3.Connection, followup_id: int) -> list[int]:
@@ -3395,7 +3412,9 @@ def hand_back(
     edited into another instruction -- while the instruction it stood in
     for still stands in its own post, on a channel this watch reads (the
     channel switched back on: `read_channels`; None, not known: never), not
-    withdrawn (instructions waiting, none taken). With both channels read
+    withdrawn: its instructions still waiting (a deletion or an edit away
+    skips them all; none of one about a call switched off was ever taken,
+    as a call traded is never switched off). With both channels read
     `followup_id`'s post was only a copy of that one, which still acts: so
     that one acts on the signal `followup_id` acted on now -- its target
     moved there, as a start moves a forward's (`_adopt_followup_copies`)
@@ -3416,23 +3435,16 @@ def hand_back(
     while held_id is not None and held_id not in seen:
         seen.add(held_id)
         held = conn.execute(
-            "SELECT f.*, m.deleted_at_utc, m.kind FROM followups f "
-            "JOIN messages m ON m.channel_id = f.channel_id AND m.message_id = f.message_id "
-            "WHERE f.followup_id = ?",
-            (held_id,),
+            "SELECT * FROM followups WHERE followup_id = ?", (held_id,)
         ).fetchone()
         if held is None:
             return None
         counts = outbox.state_counts(conn, kind="FOLLOWUP", followup_id=held_id)
         about = signal_for_followup(conn, followup_id=held_id)
         if (
-            held["deleted_at_utc"] is None
-            and held["kind"] == "followup"
-            and read_channels is not None
+            read_channels is not None
             and held["channel_id"] in read_channels
             and counts.get("QUEUED")
-            and not counts.get("CLAIMED")
-            and not counts.get("DONE")
             and about is not None
             and switched_off(conn, _signal_row(conn, about))
         ):
