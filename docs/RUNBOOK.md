@@ -240,6 +240,10 @@ missed. Once you have dealt with one, clear it:
   cancelled, not traded (the alert names the posts). Nothing to do. If part
   of it had already been traded, the alert is CRITICAL: that trade was not
   closed — check it by hand.
+- **OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF** — as above, but those signals
+  were posted longer ago than a signal may be and still be traded
+  (`max_signal_age_seconds` in policy.toml), so they could not have been
+  traded anyway. One alert says how many there were. Nothing to do.
 - **Any other alert** — copy its two lines and send them to whoever looks
   after xaucopier, then clear it.
 

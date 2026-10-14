@@ -62,7 +62,9 @@ round 4); one line says how many older ones are not. The same job
 withdraws a signal of a channel switched on that only a post on a channel
 switched off still showed (final fix round 5, R5-1): its own post went
 while watch read both channels, so its removal was an echo or a repeat,
-and nothing would see that other post go now.
+and nothing would see that other post go now. It looks only at signals
+whose own post was deleted or edited, and says the calls too old to be
+traded anyway in one line (final fix round 6, R6-2).
 
 **An older post of a call** (ruling R4-1, `old_post`). When a call was
 withdrawn and posted again, the other channel's posts of the withdrawn
@@ -330,6 +332,10 @@ OLD_COPIES_OF_CHANNEL_OFF_SIGNALS = "OLD_COPIES_OF_CHANNEL_OFF_SIGNALS"
 #: by a post on a channel switched off now, which watch no longer reads: it
 #: is withdrawn (final fix round 5, R5-1; `admit_copies_of_switched_off`).
 SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF = "SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF"
+#: WARNING, one for the whole start: the signals withdrawn so
+#: (`SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF`) that were posted too long ago to be
+#: traded anyway, of which nothing was executed (final fix round 6, R6-2).
+OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF = "OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF"
 
 #: How old a signal may be and still be traded when the caller gives no
 #: `max_signal_age_seconds` (`domain.market.Policy`'s default, 120 s).
@@ -1580,7 +1586,9 @@ def admit_copies_of_switched_off(
       one on a channel switched off now, which watch no longer reads -- is
       withdrawn, loudly (`_withdraw_calls_shown_only_off`, final fix round
       5, R5-1): whether watch saw its post go before the restart or after it
-      must not decide whether the call is traded.
+      must not decide whether the call is traded. Those too old to be
+      traded anyway are said in ONE line (`OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF`,
+      final fix round 6, R6-2).
 
     Only a post still young enough to be traded is admitted (final fix
     round 4, R4-2): posted no longer than `max_age_seconds` (the policy's
@@ -1686,12 +1694,20 @@ def admit_copies_of_switched_off(
             relay_window_seconds=relay_window_seconds,
         )
     # And a call no post on a channel switched on shows any more (R5-1).
-    raised.extend(_withdraw_calls_shown_only_off(conn, on=on, now_utc=now_utc))
+    raised.extend(
+        _withdraw_calls_shown_only_off(
+            conn, on=on, now_utc=now_utc, max_age_seconds=max_age_seconds
+        )
+    )
     return tuple(raised)
 
 
 def _withdraw_calls_shown_only_off(
-    conn: sqlite3.Connection, *, on: dict[int, _ChannelCfgLike], now_utc: datetime
+    conn: sqlite3.Connection,
+    *,
+    on: dict[int, _ChannelCfgLike],
+    now_utc: datetime,
+    max_age_seconds: int = DEFAULT_MAX_SIGNAL_AGE_SECONDS,
 ) -> list[int]:
     """For `admit_copies_of_switched_off`, at the end of its job (final fix
     round 5, R5-1): every signal of a channel switched on (`on`) that still
@@ -1707,17 +1723,35 @@ def _withdraw_calls_shown_only_off(
     removal is seen after the restart: VOIDED (flagged, when some of it was
     executed), its waiting entries cancelled, its own post the one that
     withdrew it -- with an alert naming the post on the channel switched off
-    (`SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF`). Returns the ids of the alerts."""
+    (`SIGNAL_SHOWN_ONLY_ON_CHANNEL_OFF`). Returns the ids of the alerts.
+
+    It runs at every start, over every signal ever stored -- in watch-only
+    Plan 2 their entries wait for ever -- so only a signal whose own post
+    may no longer stand is looked at (final fix round 6, R6-2): deleted, no
+    longer stored as a signal, or edited (every edit stamps
+    `edit_date_utc`). A post never edited still shows the call it was read
+    as. And a signal posted more than `max_age_seconds` before `now_utc`,
+    too old to be traded anyway, of which nothing was executed, is
+    withdrawn without an alert of its own: ONE WARNING for the whole start
+    says how many (`OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF`), as
+    `_say_too_old` does. One partly traded keeps its own CRITICAL."""
     read = frozenset(on)
     raised: list[int] = []
+    too_old: list[tuple[int, int]] = []  # (signal, entries cancelled)
     for signal in conn.execute(
-        "SELECT s.* FROM signals s WHERE EXISTS (SELECT 1 FROM outbox o WHERE o.kind = 'ENTRY' "
-        "    AND o.signal_id = s.signal_id AND o.state = 'QUEUED') "
+        "SELECT s.*, m.posted_at_utc AS own_posted_at_utc FROM signals s "
+        "JOIN messages m ON m.channel_id = s.channel_id AND m.message_id = s.message_id "
+        "WHERE m.deleted_at_utc IS NOT NULL OR m.kind <> 'signal' "
+        "  OR m.edit_date_utc IS NOT NULL "
         "ORDER BY s.signal_id"
     ).fetchall():
         channel_cfg = on.get(signal["channel_id"])
         if channel_cfg is None:
             continue  # its channel is off: its entries were cancelled already
+        if not outbox.state_counts(conn, kind="ENTRY", signal_id=signal["signal_id"]).get(
+            "QUEUED"
+        ):
+            continue  # nothing of it waits to be traded
         own = (signal["channel_id"], signal["message_id"])
         how = _how_gone(conn, signal, channel_cfg)
         if how is None:
@@ -1734,13 +1768,101 @@ def _withdraw_calls_shown_only_off(
             ),
             None,
         )
+        posted = datetime.fromisoformat(signal["own_posted_at_utc"])
+        old = (now_utc - posted).total_seconds() > max_age_seconds
+        if old and signals_repo.trade_status(conn, signal_id=signal["signal_id"]) == "pending":
+            # Too old to be traded anyway (R6-2): said in one line below.
+            skipped = _withdraw_quietly(conn, signal, how=how, now_utc=now_utc)
+            too_old.append((signal["signal_id"], skipped))
+            continue
         raised.append(
             _withdraw_shown_only_off(
                 conn, signal=signal, channel_cfg=channel_cfg, how=how, kept_by=kept_by,
                 now_utc=now_utc,
             )
         )
+    if too_old:
+        raised.append(
+            _say_old_shown_only_off(
+                conn, too_old, max_age_seconds=max_age_seconds, now_utc=now_utc
+            )
+        )
     return raised
+
+
+def _withdraw_quietly(
+    conn: sqlite3.Connection, signal: sqlite3.Row, *, how: str, now_utc: datetime
+) -> int:
+    """`_withdraw_shown_only_off`'s withdrawal of `signal` -- a call too old
+    to be traded, nothing of it executed -- with no alert of its own (R6-2):
+    VOIDED and withdrawn, its own post the one that withdrew it, its waiting
+    entries cancelled. Returns how many entries were cancelled."""
+    signal_id = signal["signal_id"]
+    signals_repo.mark_withdrawn(conn, signal_id=signal_id, now_utc=now_utc)
+    signals_repo.record_closed_by(
+        conn, signal_id=signal_id, channel_id=signal["channel_id"],
+        message_id=signal["message_id"],
+    )
+    skipped = outbox.skip_queued(
+        conn,
+        kind="ENTRY",
+        signal_id=signal_id,
+        reason=f"signal withdrawn: its post {how}, and no post on a channel switched on shows it",
+    )
+    signals_repo.set_signal_state(conn, signal_id=signal_id, state="VOIDED")
+    logger.info(
+        "signal %s VOIDED: its own post, message %s on channel %s, %s, and no post on a "
+        "channel switched on shows the call; it was posted too long ago to be traded anyway "
+        "(%s queued trade entries cancelled)",
+        signal_id,
+        signal["message_id"],
+        signal["channel_id"],
+        how,
+        skipped,
+    )
+    return skipped
+
+
+def _say_old_shown_only_off(
+    conn: sqlite3.Connection,
+    too_old: list[tuple[int, int]],
+    *,
+    max_age_seconds: int,
+    now_utc: datetime,
+) -> int:
+    """The one WARNING for `_withdraw_calls_shown_only_off` about the calls
+    it withdrew that were too old to be traded anyway (R6-2): `too_old`
+    holds each signal with the entries cancelled for it."""
+    ids = [signal_id for signal_id, _ in too_old]
+    entries = sum(skipped for _, skipped in too_old)
+    shown = ", ".join(str(signal_id) for signal_id in ids[:10])
+    if len(ids) > 10:
+        shown += f" and {len(ids) - 10} more"
+    one = len(ids) == 1
+    detail = (
+        (
+            f"signal {shown} was waiting to be traded, but its own post"
+            if one
+            else f"{len(ids)} signals ({shown}) were waiting to be traded, but their own posts"
+        )
+        + " had been deleted, or edited so that they no longer show the call, and no post on a "
+        "channel that is switched on shows the call any more (a post on a channel switched "
+        "off now is no longer read). "
+        + ("It was" if one else "They were")
+        + f" posted more than {max_age_seconds} seconds ago, too old to be traded anyway. "
+        + ("It is" if one else "They are")
+        + f" VOIDED: {entries} queued trade entr{'y was' if entries == 1 else 'ies were'} "
+        "cancelled. Nothing had been executed. Nothing to do."
+    )
+    logger.info("%s", detail)
+    return alerts.record(
+        conn,
+        now_utc=now_utc,
+        level="WARNING",
+        code=OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF,
+        signal_id=ids[0] if one else None,
+        detail=detail,
+    )
 
 
 def _how_gone(

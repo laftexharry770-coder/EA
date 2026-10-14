@@ -1538,7 +1538,7 @@ CANCELLED_TEXT = SIGNAL_TEXT + "\nCANCELLED"
 
 def _the_relays_call_kept_only_by_the_vips_forward(  # noqa: F811
     conn, *, delete_before_restart: bool, on=(RELAY,), before_restart=None, gone="deleted",
-    second_forward: bool = False,
+    second_forward: bool = False, restart_at: float = 100,
 ):
     """Seed 102253 reduced (the re-check's p_102253): the relay's call
     (signal 1) is CANCELLED; the VIP posts the call (held back, a copy of
@@ -1587,9 +1587,9 @@ def _the_relays_call_kept_only_by_the_vips_forward(  # noqa: F811
         assert _claimable(conn) == [2]  # an echo: the VIP's forward stands
     if before_restart is not None:
         before_restart(conn)
-    _restart(conn, on=on, seconds=100)
+    _restart(conn, on=on, seconds=restart_at)
     if not delete_before_restart:
-        delete(110, (R,))
+        delete(restart_at + 10, (R,))
 
 
 @pytest.mark.parametrize("gone", ["deleted", "edited away"])
@@ -1707,6 +1707,165 @@ def test_a_waiting_signal_no_post_shows_is_withdrawn_at_start_too(conn):  # noqa
         f"its own post, message {RELAY_CALL} on channel {R} (Relay), was deleted, and no other "
         "post on a channel that is switched on shows the call, so it is not traded"
     ) in " ".join(alert[5].split())
+
+
+OLD_SHOWN_OFF = relay_repo.OLD_SIGNALS_SHOWN_ONLY_ON_CHANNEL_OFF
+TWO_DAYS = 2 * 86400
+
+
+def test_the_withdrawal_at_start_re_reads_a_signals_post_re_aimed_since(conn):  # noqa: F811
+    """Final fix round 6 (R6-2): only a signal whose own post may no longer
+    stand is re-read -- deleted, no longer stored as a signal, or edited. A
+    post re-aimed to another call is still stored as a signal: its edit is
+    what has it re-read, and signal 2 is withdrawn all the same."""
+    assert _ingest(conn, RELAY, 5002).signal_id == 1
+    edits_repo.apply_edit(
+        conn, channel_cfg=RELAY, message_id=5002, text=CANCELLED_TEXT, posted_at_utc=POSTED,
+        edit_date_utc=_at(10), reply_to_message_id=None, now_utc=_at(10), accounts=ACCOUNTS,
+        detected_by="event",
+    )
+    assert _ingest(conn, VIP, 1002, posted=_at(20)).relay_of_signal_id == 1
+    assert _ingest(conn, RELAY, 5005, posted=_at(30), fwd=(V, 1002)).signal_id == 2
+    assert _ingest(conn, VIP, 1005, posted=_at(40), fwd=(V, 1002)).relay_of_signal_id == 2
+    edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=1002, text="Good morning traders",
+        posted_at_utc=_at(20), edit_date_utc=_at(50), reply_to_message_id=None,
+        now_utc=_at(50), accounts=ACCOUNTS, detected_by="event",
+    )
+    edits_repo.apply_edit(
+        conn, channel_cfg=RELAY, message_id=5005, text=REAIMED, posted_at_utc=_at(30),
+        edit_date_utc=_at(60), reply_to_message_id=None, now_utc=_at(60), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V, R),
+    )
+    conn.commit()
+    assert _claimable(conn) == [2]  # an echo: the VIP's forward stands
+    assert _q(conn, "SELECT kind FROM messages WHERE channel_id = ? AND message_id = 5005", R) == [
+        ("signal",)
+    ]
+
+    _restart(conn, on=(RELAY,), seconds=100)
+
+    assert _claimable(conn) == []
+    (alert,) = [a for a in _alerts(conn) if a[1] == SHOWN_OFF]
+    assert "was edited and no longer shows the call" in " ".join(alert[5].split())
+
+
+def _three_waiting_calls_whose_posts_are_gone(conn) -> None:  # noqa: F811
+    """Three of the relay's calls (three trades) wait to be traded with
+    their posts gone and no other post of them standing."""
+    for message_id, stop in ((7001, "4470"), (7002, "4469"), (7003, "4468")):
+        text = SIGNAL_TEXT.replace("4470", stop)
+        assert _ingest(conn, RELAY, message_id, text).outcome == "new"
+    conn.execute(
+        "UPDATE messages SET deleted_at_utc = ? WHERE channel_id = ?", (_at(20).isoformat(), R)
+    )
+    conn.commit()
+
+
+def test_old_calls_no_post_shows_are_withdrawn_at_start_in_one_line(conn):  # noqa: F811
+    """Final fix round 6 (R6-2): calls posted longer ago than a signal may
+    be and still be traded are withdrawn all the same, but ONE WARNING for
+    the whole start says so -- not one per old call, as `_say_too_old` says
+    the old copies it leaves."""
+    _three_waiting_calls_whose_posts_are_gone(conn)
+
+    _restart(conn, on=(RELAY,), seconds=TWO_DAYS)
+
+    assert _claimable(conn) == []
+    assert _q(conn, "SELECT signal_id, state, withdrawn_at_utc IS NOT NULL, closed_by_message_id "
+                    "FROM signals ORDER BY 1") == [
+        (1, "VOIDED", 1, 7001), (2, "VOIDED", 1, 7002), (3, "VOIDED", 1, 7003)
+    ]
+    assert SHOWN_OFF not in [a[1] for a in _alerts(conn)]
+    (alert,) = [a for a in _alerts(conn) if a[1] == OLD_SHOWN_OFF]
+    assert alert[:5] == ("WARNING", OLD_SHOWN_OFF, None, None, None)
+    assert " ".join(alert[5].split()) == (
+        "3 signals (1, 2, 3) were waiting to be traded, but their own posts had been deleted, "
+        "or edited so that they no longer show the call, and no post on a channel that is "
+        "switched on shows the call any more (a post on a channel switched off now is no "
+        "longer read). They were posted more than 120 seconds ago, too old to be traded "
+        "anyway. They are VOIDED: 6 queued trade entries were cancelled. Nothing had been "
+        "executed. Nothing to do."
+    )
+
+
+def test_an_old_call_only_a_switched_off_channels_post_shows_is_said_in_one_line(
+    conn,  # noqa: F811
+):
+    """The re-check's p51_states, "restart two days later": signal 2 is
+    still withdrawn, and said in the one line for old calls."""
+    _the_relays_call_kept_only_by_the_vips_forward(
+        conn, delete_before_restart=True, restart_at=TWO_DAYS
+    )
+
+    assert _claimable(conn) == []
+    assert _q(conn, "SELECT state, withdrawn_at_utc IS NOT NULL FROM signals WHERE signal_id = 2") == [
+        ("VOIDED", 1)
+    ]
+    codes = [a[1] for a in _alerts(conn)]
+    assert SHOWN_OFF not in codes
+    (alert,) = [a for a in _alerts(conn) if a[1] == OLD_SHOWN_OFF]
+    assert alert[4] == 2
+    assert " ".join(alert[5].split()).startswith(
+        "signal 2 was waiting to be traded, but its own post had been deleted"
+    )
+
+
+def test_an_old_call_partly_traded_keeps_its_own_critical(conn):  # noqa: F811
+    """An old call one account already traded is no call to sum up: its
+    open trade was not closed, and its CRITICAL says so on its own."""
+    _three_waiting_calls_whose_posts_are_gone(conn)
+    conn.execute(
+        "UPDATE outbox SET state = 'DONE' WHERE outbox_id = (SELECT MIN(outbox_id) "
+        "FROM outbox WHERE kind = 'ENTRY' AND signal_id = 2)"
+    )
+    conn.commit()
+
+    _restart(conn, on=(RELAY,), seconds=TWO_DAYS)
+
+    (critical,) = [a for a in _alerts(conn) if a[1] == SHOWN_OFF]
+    assert critical[0] == "CRITICAL" and critical[4] == 2
+    (summary,) = [a for a in _alerts(conn) if a[1] == OLD_SHOWN_OFF]
+    assert "2 signals (1, 3) were waiting" in " ".join(summary[5].split())
+
+
+def test_the_withdrawal_at_start_re_reads_no_post_left_as_it_was(conn):  # noqa: F811
+    """R6-2, the cost: 2000 signals of one channel stored over the weeks,
+    their entries waiting for ever in watch-only Plan 2, none of their posts
+    deleted or edited. The start-up job's look at them stays well under
+    0.2 s: none is re-read."""
+    import time
+
+    assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
+    for n in range(2, 2001):
+        conn.execute(
+            "INSERT INTO messages (channel_id, message_id, kind, content_hash, raw_text, "
+            "  edit_date_utc, received_at_utc, posted_at_utc, source) "
+            "SELECT channel_id, ?, kind, content_hash, raw_text, edit_date_utc, "
+            "  received_at_utc, ?, source FROM messages WHERE message_id = ?",
+            (RELAY_CALL + n, _at(n * 1000).isoformat(), RELAY_CALL),
+        )
+        conn.execute(
+            "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, state) "
+            "SELECT channel_id, ?, parsed_json, trade_hash, state FROM signals WHERE signal_id = 1",
+            (RELAY_CALL + n,),
+        )
+        conn.execute(
+            "INSERT INTO outbox (account_id, kind, signal_id, state) "
+            "SELECT account_id, kind, ?, state FROM outbox WHERE signal_id = 1",
+            (n,),
+        )
+    conn.commit()
+    assert _q(conn, "SELECT COUNT(*) FROM signals") == [(2000,)]
+
+    started = time.perf_counter()
+    raised = relay_repo._withdraw_calls_shown_only_off(
+        conn, on={R: RELAY}, now_utc=_at(2001 * 1000)
+    )
+    took = time.perf_counter() - started
+
+    assert raised == []
+    assert took < 0.2, took
 
 
 def test_the_withdrawal_at_start_looks_only_at_signals_of_channels_switched_on(
