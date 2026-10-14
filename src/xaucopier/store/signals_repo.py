@@ -31,7 +31,7 @@ import sqlite3
 from datetime import datetime
 from typing import Literal
 
-from xaucopier.domain.signal import FollowUp, Signal
+from xaucopier.domain.signal import FollowUp, FollowUpOp, Signal
 from xaucopier.store import outbox
 
 TradeStatus = Literal["pending", "in_flight", "executed"]
@@ -322,6 +322,27 @@ def update_followup_on_edit(
             channel_id,
             message_id,
         ),
+    )
+
+
+def stored_followup(conn: sqlite3.Connection, followup_id: int) -> FollowUp | None:
+    """Follow-up `followup_id`'s instruction as stored, or None."""
+    row = conn.execute(
+        "SELECT channel_id, message_id, parsed_json FROM followups WHERE followup_id = ?",
+        (followup_id,),
+    ).fetchone()
+    if row is None or not row["parsed_json"]:
+        return None
+    data = json.loads(row["parsed_json"])
+    return FollowUp(
+        channel_id=row["channel_id"],
+        message_id=row["message_id"],
+        op=FollowUpOp(data["op"]),
+        posted_at_utc=datetime.fromisoformat(data["posted_at_utc"]),
+        reply_to_message_id=data.get("reply_to_message_id"),
+        price_hint=data.get("price_hint"),
+        tp_index_hint=data.get("tp_index_hint"),
+        raw=data.get("raw", ""),
     )
 
 

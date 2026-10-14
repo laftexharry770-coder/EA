@@ -47,6 +47,24 @@ moves, executed entries and replies:
   of an instruction near another channel's post of it is one instruction,
   where both channels read throughout make it two (an accepted rule of
   final fix round 6, `relay_repo`'s known limitations). Seeds 120000 + n.
+- **INV-3h, switched off and back on, with changes** (final fix round 8,
+  R8-6). The relay's call and the VIP's copy (by hand or a forward); the
+  relay's "close half" replies, the VIP's forwards of them and its own
+  replies, near or long after; any of them edited into "close all" or
+  chatter, or deleted; the relay switched off at a restart and on and off
+  again at later ones (the age gate lifted: a call too old to trade at a
+  start is the families above's business). Once the relay is back on at
+  the end, the instructions acting on the call traded -- by op and count,
+  those handed to the user to carry out by hand included, and every one of
+  those withdrawn since said so -- are EXACTLY those of the same posts read
+  with both channels read throughout (the relay's posts while it was off
+  are never read either way). The one exception is the accepted rule of
+  final fix round 6 that INV-3g allows too: when a start took two of one
+  channel's own instructions for one (`_merged`), they may be fewer, never
+  more and never another op. With the relay off at the end, never more.
+  Two families: the round-7 re-check's scenarios, event for event (its
+  fuzz_r7.py, seeds 70000 + n), and INV-3h's own with more changes and up
+  to four restarts (130000 + n); `CYCLE_SEEDS` each by default.
 
 Every scenario uses one call (the same BUY), so "the call" is every
 signal the scenario creates. The seeds are fixed: the suite is
@@ -118,6 +136,9 @@ DEFAULT_SEEDS = 1000
 SEEDS = int(os.environ.get("XAUCOPIER_FUZZ_SEEDS", DEFAULT_SEEDS))
 #: Seeds per test item (a failing block names its seeds).
 BLOCK = 50
+#: INV-3h's two families run fewer by default (each seed is two runs with
+#: up to four restarts); `XAUCOPIER_FUZZ_SEEDS` sets them too.
+CYCLE_SEEDS = int(os.environ.get("XAUCOPIER_FUZZ_SEEDS", 500))
 
 CHANNELS = (VIP, RELAY)
 FIRST_ID = {0: 4001, 1: 7001}
@@ -797,8 +818,9 @@ def _report(family: str, seed: int, problems: list[str], log: list[str]) -> str:
     )
 
 
-def _blocks() -> list[range]:
-    return [range(start, min(start + BLOCK, SEEDS)) for start in range(0, SEEDS, BLOCK)]
+def _blocks(seeds: int | None = None) -> list[range]:
+    count = SEEDS if seeds is None else seeds
+    return [range(start, min(start + BLOCK, count)) for start in range(0, count, BLOCK)]
 
 
 @pytest.mark.parametrize("seeds", _blocks(), ids=lambda r: f"seeds{r.start}-{r.stop - 1}")
@@ -1068,13 +1090,13 @@ def test_switching_the_relay_off_never_applies_its_instruction_twice(seeds):
 # -- a channel switched back on (final fix round 7, R7-1) ----------------------
 
 
-def _start(conn, channels: tuple, now: datetime) -> None:
+def _start(conn, channels: tuple, now: datetime, **kwargs) -> None:
     """`watch`'s start-up job with only `channels` switched on."""
     enabled = tuple(channel.channel_id for channel in channels)
     ids = outbox.signals_with_entries_of_channels_off(conn, enabled_channel_ids=enabled)
     outbox.skip_entries_of_channels_off(conn, enabled_channel_ids=enabled)
     relay_repo.admit_copies_of_switched_off(
-        conn, signal_ids=ids, channels=channels, accounts=ACCOUNTS, now_utc=now
+        conn, signal_ids=ids, channels=channels, accounts=ACCOUNTS, now_utc=now, **kwargs
     )
     conn.commit()
 
@@ -1187,3 +1209,431 @@ def test_a_channel_switched_back_on_acts_as_with_both_channels_read(seeds):
             problems, log = _back_on_problems(small, vip_forwards_call)
             failures.append(_report("relay switched back on", base, problems, log))
     assert not failures, "\n\n".join(failures)
+
+
+# -- switched off and back on, with changes (final fix round 8, R8-6) --------
+
+#: What a "close half" may be edited into: another instruction, or chatter.
+CLOSE_ALL_TEXT = "Close all now"
+CHAT_TEXT = "nice trade everyone"
+#: The words of a WARNING that hands an instruction to the user to carry
+#: out by hand, and of one that only repeats such a request.
+BY_HAND = relay_repo.BY_HAND
+BY_HAND_ONCE = "once, not once for each message"
+#: The age gate lifted: INV-3h is about instructions, not about a call too
+#: old to be traded at a start (the families above test that).
+NO_AGE_GATE = 1_000_000
+
+
+def _reviewer_events(rng: random.Random) -> list[tuple]:
+    """The round-7 re-check's extended fuzz (its fuzz_r7.py, seeds 70000 +
+    n), event for event: the relay's "close half" (7005) and maybe a second
+    (7006); the VIP's forwards of 7005 and "close half" replies to its copy,
+    near or long after; the VIP deleting or editing into chatter one of
+    those; the VIP posting the call again long after (4100) and replying to
+    that; a restart with the relay switched off, maybe a second one (off
+    again, or back on); and maybe the relay deleting 7005 or editing it into
+    "close all"."""
+    relay_close = rng.randint(40, 100)
+    events: list[tuple] = [("relay close", relay_close)]
+    for _ in range(rng.randint(1, 4)):
+        at = relay_close + (rng.randint(-20, 120) if rng.random() < 0.8 else rng.randint(900, 2500))
+        events.append((rng.choice(["vip forward", "vip reply"]), max(at, 31)))
+    rng.shuffle(events)
+    if rng.random() < 0.4:
+        events.insert(rng.randint(1, len(events)), ("vip delete", rng.randint(0, 3)))
+    events.insert(rng.randint(0, len(events)), ("restart", rng.choice([0, 10, 60, 2000])))
+    if rng.random() < 0.3:
+        last = max(n for n, event in enumerate(events) if event[0] == "restart")
+        events.insert(
+            rng.randint(last + 1, len(events)),
+            (rng.choice(["restart", "restart on"]), rng.choice([0, 10, 3000])),
+        )
+    if rng.random() < 0.3:
+        events.insert(rng.randint(1, len(events)), ("vip edit", rng.randint(0, 3)))
+    if rng.random() < 0.3:
+        new_call = rng.randint(1000, 3000)
+        events.insert(rng.randint(0, len(events)), ("vip new call", new_call))
+        events.insert(rng.randint(0, len(events)), ("vip reply new", new_call + rng.randint(5, 60)))
+    if rng.random() < 0.2:
+        events.insert(rng.randint(0, len(events)), ("relay close 2", rng.randint(100, 2500)))
+    if rng.random() < 0.5:
+        last = max(n for n, event in enumerate(events) if event[0] in ("restart", "restart on"))
+        events.insert(
+            rng.randint(last, len(events)), (rng.choice(["relay del close", "relay edit close"]), 0)
+        )
+    return events
+
+
+def _cycle_events(rng: random.Random) -> list[tuple]:
+    """INV-3h's own scenarios (seeds 130000 + n): one or two "close half"
+    replies of the relay to its call, one to four VIP posts -- forwards of
+    them, or "close half" replying to its copy -- near or long after, up to
+    three changes (the relay or the VIP editing one into "close all" or into
+    chatter, or deleting it), in a random order, with a restart switching
+    the relay off somewhere and up to three more after it: on, off, on."""
+    closes = rng.randint(1, 2)
+    events: list[tuple] = [("relay close", rng.randint(35, 200), 7005 + n) for n in range(closes)]
+    for _ in range(rng.randint(1, 4)):
+        at = rng.randint(35, 260) if rng.random() < 0.8 else rng.randint(1000, 2500)
+        if rng.random() < 0.5:
+            events.append(("vip forward", at, 7005 + rng.randrange(closes)))
+        else:
+            events.append(("vip reply", at))
+    for _ in range(rng.randint(0, 3)):
+        events.append((rng.choice([
+            "relay edit", "relay edit chat", "relay delete", "vip edit all", "vip edit",
+            "vip delete",
+        ]), rng.randrange(4)))
+    rng.shuffle(events)
+    events.insert(rng.randint(0, len(events)), ("restart", 0))
+    after = [event[0] for event in events].index("restart")
+    for kind in ("restart on", "restart", "restart on")[: rng.choice([0, 1, 1, 2, 3])]:
+        after = rng.randint(after + 1, len(events))
+        events.insert(after, (kind, 0))
+    return events
+
+
+def _cycle_run(events: list[tuple], *, cycle: bool, vip_forwards_call: bool):
+    """One INV-3h scenario: the relay's call and the VIP's copy, then
+    `events`. With `cycle` False the restarts are skipped -- the same posts
+    are read with both channels read throughout (the relay's posts while it
+    is switched off are never read either way). Returns (the instructions
+    acting on the call traded, whether any signal is traded, problems,
+    whether the relay is switched on at the end, the log)."""
+    world = _World(_fresh())
+    vip, relay = CHANNELS
+    relay_on = True
+    vip_posts: list[tuple[int, int]] = []
+    try:
+        world.store(_Post(1, 7001, SIGNAL_TEXT, POSTED))
+        world.store(_Post(
+            0, 4001, SIGNAL_TEXT, POSTED + timedelta(seconds=30),
+            (1, 7001) if vip_forwards_call else None,
+        ))
+        world.next_id = {0: 4005, 1: 7010}
+        world.log.append(
+            f"post Relay/7001 at +0 s, VIP/4001 at +30 s "
+            f"({'a forward of it' if vip_forwards_call else 'by hand'})"
+        )
+        latest = POSTED + timedelta(seconds=30)
+        for event in events:
+            op, at = event[0], event[1]
+            # Both channels read throughout, without the restarts.
+            read = (
+                (vip.channel_id, relay.channel_id) if relay_on or not cycle else (vip.channel_id,)
+            )
+            if op in ("restart", "restart on"):
+                relay_on = op == "restart on"
+                if cycle:
+                    latest += timedelta(seconds=at + 1)
+                    _start(
+                        world.conn, (vip, relay) if relay_on else (vip,), latest,
+                        max_age_seconds=NO_AGE_GATE,
+                    )
+                    world.log.append(
+                        f"restart at +{int((latest - POSTED).total_seconds())} s, relay "
+                        f"{'back on' if relay_on else 'off'}"
+                    )
+                continue
+            if op in ("relay del close", "relay edit close"):
+                # The re-check's: always Relay/7005, once stored.
+                if not relay_on or (1, 7005) not in world.posts:
+                    world.log.append(f"({op}: never read)")
+                    continue
+                latest += timedelta(seconds=1)
+                _change(world, (1, 7005), "relay delete" if op == "relay del close" else "relay edit",
+                        latest, (vip.channel_id, relay.channel_id))
+                continue
+            if op in ("relay delete", "relay edit", "relay edit chat"):
+                own = sorted(
+                    key for key, post in world.posts.items()
+                    if key[0] == 1 and key[1] >= 7005 and not post.deleted
+                )
+                if not relay_on or not own:
+                    world.log.append(f"({op}: never read)")
+                    continue
+                latest += timedelta(seconds=1)
+                _change(world, own[at % len(own)], op, latest, read)
+                continue
+            if op in ("vip delete", "vip edit", "vip edit all"):
+                if not vip_posts:
+                    continue
+                key = vip_posts[at % len(vip_posts)]
+                latest += timedelta(seconds=1)
+                _change(world, key, op, latest, read)
+                if op == "vip delete":
+                    vip_posts.remove(key)
+                continue
+            if op == "vip new call":
+                latest = max(latest, POSTED + timedelta(seconds=at))
+                world.store(_Post(0, 4100, SIGNAL_TEXT, POSTED + timedelta(seconds=at)))
+                world.log.append(f"VIP/4100 posts the call again at +{at} s")
+                continue
+            posted = POSTED + timedelta(seconds=at)
+            if op == "relay close 2" and not relay_on:
+                world.log.append(f"(Relay/7006 close half at +{at} s: never read)")
+                continue
+            if op not in ("vip reply new",):
+                latest = max(latest, posted)
+            if op == "vip reply new":
+                if (0, 4100) not in world.posts:
+                    continue
+                latest = max(latest, posted)
+                post = _Post(0, world.new_id(0), CLOSE_HALF, posted, reply_to=4100)
+                world.store(post)
+                vip_posts.append((0, post.message_id))
+                world.log.append(f"VIP/{post.message_id} close half at +{at} s, replying to VIP/4100")
+                continue
+            if op in ("relay close", "relay close 2"):
+                message_id = event[2] if len(event) > 2 else (7005 if op == "relay close" else 7006)
+                if not relay_on:
+                    world.log.append(f"(Relay/{message_id} close half at +{at} s: never read)")
+                    continue
+                world.store(_Post(1, message_id, CLOSE_HALF, posted, reply_to=7001))
+                world.log.append(f"Relay/{message_id} close half at +{at} s, replying to Relay/7001")
+            elif op == "vip forward":
+                original = event[2] if len(event) > 2 else 7005
+                post = _Post(0, world.new_id(0), CLOSE_HALF, posted, (1, original))
+                world.store(post)
+                vip_posts.append((0, post.message_id))
+                world.log.append(f"VIP/{post.message_id} forwards Relay/{original} at +{at} s")
+            else:
+                post = _Post(0, world.new_id(0), CLOSE_HALF, posted, reply_to=4001)
+                world.store(post)
+                vip_posts.append((0, post.message_id))
+                world.log.append(f"VIP/{post.message_id} close half at +{at} s, replying to VIP/4001")
+        acting, traded, problems, merged = _acting_with_by_hand(world)
+        return (acting, merged), traded, problems, relay_on, world.log
+    except Exception as exc:  # noqa: BLE001 -- reported with the seed and the events
+        return None, None, [_crash(exc)], relay_on, world.log
+    finally:
+        world.conn.close()
+
+
+def _change(world: _World, key: tuple[int, int], op: str, at: datetime, read) -> None:
+    """A post of a follow-up deleted, or edited into "close all" or into
+    chatter, read with the channels `read`."""
+    post = world.posts[key]
+    if op.endswith("delete"):
+        edits_repo.apply_deletion(
+            world.conn, channel_cfg=CHANNELS[key[0]], message_id=key[1], now_utc=at,
+            accounts=ACCOUNTS, detected_by="event", read_channels=read,
+        )
+        post.deleted_by = "event"
+        how = "deletes"
+    else:
+        text = CLOSE_ALL_TEXT if op in ("relay edit", "vip edit all") else CHAT_TEXT
+        edits_repo.apply_edit(
+            world.conn, channel_cfg=CHANNELS[key[0]], message_id=key[1], text=text,
+            posted_at_utc=post.posted, edit_date_utc=at, reply_to_message_id=post.reply_to,
+            now_utc=at, accounts=ACCOUNTS, detected_by="event", read_channels=read,
+        )
+        post.text, post.edited_at = text, at
+        how = f"edits into {'close all' if text == CLOSE_ALL_TEXT else 'chatter'}"
+    world.conn.commit()
+    world.log.append(f"{world.name(key)}: its poster {how}")
+
+
+def _root_of(conn, followup_id: int) -> int:
+    """The follow-up `followup_id` stands in for, up to the first (R6-1)."""
+    seen = {followup_id}
+    while True:
+        (up,) = _q(conn, "SELECT instead_of_followup_id FROM followups WHERE followup_id = ?",
+                   followup_id)[0]
+        if up is None or up in seen:
+            return followup_id
+        seen.add(up)
+        followup_id = up
+
+
+def _acting_with_by_hand(world: _World):
+    """INV-3h's count: the instructions acting on the call traded, by op --
+
+    - every follow-up acting on a signal traded (`signal_for_followup`)
+      with an instruction waiting;
+    - every instruction handed to the user to carry out by hand (a
+      `FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL` asking for it, not a repeat of
+      such a request), by what the instruction it repeats says now -- unless
+      that one was withdrawn since, which a later alert must then say,
+      naming that request (else a problem).
+
+    Returns (the counts, whether any signal is traded, problems, whether a
+    start merged two of one channel's instructions: `_merged`)."""
+    conn = world.conn
+    traded = {row[0] for row in _q(
+        conn,
+        "SELECT DISTINCT s.signal_id FROM signals s JOIN outbox o ON o.signal_id = s.signal_id "
+        "WHERE o.kind = 'ENTRY' AND o.state IN ('QUEUED', 'CLAIMED', 'DONE') "
+        "AND s.state = 'NEW' AND s.withdrawn_at_utc IS NULL",
+    )}
+    acting: dict[str, int] = {}
+
+    def count(op: str) -> None:
+        acting[op] = acting.get(op, 0) + 1
+
+    for followup_id, op in _q(conn, "SELECT followup_id, op FROM followups WHERE edit_seq = 0"):
+        if relay_repo.signal_for_followup(conn, followup_id=followup_id) in traded and _q(
+            conn, "SELECT 1 FROM outbox WHERE kind = 'FOLLOWUP' AND followup_id = ? "
+            "AND state = 'QUEUED' LIMIT 1", followup_id,
+        ):
+            count(op)
+    problems = []
+    details = [detail for (detail,) in _q(conn, "SELECT detail FROM alerts")]
+    for alert_id, detail, copy_of in _q(
+        conn,
+        "SELECT a.alert_id, a.detail, m.relay_of_followup_id FROM alerts a JOIN messages m "
+        "ON m.channel_id = a.channel_id AND m.message_id = a.message_id WHERE a.code = ? "
+        "ORDER BY a.alert_id",
+        relay_repo.FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL,
+    ):
+        if BY_HAND not in detail or BY_HAND_ONCE in detail:
+            continue
+        root = _root_of(conn, copy_of)
+        if set(outbox.state_counts(conn, kind="FOLLOWUP", followup_id=root)) == {"SKIPPED"}:
+            if not any(f"(alert #{alert_id})" in later and "review that" in later
+                       for later in details):
+                problems.append(
+                    f"INV-3h: the instruction handed over by hand in alert #{alert_id} was "
+                    "withdrawn since, and no alert says so"
+                )
+            continue
+        count(_q(conn, "SELECT op FROM followups WHERE followup_id = ?", root)[0][0])
+    return acting, bool(traded), problems, _merged(conn)
+
+
+def _merged(conn) -> bool:
+    """Whether a start took one channel's own instruction and another of its
+    instructions -- or a repeat of another channel's -- for one (an accepted
+    rule of final fix round 6, "never two", in `relay_repo`'s known
+    limitations: after a start, a channel's own repeat near another
+    channel's post of an instruction is one instruction, where both channels
+    read throughout make it two). It shows as a post stored as a copy of an
+    instruction first given on its own channel (`_root_of`) that is not the
+    same post (no forward of it, nor of the post it forwards); a follow-up
+    standing in for one of its own channel; or a follow-up of a channel read
+    throughout, its instruction still waiting, kept with a call another
+    channel's switching off cancelled because another follow-up gives it."""
+    for channel_id, copy_of, fwd in _q(
+        conn,
+        "SELECT channel_id, relay_of_followup_id, fwd_from_channel_id || '/' || fwd_from_post_id "
+        "FROM messages WHERE relay_of_followup_id IS NOT NULL",
+    ):
+        ((root_channel, root_post, root_fwd),) = _q(
+            conn,
+            "SELECT f.channel_id, f.channel_id || '/' || f.message_id, "
+            "  m.fwd_from_channel_id || '/' || m.fwd_from_post_id FROM followups f "
+            "JOIN messages m ON m.channel_id = f.channel_id AND m.message_id = f.message_id "
+            "WHERE f.followup_id = ?",
+            _root_of(conn, copy_of),
+        )
+        if root_channel == channel_id and (fwd is None or fwd not in (root_post, root_fwd)):
+            return True
+    if _q(
+        conn,
+        "SELECT 1 FROM followups g JOIN followups h ON h.followup_id = g.instead_of_followup_id "
+        "WHERE g.channel_id = h.channel_id LIMIT 1",
+    ):
+        return True
+    for followup_id, channel_id in _q(
+        conn,
+        "SELECT f.followup_id, f.channel_id FROM followups f WHERE EXISTS (SELECT 1 FROM outbox o "
+        "WHERE o.kind = 'FOLLOWUP' AND o.followup_id = f.followup_id AND o.state = 'QUEUED')",
+    ):
+        about = relay_repo.signal_for_followup(conn, followup_id=followup_id)
+        if about is None:
+            continue
+        row = conn.execute("SELECT * FROM signals WHERE signal_id = ?", (about,)).fetchone()
+        if row["channel_id"] != channel_id and relay_repo.switched_off(conn, row):
+            return True
+    return False
+
+
+def _cycle_problems(events: list[tuple], vip_forwards_call: bool):
+    off, off_traded, off_problems, relay_on, log = _cycle_run(
+        events, cycle=True, vip_forwards_call=vip_forwards_call
+    )
+    on, on_traded, on_problems, _, _ = _cycle_run(
+        events, cycle=False, vip_forwards_call=vip_forwards_call
+    )
+    problems = [*off_problems, *on_problems]
+    if problems or off is None or on is None:
+        return problems, log
+    off, merged = off
+    on, _ = on
+    if off_traded != on_traded:
+        problems.append(f"INV-3h: traded {off_traded} with the restarts, {on_traded} without")
+    more = sum(off.values()) > sum(on.values())
+    other_op = any(op not in on for op in off)
+    if relay_on and (off != on if not merged else more or other_op):
+        problems.append(
+            f"INV-3h: relay switched back on: {off} act on the call traded, {on} with both "
+            "channels read throughout" + (" (a start merged one channel's own)" if merged else "")
+        )
+    if not relay_on and more:
+        problems.append(
+            f"INV-3h: relay switched off at the end: {off} act on the call traded, more than "
+            f"{on} with both channels read"
+        )
+    return problems, log
+
+
+def _cycle_family(base: int, generator, seeds) -> list[str]:
+    failures = []
+    for seed in seeds:
+        rng = random.Random(base + seed)
+        events = generator(rng)
+        vip_forwards_call = rng.random() < 0.3
+        problems, log = _cycle_problems(events, vip_forwards_call)
+        if problems:
+            small = _shrink(lambda e: bool(_cycle_problems(e, vip_forwards_call)[0]), events)
+            problems, log = _cycle_problems(small, vip_forwards_call)
+            failures.append(_report("switched off and back on", base + seed, problems, log))
+    return failures
+
+
+@pytest.mark.parametrize(
+    "seeds", _blocks(CYCLE_SEEDS), ids=lambda r: f"seeds{r.start}-{r.stop - 1}"
+)
+def test_a_channel_switched_off_and_on_acts_as_both_channels_read(seeds):
+    """INV-3h (final fix round 8, R8-6): the relay's call, the VIP's copy (by
+    hand or a forward), the relay's "close half" replies, the VIP's forwards
+    of them and its own replies, edits of any of them into "close all" or
+    chatter and deletions, with the relay switched off at a restart and on
+    and off again at later ones. Once the relay is back on at the end, the
+    instructions acting on the call traded -- by op and count, those handed
+    to the user by hand included -- are exactly those of the same posts read
+    with both channels read throughout. With the relay off at the end, never
+    more. Seeds 130000 + n."""
+    assert not (failures := _cycle_family(130000, _cycle_events, seeds)), "\n\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    "seeds", _blocks(CYCLE_SEEDS), ids=lambda r: f"seeds{r.start}-{r.stop - 1}"
+)
+def test_the_reviewers_switch_off_scenarios_act_as_both_channels_read(seeds):
+    """INV-3h on the round-7 re-check's own scenarios (`_reviewer_events`,
+    seeds 70000 + n): the same check."""
+    assert not (failures := _cycle_family(70000, _reviewer_events, seeds)), "\n\n".join(failures)
+
+
+@pytest.mark.parametrize("seed", [70707, 70837, 71214, 70665, 70802])
+def test_the_reviewers_seeds_act_as_both_channels_read(seed):
+    """The round-7 re-check's seeds (final fix round 8): 70707 and 70837, the
+    relay deleting its "close half" once back on, and 71214, editing it
+    (R8-2); 70665, a forward of an instruction its poster withdrew (R8-4);
+    70802, a request by hand for an instruction withdrawn since."""
+    assert not (failures := _cycle_family(0, _reviewer_events, [seed])), "\n\n".join(failures)
+
+
+@pytest.mark.parametrize("seed", [
+    130154, 130190, 130152, 130086,  # a copy of an instruction withdrawn: never adopted
+    130184,  # the relay's instruction read before the switch-off, back on
+    130178, 130289, 130416,  # adopted after the instruction was edited: says it now
+    130476, 130323,  # the VIP's stand-in edited while the relay was off, then back on
+    130005, 130016, 130172,  # a channel's own two instructions, one edited
+])
+def test_the_seeds_inv3h_found_act_as_both_channels_read(seed):
+    """The seeds INV-3h found while it was written (final fix round 8), each
+    pinned with the fix it needed."""
+    assert not (failures := _cycle_family(0, _cycle_events, [seed])), "\n\n".join(failures)

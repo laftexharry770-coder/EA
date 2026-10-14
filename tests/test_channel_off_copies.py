@@ -4006,3 +4006,53 @@ def test_a_reply_after_the_start_near_an_instruction_withdrawn_is_nothing_to_do(
             f"Message {RELAY_CLOSE} was withdrawn by its poster (alert #1). Nothing to do."
         ), alert
 
+@SWITCHED
+@pytest.mark.parametrize("vip", ["nothing", "its forward, deleted while the relay was off"])
+def test_the_relays_instruction_read_before_the_switch_off_acts_once_it_is_back_on(
+    conn, switched, vip  # noqa: F811
+):
+    """INV-3h seed 130184 (final fix round 8, R8-3 at a start). The relay's
+    "close half" was read before the start that switched it off, and no
+    post of the VIP's stands in for it about signal 2 -- the VIP never
+    repeated it, or deleted its forward while the relay was off. With the
+    relay back on its post is read again and still says "close half": with
+    both channels read that instruction acts on the call, so it acts on
+    signal 2, the call traded, from the start that switches the relay back
+    on."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    if vip != "nothing":
+        _fwd(conn)  # read before the start: it stands in for the relay's there
+    if switched:
+        _restart(conn, on=(VIP,), seconds=80)
+        if vip != "nothing":
+            assert _instructions(conn, 2) == [(2, "close_half", 2)]
+            _the_vip_changes_its_forward(conn, "deleted", read=(V,), seconds=82)
+            assert _instructions(conn, 2) == []
+        _restart(conn, on=(VIP, RELAY), seconds=90)
+    elif vip != "nothing":
+        _the_vip_changes_its_forward(conn, "deleted", read=(V, R), seconds=82)
+    traded = 2 if switched else 1
+
+    assert _claimable(conn) == [traded]
+    assert _instructions(conn, traded) == [(1, "close_half", 2)]
+
+
+def test_an_instruction_handed_over_by_hand_is_not_carried_out_again_once_back_on(
+    conn,  # noqa: F811
+):
+    """R8-3 at a start, the other side: the VIP's forward of the relay's
+    "close half", read after the start that switched the relay off, was
+    handed to the user to apply by hand on signal 2. With the relay back on
+    the relay's own follow-up stays with the cancelled signal 1: done by
+    hand, it is never carried out a second time."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _restart(conn, on=(VIP,), seconds=80)
+    _fwd(conn, seconds=81)
+    assert relay_repo.handed_over(conn, 1) is not None
+
+    _restart(conn, on=(VIP, RELAY), seconds=90)
+
+    assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
+    assert _instructions(conn, 2) == []
