@@ -4328,3 +4328,121 @@ def test_a_request_by_hand_read_in_a_copy_of_a_merged_stand_in_is_named_when_wit
         f"It was handed to you to apply by hand on signal 2 (alert #{asked[0]}), and its poster "
         "withdrew it: if you applied it, review that."
     ) in " ".join(alert[5].split()), alert
+
+
+@pytest.mark.parametrize("switched", [False, True], ids=["both channels read", "relay switched off"])
+@pytest.mark.parametrize("text, says", [("Close all now", "close_all"), ("CLOSE HALF NOW", "close_half")])
+def test_a_channels_own_instruction_kept_with_the_cancelled_call_acts_once_edited_into_another(
+    conn, switched, text, says  # noqa: F811
+):
+    """The other side of the edit above (final fix round 8): the VIP edits
+    its forward -- the one the start kept with the cancelled call -- into
+    "close all". With both channels read that is two instructions, "close
+    all" and the reply's "close half", so the forward acts on signal 2 too
+    now, beside the reply -- never "close all" lost unseen -- with a WARNING
+    naming both. Edited into the same instruction in other words, the two
+    stay the one the start took them for."""
+    _the_vips_forward_read_first_and_its_own_reply(conn)
+    if switched:
+        _restart(conn, on=(VIP,), seconds=100)
+    traded = 2 if switched else 1
+
+    edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=FWD, text=text, posted_at_utc=_at(95),
+        edit_date_utc=_at(105), reply_to_message_id=None, now_utc=_at(105), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,) if switched else (V, R),
+    )
+    conn.commit()
+
+    merged = switched and says == "close_half"
+    assert _instructions(conn, traded) == (
+        [(2, "close_half", 2)] if merged else [(1, says, 2), (2, "close_half", 2)]
+    )
+    warned = [a for a in _alerts(conn) if a[1] == "FOLLOWUP_EDITED_AFTER_DISPATCH"]
+    if not switched or merged:
+        assert warned == []
+        return
+    (alert,) = warned
+    assert alert[2:5] == (V, FWD, 2), alert
+    assert " ".join(alert[5].split()) == (
+        f"Follow-up 1 (message {FWD} on channel {V}) was edited; it now says 'close the whole "
+        f"trade'. When this program started it took it for the same instruction as follow-up 2 "
+        f"(message {REP} on channel {V}), which still says 'close half of the trade': two posts "
+        "of one channel are two instructions, so follow-up 1 acts on signal 2 too now, 2 "
+        "instruction(s) queued. [found by event]"
+    ), alert
+
+
+@pytest.mark.parametrize("how", ["deleted", "edited away"])
+def test_a_channels_own_instruction_kept_with_the_cancelled_call_withdrawn_leaves_the_other(
+    conn, how  # noqa: F811
+):
+    """The VIP withdraws its forward -- the one the start kept with the
+    cancelled call, its reply standing in for it about signal 2. With both
+    channels read the reply is an instruction of its own and still acts:
+    so it does on signal 2. Only another channel's stand-ins are its copies,
+    withdrawn with it (`relay_repo.stand_ins_of`, R8-2)."""
+    _the_vips_forward_read_first_and_its_own_reply(conn)
+    _restart(conn, on=(VIP,), seconds=100)
+
+    if how == "deleted":
+        edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=FWD, now_utc=_at(105), accounts=ACCOUNTS,
+            detected_by="event", read_channels=(V,),
+        )
+    else:
+        edits_repo.apply_edit(
+            conn, channel_cfg=VIP, message_id=FWD, text="good morning traders",
+            posted_at_utc=_at(95), edit_date_utc=_at(105), reply_to_message_id=None,
+            now_utc=_at(105), accounts=ACCOUNTS, detected_by="event", read_channels=(V,),
+        )
+    conn.commit()
+
+    assert _instructions(conn, 2) == [(2, "close_half", 2)]
+    code = "FOLLOWUP_DELETED" if how == "deleted" else "FOLLOWUP_RETRACTED_BY_EDIT"
+    (alert,) = [a for a in _alerts(conn) if a[1] == code]
+    assert "Follow-up 2" not in alert[5], alert
+
+
+@pytest.mark.parametrize("switched", [False, True], ids=["both channels read", "relay switched off"])
+def test_a_copy_adopted_at_the_start_says_what_the_instruction_it_repeats_says_now(
+    conn, switched  # noqa: F811
+):
+    """INV-3h seeds 130178, 130289 and 130416 (final fix round 8). The VIP
+    forwarded the relay's "close half", and the relay then edited its post
+    into "close all": with both channels read that is ONE instruction, "close
+    all". The start that switches the relay off adopts the forward as the
+    instruction about signal 2: it says "close all" too, never the "close
+    half" its own words still say."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    assert _fwd(conn).relay_of_followup_id == 1
+    _the_relay_changes_its_close_half(conn, "close all", seconds=75)
+    if switched:
+        _restart(conn, on=(VIP,), seconds=80)
+    traded = 2 if switched else 1
+
+    assert _instructions(conn, traded) == [(2 if switched else 1, "close_all", 2)]
+
+
+@pytest.mark.parametrize("switched", [False, True], ids=["both channels read", "relay switched off"])
+def test_a_reply_withdrawn_before_the_start_never_keeps_the_forward_from_the_call_traded(
+    conn, switched  # noqa: F811
+):
+    """INV-3h seeds 130258 and 130150 (final fix round 8). The VIP's forward
+    of the relay's "close half" was read first and the VIP's own "close
+    half" reply near the relay's post was deleted before the start. With
+    both channels read the forward still acts. So it does after the start
+    that switches the relay off: the withdrawn reply is never the "same
+    instruction" the start keeps the forward with the cancelled call for."""
+    _the_vips_forward_read_first_and_its_own_reply(conn)
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=REP, now_utc=_at(99), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V, R),
+    )
+    conn.commit()
+    if switched:
+        _restart(conn, on=(VIP,), seconds=100)
+    traded = 2 if switched else 1
+
+    assert _instructions(conn, traded) == [(1, "close_half", 2)]

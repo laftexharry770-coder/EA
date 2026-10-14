@@ -2127,10 +2127,9 @@ def _edit_of_followup(ctx: _Ctx, route_result: RouteResult, new_hash: str) -> Ed
     dispatched = counts.get("CLAIMED", 0) + counts.get("DONE", 0)
     if new_kind == "followup":
         handed = relay_repo.hand_back(
-            ctx.conn, followup_id=followup_id, read_channels=ctx.read_channels,
-            edited_into=route_result.followup,
+            ctx.conn, followup_id=followup_id, read_channels=ctx.read_channels, edited=True
         )
-        if handed is not None and not handed.merged:
+        if handed is not None:
             stood = _stand_in_edited(ctx, followup_id, route_result, handed)
             return ctx.result(
                 "withdrawn", new_kind, "a follow-up standing in for another edited",
@@ -2149,9 +2148,12 @@ def _edit_of_followup(ctx: _Ctx, route_result: RouteResult, new_hash: str) -> Ed
                 f"{dispatched} worker(s) had taken it; what they did is not undone."
             )
         signal_id = None
-        if handed is not None:
-            parts.append(_merge_undone(ctx, followup_id, route_result, handed))
-            signal_id = handed.signal_id
+        undone = relay_repo.merge_undone(
+            ctx.conn, followup_id=followup_id, read_channels=ctx.read_channels
+        )
+        if undone is not None:
+            parts.append(_merge_undone(ctx, followup_id, route_result, undone))
+            signal_id = undone.signal_id
         for other in relay_repo.stand_ins_of(ctx.conn, followup_id):
             # The same instruction about the signal traded instead: with both
             # channels read only a copy of this one, so it says what this one
@@ -2490,23 +2492,23 @@ def _stand_in_edited(
 
 
 def _merge_undone(
-    ctx: _Ctx, followup_id: int, route_result: RouteResult, handed: relay_repo.HandBack
+    ctx: _Ctx, followup_id: int, route_result: RouteResult, undone: relay_repo.MergeUndone
 ) -> str:
     """The sentence for follow-up `followup_id`, edited into another
-    instruction, that a start had taken for the same instruction as
-    `handed`'s, a post of the same channel ("never two", final fix round 6):
-    with both channels read two posts of one channel are two instructions,
-    so `handed`'s acts on the signal traded too now (`relay_repo.hand_back`,
-    final fix round 8)."""
-    says = signals_repo.stored_followup(ctx.conn, handed.followup_id)
+    instruction than `undone.other`'s, a post of the same channel a start
+    had taken it for ("never two", final fix round 6): with both channels
+    read two posts of one channel are two instructions, so `undone.acting`
+    acts on the signal traded too now (`relay_repo.merge_undone`, final fix
+    round 8)."""
+    says = signals_repo.stored_followup(ctx.conn, undone.other)
     return (
         f"Follow-up {followup_id} (message {ctx.message_id} on channel {ctx.channel_id}) was "
         f"edited; {_now_says(route_result)}. When this program started it took it for the same "
-        f"instruction as follow-up {handed.followup_id} (message {handed.message_id} on channel "
-        f"{handed.channel_id}), which still says '"
+        f"instruction as follow-up {undone.other} (message {undone.other_message_id} on channel "
+        f"{undone.other_channel_id}), which still says '"
         + (store_words.instruction_words(says) if says else "?")
         + "': two posts of one channel are two instructions, so follow-up "
-        f"{handed.followup_id} acts on signal {handed.signal_id} too now, {handed.queued} "
+        f"{undone.acting} acts on signal {undone.signal_id} too now, {undone.queued} "
         "instruction(s) queued."
     )
 

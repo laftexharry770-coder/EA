@@ -3461,10 +3461,6 @@ class HandBack:
     signal_id: int
     #: Its instructions waiting.
     queued: int
-    #: It is on the channel of the follow-up it was handed back from, which
-    #: stood in for it: two posts of one channel a start took for one
-    #: instruction, not a copy of it (`hand_back`).
-    merged: bool = False
 
 
 def hand_back(
@@ -3472,7 +3468,7 @@ def hand_back(
     *,
     followup_id: int,
     read_channels: Collection[int] | None,
-    edited_into: FollowUp | None = None,
+    edited: bool = False,
 ) -> HandBack | None:
     """Follow-up `followup_id`, standing in for a held one about a call whose
     channel was switched off (`followups.instead_of_followup_id`, R6-1), no
@@ -3492,13 +3488,10 @@ def hand_back(
 
     One it stands in for on its own channel -- two posts of one channel a
     start took for one instruction ("never two", final fix round 6) -- is
-    no copy of it: with both channels read they are two instructions
-    (`HandBack.merged`). When `followup_id` is withdrawn the other one still
-    acts, so it is handed back all the same; when `followup_id`'s post is
-    edited into another instruction (`edited_into`) the other one, still
-    saying its own, acts again too -- beside `followup_id`, which says the
-    new one: the caller keeps it. Edited into the same instruction in other
-    words, the two stay the one the start took them for: None.
+    no copy of it: with both channels read they are two instructions. When
+    `followup_id` is withdrawn the other one still acts, so it is handed
+    back all the same; but an edit of `followup_id`'s post (`edited`) is
+    none of this: `merge_undone` says what it changes.
 
     None, changing nothing, when there is none such or when `followup_id`
     acted on no signal still traded."""
@@ -3511,15 +3504,8 @@ def hand_back(
     if signal_id is None or not carries(conn, _signal_row(conn, signal_id)):
         return None
     signal = _signal_row(conn, signal_id)
-    first = conn.execute("SELECT * FROM followups WHERE followup_id = ?", (row[0],)).fetchone()
-    (own_channel,) = conn.execute(
-        "SELECT channel_id FROM followups WHERE followup_id = ?", (followup_id,)
-    ).fetchone()
-    merged = first is not None and first["channel_id"] == own_channel
-    if merged and edited_into is not None and not _other_instruction(
-        edited_into.op.value, json.loads(signals_repo.followup_to_json(edited_into)), first
-    ):
-        return None  # the same instruction still: the two stay one
+    if edited and _merged_with(conn, followup_id, row[0]):
+        return None  # two of its own channel's: `merge_undone`
     held_id, seen = row[0], {followup_id}
     while held_id is not None and held_id not in seen:
         seen.add(held_id)
@@ -3548,10 +3534,100 @@ def hand_back(
                 signal_id,
             )
             return HandBack(
-                held_id, held["channel_id"], held["message_id"], signal_id, counts["QUEUED"],
-                merged,
+                held_id, held["channel_id"], held["message_id"], signal_id, counts["QUEUED"]
             )
         held_id = held["instead_of_followup_id"]
+    return None
+
+
+def _merged_with(conn: sqlite3.Connection, followup_id: int, other_id: int) -> bool:
+    """Whether follow-ups `followup_id` and `other_id` are posts of one
+    channel."""
+    return conn.execute(
+        "SELECT COUNT(DISTINCT channel_id) FROM followups WHERE followup_id IN (?, ?)",
+        (followup_id, other_id),
+    ).fetchone()[0] == 1
+
+
+@dataclass(frozen=True, slots=True)
+class MergeUndone:
+    """`merge_undone`'s answer: follow-up `acting` acts on `signal_id` now,
+    beside follow-up `other` -- the other post of the two."""
+
+    acting: int
+    other: int
+    other_channel_id: int
+    other_message_id: int
+    signal_id: int
+    #: `acting`'s instructions waiting.
+    queued: int
+
+
+def merge_undone(
+    conn: sqlite3.Connection, *, followup_id: int, read_channels: Collection[int] | None
+) -> MergeUndone | None:
+    """Follow-up `followup_id`'s post was just edited into an instruction.
+    A start may have taken it and another post of its own channel for one
+    instruction ("never two", final fix round 6): the one kept with a call
+    whose channel was switched off, the other standing in for it about the
+    call traded instead (`followups.instead_of_followup_id`). With both
+    channels read they are two instructions. While both say the same, the
+    start's one stays one; once the edit -- of either -- makes them say
+    different ones, the one kept with the switched-off call acts on the
+    call traded too, beside the other: its target moved there, as
+    `hand_back` moves one (final fix round 8). Only while its instructions
+    wait, on a channel this watch reads, its call still switched off, and
+    the other still acting on a signal traded. None, changing nothing,
+    otherwise."""
+    if read_channels is None:
+        return None
+    me = conn.execute("SELECT * FROM followups WHERE followup_id = ?", (followup_id,)).fetchone()
+    pairs = [
+        (held_id, followup_id)
+        for (held_id,) in [(me["instead_of_followup_id"],)] if held_id is not None
+    ] + [
+        (followup_id, stand_in)
+        for (stand_in,) in conn.execute(
+            "SELECT followup_id FROM followups WHERE edit_seq = 0 AND instead_of_followup_id = ? "
+            "ORDER BY followup_id",
+            (followup_id,),
+        ).fetchall()
+    ]
+    for held_id, stand_in in pairs:
+        if not _merged_with(conn, held_id, stand_in):
+            continue  # another channel's: a copy of it (`hand_back`)
+        held = conn.execute("SELECT * FROM followups WHERE followup_id = ?", (held_id,)).fetchone()
+        counts = outbox.state_counts(conn, kind="FOLLOWUP", followup_id=held_id)
+        about = signal_for_followup(conn, followup_id=held_id)
+        signal_id = signal_for_followup(conn, followup_id=stand_in)
+        if (
+            held["channel_id"] not in read_channels
+            or not counts.get("QUEUED")
+            or about is None
+            or not switched_off(conn, _signal_row(conn, about))
+            or set(outbox.state_counts(conn, kind="FOLLOWUP", followup_id=stand_in)) <= {"SKIPPED"}
+            or signal_id is None
+            or not carries(conn, _signal_row(conn, signal_id))
+            or not _says_other(conn, stand_in, held)
+        ):
+            continue
+        _act_on(conn, held, _signal_row(conn, signal_id))
+        other = stand_in if held_id == followup_id else held_id
+        where = conn.execute(
+            "SELECT channel_id, message_id FROM followups WHERE followup_id = ?", (other,)
+        ).fetchone()
+        logger.info(
+            "follow-ups %s and %s, two posts of channel %s a start took for one instruction, "
+            "say different ones now: follow-up %s acts on signal %s too",
+            held_id,
+            stand_in,
+            held["channel_id"],
+            held_id,
+            signal_id,
+        )
+        return MergeUndone(
+            held_id, other, where["channel_id"], where["message_id"], signal_id, counts["QUEUED"]
+        )
     return None
 
 
@@ -3581,17 +3657,10 @@ def _says_other(conn: sqlite3.Connection, followup_id: int, held: sqlite3.Row) -
     (op, parsed) = conn.execute(
         "SELECT op, parsed_json FROM followups WHERE followup_id = ?", (followup_id,)
     ).fetchone()
-    return _other_instruction(op, json.loads(parsed or "{}"), held)
-
-
-def _other_instruction(op: str, parsed: dict, held: sqlite3.Row) -> bool:
-    """Whether the instruction `op` with stored parse `parsed` is another
-    than follow-up `held`'s (a `followups` row): another op, or the same
-    with another price or take profit (R8-3)."""
     if op != held["op"]:
         return True
-    theirs = json.loads(held["parsed_json"] or "{}")
-    return any(parsed.get(key) != theirs.get(key) for key in ("price_hint", "tp_index_hint"))
+    mine, theirs = json.loads(parsed or "{}"), json.loads(held["parsed_json"] or "{}")
+    return any(mine.get(key) != theirs.get(key) for key in ("price_hint", "tp_index_hint"))
 
 
 def _taken(conn: sqlite3.Connection, followup_id: int) -> bool:
