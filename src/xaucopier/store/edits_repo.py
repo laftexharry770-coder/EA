@@ -2100,7 +2100,10 @@ def _edit_of_followup(ctx: _Ctx, route_result: RouteResult, new_hash: str) -> Ed
     if followup_id is None:
         if ctx.relay_of_followup_id is not None:
             raised = _followup_copy_changed(
-                ctx, how=f"edited to {_describe(route_result)}", new_hash=new_hash
+                ctx,
+                how=f"edited to {_describe(route_result)}",
+                new_hash=new_hash,
+                now_says=_now_says(route_result),
             )
             return ctx.result(
                 "recorded", new_kind, "a copy of a follow-up edited", alert_ids=raised
@@ -2151,12 +2154,19 @@ def _edit_of_followup(ctx: _Ctx, route_result: RouteResult, new_hash: str) -> Ed
     )
 
 
-def _followup_copy_changed(ctx: _Ctx, *, how: str, new_hash: str | None) -> tuple[int, ...]:
+def _followup_copy_changed(
+    ctx: _Ctx, *, how: str, new_hash: str | None, now_says: str | None = None
+) -> tuple[int, ...]:
     """A relay copy of a follow-up (`ctx.relay_of_followup_id`) was edited
-    or deleted. The follow-up acted on is the other post's, and it is not
-    changed by guess: a WARNING names both, unless the change is already
-    there -- the follow-up's own message reads the same, or was withdrawn
-    (the same change reaching both posts)."""
+    (`now_says`: what it says now, in plain words) or deleted (None). The
+    follow-up acted on is the other post's, and it is not changed by guess:
+    a WARNING names both, unless the change is already there -- the
+    follow-up's own message reads the same, or was withdrawn (the same
+    change reaching both posts). A copy never applied -- of a follow-up
+    about a signal whose channel is switched off, or one the user was told
+    of when it was read (`FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL`) and whose
+    follow-up was withdrawn since -- says so instead
+    (`_copy_not_applied_changed`)."""
     row = ctx.conn.execute(
         "SELECT f.followup_id, f.channel_id, f.message_id, m.content_hash, m.kind, "
         "       m.deleted_at_utc "
@@ -2167,6 +2177,10 @@ def _followup_copy_changed(ctx: _Ctx, *, how: str, new_hash: str | None) -> tupl
     ).fetchone()
     if row is None:
         return ()
+    if row["content_hash"] != new_hash:
+        not_applied = _copy_not_applied_changed(ctx, row, how=how, now_says=now_says)
+        if not_applied is not None:
+            return (not_applied,)
     if row["content_hash"] == new_hash or row["deleted_at_utc"] is not None or (
         row["kind"] != "followup"
     ):
@@ -2186,12 +2200,101 @@ def _followup_copy_changed(ctx: _Ctx, *, how: str, new_hash: str | None) -> tupl
         FOLLOWUP_COPY_CHANGED,
         f"message {ctx.message_id} on channel {ctx.channel_id}, a copy of follow-up "
         f"{row['followup_id']} (message {row['message_id']} on channel {row['channel_id']}), "
-        f"was {how}. Follow-up {row['followup_id']} is the one acted on, and it was NOT "
-        "changed: the instruction stands as first recorded, "
+        f"was {_changed(how, now_says)}. Follow-up {row['followup_id']} is the one acted on, "
+        "and it was NOT changed: the instruction stands as first recorded, "
         f"{counts.get('QUEUED', 0)} instruction(s) still queued, {taken} already taken by a "
         "worker. If the poster changed or withdrew the instruction, review it by hand.",
     )
     return (alert,)
+
+
+def _copy_not_applied_changed(
+    ctx: _Ctx, held: sqlite3.Row, *, how: str, now_says: str | None
+) -> int | None:
+    """For `_followup_copy_changed` (final fix round 7, R7-4): the changed
+    message is a copy of follow-up `held`, and it was never applied
+    (`relay_repo.followup_after_channel_off`) -- held "is the one acted on"
+    would be untrue -- because
+
+    - held is about a signal whose channel is switched off
+      (`relay_repo.switched_off`); or
+    - held is the instruction about the signal traded instead, withdrawn
+      since (none of its instructions waiting or taken), and the message's
+      WARNING (`FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL`) was raised: it asked for
+      the instruction by hand, or said held acts in its place.
+
+    Its WARNING says that, names the WARNING raised when it was read, says
+    what the message says now in plain words or that it was deleted, and --
+    when that WARNING named the signal traded instead -- to review what was
+    done by hand there. Never silent, as when "the same change reached both
+    posts". None otherwise."""
+    about = relay_repo.signal_for_followup(ctx.conn, followup_id=held["followup_id"])
+    signal = (
+        None if about is None
+        else ctx.conn.execute("SELECT * FROM signals WHERE signal_id = ?", (about,)).fetchone()
+    )
+    if signal is None:
+        return None
+    asked = ctx.conn.execute(
+        "SELECT alert_id, signal_id FROM alerts WHERE code = ? AND channel_id = ? "
+        "AND message_id = ? ORDER BY alert_id LIMIT 1",
+        (relay_repo.FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL, ctx.channel_id, ctx.message_id),
+    ).fetchone()
+    if relay_repo.switched_off(ctx.conn, signal):
+        why = (
+            f"follow-up {held['followup_id']} is about signal {about}, whose channel is "
+            "switched off"
+        )
+        # That WARNING names the signal traded instead when it asked for the
+        # instruction by hand, else the switched-off one.
+        by_hand = (
+            None if asked is None or asked["signal_id"] in (None, about) else asked["signal_id"]
+        )
+    elif asked is not None and set(
+        outbox.state_counts(ctx.conn, kind="FOLLOWUP", followup_id=held["followup_id"])
+    ) == {"SKIPPED"}:
+        why = (
+            f"follow-up {held['followup_id']}, the same instruction about signal {about}, was "
+            "withdrawn since"
+        )
+        by_hand = asked["signal_id"]
+    else:
+        return None
+    changed = _changed(how, now_says)
+    return ctx.alert(
+        "WARNING",
+        FOLLOWUP_COPY_CHANGED,
+        f"message {ctx.message_id} on channel {ctx.channel_id}, a copy of follow-up "
+        f"{held['followup_id']} (message {held['message_id']} on channel {held['channel_id']}), "
+        f"was {changed}. This message was NOT applied: {why}"
+        + ("" if asked is None else f" (alert #{asked['alert_id']})")
+        + "."
+        + (
+            " Nothing to do." if by_hand is None
+            else f" If you applied the instruction by hand on signal {by_hand}, review that."
+        ),
+        signal_id=by_hand if by_hand is not None else about,
+    )
+
+
+def _changed(how: str, now_says: str | None) -> str:
+    """How a copy was changed, for an alert: deleted (`how`), or edited and
+    what it says now in plain words (`now_says`, R7-4)."""
+    return how if now_says is None else f"edited; {now_says}"
+
+
+def _now_says(route_result: RouteResult) -> str:
+    """What an edited message says now, in plain words, for an alert (final
+    fix round 7, R7-4): never a raw instruction name such as "close_all"."""
+    if route_result.kind == "followup":
+        return f"it now says '{store_words.instruction_words(route_result.followup)}'"
+    if _is_retraction(route_result):
+        words = route_result.detail.removeprefix(_RETRACTION_DETAIL)
+        words = words.removesuffix(" (a retraction)")
+        return f"it now reads as a trade signal with {words} added (a retraction)"
+    if route_result.kind == "signal":
+        return f"it now reads as a trade signal: {_describe(route_result)}"
+    return "it no longer reads as an instruction"
 
 
 def _unqueued_instruction(route_result: RouteResult) -> str:

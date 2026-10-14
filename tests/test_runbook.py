@@ -204,3 +204,13 @@ def test_the_runbook_says_a_call_on_a_channel_on_is_still_traded_after_a_switch_
     """Final fix round 3 (R3-1): switching a channel off cancels its waiting
     signals, never the same call standing on a channel switched on."""
     assert "the same call posted by a channel that is\n  switched on is still traded" in RUNBOOK
+
+
+def test_the_runbook_says_a_change_to_an_instruction_not_carried_out_is_reported() -> None:
+    """Final fix round 7 (R7-4): an edit or deletion of a message that was not
+    carried out, and perhaps applied by hand, is reported with what to do."""
+    assert (
+        "If that message is edited or deleted later, a\n  **FOLLOWUP_COPY_CHANGED** alert says "
+        "it was not carried out, and what it\n  says now: if you applied it by hand, review "
+        "what you did." in RUNBOOK
+    )

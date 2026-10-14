@@ -251,7 +251,9 @@ missed. Once you have dealt with one, clear it:
   and says the instruction may be meant for it, look at the message: if
   it is, **apply it by hand** — once, even when several alerts name the
   same instruction. If the alert says it already acts on that signal,
-  nothing to do.
+  nothing to do. If that message is edited or deleted later, a
+  **FOLLOWUP_COPY_CHANGED** alert says it was not carried out, and what it
+  says now: if you applied it by hand, review what you did.
 - **Any other alert** — copy its two lines and send them to whoever looks
   after xaucopier, then clear it.
 

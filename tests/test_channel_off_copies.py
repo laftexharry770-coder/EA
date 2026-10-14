@@ -1586,6 +1586,207 @@ def test_repeats_of_an_instruction_withdrawn_since_ask_for_it_by_hand_once(
     ), two
 
 
+@pytest.mark.parametrize(
+    "change", ["edited to close all", "deleted", "edited, no signal trades the call"]
+)
+def test_a_change_to_a_message_not_applied_says_so_and_what_to_review_by_hand(
+    conn, change  # noqa: F811
+):
+    """The re-check's r61_byhand_copy_changed (final fix round 7, R7-4).
+    After the start with the relay switched off, the VIP forwards the
+    relay's "close half": a copy of follow-up 1, about the cancelled signal
+    1, NOT applied, with the WARNING asking for it by hand on signal 2. Then
+    the VIP edits that forward into "close all", or deletes it. The alert
+    says this message was NOT applied (naming that WARNING), what it says
+    now in plain words -- never "close_all" -- or that it was deleted, and
+    that a by-hand "close half" on signal 2 needs a review; never that
+    follow-up 1 "is the one acted on" with instructions "still queued".
+    With no signal trading the call (the VIP's copy withdrawn first) no
+    by-hand request was made: nothing to do."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _restart(conn, on=(VIP,), seconds=65)
+    if change == "edited, no signal trades the call":
+        edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=VIP_COPY, now_utc=_at(68), accounts=ACCOUNTS,
+            detected_by="event", read_channels=(V,),
+        )
+        conn.commit()
+    assert _fwd(conn).relay_of_followup_id == 1
+    (asked,) = _q(conn, "SELECT alert_id FROM alerts WHERE code = ?", ABOUT_OFF)
+
+    if change == "deleted":
+        edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=FWD, now_utc=_at(80), accounts=ACCOUNTS,
+            detected_by="event", read_channels=(V,),
+        )
+    else:
+        edits_repo.apply_edit(
+            conn, channel_cfg=VIP, message_id=FWD, text="Close all now", posted_at_utc=_at(70),
+            edit_date_utc=_at(80), reply_to_message_id=None, now_utc=_at(80), accounts=ACCOUNTS,
+            detected_by="event", read_channels=(V,),
+        )
+    conn.commit()
+
+    (alert,) = _q(
+        conn, "SELECT level, signal_id, detail FROM alerts WHERE code = ?",
+        edits_repo.FOLLOWUP_COPY_CHANGED,
+    )
+    flat = " ".join(alert[2].split())
+    what = (
+        "was deleted, found by event." if change == "deleted"
+        else "was edited; it now says 'close the whole trade'."
+    )
+    then = (
+        "Nothing to do." if change == "edited, no signal trades the call"
+        else "If you applied the instruction by hand on signal 2, review that."
+    )
+    assert flat == (
+        f"message {FWD} on channel {V}, a copy of follow-up 1 (message {RELAY_CLOSE} on channel "
+        f"{R}), {what} This message was NOT applied: follow-up 1 is about signal 1, whose "
+        f"channel is switched off (alert #{asked[0]}). {then} [found by event]"
+    ), flat
+    assert alert[0] == "WARNING"
+    assert "close_all" not in flat and "is the one acted on" not in flat
+    assert _acting_on(conn, 2) == []
+
+
+
+@pytest.mark.parametrize(
+    ("text", "now"),
+    [
+        ("Close all now", "it now says 'close the whole trade'"),
+        ("nice trade everyone", "it no longer reads as an instruction"),
+        (
+            SIGNAL_TEXT,
+            "it now reads as a trade signal: BUY 4480-4485 SL 4470 TP 4490/4495/4500/4505",
+        ),
+        (
+            SIGNAL_TEXT + "\nCANCELLED",
+            "it now reads as a trade signal with CANCELLED added (a retraction)",
+        ),
+    ],
+    ids=["an instruction", "chatter", "a call", "a call cancelled"],
+)
+def test_a_message_not_applied_edited_says_what_it_says_now_in_plain_words(
+    conn, text, now  # noqa: F811
+):
+    """R7-4: whatever the VIP edits its forward of the relay's "close half"
+    into -- after the start with the relay switched off, so it was NOT
+    applied -- the WARNING says what it says now in plain words."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _restart(conn, on=(VIP,), seconds=65)
+    _fwd(conn)
+
+    edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=FWD, text=text, posted_at_utc=_at(70),
+        edit_date_utc=_at(80), reply_to_message_id=None, now_utc=_at(80), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+    (detail,) = _q(
+        conn, "SELECT detail FROM alerts WHERE code = ?", edits_repo.FOLLOWUP_COPY_CHANGED
+    )
+    flat = " ".join(detail[0].split())
+    assert f"), was edited; {now}. This message was NOT applied: " in flat, flat
+
+
+
+@pytest.mark.parametrize("change", ["edited to close all", "deleted"])
+@pytest.mark.parametrize("stand_in", ["withdrawn since", "acting"])
+def test_a_change_to_a_repeat_of_the_instruction_about_the_call_traded_is_never_silent(
+    conn, stand_in, change  # noqa: F811
+):
+    """R7-4, the same for a repeat of the instruction standing in for the
+    relay's: after the start the VIP's "close half" replying to its copy is
+    the instruction about signal 2 (follow-up 2), and the VIP forwards the
+    relay's "close half" -- a copy of follow-up 2, NOT applied. When the
+    VIP had deleted follow-up 2 first, that forward's WARNING asked for the
+    instruction by hand; its edit or deletion then says this message was NOT
+    applied and to review what was done by hand -- never nothing, as when
+    the change "reached both posts". With follow-up 2 acting, it is the one
+    acted on, and the WARNING says so, as before."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _restart(conn, on=(VIP,), seconds=65)
+    assert _rep(conn, seconds=70).followup_id == 2
+    if stand_in == "withdrawn since":
+        edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=REP, now_utc=_at(72), accounts=ACCOUNTS,
+            detected_by="event", read_channels=(V,),
+        )
+        conn.commit()
+    assert _fwd(conn, seconds=74).relay_of_followup_id == 2
+    (asked,) = _q(conn, "SELECT alert_id FROM alerts WHERE code = ?", ABOUT_OFF)
+
+    if change == "deleted":
+        edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=FWD, now_utc=_at(80), accounts=ACCOUNTS,
+            detected_by="event", read_channels=(V,),
+        )
+    else:
+        edits_repo.apply_edit(
+            conn, channel_cfg=VIP, message_id=FWD, text="Close all now", posted_at_utc=_at(74),
+            edit_date_utc=_at(80), reply_to_message_id=None, now_utc=_at(80), accounts=ACCOUNTS,
+            detected_by="event", read_channels=(V,),
+        )
+    conn.commit()
+
+    (alert,) = _q(
+        conn, "SELECT level, detail FROM alerts WHERE code = ?", edits_repo.FOLLOWUP_COPY_CHANGED
+    )
+    flat = " ".join(alert[1].split())
+    assert alert[0] == "WARNING"
+    start = f"message {FWD} on channel {V}, a copy of follow-up 2 (message {REP} on channel {V}), "
+    assert flat.startswith(start), flat
+    if stand_in == "acting":
+        assert "Follow-up 2 is the one acted on, and it was NOT changed" in flat, flat
+        if change != "deleted":
+            assert "was edited; it now says 'close the whole trade'." in flat, flat
+            assert "close_all" not in flat, flat
+        assert "2 instruction(s) still queued" in flat, flat
+        return
+    what = (
+        "was deleted, found by event." if change == "deleted"
+        else "was edited; it now says 'close the whole trade'."
+    )
+    assert flat == (
+        f"{start}{what} This message was NOT applied: follow-up 2, the same instruction about "
+        f"signal 2, was withdrawn since (alert #{asked[0]}). If you applied the instruction by "
+        "hand on signal 2, review that. [found by event]"
+    ), flat
+
+
+
+def test_a_message_not_applied_reworded_into_the_instruction_it_repeats_is_nothing_new(
+    conn,  # noqa: F811
+):
+    """R7-4 keeps the rule that a copy edited to read as the instruction it
+    repeats changes nothing: the VIP's forward of the relay's "close half",
+    NOT applied after the start with the relay switched off, worded
+    differently, is edited to read exactly as the relay's post. No new
+    WARNING: the by-hand request stands as it was."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _restart(conn, on=(VIP,), seconds=65)
+    copy = _ingest(conn, VIP, FWD, "Close half of it now", posted=_at(70), fwd=(R, RELAY_CLOSE))
+    assert copy.relay_of_followup_id == 1, copy
+    assert _q(conn, "SELECT kind FROM messages WHERE message_id = ?", FWD) == [("followup",)]
+
+    result = edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=FWD, text=CLOSE_HALF, posted_at_utc=_at(70),
+        edit_date_utc=_at(80), reply_to_message_id=None, now_utc=_at(80), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+    assert result.alert_ids == (), result
+    assert [a[1] for a in _alerts(conn)] == [CODE, ABOUT_OFF]
+
+
+
 @pytest.mark.parametrize("again", ["the relay's post", "its own forward"])
 def test_a_repeat_read_after_the_start_of_an_instruction_one_acts_on_is_nothing_to_do(
     conn, again  # noqa: F811
