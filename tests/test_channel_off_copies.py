@@ -1519,6 +1519,45 @@ def test_a_repeat_of_an_instruction_withdrawn_since_is_not_applied_and_said_so(
     ), flat
 
 
+@pytest.mark.parametrize("again", ["the relay's post", "its own forward"])
+def test_a_repeat_read_after_the_start_of_an_instruction_one_acts_on_is_nothing_to_do(
+    conn, again  # noqa: F811
+):
+    """The re-check's r61_m10 (final fix round 7, R7-5 a). The VIP forwarded
+    the relay's "close half" before the relay's post was stored -- its
+    forward holds the instruction -- then said "close half" itself,
+    replying to its copy of the call; watch restarted with the relay
+    switched off. The VIP's reply acts on signal 2 in the forward's place,
+    and the start records it standing in for the forward. Then the VIP
+    forwards the relay's post again, or its own forward: still ONE
+    instruction on signal 2, and the WARNING says the same instruction
+    already acts on it -- never "apply it by hand", which would close half
+    twice."""
+    _relay_call_then_vip_copy(conn)
+    _fwd(conn)
+    _the_relays_close_half(conn)
+    _rep(conn)
+    _restart(conn, on=(VIP,), seconds=100)
+    assert _q(conn, "SELECT followup_id, message_id, instead_of_followup_id FROM followups "
+                    "ORDER BY 1") == [(1, FWD, None), (2, REP, 1)]
+
+    repeat_id = 4007 if again == "the relay's post" else 4008
+    forwarded = (R, RELAY_CLOSE) if again == "the relay's post" else (V, FWD)
+    repeat = _ingest(conn, VIP, repeat_id, CLOSE_HALF, posted=_at(110), fwd=forwarded)
+
+    assert repeat.outcome == "relay_duplicate", repeat
+    assert _acting_on(conn, 2) == [(V, REP)]
+    assert _followup_rows(conn, 2) == [("acct-1", "QUEUED"), ("acct-2", "QUEUED")]
+    ((message_id, signal_id, level, detail),) = _about_off(conn)
+    assert (message_id, signal_id, level) == (repeat_id, 2, "WARNING")
+    flat = " ".join(detail.split())
+    assert flat.endswith(
+        "Signal 2 trades that call instead, and the same instruction already acts on it as "
+        f"follow-up 2 (message {REP} on channel {V}). Nothing to do."
+    ), flat
+    assert "by hand" not in flat, flat
+
+
 def test_a_close_half_given_long_after_is_an_instruction_of_its_own(conn):  # noqa: F811
     """After the restart the VIP forwards the relay's "close half" -- NOT
     applied, handed over by hand -- and half an hour later says "close
@@ -1921,7 +1960,7 @@ CANCELLED_TEXT = SIGNAL_TEXT + "\nCANCELLED"
 
 def _the_relays_call_kept_only_by_the_vips_forward(  # noqa: F811
     conn, *, delete_before_restart: bool, on=(RELAY,), before_restart=None, gone="deleted",
-    second_forward: bool = False, restart_at: float = 100,
+    second_forward: bool | str = False, restart_at: float = 100,
 ):
     """Seed 102253 reduced (the re-check's p_102253): the relay's call
     (signal 1) is CANCELLED; the VIP posts the call (held back, a copy of
@@ -1940,9 +1979,13 @@ def _the_relays_call_kept_only_by_the_vips_forward(  # noqa: F811
     conn.commit()
     assert _ingest(conn, VIP, 1002, posted=_at(20)).relay_of_signal_id == 1
     assert _ingest(conn, RELAY, 5005, posted=_at(30), fwd=(V, 1002)).signal_id == 2
-    assert _ingest(conn, VIP, 1005, posted=_at(40), fwd=(V, 1002)).relay_of_signal_id == 2
-    if second_forward:
-        assert _ingest(conn, VIP, 1006, posted=_at(45), fwd=(V, 1002)).relay_of_signal_id == 2
+    forwards = [(1005, 40), (1006, 45)] if second_forward else [(1005, 40)]
+    if second_forward == "newer stored first":
+        forwards.reverse()
+    for message_id, seconds in forwards:
+        assert _ingest(
+            conn, VIP, message_id, posted=_at(seconds), fwd=(V, 1002)
+        ).relay_of_signal_id == 2
     edits_repo.apply_edit(
         conn, channel_cfg=VIP, message_id=1002, text="Good morning traders",
         posted_at_utc=_at(20), edit_date_utc=_at(50), reply_to_message_id=None,
@@ -2025,14 +2068,16 @@ def test_a_call_only_a_switched_off_channels_post_shows_is_not_traded_in_either_
         ) in codes
 
 
+@pytest.mark.parametrize("stored", ["older stored first", "newer stored first"])
 def test_the_withdrawal_at_start_names_the_oldest_post_on_the_channel_switched_off(
-    conn,  # noqa: F811
+    conn, stored  # noqa: F811
 ):
     """Final fix round 6 (R6-3): with two posts of the call still standing
     on the channel switched off -- the VIP forwarded its post twice -- the
-    alert names the older one, whichever was stored first."""
+    alert names the older one, whichever was stored first (final fix round
+    7, R7-5 e: the newer one stored first too)."""
     _the_relays_call_kept_only_by_the_vips_forward(
-        conn, delete_before_restart=True, second_forward=True
+        conn, delete_before_restart=True, second_forward=stored
     )
 
     assert _claimable(conn) == []
@@ -2210,6 +2255,63 @@ def test_an_old_call_partly_traded_keeps_its_own_critical(conn):  # noqa: F811
     assert critical[0] == "CRITICAL" and critical[4] == 2
     (summary,) = [a for a in _alerts(conn) if a[1] == OLD_SHOWN_OFF]
     assert "2 signals (1, 3) were waiting" in " ".join(summary[5].split())
+
+
+def _waiting_calls_whose_posts_are_gone(conn, count: int) -> None:  # noqa: F811
+    """`count` of the relay's calls (each another trade: another stop) wait
+    to be traded with their posts gone and no other post of them standing."""
+    for n in range(count):
+        text = SIGNAL_TEXT.replace("4470", str(4470 - n))
+        assert _ingest(conn, RELAY, 7001 + n, text).outcome == "new"
+    conn.execute(
+        "UPDATE messages SET deleted_at_utc = ? WHERE channel_id = ?", (_at(20).isoformat(), R)
+    )
+    conn.commit()
+
+
+def test_a_call_too_old_to_trade_but_not_ten_times_so_is_summed_up(conn):  # noqa: F811
+    """Final fix round 7 (R7-5 b): "too old to be traded" is the policy's
+    age itself -- a call posted 500 s before the start, past the 120 s a
+    signal may be and still be traded, is summed up in the one line, not
+    given a WARNING of its own."""
+    _waiting_calls_whose_posts_are_gone(conn, 1)
+
+    _restart(conn, on=(RELAY,), seconds=500)
+
+    assert _claimable(conn) == []
+    assert SHOWN_OFF not in [a[1] for a in _alerts(conn)]
+    (alert,) = [a for a in _alerts(conn) if a[1] == OLD_SHOWN_OFF]
+    assert " ".join(alert[5].split()).startswith(
+        "signal 1 was waiting to be traded, but its own post had been deleted"
+    ), alert
+
+
+def test_the_policys_age_decides_what_is_too_old_at_start(conn):  # noqa: F811
+    """R7-5 c: with policy.toml allowing a signal 300 s, a call posted 200 s
+    before the start could still be traded: it gets its own WARNING, not the
+    line for calls too old to be traded anyway."""
+    _waiting_calls_whose_posts_are_gone(conn, 1)
+
+    _restart(conn, on=(RELAY,), seconds=200, max_age_seconds=300)
+
+    assert _claimable(conn) == []
+    assert OLD_SHOWN_OFF not in [a[1] for a in _alerts(conn)]
+    (alert,) = [a for a in _alerts(conn) if a[1] == SHOWN_OFF]
+    assert alert[:5] == ("WARNING", SHOWN_OFF, R, 7001, 1)
+
+
+def test_the_line_for_old_calls_names_ten_and_counts_the_rest(conn):  # noqa: F811
+    """R7-5 d: twelve old calls -- the one line names the first ten and says
+    how many more, as `_say_too_old` does."""
+    _waiting_calls_whose_posts_are_gone(conn, 12)
+
+    _restart(conn, on=(RELAY,), seconds=TWO_DAYS)
+
+    (alert,) = [a for a in _alerts(conn) if a[1] == OLD_SHOWN_OFF]
+    assert " ".join(alert[5].split()).startswith(
+        "12 signals (1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 2 more) were waiting to be traded"
+    ), alert
+    assert "24 queued trade entries were cancelled" in alert[5], alert
 
 
 def test_the_withdrawal_at_start_re_reads_no_post_left_as_it_was(conn):  # noqa: F811
