@@ -1787,6 +1787,49 @@ def test_a_message_not_applied_reworded_into_the_instruction_it_repeats_is_nothi
 
 
 
+def test_fuzz_seed_42417_repeats_after_the_instruction_was_withdrawn_ask_for_it_once(
+    conn,  # noqa: F811
+):
+    """The re-check's fuzz seed 42417 (R7-3). After the start with the
+    relay switched off, the VIP's "close half" replying to its copy is the
+    instruction about signal 2, and its forward of the relay's "close half"
+    (posted earlier, read after) repeats it: nothing to do. The VIP then
+    deletes that "close half", and forwards the relay's post and says
+    "close half" again. Neither is applied; each asks for it by hand ONCE,
+    naming the first message of that instruction -- never two requests that
+    each read as their own."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn, seconds=86)
+    _restart(conn, on=(VIP,), seconds=147)
+    assert _rep(conn, message_id=4005, seconds=179).followup_id == 2
+    assert _fwd(conn, message_id=4006, seconds=149).relay_of_followup_id == 2
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=4005, now_utc=_at(180), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+    again = (_fwd(conn, message_id=4007, seconds=105), _rep(conn, message_id=4008, seconds=150))
+
+    assert [a.outcome for a in again] == ["relay_duplicate", "relay_duplicate"]
+    assert _followup_rows(conn, 2) == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+    assert _q(conn, "SELECT COUNT(*) FROM followups") == [(2,)]
+    alerts = _q(
+        conn, "SELECT alert_id, message_id, detail FROM alerts WHERE code = ? ORDER BY alert_id",
+        ABOUT_OFF,
+    )
+    assert [a[1] for a in alerts] == [4006, 4007, 4008]
+    first, *repeats = (" ".join(a[2].split()) for a in alerts)
+    assert first.endswith("Nothing to do."), first
+    for flat in repeats:
+        assert (
+            f"It is the same instruction as message 4006 on channel {V} (alert #{alerts[0][0]})."
+            in flat
+        ), flat
+        assert flat.endswith("apply it by hand -- once, not once for each message."), flat
+
+
+
 @pytest.mark.parametrize("again", ["the relay's post", "its own forward"])
 def test_a_repeat_read_after_the_start_of_an_instruction_one_acts_on_is_nothing_to_do(
     conn, again  # noqa: F811
@@ -3151,3 +3194,69 @@ def test_watch_trades_no_copy_on_a_channel_switched_off_too(tmp_path: Path) -> N
     assert signals == [(1, R, RELAY_CALL, "NEW")]
     assert queued == []
     assert codes == ["CHANNEL_OFF_ENTRIES_SKIPPED"]
+
+
+@SWITCHED
+def test_fuzz_seed_42969_the_vip_read_while_the_relay_is_off_then_the_relay_is_one_instruction(
+    conn, switched  # noqa: F811
+):
+    """The re-check's fuzz seed 42969 (R7-2). With the relay switched off
+    at a restart, the VIP says "close half" replying to its copy -- the
+    instruction about signal 2. The relay is switched back on at the next
+    restart, and its "close half" replying to its call is read then; later
+    the VIP forwards the relay's post. With both channels read that is ONE
+    instruction; so it is with the relay off and back on -- the relay's
+    post is about signal 2, a copy of the VIP's -- and nothing asks for an
+    instruction by hand."""
+    _relay_call_then_vip_copy(conn)
+    if switched:
+        _restart(conn, on=(VIP,), seconds=91)
+    _ingest(conn, VIP, 4005, CLOSE_HALF, posted=_at(95), reply_to=VIP_COPY)
+    if switched:
+        _restart(conn, on=(VIP, RELAY), seconds=106)
+    relay = _ingest(conn, RELAY, RELAY_CLOSE, CLOSE_HALF, posted=_at(95), reply_to=RELAY_CALL)
+    forward = _ingest(conn, VIP, 4006, CLOSE_HALF, posted=_at(192), fwd=(R, RELAY_CLOSE))
+
+    traded = 2 if switched else 1
+    assert _acting_on(conn, traded) == [(V, 4005)]
+    assert _followup_rows(conn, 1) == QUEUED_TWICE
+    assert [row[:3] for row in _followups(conn)] == [(1, V, 4005)]
+    assert (relay.relay_of_followup_id, forward.relay_of_followup_id) == (1, 1)
+    assert ABOUT_OFF not in [a[1] for a in _alerts(conn)]
+
+
+def test_a_call_admitted_twice_matches_an_instruction_to_the_one_switched_off_last(
+    conn,  # noqa: F811
+):
+    """R7-1 with two admissions in one call. The relay's call, the VIP's and
+    the other channel's copies; a start with the relay switched off admits
+    the other channel's copy (signal 2), whose "close half" replying to it
+    is the instruction about signal 2; a later start with that channel
+    switched off (the relay back on) admits the VIP's copy (signal 3). The
+    VIP's "close half" replying to its copy then gives the instruction of
+    signal 2's -- the call switched off last, not the relay's -- so it
+    stands in for it: when the relay forwards the other channel's post, that
+    is the same instruction acting on signal 3 already. Nothing to do --
+    never "apply it by hand" while one acts."""
+    _relay_call_then_vip_copy(conn)
+    assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(35)).relay_of_signal_id == 1
+    _restart(conn, on=(VIP, OTHER), seconds=40)
+    other = _ingest(conn, OTHER, 9005, CLOSE_HALF, posted=_at(60), reply_to=OTHER_COPY)
+    assert other.followup_id == 1, other
+    _restart(conn, on=(RELAY, VIP), seconds=65)
+    assert relay_repo.live_signal_for(conn, 1) == 3
+    assert relay_repo.admitted_for(conn, 2) == 3
+
+    vip = _ingest(conn, VIP, 4005, CLOSE_HALF, posted=_at(70), reply_to=VIP_COPY)
+    relay = _ingest(conn, RELAY, 7009, CLOSE_HALF, posted=_at(80), fwd=(OTHER.channel_id, 9005))
+
+    assert vip.followup_id == 2, vip
+    assert _q(conn, "SELECT instead_of_followup_id FROM followups WHERE followup_id = 2") == [(1,)]
+    assert _followup_rows(conn, 2) == QUEUED_TWICE
+    assert relay.relay_of_followup_id == 2, relay
+    (alert,) = [a for a in _alerts(conn) if a[1] == ABOUT_OFF]
+    flat = " ".join(alert[5].split())
+    assert flat.endswith(
+        f"Signal 3 trades that call instead, and the same instruction already acts on it as "
+        f"follow-up 2 (message 4005 on channel {V}). Nothing to do."
+    ), flat
