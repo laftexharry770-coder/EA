@@ -3450,7 +3450,11 @@ class HandBack:
 
 
 def hand_back(
-    conn: sqlite3.Connection, *, followup_id: int, read_channels: Collection[int] | None
+    conn: sqlite3.Connection,
+    *,
+    followup_id: int,
+    read_channels: Collection[int] | None,
+    own_channel: bool = True,
 ) -> HandBack | None:
     """Follow-up `followup_id`, standing in for a held one about a call whose
     channel was switched off (`followups.instead_of_followup_id`, R6-1), no
@@ -3466,8 +3470,14 @@ def hand_back(
     moved there, as a start moves a forward's (`_adopt_followup_copies`)
     (final fix round 8, R8-3). After two admissions the one it stands in
     for may be on a channel switched off; then the one THAT stands in for,
-    and so on. None, changing nothing, when there is none such or when
-    `followup_id` acted on no signal still traded."""
+    and so on. One it stands in for on its own channel -- two of one
+    channel's instructions a start merged ("never two", final fix round 6)
+    -- is no copy relation: with both channels read the other one still
+    acts when this one is withdrawn, so it is handed back to all the same;
+    but not for an edit into another instruction (`own_channel` False),
+    which with both channels read changes only this one. None, changing
+    nothing, when there is none such or when `followup_id` acted on no
+    signal still traded."""
     row = conn.execute(
         "SELECT instead_of_followup_id FROM followups WHERE followup_id = ?", (followup_id,)
     ).fetchone()
@@ -3486,7 +3496,7 @@ def hand_back(
         held = conn.execute(
             "SELECT * FROM followups WHERE followup_id = ?", (held_id,)
         ).fetchone()
-        if held is None or held["channel_id"] == follower["channel_id"]:
+        if held is None or (not own_channel and held["channel_id"] == follower["channel_id"]):
             return None  # its own channel's: no copy of it (`stand_ins_of`)
         counts = outbox.state_counts(conn, kind="FOLLOWUP", followup_id=held_id)
         about = signal_for_followup(conn, followup_id=held_id)

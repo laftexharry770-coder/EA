@@ -2461,7 +2461,7 @@ def _stand_in_edited(
     one's instructions are skipped, and a `FOLLOWUP_COPY_CHANGED` WARNING
     says so (final fix round 8, R8-3). None otherwise, changing nothing."""
     handed = relay_repo.hand_back(
-        ctx.conn, followup_id=followup_id, read_channels=ctx.read_channels
+        ctx.conn, followup_id=followup_id, read_channels=ctx.read_channels, own_channel=False
     )
     if handed is None:
         return None

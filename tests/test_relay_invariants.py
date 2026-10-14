@@ -1511,9 +1511,11 @@ def _merged(conn) -> bool:
     read throughout make it two). It shows as a post stored as a copy of an
     instruction first given on its own channel (`_root_of`) that is not the
     same post (no forward of it, nor of the post it forwards); a follow-up
-    standing in for one of its own channel; or a follow-up of a channel read
-    throughout, its instruction still waiting, kept with a call another
-    channel's switching off cancelled because another follow-up gives it."""
+    with an instruction waiting standing in for one of its own channel; or a
+    follow-up of a channel read throughout, its instruction still waiting,
+    kept with a call another channel's switching off cancelled while another
+    follow-up with an instruction waiting gives the same one about the call
+    traded."""
     for channel_id, copy_of, fwd in _q(
         conn,
         "SELECT channel_id, relay_of_followup_id, fwd_from_channel_id || '/' || fwd_from_post_id "
@@ -1529,21 +1531,40 @@ def _merged(conn) -> bool:
         )
         if root_channel == channel_id and (fwd is None or fwd not in (root_post, root_fwd)):
             return True
-    if _q(
-        conn,
-        "SELECT 1 FROM followups g JOIN followups h ON h.followup_id = g.instead_of_followup_id "
-        "WHERE g.channel_id = h.channel_id LIMIT 1",
+    waiting = {
+        followup_id: (channel_id, op) for followup_id, channel_id, op in _q(
+            conn,
+            "SELECT f.followup_id, f.channel_id, f.op FROM followups f WHERE EXISTS (SELECT 1 "
+            "FROM outbox o WHERE o.kind = 'FOLLOWUP' AND o.followup_id = f.followup_id "
+            "AND o.state = 'QUEUED')",
+        )
+    }
+    if any(
+        stand_in in waiting
+        for stand_in, in _q(
+            conn,
+            "SELECT g.followup_id FROM followups g "
+            "JOIN followups h ON h.followup_id = g.instead_of_followup_id "
+            "WHERE g.channel_id = h.channel_id",
+        )
     ):
         return True
-    for followup_id, channel_id in _q(
-        conn,
-        "SELECT f.followup_id, f.channel_id FROM followups f WHERE EXISTS (SELECT 1 FROM outbox o "
-        "WHERE o.kind = 'FOLLOWUP' AND o.followup_id = f.followup_id AND o.state = 'QUEUED')",
-    ):
-        about = relay_repo.signal_for_followup(conn, followup_id=followup_id)
-        if about is None:
+    about = {
+        followup_id: relay_repo.signal_for_followup(conn, followup_id=followup_id)
+        for followup_id in waiting
+    }
+    traded_ops = {
+        waiting[followup_id][1] for followup_id, signal_id in about.items()
+        if signal_id is not None and relay_repo.carries(
+            conn, conn.execute("SELECT * FROM signals WHERE signal_id = ?", (signal_id,)).fetchone()
+        )
+    }
+    for followup_id, (channel_id, op) in waiting.items():
+        if about[followup_id] is None or op not in traded_ops:
             continue
-        row = conn.execute("SELECT * FROM signals WHERE signal_id = ?", (about,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM signals WHERE signal_id = ?", (about[followup_id],)
+        ).fetchone()
         if row["channel_id"] != channel_id and relay_repo.switched_off(conn, row):
             return True
     return False
@@ -1563,14 +1584,13 @@ def _cycle_problems(events: list[tuple], vip_forwards_call: bool):
     on, _ = on
     if off_traded != on_traded:
         problems.append(f"INV-3h: traded {off_traded} with the restarts, {on_traded} without")
-    more = sum(off.values()) > sum(on.values())
-    other_op = any(op not in on for op in off)
-    if relay_on and (off != on if not merged else more or other_op):
+    more = any(count > on.get(op, 0) for op, count in off.items())
+    if relay_on and (off != on if not merged else more):
         problems.append(
             f"INV-3h: relay switched back on: {off} act on the call traded, {on} with both "
             "channels read throughout" + (" (a start merged one channel's own)" if merged else "")
         )
-    if not relay_on and more:
+    if not relay_on and sum(off.values()) > sum(on.values()):
         problems.append(
             f"INV-3h: relay switched off at the end: {off} act on the call traded, more than "
             f"{on} with both channels read"
@@ -1632,6 +1652,7 @@ def test_the_reviewers_seeds_act_as_both_channels_read(seed):
     130178, 130289, 130416,  # adopted after the instruction was edited: says it now
     130476, 130323,  # the VIP's stand-in edited while the relay was off, then back on
     130005, 130016, 130172,  # a channel's own two instructions, one edited
+    132612,  # a channel's own two instructions a start merged, one withdrawn
 ])
 def test_the_seeds_inv3h_found_act_as_both_channels_read(seed):
     """The seeds INV-3h found while it was written (final fix round 8), each

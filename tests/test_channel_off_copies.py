@@ -4056,3 +4056,62 @@ def test_an_instruction_handed_over_by_hand_is_not_carried_out_again_once_back_o
 
     assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
     assert _instructions(conn, 2) == []
+
+
+def _the_vips_forward_read_first_and_its_own_reply(conn) -> None:  # noqa: F811
+    """INV-3h seed 132612, reduced: the VIP's forward of the relay's "close
+    half" is read before the relay's post (follow-up 1, which the relay's
+    post is a copy of), and the VIP also says "close half" replying to its
+    copy of the call (follow-up 2) -- two posts of one channel, two
+    instructions with both channels read."""
+    _relay_call_then_vip_copy(conn)
+    assert _ingest(conn, VIP, FWD, CLOSE_HALF, posted=_at(95), fwd=(R, RELAY_CLOSE)).followup_id == 1
+    relay = _ingest(conn, RELAY, RELAY_CLOSE, CLOSE_HALF, posted=_at(60), reply_to=RELAY_CALL)
+    assert relay.relay_of_followup_id == 1, relay
+    assert _ingest(conn, VIP, REP, CLOSE_HALF, posted=_at(72), reply_to=VIP_COPY).followup_id == 2
+
+
+@pytest.mark.parametrize("how", ["deleted", "edited away"])
+@pytest.mark.parametrize("switched", [False, True], ids=["both channels read", "relay switched off"])
+def test_a_channels_own_instruction_a_start_merged_acts_again_when_the_other_is_withdrawn(
+    conn, switched, how  # noqa: F811
+):
+    """INV-3h seed 132612 (final fix round 8). The start that switches the
+    relay off takes the VIP's reply for the instruction about signal 2 in
+    place of its forward, read first (round 6's "never two": one channel's
+    two posts near another channel's taken for one). The VIP then deletes
+    its reply, or edits it into chatter: with both channels read its forward
+    still says "close half", so it acts on the call traded -- handed back to
+    it, as to a post of another channel (R8-3), and the alert says so. It is
+    on the VIP's channel, read: whether the relay is read does not matter."""
+    _the_vips_forward_read_first_and_its_own_reply(conn)
+    if switched:
+        _restart(conn, on=(VIP,), seconds=100)
+        assert _instructions(conn, 2) == [(2, "close_half", 2)]
+    traded = 2 if switched else 1
+    read = (V,) if switched else (V, R)
+
+    if how == "deleted":
+        edits_repo.apply_deletion(
+            conn, channel_cfg=VIP, message_id=REP, now_utc=_at(105), accounts=ACCOUNTS,
+            detected_by="event", read_channels=read,
+        )
+    else:
+        edits_repo.apply_edit(
+            conn, channel_cfg=VIP, message_id=REP, text="good morning traders",
+            posted_at_utc=_at(72), edit_date_utc=_at(105), reply_to_message_id=VIP_COPY,
+            now_utc=_at(105), accounts=ACCOUNTS, detected_by="event", read_channels=read,
+        )
+    conn.commit()
+
+    assert _claimable(conn) == [traded]
+    assert _instructions(conn, traded) == [(1, "close_half", 2)]
+    if switched:
+        code = "FOLLOWUP_DELETED" if how == "deleted" else "FOLLOWUP_RETRACTED_BY_EDIT"
+        (alert,) = [a for a in _alerts(conn) if a[1] == code]
+        assert alert[4] == 2, alert
+        assert (
+            f"The same instruction still stands in message {FWD} on channel {V} (follow-up 1), "
+            "on a channel this program reads: it acts on signal 2 in this one's place now, 2 "
+            "instruction(s) queued."
+        ) in " ".join(alert[5].split()), alert
