@@ -518,8 +518,10 @@ def chain_ids(conn: sqlite3.Connection, signal_id: int) -> list[int]:
     """Every signal of `signal_id`'s call, oldest first: the ones it
     replaced, itself, and the ones that replaced it -- through a
     replacement or an admission at watch's start (`live_signal_for`). (A
-    signal both replacing a withdrawn one and admitted in place of another
-    follows the replacement back.)"""
+    signal both replacing a withdrawn one of its own channel and admitted
+    in place of another's -- two links back -- follows the replacement
+    back: the switched-off call is not in its chain, only it is in the
+    switched-off call's. `_segments` cuts before it all the same.)"""
     earlier: list[int] = []
     current = signal_id
     while True:
@@ -535,25 +537,36 @@ def chain_ids(conn: sqlite3.Connection, signal_id: int) -> list[int]:
     return [*reversed(earlier), signal_id, *_replacements(conn, signal_id)]
 
 
-def _admitted_after(conn: sqlite3.Connection, earlier: int, later: int) -> bool:
-    """Whether signal `later` follows signal `earlier` in their call's chain
-    by an admission at watch's start (`signals.admitted_from_signal_id`;
-    final fix round 7, R7-1), not by a replacement."""
+def _admitted(conn: sqlite3.Connection, signal_id: int) -> int | None:
+    """The switched-off signal watch's start admitted signal `signal_id` in
+    place of (`signals.admitted_from_signal_id`; final fix round 7, R7-1),
+    or None."""
     row = conn.execute(
-        "SELECT 1 FROM signals WHERE signal_id = ? AND admitted_from_signal_id = ?",
-        (later, earlier),
+        "SELECT admitted_from_signal_id FROM signals WHERE signal_id = ?", (signal_id,)
     ).fetchone()
-    return row is not None
+    return None if row is None else row[0]
 
 
 def _segments(conn: sqlite3.Connection, signal_id: int) -> list[list[int]]:
     """`signal_id`'s call (`chain_ids`) cut at each admission at watch's
     start (R7-1), oldest first: the signals of one switched-off call, then
-    those of the one admitted in its place, and so on."""
+    those of the one admitted in its place, and so on.
+
+    The cut comes before EVERY signal admitted at a start -- also one whose
+    link back in `chain_ids` is a replacement: a post of the VIP's posted
+    again after it withdrew its call, stored as a copy of the relay's call
+    and admitted in its place (final fix round 8, R8-1). So an admitted
+    signal always begins a segment of its own, whichever signal of the call
+    the chain is taken from, and the follow-ups kept with the withdrawn
+    signal it replaced (`kept_closer`) are never taken for ones about the
+    call it carries. (The follow-ups that replacement moves to it are moved
+    as it is stored, before the admission is recorded: `record_replacement`.)
+    The switched-off part is the one its `admitted_from_signal_id` names
+    (`_switched_off_part`), not always the segment before it."""
     chain = chain_ids(conn, signal_id)
     segments = [[chain[0]]]
-    for earlier, later in zip(chain, chain[1:], strict=False):
-        if _admitted_after(conn, earlier, later):
+    for later in chain[1:]:
+        if _admitted(conn, later) is not None:
             segments.append([later])
         else:
             segments[-1].append(later)
@@ -564,6 +577,18 @@ def _segment_of(conn: sqlite3.Connection, signal_id: int) -> list[int]:
     """The signals of `signal_id`'s call between two admissions at watch's
     start (`_segments`) that `signal_id` is one of."""
     return next(segment for segment in _segments(conn, signal_id) if signal_id in segment)
+
+
+def _switched_off_part(conn: sqlite3.Connection, segment: list[int]) -> list[int] | None:
+    """For a segment of a call (`_segments`): the switched-off call's own
+    part that its admission at watch's start was in place of -- the segment
+    of its first signal's `admitted_from_signal_id` -- or None when it was
+    no admission (final fix round 8, R8-1). Only a segment's first signal
+    can be admitted at a start: `_segments` cuts before each one, and the
+    chain's first signal never is (`chain_ids` walks back over every
+    link)."""
+    switched = _admitted(conn, segment[0])
+    return None if switched is None else _segment_of(conn, switched)
 
 
 def signal_for_post(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> int | None:
@@ -3136,12 +3161,12 @@ def _repeated_about_admitted(
     another channel within `window` seconds. With whether it is about
     `signal_id`'s call already (True) or the switched-off one's (False).
     None otherwise."""
-    segments = _segments(conn, signal_id)
-    index = next(n for n, segment in enumerate(segments) if signal_id in segment)
-    if index == 0:
-        return None  # no admission before it
-    # The signal's own part of the call, and the switched-off one's (R7-1).
-    chain, switched = segments[index], segments[index - 1]
+    # The signal's own part of the call, and the switched-off one's that
+    # its admission named (R7-1, R8-1).
+    chain = _segment_of(conn, signal_id)
+    switched = _switched_off_part(conn, chain)
+    if switched is None:
+        return None  # no admission in its part of the call
     both = [*chain, *switched]
     marks = ", ".join("?" for _ in both)
     candidates = conn.execute(
