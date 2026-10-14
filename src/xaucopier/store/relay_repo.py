@@ -317,11 +317,13 @@ two watched channels carrying the same calls, unless it says otherwise):
   VIP's forward and its own reply comes first decides whether the
   instruction is applied once or handed over (never twice). And two posts
   of one channel are two instructions, as with both channels read --
-  unless a post of another channel near one makes it a repeat: after the
-  start, such a repeat is matched across the instructions about the
-  switched-off call and the signal traded instead, so the VIP's forward
-  stored before the relay's post and the VIP's own reply act once, not
-  twice as while both channels were read.
+  unless a post of another channel giving the instruction near one makes
+  it a repeat: after the start, such a repeat is matched across the
+  instructions about the switched-off call and the signal traded instead,
+  so the VIP's forward stored before the relay's post and the VIP's own
+  reply act once, not twice as while both channels were read. (A post
+  giving it is the follow-up's own, or the one it forwards; its other
+  copies never make a repeat: `_carried_near`, final fix round 8.)
 - The posts of one report are told apart by their deletion time: the
   listener stamps every job of one report with the report's moment. A
   post of the report whose job failed and was marked deleted later, by
@@ -3163,14 +3165,24 @@ def _carried_near(
     posted_at_utc: datetime,
     window: int,
 ) -> bool:
-    """Whether a post carrying follow-up `followup_id` -- its own, or one
-    stored as a copy of it -- on a channel other than `other_than` was
-    posted within `window` seconds of `posted_at_utc` (R6-1)."""
+    """Whether a post giving follow-up `followup_id`'s instruction on a
+    channel other than `other_than` was posted within `window` seconds of
+    `posted_at_utc` (R6-1): its own post, or -- a forward read before the
+    post it forwards -- that post, stored as its copy. Its other copies
+    (another forward of that post, a repeat the relay rules matched to it)
+    never count: with both channels read the relay rules time a repeat by
+    the post that gives the instruction, never by its copies
+    (`find_followup_relay`). So the relay's second "close half" near the
+    VIP's forward of its first is a second instruction after a start too,
+    as with both channels read (INV-3h seed 134569, final fix round 8)."""
     limit = timedelta(seconds=window)
     for row in conn.execute(
-        "SELECT m.channel_id, m.posted_at_utc FROM messages m JOIN followups f "
-        "ON f.followup_id = ? WHERE (m.channel_id = f.channel_id AND m.message_id = f.message_id) "
-        "  OR m.relay_of_followup_id = f.followup_id",
+        "SELECT m.channel_id, m.posted_at_utc FROM followups f "
+        "JOIN messages own ON own.channel_id = f.channel_id AND own.message_id = f.message_id "
+        "JOIN messages m ON (m.channel_id = own.channel_id AND m.message_id = own.message_id) "
+        "  OR (m.channel_id = own.fwd_from_channel_id AND m.message_id = own.fwd_from_post_id "
+        "      AND m.relay_of_followup_id = f.followup_id) "
+        "WHERE f.followup_id = ?",
         (followup_id,),
     ).fetchall():
         if row[0] != other_than and abs(datetime.fromisoformat(row[1]) - posted_at_utc) <= limit:
@@ -3193,8 +3205,9 @@ def _repeated_about_admitted(
     or one of its call -- was admitted at watch's start in place of a
     switched-off one (R6-1), the follow-up about either call it repeats, as
     the relay rules would have matched it while both channels were read: the
-    same op and words, one of its posts (its own, or a copy of it) on
-    another channel within `window` seconds. With whether it is about
+    same op and words, a post giving it (its own, or the post it forwards:
+    `_carried_near`) on another channel within `window` seconds. With
+    whether it is about
     `signal_id`'s call already (True) or the switched-off one's (False).
     None otherwise."""
     # The signal's own part of the call, and the switched-off one's that
@@ -3232,8 +3245,9 @@ def _same_instruction_about(
 ) -> int | None:
     """For the start-up job (R6-1): another follow-up about `signal_id` that
     gives follow-up `followup_id`'s instruction -- standing in for it
-    already, or the same op and words with a post of `followup_id`'s (its
-    own, or a copy) on another channel within `window` seconds of its own:
+    already, or the same op and words with a post giving `followup_id`'s
+    (its own, or the post it forwards: `_carried_near`) on another channel
+    within `window` seconds of its own:
     the relay rules would have taken one for a copy of the other. None
     otherwise."""
     row = conn.execute(

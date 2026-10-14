@@ -4162,3 +4162,33 @@ def test_a_channels_own_instruction_a_start_merged_acts_again_when_the_other_say
         "channel are two instructions, so follow-up 1 acts on signal 2 too now, 2 "
         "instruction(s) queued. [found by event]"
     ), alert
+
+
+@SWITCHED
+def test_the_relays_second_instruction_near_the_vips_forward_of_its_first_is_a_second(
+    conn, switched  # noqa: F811
+):
+    """INV-3h seed 134569 (final fix round 8). The VIP's forward of the
+    relay's "close half" (7005) is read before it (follow-up 1, which 7005
+    is a copy of); the VIP forwards 7005 again. The relay, back on, says
+    "close half" a second time (7006), near that second forward but far
+    from the first. With both channels read the relay rules time a repeat
+    by the post that gives the instruction, never by its copies: 7006 is a
+    second instruction -- two posts of the relay, two instructions. So it is
+    after the start: never taken for a repeat because a copy is near."""
+    _relay_call_then_vip_copy(conn)
+    assert _ingest(conn, VIP, FWD, CLOSE_HALF, posted=_at(1100), fwd=(R, RELAY_CLOSE)).followup_id == 1
+    relay = _ingest(conn, RELAY, RELAY_CLOSE, CLOSE_HALF, posted=_at(194), reply_to=RELAY_CALL)
+    assert relay.relay_of_followup_id == 1, relay
+    if switched:
+        _restart(conn, on=(VIP,), seconds=1101, max_age_seconds=LONG_GATE)
+    assert _ingest(conn, VIP, FWD2, CLOSE_HALF, posted=_at(224), fwd=(R, RELAY_CLOSE)).relay_of_followup_id == 1
+    if switched:
+        _restart(conn, on=(VIP, RELAY), seconds=1102, max_age_seconds=LONG_GATE)
+    traded = 2 if switched else 1
+
+    again = _ingest(conn, RELAY, 7006, CLOSE_HALF, posted=_at(167), reply_to=RELAY_CALL)
+
+    assert again.followup_id == 2, again
+    assert _claimable(conn) == [traded]
+    assert _instructions(conn, traded) == [(1, "close_half", 2), (2, "close_half", 2)]

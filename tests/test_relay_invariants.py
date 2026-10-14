@@ -1653,6 +1653,7 @@ def test_the_reviewers_seeds_act_as_both_channels_read(seed):
     130476, 130323,  # the VIP's stand-in edited while the relay was off, then back on
     130005, 130016, 130172,  # a channel's own two instructions, one edited
     132612,  # a channel's own two instructions a start merged, one withdrawn
+    134569,  # a channel's second instruction near a copy of its first: a second
 ])
 def test_the_seeds_inv3h_found_act_as_both_channels_read(seed):
     """The seeds INV-3h found while it was written (final fix round 8), each
