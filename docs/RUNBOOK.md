@@ -300,7 +300,11 @@ Signals can come from more than one Telegram channel, and you choose which.
   skipped, and only that. A channel switched off for only a few minutes
   may have posted nothing outside that margin: then everything it posted
   while off is read, and a signal it posted then is handled like any other —
-  `watch` says so when it reads the channel.
+  `watch` says so when it reads the channel. A call the channel posted
+  before you switched it off that another channel's post was traded in
+  place of (**COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED**) stays that one trade:
+  what the channel says about it once it is back on — a "close half"
+  replying to it, an edit, deleting it — acts on the trade made instead.
 - **If it says the time it was switched off could not be saved** (the
   database was busy or could not be used), the channel is still switched
   off. If the database was busy, run the same `.\xaucopier channels off 2`

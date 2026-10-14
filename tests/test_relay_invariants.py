@@ -29,7 +29,24 @@ moves, executed entries and replies:
   replies, near it or long after, stored in any order, with watch
   restarted at any point with the relay switched off (the relay's posts
   after that are never read), against the same posts read with no
-  channel switched off. Seeds 110000 + n.
+  channel switched off. Seeds 110000 + n. Since final fix round 7 (R7-1)
+  half the scenarios also restart later with the relay switched back on
+  -- its posts after that are read again -- and may have the relay delete
+  its call (an event of its own random stream, so the scenarios of the
+  other half are what they were).
+- **INV-3g, a channel switched back on** (final fix round 7, R7-1). The
+  relay's call and the VIP's copy, a restart with the relay switched off,
+  a restart with it switched back on, then the relay's "close half"
+  replies to its call, the VIP's forwards of them and its own replies,
+  and the relay deleting its call, in any order: the call is traded or
+  not exactly as when the same posts are read with both channels read
+  throughout, and the instructions acting on it are never more than then
+  -- and never none when there are some then (the relay's "close half"
+  read once it is back on is never lost). They may be fewer: after a
+  start that admitted a call in place of another, a channel's own repeat
+  of an instruction near another channel's post of it is one instruction,
+  where both channels read throughout make it two (an accepted rule of
+  final fix round 6, `relay_repo`'s known limitations). Seeds 120000 + n.
 
 Every scenario uses one call (the same BUY), so "the call" is every
 signal the scenario creates. The seeds are fixed: the suite is
@@ -894,12 +911,16 @@ def test_posts_on_either_side_of_the_window_then_the_first_withdrawn_trade_once(
 # -- the relay switched off around its follow-ups (final fix round 6, R6-1) ---
 
 
-def _switch_off_events(rng: random.Random) -> list[tuple]:
+def _switch_off_events(rng: random.Random, cycle: random.Random | None = None) -> list[tuple]:
     """The relay's call at +0 s, the VIP's copy at +30 s (by hand or a
     forward), the relay's "close half" replying to its call, and one to
     four VIP posts -- a forward of that "close half", or a "close half"
     replying to its copy -- near it or long after; stored in a random
-    order, with a restart (the relay switched off) at a random place."""
+    order, with a restart (the relay switched off) at a random place.
+
+    `cycle` (final fix round 7, R7-1), its own random stream: half the
+    time a later restart switches the relay back on, and a third of the
+    time the relay deletes its call somewhere."""
     relay_close = rng.randint(40, 100)
     events: list[tuple] = [("relay close", relay_close)]
     for _ in range(rng.randint(1, 4)):
@@ -907,6 +928,12 @@ def _switch_off_events(rng: random.Random) -> list[tuple]:
         events.append((rng.choice(["vip forward", "vip reply"]), max(at, 31)))
     rng.shuffle(events)
     events.insert(rng.randint(0, len(events)), ("restart", rng.choice([0, 10, 60, 2000])))
+    if cycle is not None:
+        if cycle.random() < 0.5:
+            after = [event[0] for event in events].index("restart")
+            events.insert(cycle.randint(after + 1, len(events)), ("switch on", cycle.choice([0, 10])))
+        if cycle.random() < 0.33:
+            events.insert(cycle.randint(0, len(events)), ("relay delete", 0))
     return events
 
 
@@ -953,24 +980,31 @@ def _switch_off_run(
         latest = POSTED + timedelta(seconds=30)
         for event in events:
             op, at = event
-            if op == "restart":
+            if op in ("restart", "switch on"):
                 # Without the restart, the same posts are read: the relay's
-                # after this point never are.
-                relay_on = False
+                # after this point never are -- until it is switched back on.
+                relay_on = op == "switch on"
                 if not restart:
                     continue
                 now = latest + timedelta(seconds=at + 1)
-                ids = outbox.signals_with_entries_of_channels_off(
-                    world.conn, enabled_channel_ids=(vip.channel_id,)
+                _start(world.conn, (vip, relay) if relay_on else (vip,), now)
+                world.log.append(
+                    f"restart at +{int((now - POSTED).total_seconds())} s, relay "
+                    f"{'back on' if relay_on else 'off'}"
                 )
-                outbox.skip_entries_of_channels_off(
-                    world.conn, enabled_channel_ids=(vip.channel_id,)
-                )
-                relay_repo.admit_copies_of_switched_off(
-                    world.conn, signal_ids=ids, channels=(vip,), accounts=ACCOUNTS, now_utc=now
+                continue
+            if op == "relay delete":
+                if not relay_on:
+                    world.log.append("(the relay's deletion of its call is never read)")
+                    continue
+                latest += timedelta(seconds=1)
+                edits_repo.apply_deletion(
+                    world.conn, channel_cfg=relay, message_id=7001, now_utc=latest,
+                    accounts=ACCOUNTS, detected_by="event",
+                    read_channels=(vip.channel_id, relay.channel_id),
                 )
                 world.conn.commit()
-                world.log.append(f"restart at +{int((now - POSTED).total_seconds())} s, relay off")
+                world.log.append("the relay deletes Relay/7001")
                 continue
             posted = POSTED + timedelta(seconds=at)
             latest = max(latest, posted)
@@ -1012,13 +1046,14 @@ def _switch_off_problems(seed: int, events: list[tuple], vip_forwards_call: bool
 @pytest.mark.parametrize("seeds", _blocks(), ids=lambda r: f"seeds{r.start}-{r.stop - 1}")
 def test_switching_the_relay_off_never_applies_its_instruction_twice(seeds):
     """INV-3f: the relay's one "close half" and the VIP's repeats of it,
-    with watch restarted at any point with the relay switched off, never
+    with watch restarted at any point with the relay switched off -- and
+    maybe later switched back on, and the relay deleting its call -- never
     act more often on the call traded than with both channels read."""
     failures = []
     for seed in seeds:
         base = 110000 + seed
         rng = random.Random(base)
-        events = _switch_off_events(rng)
+        events = _switch_off_events(rng, random.Random(f"cycle-{base}"))
         vip_forwards_call = rng.random() < 0.3
         problems, log = _switch_off_problems(base, events, vip_forwards_call)
         if problems:
@@ -1027,4 +1062,128 @@ def test_switching_the_relay_off_never_applies_its_instruction_twice(seeds):
             )
             problems, log = _switch_off_problems(base, small, vip_forwards_call)
             failures.append(_report("relay switched off", base, problems, log))
+    assert not failures, "\n\n".join(failures)
+
+
+# -- a channel switched back on (final fix round 7, R7-1) ----------------------
+
+
+def _start(conn, channels: tuple, now: datetime) -> None:
+    """`watch`'s start-up job with only `channels` switched on."""
+    enabled = tuple(channel.channel_id for channel in channels)
+    ids = outbox.signals_with_entries_of_channels_off(conn, enabled_channel_ids=enabled)
+    outbox.skip_entries_of_channels_off(conn, enabled_channel_ids=enabled)
+    relay_repo.admit_copies_of_switched_off(
+        conn, signal_ids=ids, channels=channels, accounts=ACCOUNTS, now_utc=now
+    )
+    conn.commit()
+
+
+def _back_on_events(rng: random.Random) -> list[tuple]:
+    """Read once the relay is back on, in a random order: one or two
+    "close half" replies of the relay to its call (7005, 7006), the VIP's
+    forwards of them and its own "close half" replies to its copy -- near
+    each other or long after -- and maybe the relay deleting its call."""
+    events: list[tuple] = []
+    closes = rng.randint(1, 2)
+    for n in range(closes):
+        events.append(("relay close", 7005 + n, rng.randint(35, 200)))
+    for _ in range(rng.randint(0, 3)):
+        at = rng.randint(35, 260) if rng.random() < 0.8 else rng.randint(1000, 2500)
+        if rng.random() < 0.5:
+            events.append(("vip forward", 7005 + rng.randrange(closes), at))
+        else:
+            events.append(("vip reply", None, at))
+    if rng.random() < 0.3:
+        events.append(("relay delete", None, 0))
+    rng.shuffle(events)
+    return events
+
+
+def _back_on_run(events: list[tuple], *, cycle: bool, vip_forwards_call: bool):
+    """The relay's call and the VIP's copy, then -- with `cycle` -- a start
+    with the relay switched off and one with it back on, then `events`.
+    Returns (instructions acting on the call traded with one waiting,
+    whether any signal is claimable, the log), or (problems, None, log)."""
+    world = _World(_fresh())
+    vip, relay = CHANNELS
+    try:
+        world.store(_Post(1, 7001, SIGNAL_TEXT, POSTED))
+        world.store(_Post(
+            0, 4001, SIGNAL_TEXT, POSTED + timedelta(seconds=30),
+            (1, 7001) if vip_forwards_call else None,
+        ))
+        world.next_id = {0: 4005, 1: 7010}
+        world.log.append(
+            f"post Relay/7001 at +0 s, VIP/4001 at +30 s "
+            f"({'a forward of it' if vip_forwards_call else 'by hand'})"
+        )
+        if cycle:
+            _start(world.conn, (vip,), POSTED + timedelta(seconds=31))
+            _start(world.conn, (vip, relay), POSTED + timedelta(seconds=32))
+            world.log.append("restart at +31 s with the relay off, at +32 s with it back on")
+        latest = POSTED + timedelta(seconds=32)
+        for op, ref, at in events:
+            posted = POSTED + timedelta(seconds=at)
+            if op == "relay close":
+                world.store(_Post(1, ref, CLOSE_HALF, posted, reply_to=7001))
+                world.log.append(f"Relay/{ref} close half at +{at} s, replying to Relay/7001")
+            elif op == "vip forward":
+                post = _Post(0, world.new_id(0), CLOSE_HALF, posted, (1, ref))
+                world.store(post)
+                world.log.append(f"VIP/{post.message_id} forwards Relay/{ref} at +{at} s")
+            elif op == "vip reply":
+                post = _Post(0, world.new_id(0), CLOSE_HALF, posted, reply_to=4001)
+                world.store(post)
+                world.log.append(
+                    f"VIP/{post.message_id} close half at +{at} s, replying to VIP/4001"
+                )
+            else:
+                latest = max(latest, max(p.posted for p in world.posts.values()))
+                edits_repo.apply_deletion(
+                    world.conn, channel_cfg=relay, message_id=7001,
+                    now_utc=latest + timedelta(seconds=1), accounts=ACCOUNTS,
+                    detected_by="event", read_channels=(vip.channel_id, relay.channel_id),
+                )
+                world.conn.commit()
+                world.log.append("the relay deletes Relay/7001")
+        return _instructions_on_traded(world.conn), bool(_claimable(world.conn)), world.log
+    except Exception as exc:  # noqa: BLE001 -- reported with the seed and the events
+        return [_crash(exc)], None, world.log
+    finally:
+        world.conn.close()
+
+
+def _back_on_problems(events: list[tuple], vip_forwards_call: bool):
+    off = _back_on_run(events, cycle=True, vip_forwards_call=vip_forwards_call)
+    on = _back_on_run(events, cycle=False, vip_forwards_call=vip_forwards_call)
+    for outcome in (off, on):
+        if isinstance(outcome[0], list):
+            return outcome[0], off[2]
+    if off[0] > on[0] or (on[0] and not off[0]) or off[1] != on[1]:
+        return [
+            f"INV-3g: relay switched off and back on: {off[0]} instruction(s) on the call "
+            f"traded, traded: {off[1]}; both channels read: {on[0]}, traded: {on[1]}"
+        ], off[2]
+    return [], off[2]
+
+
+@pytest.mark.parametrize("seeds", _blocks(), ids=lambda r: f"seeds{r.start}-{r.stop - 1}")
+def test_a_channel_switched_back_on_acts_as_with_both_channels_read(seeds):
+    """INV-3g: once the relay is switched back on, its posts about its call
+    and the VIP's repeats of them act on the call traded -- the VIP's post
+    admitted in its place -- as with both channels read throughout: the
+    call traded or withdrawn alike, never more instructions, and never none
+    where there are some."""
+    failures = []
+    for seed in seeds:
+        base = 120000 + seed
+        rng = random.Random(base)
+        events = _back_on_events(rng)
+        vip_forwards_call = rng.random() < 0.3
+        problems, log = _back_on_problems(events, vip_forwards_call)
+        if problems:
+            small = _shrink(lambda e: bool(_back_on_problems(e, vip_forwards_call)[0]), events)
+            problems, log = _back_on_problems(small, vip_forwards_call)
+            failures.append(_report("relay switched back on", base, problems, log))
     assert not failures, "\n\n".join(failures)

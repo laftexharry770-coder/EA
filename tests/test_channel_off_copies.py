@@ -163,8 +163,10 @@ def test_an_older_copy_the_newest_is_too_far_from_is_never_a_second_signal(
 ):
     """The VIP copied the relay's call 800 s before it was posted, the other
     channel 800 s after: both copies of signal 1, but 1600 s apart. The
-    newest is the signal; the VIP's copy is outside its window and stays a
-    copy of signal 1 -- never a second signal of the same call."""
+    newest is the signal -- never a second signal of the same call. The
+    VIP's copy, outside its window, still repeats signal 1's call, which
+    signal 2 carries now (final fix round 7, R7-1: the admission is a link
+    of the call's chain): it repeats signal 2."""
     assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
     assert _ingest(conn, VIP, VIP_COPY, posted=_at(-800)).relay_of_signal_id == 1
     assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(800)).relay_of_signal_id == 1
@@ -172,7 +174,8 @@ def test_an_older_copy_the_newest_is_too_far_from_is_never_a_second_signal(
     _restart(conn)
 
     assert _signals(conn)[1:] == [(2, OTHER.channel_id, OTHER_COPY, "NEW")]
-    assert _link(conn, VIP, VIP_COPY) == 1
+    assert _link(conn, VIP, VIP_COPY) == 2
+    assert relay_repo.signal_for_post(conn, channel_id=V, message_id=VIP_COPY) == 2
     assert _queued(conn) == [(2, "acct-1"), (2, "acct-2")]
 
 
@@ -513,8 +516,9 @@ def test_an_old_copy_of_a_call_traded_from_a_young_one_is_not_said_to_be_too_old
     relay's call by hand 30 s after it, and forwarded the relay's post
     2000 s later -- a forward is the same post however late. Newest first,
     the young forward is traded (signal 2). The old hand copy is outside
-    signal 2's window, so it is left as it was -- the call IS traded, so no
-    line may say that this post is not traded because it is too old."""
+    signal 2's window, yet repeats signal 1's call, which signal 2 carries
+    now (R7-1): it repeats signal 2 -- the call IS traded, so no line may
+    say that this post is not traded because it is too old."""
     assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
     assert _ingest(conn, VIP, 4002, posted=_at(30)).relay_of_signal_id == 1
     forward = _ingest(conn, VIP, VIP_COPY, posted=_at(2000), fwd=(R, RELAY_CALL))
@@ -523,7 +527,7 @@ def test_an_old_copy_of_a_call_traded_from_a_young_one_is_not_said_to_be_too_old
     _restart(conn, on=(VIP,), seconds=2050)
 
     assert _signals(conn)[1:] == [(2, V, VIP_COPY, "NEW")]
-    assert _link(conn, VIP, 4002) == 1
+    assert _link(conn, VIP, 4002) == 2
     assert [a[1] for a in _alerts(conn)] == [CODE]
 
 
@@ -682,13 +686,16 @@ def test_a_copy_held_back_then_repeats_the_older_copy_traded_instead(
     assert unacked_by_hand == []
 
 
-def test_a_held_back_copy_the_traded_call_does_not_repeat_stays_held_back(
+def test_a_held_back_copy_of_the_switched_off_call_repeats_the_call_traded_in_its_place(
     conn,  # noqa: F811
 ):
     """The VIP's copies are 950 s apart: the +900 s one, held back against
     the withdrawn signal 2, is outside the window of signal 3 (the -50 s
-    copy), so by the relay rules it is another call -- it stays held back,
-    its alert standing."""
+    copy). But it repeats signal 1's call -- it is within signal 1's window,
+    and a live call wins over a withdrawn one -- and signal 3 carries that
+    call now (final fix round 7, R7-1): it repeats signal 3, and no "trade
+    it by hand" stands while the call is queued. (It stayed held back
+    before, its CRITICAL standing.)"""
     assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
     assert _ingest(conn, VIP, VIP_COPY, posted=_at(-50)).relay_of_signal_id == 1
     assert _ingest(conn, VIP, VIP_REPOST, posted=_at(900)).relay_of_signal_id == 1
@@ -702,10 +709,11 @@ def test_a_held_back_copy_the_traded_call_does_not_repeat_stays_held_back(
     _restart(conn, on=(VIP,), seconds=1100, max_age_seconds=LONG_GATE)
 
     assert _signals(conn)[2:] == [(3, V, VIP_COPY, "NEW")]
-    assert _link(conn, VIP, VIP_REPOST) == 2
-    assert _q(conn, "SELECT code, acked FROM alerts WHERE code IN (?, ?)", HELD, SUPERSEDED) == [
-        (HELD, 0)
-    ]
+    assert _link(conn, VIP, VIP_REPOST) == 3
+    assert _q(
+        conn, "SELECT code, acked, signal_id FROM alerts WHERE code IN (?, ?) ORDER BY alert_id",
+        HELD, SUPERSEDED,
+    ) == [(HELD, 1, 2), (SUPERSEDED, 0, 3)]
 
 
 def test_a_reply_to_a_held_back_copy_moves_with_it_to_the_traded_call(conn):  # noqa: F811
@@ -1060,14 +1068,16 @@ def test_a_deleted_or_edited_away_follow_up_copy_gives_no_instruction(conn):  # 
     assert _acting_on(conn, 2) == []
 
 
-def test_a_follow_up_copy_replying_to_a_post_the_new_signal_does_not_carry_stays_a_copy(
+def test_a_follow_up_copy_replying_to_an_old_copy_acts_on_the_call_traded_in_its_place(
     conn,  # noqa: F811
 ):
     """The VIP copied the relay's call 800 s before it was posted, the other
-    channel 800 s after: the other channel's post is signal 2, and the
-    VIP's, 1600 s away from it, stays a copy of signal 1 -- another call by
-    the relay rules. The VIP's "close half" replying to that post is about
-    signal 1's call, not signal 2's: it is left as it was."""
+    channel 800 s after: the other channel's post is signal 2. The VIP's,
+    1600 s away from it, still repeats signal 1's call, which signal 2
+    carries now (final fix round 7, R7-1): it repeats signal 2. So the
+    VIP's "close half" replying to it, stored as a copy of the relay's, is
+    the instruction about signal 2 now -- one, as with both channels read.
+    (It was left a copy of the relay's before: nothing closed half.)"""
     assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
     assert _ingest(conn, VIP, VIP_COPY, posted=_at(-800)).relay_of_signal_id == 1
     assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(800)).relay_of_signal_id == 1
@@ -1078,10 +1088,11 @@ def test_a_follow_up_copy_replying_to_a_post_the_new_signal_does_not_carry_stays
     _restart(conn, seconds=900)
 
     assert _signals(conn)[1:] == [(2, OTHER.channel_id, OTHER_COPY, "NEW")]
-    assert _link(conn, VIP, VIP_COPY) == 1
-    assert _acting_on(conn, 2) == []
+    assert _link(conn, VIP, VIP_COPY) == 2
+    assert _acting_on(conn, 2) == [(V, VIP_CLOSE)]
+    assert _acting_on(conn, 1) == [(R, RELAY_CLOSE)]
     assert _q(conn, "SELECT relay_of_followup_id FROM messages WHERE message_id = ?", VIP_CLOSE) == [
-        (1,)
+        (None,)
     ]
 
 
@@ -1301,14 +1312,17 @@ def test_a_follow_up_on_the_channel_switched_off_stays_with_the_cancelled_call(
     assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
 
 
-def test_a_reply_after_the_restart_to_a_post_the_new_signal_does_not_carry_stays_a_copy(
+def test_a_reply_after_the_restart_to_an_old_copy_acts_on_the_call_traded_in_its_place(
     conn,  # noqa: F811
 ):
-    """As at the start (R4-4): the other channel's copy, 800 s after the
-    relay's call, is signal 2; the VIP's copy 800 s before it is 1600 s from
-    signal 2 and stays a copy of signal 1. The VIP's "close half" replying
-    to it, read after the restart, is about signal 1's call -- a copy of the
-    relay's instruction, never one about signal 2."""
+    """As at the start: the other channel's copy, 800 s after the relay's
+    call, is signal 2; the VIP's copy 800 s before it is 1600 s from signal
+    2 but repeats signal 1's call, which signal 2 carries now (final fix
+    round 7, R7-1). The VIP's "close half" replying to it, read after the
+    restart, repeats the relay's instruction as the relay rules match it
+    with both channels read (another channel, within the window): it is
+    that instruction about signal 2, standing in for the relay's -- one,
+    never two."""
     assert _ingest(conn, RELAY, RELAY_CALL).signal_id == 1
     assert _ingest(conn, VIP, VIP_COPY, posted=_at(-800)).relay_of_signal_id == 1
     assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(800)).relay_of_signal_id == 1
@@ -1316,10 +1330,14 @@ def test_a_reply_after_the_restart_to_a_post_the_new_signal_does_not_carry_stays
     _restart(conn, seconds=900)
     assert _signals(conn)[1:] == [(2, OTHER.channel_id, OTHER_COPY, "NEW")]
 
-    copy = _ingest(conn, VIP, VIP_CLOSE, CLOSE_HALF, posted=_at(820), reply_to=VIP_COPY)
+    reply = _ingest(conn, VIP, VIP_CLOSE, CLOSE_HALF, posted=_at(820), reply_to=VIP_COPY)
 
-    assert copy.relay_of_followup_id == 1, copy
-    assert _acting_on(conn, 2) == []
+    assert reply.outcome == "new", reply
+    assert _acting_on(conn, 2) == [(V, VIP_CLOSE)]
+    assert _acting_on(conn, 1) == [(R, RELAY_CLOSE)]
+    assert _q(conn, "SELECT instead_of_followup_id FROM followups WHERE followup_id = ?",
+              reply.followup_id) == [(1,)]
+    assert _about_off(conn) == []
 
 
 def test_a_forward_of_a_close_half_about_a_call_still_traded_stays_a_copy(
@@ -1743,6 +1761,290 @@ def test_a_later_start_never_adopts_a_second_copy_of_one_held_instruction(
 
     assert _acting_on(conn, 2) == [(V, FWD)]
     assert _q(conn, "SELECT relay_of_followup_id FROM messages WHERE message_id = ?", REP) == [(2,)]
+
+
+# -- a channel switched back on (final fix round 7, R7-1, R7-2) ---------------
+
+QUEUED_TWICE = [("acct-1", "QUEUED"), ("acct-2", "QUEUED")]
+SWITCHED = pytest.mark.parametrize(
+    "switched", [False, True], ids=["both channels read", "relay off, then back on"]
+)
+
+
+def _relay_off_then_back_on(conn, *, off_at: float = 40, on_at: float = 50):  # noqa: F811
+    """`watch` restarts with the relay switched off -- the VIP's copy of its
+    call is admitted as signal 2 -- and later restarts with it switched
+    back on."""
+    _restart(conn, on=(VIP,), seconds=off_at)
+    _restart(conn, on=(VIP, RELAY), seconds=on_at)
+
+
+@pytest.mark.parametrize(
+    "posted", [60, 35], ids=["posted once back on", "posted before the switch-off, read once on"]
+)
+@SWITCHED
+def test_the_relays_close_half_read_once_it_is_back_on_acts_on_the_call_traded(
+    conn, switched, posted  # noqa: F811
+):
+    """The re-check's r61_back_on_relay_only (final fix round 7, R7-1). The
+    relay's call is signal 1 and the VIP's copy of it signal 2 since the
+    start with the relay switched off; the relay is switched back on. Its
+    "close half" replying to its call -- posted after that, or posted
+    before the switch-off and read only once it is back on -- acts on
+    signal 2, the call traded, exactly as it acts on signal 1 with both
+    channels read throughout. Before, it acted on the cancelled signal 1:
+    nothing closed half, and nothing said so."""
+    _relay_call_then_vip_copy(conn)
+    if switched:
+        _relay_off_then_back_on(conn)
+    traded = 2 if switched else 1
+
+    close = _ingest(conn, RELAY, RELAY_CLOSE, CLOSE_HALF, posted=_at(posted), reply_to=RELAY_CALL)
+
+    assert close.outcome == "new", close
+    assert _claimable(conn) == [traded]
+    assert _acting_on(conn, traded) == [(R, RELAY_CLOSE)]
+    assert _followup_rows(conn, close.followup_id) == QUEUED_TWICE
+    assert [a[1] for a in _alerts(conn)] == ([CODE] if switched else [])
+
+
+@pytest.mark.parametrize("executed", [False, True], ids=["nothing executed", "one account traded"])
+@SWITCHED
+def test_the_relay_deleting_its_call_once_back_on_withdraws_the_call_traded(
+    conn, switched, executed  # noqa: F811
+):
+    """r61_back_on_edits, the deletion (R7-1 b). The relay deletes its call,
+    its last post of it, once it is back on: the call is withdrawn (ruling
+    C2) -- signal 2, the one traded, VOIDED when nothing of it was executed,
+    flagged CRITICAL when it was -- as signal 1 is with both channels read.
+    Never "Nothing had been executed" about the cancelled signal 1 while
+    signal 2 stays claimable."""
+    _relay_call_then_vip_copy(conn)
+    if switched:
+        _relay_off_then_back_on(conn)
+    traded = 2 if switched else 1
+    if executed:
+        conn.execute(
+            "UPDATE outbox SET state = 'DONE' WHERE outbox_id = (SELECT MIN(outbox_id) "
+            "FROM outbox WHERE kind = 'ENTRY' AND signal_id = ?)",
+            (traded,),
+        )
+        conn.commit()
+
+    result = edits_repo.apply_deletion(
+        conn, channel_cfg=RELAY, message_id=RELAY_CALL, now_utc=_at(60), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V, R),
+    )
+    conn.commit()
+
+    assert result.outcome == ("flagged" if executed else "voided"), result
+    assert result.signal_id == traded, result
+    assert _claimable(conn) == []
+    assert _q(conn, "SELECT state, withdrawn_at_utc IS NOT NULL FROM signals WHERE signal_id = ?",
+              traded) == [("NEW" if executed else "VOIDED", 1)]
+    (alert,) = [a for a in _alerts(conn) if a[1] != CODE]
+    flat = " ".join(alert[5].split())
+    if executed:
+        assert alert[:2] == ("CRITICAL", edits_repo.LIVE_SIGNAL_DELETED), alert
+        assert f"signal {traded} was withdrawn by the poster" in flat, flat
+    else:
+        assert alert[:2] == ("WARNING", edits_repo.SIGNAL_VOIDED_BY_DELETION), alert
+        assert f"signal {traded} VOIDED: the poster withdrew it" in flat, flat
+        assert "Nothing had been executed; 2 queued entries skipped." in flat, flat
+    assert alert[4] == traded
+    if switched:
+        assert "signal 1 VOIDED" not in flat, flat
+        assert flat.startswith(
+            f"message {RELAY_CALL} on channel {R} first carried this call as signal 1; signal 2 "
+            f"(message {VIP_COPY} on channel {V}) carries it now: "
+        ), flat
+
+
+@pytest.mark.parametrize("how", ["stop moved", "re-aimed"])
+@SWITCHED
+def test_the_relays_edit_of_its_call_once_back_on_reaches_the_call_traded(
+    conn, switched, how  # noqa: F811
+):
+    """r61_back_on_edits, the edits (R7-1). Once the relay is back on, its
+    edit of its call reaches signal 2, the call traded, as it reaches signal
+    1 with both channels read: a stop moved is the traded signal's stop now
+    (signal 1, cancelled, keeps the one it had), and a call re-aimed to
+    another zone -- the relay's last post of it -- invalidates it."""
+    _relay_call_then_vip_copy(conn)
+    if switched:
+        _relay_off_then_back_on(conn)
+    traded = 2 if switched else 1
+
+    edits_repo.apply_edit(
+        conn, channel_cfg=RELAY, message_id=RELAY_CALL,
+        text=OTHER_CALL if how == "stop moved" else REAIMED, posted_at_utc=POSTED,
+        edit_date_utc=_at(60), reply_to_message_id=None, now_utc=_at(60), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V, R),
+    )
+    conn.commit()
+
+    stops = dict(_q(conn, "SELECT signal_id, json_extract(parsed_json, '$.sl') FROM signals"))
+    if how == "stop moved":
+        assert _claimable(conn) == [traded]
+        assert stops[traded] == 4465
+        if switched:
+            assert stops[1] == 4470
+    else:
+        assert _claimable(conn) == []
+        assert _q(conn, "SELECT state FROM signals WHERE signal_id = ?", traded) == [("INVALID",)]
+        (alert,) = [a for a in _alerts(conn) if a[1] != CODE]
+        assert alert[:2] == ("CRITICAL", edits_repo.SIGNAL_INVALIDATED_BY_EDIT), alert
+        assert alert[4] == traded
+
+
+def test_an_instruction_read_before_the_switch_off_stays_one_once_back_on(conn):  # noqa: F811
+    """R7-1 keeps every R6-1 outcome. The relay's "close half" was read
+    before the start that switched it off, and the VIP's forward of it was
+    adopted there as the instruction about signal 2. With the relay back on
+    the relay's own follow-up still acts on the cancelled signal 1 -- the
+    VIP's forward acts in its place -- so the one instruction stays one."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _fwd(conn)
+    _relay_off_then_back_on(conn, off_at=80, on_at=90)
+
+    assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
+    assert _acting_on(conn, 2) == [(V, FWD)]
+    assert relay_repo.live_signal_for(conn, 1) == 2
+
+
+@SWITCHED
+def test_the_relay_back_on_posting_its_withdrawn_call_again_is_a_new_signal(
+    conn, switched  # noqa: F811
+):
+    """R7-1: the relay, back on, deletes its call -- the call traded is
+    withdrawn -- and posts it again. The relay withdrew the call, so its new
+    post is a new signal in its place (ruling R3-P3), queued, as with both
+    channels read -- never held back as a copy of a call withdrawn by
+    another channel, with a CRITICAL "trade it by hand"."""
+    _relay_call_then_vip_copy(conn)
+    if switched:
+        _relay_off_then_back_on(conn)
+    traded = 2 if switched else 1
+    edits_repo.apply_deletion(
+        conn, channel_cfg=RELAY, message_id=RELAY_CALL, now_utc=_at(60), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V, R),
+    )
+    conn.commit()
+
+    again = _ingest(conn, RELAY, 7002, posted=_at(70))
+
+    assert (again.outcome, again.signal_id) == ("new", traded + 1), again
+    assert _q(conn, "SELECT promoted_from_signal_id, replacement_kind FROM signals "
+                    "WHERE signal_id = ?", again.signal_id) == [(traded, "posted_again")]
+    assert _claimable(conn) == [again.signal_id]
+    assert relay_repo.COPY_OF_WITHDRAWN_SIGNAL not in [a[1] for a in _alerts(conn)]
+
+
+def test_a_follow_up_kept_with_the_switched_off_call_never_follows_it_posted_again(
+    conn,  # noqa: F811
+):
+    """R7-1: the relay's "close half", read before the start, stays with the
+    cancelled signal 1; the VIP's forward of it acts on signal 2 in its
+    place. The VIP then deletes its post -- signal 2 withdrawn -- and posts
+    the call again: signal 3 replaces signal 2, and the VIP's instruction
+    moves to it. The relay's never does: one instruction, not two."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _fwd(conn)
+    _restart(conn, on=(VIP,), seconds=80)
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=VIP_COPY, now_utc=_at(85), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+    again = _ingest(conn, VIP, 4030, posted=_at(90))
+
+    assert again.signal_id == 3, again
+    assert _q(conn, "SELECT promoted_from_signal_id FROM signals WHERE signal_id = 3") == [(2,)]
+    assert _acting_on(conn, 3) == [(V, FWD)]
+    assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
+
+
+def test_a_call_carried_elsewhere_takes_only_the_follow_ups_since_the_start(
+    conn,  # noqa: F811
+):
+    """R7-1, `record_carried`: when signal 2 -- admitted in place of the
+    relay's call -- is withdrawn and another signal carries the same trade,
+    the follow-ups about signal 2 repeat that one; the relay's, kept with
+    the cancelled signal 1, does not."""
+    _relay_call_then_vip_copy(conn)
+    _the_relays_close_half(conn)
+    _fwd(conn)
+    _restart(conn, on=(VIP,), seconds=80)
+    assert _ingest(conn, OTHER, OTHER_COPY, posted=_at(5000)).signal_id == 3
+
+    relay_repo.record_carried(conn, carrier_signal_id=3, withdrawn_signal_id=2)
+
+    assert _acting_on(conn, 3) == [(V, FWD)]
+    assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
+
+
+def test_the_vips_bump_of_its_own_close_half_stays_one_instruction_at_the_start(
+    conn,  # noqa: F811
+):
+    """R7-1: the VIP said "close half" replying to its copy of the call, and
+    forwarded that post of its own (a bump) -- a copy of it. At the start
+    the VIP's copy is signal 2 and its "close half" moves with it; the bump
+    repeats an instruction about signal 2 already, and stays a copy: one
+    instruction, not two."""
+    _relay_call_then_vip_copy(conn)
+    _rep(conn)
+    bump = _ingest(conn, VIP, 4009, CLOSE_HALF, posted=_at(80), fwd=(V, REP))
+    assert bump.relay_of_followup_id == 1, bump
+
+    _restart(conn, on=(VIP,), seconds=100)
+
+    assert _acting_on(conn, 2) == [(V, REP)]
+    assert _q(conn, "SELECT relay_of_followup_id FROM messages WHERE message_id = 4009") == [(1,)]
+
+
+def test_admitted_for_names_only_a_signal_admitted_in_its_place(conn):  # noqa: F811
+    """R7-1 keeps `admitted_for`: the signal a start admitted in place of a
+    switched-off one, and only that -- never a signal for itself."""
+    _relay_call_then_vip_copy(conn)
+    assert relay_repo.admitted_for(conn, 1) is None
+
+    _restart(conn, on=(VIP,), seconds=40)
+
+    assert relay_repo.admitted_for(conn, 1) == 2
+    assert relay_repo.admitted_for(conn, 2) is None
+    assert relay_repo.chain_ids(conn, 2) == relay_repo.chain_ids(conn, 1) == [1, 2]
+
+
+@pytest.mark.parametrize("relay_first", [False, True], ids=["the VIP first", "the relay first"])
+@SWITCHED
+def test_the_vip_and_the_relay_back_on_saying_close_half_give_one_instruction(
+    conn, switched, relay_first  # noqa: F811
+):
+    """The re-check's r61_relay_back_on (fuzz seed 42969; R7-2). With the
+    relay back on, the VIP says "close half" replying to its copy, the relay
+    says it replying to its call a few seconds apart, and the VIP forwards
+    the relay's post. With both channels read that is ONE instruction; so it
+    is once the relay is back on: the relay's post is about signal 2 too, so
+    the relay rules take it for a copy of the VIP's, or the VIP's for a copy
+    of it. No WARNING asks for it to be applied by hand."""
+    _relay_call_then_vip_copy(conn)
+    if switched:
+        _relay_off_then_back_on(conn, off_at=31, on_at=33)
+    traded = 2 if switched else 1
+    vip = lambda c: _ingest(c, VIP, 4005, CLOSE_HALF, posted=_at(75), reply_to=VIP_COPY)  # noqa: E731
+    relay = lambda c: _ingest(c, RELAY, RELAY_CLOSE, CLOSE_HALF, posted=_at(81), reply_to=RELAY_CALL)  # noqa: E731
+    for say in (relay, vip) if relay_first else (vip, relay):
+        say(conn)
+    _ingest(conn, VIP, 4006, CLOSE_HALF, posted=_at(113), fwd=(R, RELAY_CLOSE))
+
+    first = (R, RELAY_CLOSE) if relay_first else (V, 4005)
+    assert _acting_on(conn, traded) == [first], _followups(conn)
+    assert _followup_rows(conn, 1) == QUEUED_TWICE
+    assert [row[1:3] for row in _followups(conn)] == [first]
+    assert _about_off(conn) == []
 
 
 # -- a post on a channel switched off keeps no call standing (R4-5) ---------

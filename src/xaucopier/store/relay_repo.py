@@ -19,7 +19,13 @@ delivery. So the rules speak of *the call* and *its posts*, never of
 when a signal is withdrawn before anything was executed and the same
 call is posted again (a repost promoted in its place, or posted again by
 a channel that withdrew it), the new signal records the one it
-replaces (`signals.promoted_from_signal_id`). The *newest* signal of the
+replaces (`signals.promoted_from_signal_id`). So does a post of the call
+on a channel switched on that watch's start admitted as a signal in place
+of one whose channel was switched off (`signals.admitted_from_signal_id`,
+final fix round 7, R7-1, below): once that channel is switched back on,
+its posts of the call -- their edits, their deletion, the follow-ups
+replying to them -- act on the signal traded in its place, as with both
+channels read. The *newest* signal of the
 chain carries the call: `live_signal_for` -- the one helper every
 consumer resolves through, Plan 3 included. The call's *posts* are the
 chain's own messages and every message stored as a copy of one of them
@@ -220,7 +226,14 @@ standing in for the held one; else a copy, NOT applied, with a WARNING
 (`FOLLOWUP_ABOUT_CHANNEL_OFF_SIGNAL`) that names the signal admitted in
 its place, if one was, for the user to apply it by hand -- and none is
 ever searched for by time. Once one copy of a held instruction was handed
-over so, no later copy of it is applied either: never done twice.
+over so, no later copy of it is applied either: never done twice. The
+admission is a link of the call's chain (final fix round 7, R7-1), yet a
+follow-up stored before it about the switched-off signal stays with that
+signal (`signal_for_followup`): its copies act in its place, or it was
+handed over -- carried over the admission it would act twice. One read
+after the start that replies to a post of the call -- the channel
+switched back on -- is about the signal traded instead, as any reply is,
+and the relay rules match it against the instructions about that signal.
 
 **Every copy is visible.** `record_signal_copy` / `record_followup_copy`
 store the link on the copy's `messages` row, log it at INFO with both
@@ -477,9 +490,15 @@ def live_signal_for(conn: sqlite3.Connection, signal_id: int) -> int:
     """**The signal that carries `signal_id`'s call now** (ruling R3-P2):
     `signal_id` itself, or the newest signal that replaced it -- a repost
     promoted when it was withdrawn, or the call posted again by the
-    channel that withdrew it (`signals.promoted_from_signal_id`, followed
-    to its end). Only that newest signal can be live: each one it
-    replaced was withdrawn before anything of it was executed.
+    channel that withdrew it (`signals.promoted_from_signal_id`), or a post
+    of the call on a channel switched on that watch's start admitted in
+    place of a signal whose channel was switched off
+    (`signals.admitted_from_signal_id`; final fix round 7, R7-1) --
+    followed to its end. Only that newest signal can be live: each one it
+    replaced was withdrawn, or its channel switched off, before anything
+    of it was executed. So a post of the call on a channel switched back
+    on -- its edits, its deletion, the follow-ups replying to it -- acts on
+    the signal traded in its place, as with both channels read.
 
     Every consumer holding a signal id taken from a post or a follow-up
     resolves it through here: the edit and deletion policy, the reply
@@ -497,18 +516,54 @@ def live_signal_for(conn: sqlite3.Connection, signal_id: int) -> int:
 
 def chain_ids(conn: sqlite3.Connection, signal_id: int) -> list[int]:
     """Every signal of `signal_id`'s call, oldest first: the ones it
-    replaced, itself, and the ones that replaced it."""
+    replaced, itself, and the ones that replaced it -- through a
+    replacement or an admission at watch's start (`live_signal_for`). (A
+    signal both replacing a withdrawn one and admitted in place of another
+    follows the replacement back.)"""
     earlier: list[int] = []
     current = signal_id
     while True:
         row = conn.execute(
-            "SELECT promoted_from_signal_id FROM signals WHERE signal_id = ?", (current,)
+            "SELECT COALESCE(promoted_from_signal_id, admitted_from_signal_id) FROM signals "
+            "WHERE signal_id = ?",
+            (current,),
         ).fetchone()
         if row is None or row[0] is None or row[0] >= current:
             break
         current = row[0]
         earlier.append(current)
     return [*reversed(earlier), signal_id, *_replacements(conn, signal_id)]
+
+
+def _admitted_after(conn: sqlite3.Connection, earlier: int, later: int) -> bool:
+    """Whether signal `later` follows signal `earlier` in their call's chain
+    by an admission at watch's start (`signals.admitted_from_signal_id`;
+    final fix round 7, R7-1), not by a replacement."""
+    row = conn.execute(
+        "SELECT 1 FROM signals WHERE signal_id = ? AND admitted_from_signal_id = ?",
+        (later, earlier),
+    ).fetchone()
+    return row is not None
+
+
+def _segments(conn: sqlite3.Connection, signal_id: int) -> list[list[int]]:
+    """`signal_id`'s call (`chain_ids`) cut at each admission at watch's
+    start (R7-1), oldest first: the signals of one switched-off call, then
+    those of the one admitted in its place, and so on."""
+    chain = chain_ids(conn, signal_id)
+    segments = [[chain[0]]]
+    for earlier, later in zip(chain, chain[1:], strict=False):
+        if _admitted_after(conn, earlier, later):
+            segments.append([later])
+        else:
+            segments[-1].append(later)
+    return segments
+
+
+def _segment_of(conn: sqlite3.Connection, signal_id: int) -> list[int]:
+    """The signals of `signal_id`'s call between two admissions at watch's
+    start (`_segments`) that `signal_id` is one of."""
+    return next(segment for segment in _segments(conn, signal_id) if signal_id in segment)
 
 
 def signal_for_post(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> int | None:
@@ -584,7 +639,15 @@ def signal_for_followup(conn: sqlite3.Connection, *, followup_id: int) -> int | 
     must act on (PLAN3-OBLIGATIONS #45): its `target_signal_id` resolved
     through `live_signal_for`, unless it replies to the post that closed
     that signal and that post stays with it (`kept_closer`), when it is
-    that signal itself. None when it has no target."""
+    that signal itself. None when it has no target.
+
+    A follow-up targeting a signal whose channel was switched off, stored
+    before watch's start admitted another in its place, stays with it (its
+    copies on a channel switched on act in its place, or the user was told
+    to apply it by hand: final fix rounds 4-6): it is never carried over
+    the admission (final fix round 7, R7-1). One stored after it -- a reply
+    to a post of the call read once that channel is back on -- targets the
+    admitted signal already (`resolve_reply_target`)."""
     row = conn.execute(
         "SELECT channel_id, reply_to_message_id, target_signal_id FROM followups "
         "WHERE followup_id = ?",
@@ -595,7 +658,8 @@ def signal_for_followup(conn: sqlite3.Connection, *, followup_id: int) -> int | 
     target = row["target_signal_id"]
     if kept_closer(conn, target) == (row["channel_id"], row["reply_to_message_id"]):
         return target
-    return live_signal_for(conn, target)
+    segment = _segment_of(conn, target)
+    return segment[-1]
 
 
 def is_relayed(conn: sqlite3.Connection, *, signal_id: int) -> bool:
@@ -841,7 +905,14 @@ def record_replacement(
         for sid in earlier
         if not closed_by_promotion(conn, sid) and (closer := kept_closer(conn, sid)) is not None
     }
-    _move_followups(conn, earlier=earlier, new=new, kept=kept)
+    # Never a follow-up about a call before an admission at watch's start:
+    # it stays with the switched-off signal (`signal_for_followup`, R7-1).
+    _move_followups(
+        conn,
+        earlier=[sid for sid in _segment_of(conn, new_signal_id) if sid != new_signal_id],
+        new=new,
+        kept=kept,
+    )
     held_back = conn.execute(
         "SELECT alert_id, channel_id, message_id, signal_id, acked FROM alerts "
         f"WHERE code = ? AND signal_id IN ({marks}) ORDER BY alert_id",
@@ -985,7 +1056,10 @@ def record_carried(
         for sid in earlier
         if sid != withdrawn_signal_id and (post := kept_closer(conn, sid)) is not None
     }
-    _move_followups(conn, earlier=earlier, new=carrier, kept=kept)
+    # Never over an admission at watch's start (R7-1, `signal_for_followup`).
+    _move_followups(
+        conn, earlier=_segment_of(conn, withdrawn_signal_id), new=carrier, kept=kept
+    )
     logger.info(
         "withdrawn signal %s: its call is carried by signal %s (channel %s message %s); its "
         "copies and follow-ups repeat that signal now (the call's earlier signals: %s)",
@@ -1727,12 +1801,14 @@ def admit_copies_of_switched_off(
     if too_old:
         raised.append(_say_too_old(conn, too_old, max_age_seconds=max_age_seconds, now_utc=now_utc))
     # Once every post is where it stays: the follow-up copies (R4-4).
-    old_chains = {sid for _, old in admissions for sid in chain_ids(conn, old)}
+    # The switched-off calls' own signals: the admissions are links of their
+    # chains now (R7-1), so never the signals admitted.
+    old_chains = {sid for _, old in admissions for sid in _segment_of(conn, old)}
     for new_id, old in admissions:
         _adopt_followup_copies(
             conn,
             new=_signal_row(conn, new_id),
-            admitted_from=chain_ids(conn, old),
+            admitted_from=_segment_of(conn, old),
             old_chains=old_chains,
             on=on,
             accounts=accounts,
@@ -2970,18 +3046,13 @@ def followup_after_channel_off(
 def admitted_for(conn: sqlite3.Connection, signal_id: int) -> int | None:
     """The signal watch's start admitted in place of `signal_id`'s call
     (`signals.admitted_from_signal_id`, final fix round 6, R6-1) -- the
-    newest signal of its own call -- while it carries that call (`carries`);
-    else None. Never a signal found by time."""
-    chain = chain_ids(conn, signal_id)
-    marks = ", ".join("?" for _ in chain)
-    row = conn.execute(
-        f"SELECT signal_id FROM signals WHERE admitted_from_signal_id IN ({marks}) "
-        "ORDER BY signal_id DESC LIMIT 1",
-        chain,
-    ).fetchone()
-    if row is None:
-        return None
-    live = live_signal_for(conn, row[0])
+    newest signal of the call since (`live_signal_for`: the admission is a
+    link of its chain, final fix round 7, R7-1) -- while it carries that
+    call (`carries`); else None. Never a signal found by time."""
+    segments = _segments(conn, signal_id)
+    if signal_id in segments[-1]:
+        return None  # no admission after it
+    live = segments[-1][-1]
     return live if carries(conn, _signal_row(conn, live)) else None
 
 
@@ -3060,16 +3131,12 @@ def _repeated_about_admitted(
     another channel within `window` seconds. With whether it is about
     `signal_id`'s call already (True) or the switched-off one's (False).
     None otherwise."""
-    chain = chain_ids(conn, signal_id)
-    marks = ", ".join("?" for _ in chain)
-    row = conn.execute(
-        f"SELECT admitted_from_signal_id FROM signals WHERE signal_id IN ({marks}) "
-        "AND admitted_from_signal_id IS NOT NULL ORDER BY signal_id DESC LIMIT 1",
-        chain,
-    ).fetchone()
-    if row is None:
-        return None
-    switched = chain_ids(conn, row[0])
+    segments = _segments(conn, signal_id)
+    index = next(n for n, segment in enumerate(segments) if signal_id in segment)
+    if index == 0:
+        return None  # no admission before it
+    # The signal's own part of the call, and the switched-off one's (R7-1).
+    chain, switched = segments[index], segments[index - 1]
     both = [*chain, *switched]
     marks = ", ".join("?" for _ in both)
     candidates = conn.execute(
@@ -3204,15 +3271,18 @@ def _say_about_channel_off(
 
 def _replacements(conn: sqlite3.Connection, signal_id: int) -> list[int]:
     """The signals that replaced `signal_id`, one after the other, oldest
-    first (each records the one before it in `promoted_from_signal_id`; a
-    replacement is always stored after the signal it replaces)."""
+    first (each records the one before it in `promoted_from_signal_id`, or
+    -- admitted at watch's start in its place -- in `admitted_from_signal_id`
+    (final fix round 7, R7-1); a replacement is always stored after the
+    signal it replaces)."""
     chain: list[int] = []
     current = signal_id
     while True:
         row = conn.execute(
-            "SELECT signal_id FROM signals WHERE promoted_from_signal_id = ? AND signal_id > ? "
+            "SELECT signal_id FROM signals "
+            "WHERE (promoted_from_signal_id = ? OR admitted_from_signal_id = ?) AND signal_id > ? "
             "ORDER BY signal_id DESC LIMIT 1",
-            (current, current),
+            (current, current, current),
         ).fetchone()
         if row is None:
             return chain

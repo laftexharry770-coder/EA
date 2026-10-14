@@ -188,6 +188,18 @@ def test_the_runbook_says_a_short_switch_off_may_read_everything_it_posted() -> 
     )
 
 
+def test_the_runbook_says_a_channel_back_on_acts_on_the_trade_made_instead() -> None:
+    """Final fix round 7 (R7-1): a channel switched back on speaks about its
+    old call to the trade made in its place."""
+    flat = " ".join(RUNBOOK.split())
+    assert (
+        "A call the channel posted before you switched it off that another channel's post was "
+        "traded in place of (**COPY_OF_CHANNEL_OFF_SIGNAL_ADMITTED**) stays that one trade: "
+        "what the channel says about it once it is back on — a \"close half\" replying to it, "
+        "an edit, deleting it — acts on the trade made instead." in flat
+    )
+
+
 def test_the_runbook_says_a_call_on_a_channel_on_is_still_traded_after_a_switch_off() -> None:
     """Final fix round 3 (R3-1): switching a channel off cancels its waiting
     signals, never the same call standing on a channel switched on."""
