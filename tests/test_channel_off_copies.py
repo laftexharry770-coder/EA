@@ -4192,3 +4192,139 @@ def test_the_relays_second_instruction_near_the_vips_forward_of_its_first_is_a_s
     assert again.followup_id == 2, again
     assert _claimable(conn) == [traded]
     assert _instructions(conn, traded) == [(1, "close_half", 2), (2, "close_half", 2)]
+
+
+def _the_vips_stand_in_edited_while_the_relay_is_off(conn, relay_says: str, edited: str) -> None:  # noqa: F811
+    """The relay's instruction (follow-up 1) and the VIP's forward of it,
+    read before the start that switches the relay off: there the forward is
+    follow-up 2, standing in for follow-up 1 about signal 2. While the relay
+    is off the VIP edits its forward into `edited`."""
+    _relay_call_then_vip_copy(conn)
+    assert _ingest(
+        conn, RELAY, RELAY_CLOSE, relay_says, posted=_at(60), reply_to=RELAY_CALL
+    ).followup_id == 1
+    assert _ingest(
+        conn, VIP, FWD, relay_says, posted=_at(70), fwd=(R, RELAY_CLOSE)
+    ).relay_of_followup_id == 1
+    _restart(conn, on=(VIP,), seconds=80)
+    edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=FWD, text=edited, posted_at_utc=_at(70),
+        edit_date_utc=_at(85), reply_to_message_id=None, now_utc=_at(85), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+
+@pytest.mark.parametrize(
+    "relay_says, edited, op, says, still",
+    [
+        (CLOSE_HALF, "Close all now", "close_half", "close the whole trade",
+         "close half of the trade"),
+        ("Move SL to 4450", "Move SL to 4440", "amend_sl", "move the stop loss to 4440",
+         "move the stop loss to 4450"),
+    ],
+    ids=["another op", "another price"],
+)
+def test_the_vips_stand_in_edited_while_the_relay_was_off_gives_way_once_it_is_back_on(
+    conn, relay_says, edited, op, says, still  # noqa: F811
+):
+    """INV-3h seeds 130476 and 130323 (final fix round 8, R8-3 at a start).
+    While the relay was off the VIP edited its forward -- the instruction
+    about signal 2 -- into another one: "close all", or the stop moved to
+    another price. With both channels read the forward was only a copy of
+    the relay's post, which still says what it said. So once the relay is
+    back on the relay's instruction acts on signal 2 and the forward's are
+    skipped, with a WARNING naming both."""
+    _the_vips_stand_in_edited_while_the_relay_is_off(conn, relay_says, edited)
+    assert [row[1] for row in _instructions(conn, 2)] == [
+        "close_all" if op == "close_half" else "amend_sl"
+    ]
+
+    _restart(conn, on=(VIP, RELAY), seconds=90)
+
+    assert _instructions(conn, 2) == [(1, op, 2)]
+    if op == "amend_sl":
+        assert _q(
+            conn, "SELECT json_extract(parsed_json, '$.price_hint') FROM followups "
+            "WHERE followup_id = 1"
+        ) == [(4450.0,)]
+    assert _followup_rows(conn, 2) == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
+    (alert,) = [a for a in _alerts(conn) if a[1] == "FOLLOWUP_COPY_CHANGED"]
+    assert alert[:5] == ("WARNING", "FOLLOWUP_COPY_CHANGED", V, FWD, 2), alert
+    assert (
+        f"it says '{says}', and message {RELAY_CLOSE} still says '{still}'. That channel is "
+        "read again, so follow-up 1 acts on signal 2 in its place"
+    ) in " ".join(alert[5].split()), alert
+
+
+def test_the_vips_stand_in_edited_and_taken_while_the_relay_was_off_is_kept_and_said(
+    conn,  # noqa: F811
+):
+    """R8-3 at a start, the other side: a worker had taken one of the
+    edited forward's instructions ("close all") while the relay was off.
+    What was taken is not undone and the forward stays the instruction about
+    signal 2 -- never two -- but it says another one than the relay's post,
+    read again: a WARNING says so, naming both, never silently."""
+    _the_vips_stand_in_edited_while_the_relay_is_off(conn, CLOSE_HALF, "Close all now")
+    conn.execute(
+        "UPDATE outbox SET state = 'CLAIMED' WHERE kind = 'FOLLOWUP' AND followup_id = 2 "
+        "AND account_id = 'acct-1'"
+    )
+    conn.commit()
+
+    _restart(conn, on=(VIP, RELAY), seconds=90)
+
+    assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
+    assert _instructions(conn, 2) == [(2, "close_all", 1)]
+    assert _followup_rows(conn, 2) == [("acct-1", "CLAIMED"), ("acct-2", "QUEUED")]
+    (alert,) = [a for a in _alerts(conn) if a[1] == "FOLLOWUP_COPY_CHANGED"]
+    assert alert[:5] == ("WARNING", "FOLLOWUP_COPY_CHANGED", V, FWD, 2), alert
+    assert " ".join(alert[5].split()) == (
+        f"message {FWD} on channel {V} (follow-up 2) stood in for follow-up 1 (message "
+        f"{RELAY_CLOSE} on channel {R}) about signal 2 while that channel was switched off, and "
+        "was edited since: it says 'close the whole trade', and message "
+        f"{RELAY_CLOSE} still says 'close half of the trade'. That channel is read again, but 1 "
+        "of follow-up 2's instructions was already taken by a worker, so nothing was changed: "
+        "follow-up 2 still acts on signal 2, 1 instruction(s) queued, and follow-up 1 does "
+        "not. Check the trade on signal 2 by hand."
+    ), alert
+
+    _restart(conn, on=(VIP, RELAY), seconds=95)  # once, not at every start
+
+    assert len([a for a in _alerts(conn) if a[1] == "FOLLOWUP_COPY_CHANGED"]) == 1
+    assert _followup_rows(conn, 2) == [("acct-1", "CLAIMED"), ("acct-2", "QUEUED")]
+
+
+def test_a_request_by_hand_read_in_a_copy_of_a_merged_stand_in_is_named_when_withdrawn(
+    conn,  # noqa: F811
+):
+    """`relay_repo.handed_over` finds a request by hand made for a copy of
+    a follow-up standing in for one of its own channel (a start's merge),
+    too. The VIP's reply stood in for its forward, read first; it was
+    deleted where the channels read were not known -- nothing was handed
+    back -- so the VIP's next forward of the relay's post asked for the
+    instruction by hand. When the VIP then deletes its first forward, the
+    alert names that request and says to review it."""
+    _the_vips_forward_read_first_and_its_own_reply(conn)
+    _restart(conn, on=(VIP,), seconds=100)
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=REP, now_utc=_at(105), accounts=ACCOUNTS,
+        detected_by="event", read_channels=None,
+    )
+    conn.commit()
+    assert _ingest(conn, VIP, 4009, CLOSE_HALF, posted=_at(106), fwd=(R, RELAY_CLOSE)).relay_of_followup_id == 2
+    (asked,) = _q(conn, "SELECT alert_id, detail FROM alerts WHERE code = ?", ABOUT_OFF)
+    assert relay_repo.BY_HAND in asked[1]
+
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=FWD, now_utc=_at(110), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+    (alert,) = [a for a in _alerts(conn) if a[1] == "FOLLOWUP_DELETED" and a[3] == FWD]
+    assert alert[4] == 2, alert
+    assert (
+        f"It was handed to you to apply by hand on signal 2 (alert #{asked[0]}), and its poster "
+        "withdrew it: if you applied it, review that."
+    ) in " ".join(alert[5].split()), alert

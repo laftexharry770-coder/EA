@@ -3612,17 +3612,91 @@ def _say_stand_in_dropped(
     was switched off -- its own post edited since. With that channel read
     again, `held` acts in its place, as with both channels read: `stand_in`'s
     instructions are skipped, with a WARNING (final fix round 8, R8-3)."""
-    from xaucopier.store import edits_repo  # edits_repo imports this module
-
     skipped = outbox.skip_queued(
         conn, kind="FOLLOWUP", followup_id=stand_in,
         reason="follow-up withdrawn: the one it stood in for is read again",
     )
+    alert_id = _say_stand_in_edited(
+        conn, stand_in=stand_in, held=held, signal_id=signal_id, now_utc=now_utc,
+        then=(
+            f"That channel is read again, so follow-up {held['followup_id']} acts on signal "
+            f"{signal_id} in its place, as with both channels read, and follow-up {stand_in}'s "
+            f"{skipped} queued instruction(s) were skipped. If the poster changed the "
+            "instruction, review it by hand."
+        ),
+    )
+    assert alert_id is not None  # never `once`: always raised
+    return alert_id
+
+
+def _say_stand_in_kept(
+    conn: sqlite3.Connection,
+    *,
+    stand_in: int,
+    held: sqlite3.Row,
+    signal_id: int,
+    now_utc: datetime,
+) -> int | None:
+    """For `_hand_back_on_switch_on`: as `_say_stand_in_dropped`, but a
+    worker had taken some of follow-up `stand_in`'s instructions already, so
+    nothing is changed -- what was taken is not undone, and `stand_in` stays
+    the instruction about `signal_id`, never two -- and the WARNING says so:
+    it gives another instruction than the post read again, which is never
+    silent (final fix round 8). Once: None when the same WARNING was raised
+    at an earlier start."""
+    counts = outbox.state_counts(conn, kind="FOLLOWUP", followup_id=stand_in)
+    taken = counts.get("CLAIMED", 0) + counts.get("DONE", 0)
+    return _say_stand_in_edited(
+        conn, stand_in=stand_in, held=held, signal_id=signal_id, now_utc=now_utc,
+        then=(
+            f"That channel is read again, but {taken} of follow-up {stand_in}'s instructions "
+            f"{'was' if taken == 1 else 'were'} already taken by a worker, so nothing was "
+            f"changed: follow-up {stand_in} still acts on signal {signal_id}, "
+            f"{counts.get('QUEUED', 0)} instruction(s) queued, and follow-up "
+            f"{held['followup_id']} does not. Check the trade on signal {signal_id} by hand."
+        ),
+        once=True,
+    )
+
+
+def _say_stand_in_edited(
+    conn: sqlite3.Connection,
+    *,
+    stand_in: int,
+    held: sqlite3.Row,
+    signal_id: int,
+    now_utc: datetime,
+    then: str,
+    once: bool = False,
+) -> int | None:
+    """The WARNING (`FOLLOWUP_COPY_CHANGED`) naming follow-up `stand_in`,
+    edited since it stood in for `held` while `held`'s channel was switched
+    off, what each says, and `then`: what the start did about it. With
+    `once`, None -- nothing raised -- when the very same WARNING was raised
+    before."""
+    from xaucopier.store import edits_repo  # edits_repo imports this module
+
     row = conn.execute(
         "SELECT channel_id, message_id FROM followups WHERE followup_id = ?", (stand_in,)
     ).fetchone()
     says = signals_repo.stored_followup(conn, stand_in)
     held_says = signals_repo.stored_followup(conn, held["followup_id"])
+    detail = (
+        f"message {row['message_id']} on channel {row['channel_id']} (follow-up "
+        f"{stand_in}) stood in for follow-up {held['followup_id']} (message "
+        f"{held['message_id']} on channel {held['channel_id']}) about signal {signal_id} "
+        "while that channel was switched off, and was edited since: it says '"
+        + (store_words.instruction_words(says) if says else "?")
+        + f"', and message {held['message_id']} still says '"
+        + (store_words.instruction_words(held_says) if held_says else "?")
+        + f"'. {then}"
+    )
+    if once and conn.execute(
+        "SELECT 1 FROM alerts WHERE code = ? AND channel_id = ? AND message_id = ? "
+        "AND detail = ? LIMIT 1",
+        (edits_repo.FOLLOWUP_COPY_CHANGED, row["channel_id"], row["message_id"], detail),
+    ).fetchone():
+        return None
     return alerts.record(
         conn,
         now_utc=now_utc,
@@ -3631,19 +3705,7 @@ def _say_stand_in_dropped(
         channel_id=row["channel_id"],
         message_id=row["message_id"],
         signal_id=signal_id,
-        detail=(
-            f"message {row['message_id']} on channel {row['channel_id']} (follow-up "
-            f"{stand_in}) stood in for follow-up {held['followup_id']} (message "
-            f"{held['message_id']} on channel {held['channel_id']}) about signal {signal_id} "
-            "while that channel was switched off, and was edited since: it says '"
-            + (store_words.instruction_words(says) if says else "?")
-            + f"', and message {held['message_id']} still says '"
-            + (store_words.instruction_words(held_says) if held_says else "?")
-            + f"'. That channel is read again, so follow-up {held['followup_id']} acts on "
-            f"signal {signal_id} in its place, as with both channels read, and follow-up "
-            f"{stand_in}'s {skipped} queued instruction(s) were skipped. If the poster "
-            "changed the instruction, review it by hand."
-        ),
+        detail=detail,
     )
 
 
@@ -3665,7 +3727,8 @@ def _hand_back_on_switch_on(
     in that says another instruction -- edited while the channel was off --
     is a copy edited, as with both channels read: its instructions are
     skipped, with a WARNING (`_say_stand_in_dropped`) -- unless one of them
-    was taken, when nothing changes. Returns the alerts raised."""
+    was taken, when nothing changes, and a WARNING says that
+    (`_say_stand_in_kept`). Returns the alerts raised."""
     raised: list[int] = []
     marks = ", ".join("?" for _ in on)
     if not marks:
@@ -3702,7 +3765,16 @@ def _hand_back_on_switch_on(
         if any(not _says_other(conn, other, held) for other in acting):
             continue  # one standing in for it gives its instruction already
         if any(_taken(conn, other) for other in acting):
-            continue  # what was taken of one standing in for it is not undone
+            # What was taken of one standing in for it is not undone; it
+            # stays the instruction, and a WARNING says so.
+            said = [
+                _say_stand_in_kept(
+                    conn, stand_in=other, held=held, signal_id=admitted, now_utc=now_utc
+                )
+                for other in acting
+            ]
+            raised.extend(alert_id for alert_id in said if alert_id is not None)
+            continue
         for other in acting:
             raised.append(_say_stand_in_dropped(
                 conn, stand_in=other, held=held, signal_id=admitted, now_utc=now_utc
