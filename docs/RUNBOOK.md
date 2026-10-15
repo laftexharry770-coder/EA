@@ -253,7 +253,22 @@ missed. Once you have dealt with one, clear it:
   same instruction. If the alert says it already acts on that signal,
   nothing to do. If that message is edited or deleted later, a
   **FOLLOWUP_COPY_CHANGED** alert says it was not carried out, and what it
-  says now: if you applied it by hand, review what you did.
+  says now: if you applied it by hand, review what you did. If the
+  instruction itself was withdrawn by the channel that first gave it
+  (deleted or edited away), the alert says **"withdrawn by its poster …
+  Nothing to do."** — do not apply it.
+- **FOLLOWUP_COPY_CHANGED at start-up** — while a channel was switched
+  off, another channel's copy of one of its instructions was acting in its
+  place, and that copy was edited. Now that the channel is read again,
+  either its own post acts again instead of the copy (nothing to do), or,
+  if part of the instruction had already been carried out, the copy is kept
+  and the alert says **"Check the trade on signal N by hand"**: look at
+  that trade and the two messages, and put it right by hand if needed.
+- **FOLLOWUP_EDITED_AFTER_DISPATCH (two posts of one channel)** — two
+  instructions the same channel posted had been treated as one, and one of
+  them was then edited to say something else. They are two instructions
+  again, and both act on the trade (the alert names both). Nothing to do,
+  unless they contradict each other: then check the channel.
 - **Any other alert** — copy its two lines and send them to whoever looks
   after xaucopier, then clear it.
 
