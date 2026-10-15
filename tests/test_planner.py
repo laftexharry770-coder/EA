@@ -125,10 +125,12 @@ def test_market_entries_are_unaffected_by_the_move():
     assert all(leg.kind is OrderKind.MARKET for leg in plan.legs)
 
 def test_leg_index_is_in_the_comment():
+    # Plan 1b: the suffix is "-{leg_index}t{tp_index}", so a position names
+    # both itself and its take profit at the broker.
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
     comments = [leg.comment for leg in plan.legs]
     assert len(set(comments)) == 4
-    assert comments[0].endswith("-0")
+    assert comments == ["335-0t0", "335-1t1", "335-2t2", "335-3t3"]
 
 def test_comment_fits_broker_limit():
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
@@ -146,7 +148,7 @@ def test_leg_index_survives_an_absurdly_large_message_id():
     plan = plan_entry(huge, ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
     assert plan.accepted
     for leg in plan.legs:
-        assert leg.comment.endswith(f"-{leg.leg_index}")
+        assert leg.comment.endswith(f"-{leg.leg_index}t{leg.tp_index}")
         assert len(leg.comment) <= 20
 
 def test_magic_is_constant_across_legs():
@@ -171,19 +173,22 @@ def test_wide_spread_is_rejected():
     assert not plan.accepted and plan.reason is RejectReason.SPREAD_WIDE
 
 
-# --- Item 1: leg_index must reflect the position in the original sig.tps,
-# not the position in the filtered/surviving list. ---
+# --- Item 1: a leg must name its real position in the original sig.tps, not
+# its position in the filtered/surviving list. Plan 1b moved that job from
+# leg_index (now the position's ordinal, 0..N-1) to tp_index, and the
+# comment carries both. ---
 
-def test_leg_index_reflects_original_tp_position_when_earlier_tps_have_passed():
+def test_tp_index_names_the_original_tp_when_earlier_tps_have_passed():
     # Price has run past TP1 and TP2; only TP3 and TP4 survive. Those legs
-    # must be labelled 2 and 3 (their real position in sig.tps), not 0 and 1
-    # (their position in the surviving subset) — reconciliation depends on
-    # the comment's leg index to tell legs of the same signal apart.
+    # target TP3 and TP4 (indexes 2 and 3 in sig.tps), not 0 and 1 (their
+    # position in the surviving subset) -- reconciliation reads the TP from
+    # the comment's "t" part. leg_index is the position's own number.
     plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
     assert [leg.tp for leg in plan.legs] == [4500.0, 4505.0]
-    assert [leg.leg_index for leg in plan.legs] == [2, 3]
-    assert plan.legs[0].comment.endswith("-2")
-    assert plan.legs[1].comment.endswith("-3")
+    assert [leg.leg_index for leg in plan.legs] == [0, 1]
+    assert [leg.tp_index for leg in plan.legs] == [2, 3]
+    assert plan.legs[0].comment.endswith("-0t2")
+    assert plan.legs[1].comment.endswith("-1t3")
 
 def test_leg_index_is_unchanged_when_no_tp_has_passed():
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)

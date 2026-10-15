@@ -32,14 +32,49 @@ _SIGNAL_GATES = (
 )
 
 
-def _comment(sig: Signal, leg_index: int) -> str:
-    """base36(message_id)-leg, capped to the broker's 20-char comment limit.
+def distribute(
+    n_positions: int | None,
+    surviving: tuple[tuple[int, float], ...],
+) -> tuple[tuple[int, float], ...]:
+    """Spread N positions over the surviving take profits, one entry each.
 
-    The leg index is mandatory: without it the legs of one signal are
-    indistinguishable at the broker, and reconciliation cannot tell which
-    position is which. So the base36 prefix is what gets truncated when the
-    two together would overflow 20 chars -- never the suffix, or a large
-    enough message_id would silently drop the one field that must survive.
+    `surviving` is `(tp_index, tp)` in TP order, where tp_index is the
+    index into `sig.tps`; the result has one `(tp_index, tp)` per position.
+    The user's staggered rule (2026-09-23):
+
+    - `None` (positions not set): one position per surviving TP, unchanged.
+    - `N >= T`: one per TP, and the `N - T` extras on the LAST TP.
+    - `N < T`: the FIRST N TPs.
+
+    It is given the SURVIVING TPs, never all of them: a position aimed at a
+    TP price has already passed would close at once or be rejected. With
+    nothing surviving there is nothing to aim at, so there is no position
+    (plan_entry rejects that case with ALL_TPS_BEHIND before it gets here).
+    """
+    if n_positions is None:
+        return tuple(surviving)
+    # The account loader already refuses these. AccountSpec does not, so
+    # this is the last line of defence: zero would plan an accepted signal
+    # with no orders, and a bool is an int that silently means 0 or 1.
+    if isinstance(n_positions, bool) or not isinstance(n_positions, int) or n_positions < 1:
+        raise ValueError(f"positions must be a whole number of at least 1, got {n_positions!r}")
+    if not surviving:
+        return ()
+    if n_positions < len(surviving):
+        return tuple(surviving[:n_positions])
+    return tuple(surviving) + (surviving[-1],) * (n_positions - len(surviving))
+
+
+def _comment(sig: Signal, leg_index: int, tp_index: int) -> str:
+    """base36(message_id)-{leg}t{tp}, capped to the broker's 20-char limit.
+
+    The suffix is mandatory. The leg index tells the legs of one signal
+    apart at the broker -- without it reconciliation cannot say which
+    position is which -- and the TP index names the take profit the
+    position targets, so a position is self-describing even if its database
+    row is lost. So the base36 prefix is what gets truncated when the two
+    together would overflow 20 chars -- never the suffix, or a large enough
+    message_id would silently drop the fields that must survive.
     """
     digits = "0123456789abcdefghijklmnopqrstuvwxyz"
     n, out = sig.message_id, ""
@@ -48,7 +83,7 @@ def _comment(sig: Signal, leg_index: int) -> str:
         out = digits[rem] + out
         if n == 0:
             break
-    suffix = f"-{leg_index}"
+    suffix = f"-{leg_index}t{tp_index}"
     prefix_budget = max(0, 20 - len(suffix))
     return f"{out[:prefix_budget]}{suffix}"[:20]
 
@@ -75,13 +110,13 @@ def plan_entry(
 
     # gates.surviving_tps is the single source of truth for which targets
     # survive; here we only re-pair each survivor with its original position
-    # in sig.tps, so leg_index (and the comment) names the real TP, not its
+    # in sig.tps, so tp_index (and the comment) names the real TP, not its
     # position in the filtered list.
-    #
-    # With one leg per surviving TP, a leg's leg_index and tp_index are the
-    # same number; they part once positions can outnumber the TPs.
     survived = set(surviving)
     surviving_indexed = tuple((i, tp) for i, tp in enumerate(sig.tps) if tp in survived)
+    # One entry per position. leg_index is the position's ordinal (0..N-1),
+    # unique per leg; several positions may share a tp_index.
+    targets = distribute(account.positions, surviving_indexed)
 
     price = snap.ask if sig.side is Side.BUY else snap.bid
     kind, entry_price, expires = _entry_for(sig, snap, pol, price)
@@ -112,14 +147,14 @@ def plan_entry(
             price=round_price(entry_price, spec),
             sl=round_price(sig.sl, spec),
             tp=round_price(tp, spec),
-            leg_index=index,
-            tp_index=index,
+            leg_index=leg_index,
+            tp_index=tp_index,
             magic=account.magic_base,
-            comment=_comment(sig, index),
+            comment=_comment(sig, leg_index, tp_index),
             deviation_points=usd_to_points(pol.max_slippage_usd, spec),
             expires_at_utc=expires,
         )
-        for index, tp in surviving_indexed
+        for leg_index, (tp_index, tp) in enumerate(targets)
     )
     notes = (f"{len(sig.tps) - len(surviving_indexed)} take profit(s) already passed",) \
         if len(surviving_indexed) != len(sig.tps) else ()
