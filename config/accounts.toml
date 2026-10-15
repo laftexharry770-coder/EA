@@ -1,0 +1,13 @@
+# one account for v1
+[[accounts]]
+account_id    = "ic_demo"
+broker        = "ICMarkets"
+terminal_path = "C:\\MT5\\bot-icmarkets\\terminal64.exe"
+login         = 53027243
+server        = "ICMarketsKE-Demo"
+symbol        = "XAUUSD"
+fixed_lot     = 0.01
+magic_base    = 77001
+ordinal       = 1
+allow_live    = false
+enabled       = true

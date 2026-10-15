@@ -1,9 +1,17 @@
 """Config loading. The only place a raw TOML file becomes Python."""
 from __future__ import annotations
 
+import time
 import tomllib
 from pathlib import Path
 from typing import Any
+
+#: How long a read of a config file waits out Windows refusing to open it
+#: (PermissionError) -- what a reader meets in the moment another xaucopier
+#: command replaces the file (final fix FF9). Each replace takes
+#: milliseconds; a refusal that outlasts this is re-raised.
+REPLACE_WAIT_SECONDS = 1.0
+_REPLACE_RETRY_SECONDS = 0.05
 
 
 class ConfigError(ValueError):
@@ -32,8 +40,22 @@ def _assert_no_points_keys(node: Any, trail: str = "") -> None:
             _assert_no_points_keys(item, trail)
 
 
+def read_while_replaced(path: Path) -> bytes:
+    """`path`'s bytes, waiting up to `REPLACE_WAIT_SECONDS` while Windows
+    refuses to open it (PermissionError) because another xaucopier command
+    is replacing it. Still refused after that: the PermissionError."""
+    deadline = time.monotonic() + REPLACE_WAIT_SECONDS
+    while True:
+        try:
+            with path.open("rb") as handle:
+                return handle.read()
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_REPLACE_RETRY_SECONDS)
+
+
 def load_policy_dict(path: Path) -> dict[str, Any]:
-    with path.open("rb") as handle:
-        data = tomllib.load(handle)
+    data = tomllib.loads(read_while_replaced(path).decode("utf-8"))
     _assert_no_points_keys(data)
     return data

@@ -1,0 +1,7 @@
+# The numeric id is resolved later by `xaucopier resolve-channels`
+[[channels]]
+channel_id = 0            # placeholder; Task 11's CLI fills this in
+name       = "MARKET MASTERY HUB / COMMUNITY"
+parser     = "mmh"
+ordinal    = 1
+enabled    = false        # stays off until the real id is resolved

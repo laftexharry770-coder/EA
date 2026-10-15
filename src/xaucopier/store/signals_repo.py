@@ -1,0 +1,402 @@
+"""Persistence for `signals`, `followups`, and the `channel_state`
+parse-failure counter.
+
+`messages_repo.ingest()` and `edits_repo` (Task 10) are the callers and
+own the transaction (each runs inside a `Writer.submit()` job -- see
+store/db.py); every function here just executes statements against the
+`conn` it is given and never commits or rolls back.
+
+`followups` holds two kinds of row since migration 2 (see migrations.py):
+a message's *own* follow-up, `edit_seq = 0`, and the `AMEND_SL`/`AMEND_TP`
+rows an edit of an executed signal derives, `edit_seq = 1, 2, ...`, keyed
+by that signal's message. Everything that means "this message's
+follow-up" filters on `edit_seq = 0`.
+
+JSON serialisation lives here rather than on the domain types themselves,
+because `domain/signal.py` must stay pure (no `json` import) -- see
+tests/test_purity.py.
+
+`signals.parsed_json.source` is the signal message's own
+`messages.source` (live / poll / backfill), read from the stored message
+row whenever the JSON is written -- never the parsed `Signal.source`,
+which routing always leaves at 'live' (final review F39: every signal
+the poll or backfill recovered said 'live', and Plan 3 is told to read
+parsed_json at claim time). An edit keeps it: the message's provenance
+is how it was first stored.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime
+from typing import Literal
+
+from xaucopier.domain.signal import FollowUp, FollowUpOp, Signal
+from xaucopier.store import outbox
+
+TradeStatus = Literal["pending", "in_flight", "executed"]
+#: How a signal replaced a withdrawn one (`signals.replacement_kind`).
+ReplacementKind = Literal["promoted", "posted_again"]
+
+
+def signal_to_json(signal: Signal, *, source: str) -> str:
+    """The persisted form of a parsed signal. Re-derived in full on every
+    edit (see update_signal_on_edit) so `signals.parsed_json` always
+    reflects the latest accepted parse, never a stale first cut.
+
+    `source` is the message's real provenance (see the module docstring);
+    `signal.source` is not used.
+    """
+    return json.dumps(
+        {
+            "side": signal.side.value,
+            "symbol_alias": signal.symbol_alias,
+            "zone": {"lo": signal.zone.lo, "hi": signal.zone.hi},
+            "sl": signal.sl,
+            "tps": list(signal.tps),
+            "posted_at_utc": signal.posted_at_utc.isoformat(),
+            "content_hash": signal.content_hash,
+            "source": source,
+        }
+    )
+
+
+def _message_source(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> str:
+    """`messages.source` of a signal's own message. The message row is
+    always stored first (signals has a foreign key to it)."""
+    row = conn.execute(
+        "SELECT source FROM messages WHERE channel_id = ? AND message_id = ?",
+        (channel_id, message_id),
+    ).fetchone()
+    if row is None:
+        raise LookupError(
+            f"no stored message ({channel_id}, {message_id}) for this signal; the "
+            "message row must be written before its signal"
+        )
+    return row[0]
+
+
+def followup_to_json(followup: FollowUp) -> str:
+    return json.dumps(
+        {
+            "op": followup.op.value,
+            "posted_at_utc": followup.posted_at_utc.isoformat(),
+            "reply_to_message_id": followup.reply_to_message_id,
+            "price_hint": followup.price_hint,
+            "tp_index_hint": followup.tp_index_hint,
+            "raw": followup.raw,
+        }
+    )
+
+
+def trade_status(conn: sqlite3.Connection, *, signal_id: int) -> TradeStatus:
+    """Whether a signal has been traded -- by its ENTRY outbox rows, the
+    proxy until Plan 3's legs table exists: one `DONE` is executed; one
+    `CLAIMED` (a worker holds it, possibly mid order-send) is in flight.
+    The one definition: `edits_repo` (what an edit or deletion does) and
+    `relay_repo` (whether a withdrawn call was ever traded) both ask here.
+    Replace it with the legs table when Plan 3 lands."""
+    counts = outbox.state_counts(conn, kind="ENTRY", signal_id=signal_id)
+    if counts.get("DONE"):
+        return "executed"
+    if counts.get("CLAIMED"):
+        return "in_flight"
+    return "pending"
+
+
+def insert_signal(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    message_id: int,
+    signal: Signal,
+    promoted_from_signal_id: int | None = None,
+    replacement_kind: ReplacementKind | None = None,
+) -> int:
+    """A new NEW signal for an already-stored message; parsed_json's
+    `source` is that message's `messages.source` (F39).
+    `promoted_from_signal_id` is set for a signal that replaces a
+    withdrawn one (final review F04, ruling R3-P2), with
+    `replacement_kind` saying how: `"promoted"`, a standing repost
+    promoted when the signal lost its own message while its channel still
+    showed the call -- the call never stopped (ruling R5-3) -- or
+    `"posted_again"`, the call posted again by a channel that withdrew it.
+    `relay_repo.live_signal_for` follows these links to the signal that
+    carries a call now."""
+    if (promoted_from_signal_id is None) != (replacement_kind is None):
+        raise ValueError(
+            "promoted_from_signal_id and replacement_kind go together: "
+            f"{promoted_from_signal_id!r}, {replacement_kind!r}"
+        )
+    source = _message_source(conn, channel_id=channel_id, message_id=message_id)
+    cursor = conn.execute(
+        "INSERT INTO signals (channel_id, message_id, parsed_json, trade_hash, "
+        "first_trade_hash, state, version, promoted_from_signal_id, replacement_kind) "
+        "VALUES (?, ?, ?, ?, ?, 'NEW', 1, ?, ?)",
+        (
+            channel_id,
+            message_id,
+            signal_to_json(signal, source=source),
+            signal.content_hash,
+            signal.content_hash,
+            promoted_from_signal_id,
+            replacement_kind,
+        ),
+    )
+    return cursor.lastrowid
+
+
+def update_signal_on_edit(
+    conn: sqlite3.Connection, *, channel_id: int, message_id: int, signal: Signal
+) -> None:
+    """Re-record a corrected parse in place and bump `version`. Task 10
+    decides what -- if anything -- to *do* about a live position when this
+    happens; this just makes the correction faithfully visible.
+
+    A no-op (matches zero rows) if the original message never produced a
+    `signals` row in the first place -- e.g. it was a relay_duplicate.
+    There is nothing to correct in that case; nothing to fabricate either.
+
+    `first_trade_hash` is left alone: relay dedup keeps matching the call
+    as it was first accepted (see `relay_repo.find_signal_relay`). So is
+    parsed_json's `source`: it stays the message's `messages.source`.
+    """
+    source = _message_source(conn, channel_id=channel_id, message_id=message_id)
+    conn.execute(
+        "UPDATE signals SET parsed_json = ?, trade_hash = ?, version = version + 1 "
+        "WHERE channel_id = ? AND message_id = ?",
+        (signal_to_json(signal, source=source), signal.content_hash, channel_id, message_id),
+    )
+
+
+def get_signal(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> sqlite3.Row | None:
+    """The whole `signals` row for a message, or None."""
+    return conn.execute(
+        "SELECT * FROM signals WHERE channel_id = ? AND message_id = ?",
+        (channel_id, message_id),
+    ).fetchone()
+
+
+def set_signal_state(
+    conn: sqlite3.Connection, *, signal_id: int, state: str, from_state: str = "NEW"
+) -> bool:
+    """Move a signal from `from_state` to `state`; False if it was not in
+    `from_state` (so a terminal state is never overwritten)."""
+    cursor = conn.execute(
+        "UPDATE signals SET state = ? WHERE signal_id = ? AND state = ?",
+        (state, signal_id, from_state),
+    )
+    return cursor.rowcount == 1
+
+
+def mark_withdrawn(conn: sqlite3.Connection, *, signal_id: int, now_utc: datetime) -> None:
+    """Record that the poster withdrew this signal (deleted it, or edited
+    it into something that is no signal). Kept once set. `outbox.claim()`
+    never hands out an ENTRY of a withdrawn signal, even one whose
+    `state` stays NEW because it is live."""
+    conn.execute(
+        "UPDATE signals SET withdrawn_at_utc = ? WHERE signal_id = ? AND withdrawn_at_utc IS NULL",
+        (now_utc.isoformat(), signal_id),
+    )
+
+
+def record_closed_by(
+    conn: sqlite3.Connection, *, signal_id: int, channel_id: int, message_id: int
+) -> None:
+    """Record the post whose deletion or edit withdrew or invalidated this
+    signal -- its own message, or a relay copy of it. Kept once set: the
+    first post to close a signal is the one that did. A withdrawn call
+    posted again on that post's channel is a new signal (final review
+    F04, ruling R3-P3; see `relay_repo.relay_of_signal`)."""
+    conn.execute(
+        "UPDATE signals SET closed_by_channel_id = ?, closed_by_message_id = ? "
+        "WHERE signal_id = ? AND closed_by_channel_id IS NULL",
+        (channel_id, message_id, signal_id),
+    )
+
+
+def release_closed_by(
+    conn: sqlite3.Connection, *, signal_id: int, channel_id: int, message_id: int
+) -> None:
+    """Forget that post (`channel_id`, `message_id`) closed this signal: the
+    window had inferred it deleted, it is back, and it still shows the call,
+    which a newer signal carries now (ruling R4-5; see
+    `edits_repo._stands_again`). Only that post's record is cleared."""
+    conn.execute(
+        "UPDATE signals SET closed_by_channel_id = NULL, closed_by_message_id = NULL "
+        "WHERE signal_id = ? AND closed_by_channel_id = ? AND closed_by_message_id = ?",
+        (signal_id, channel_id, message_id),
+    )
+
+
+def get_signal_id(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> int | None:
+    row = conn.execute(
+        "SELECT signal_id FROM signals WHERE channel_id = ? AND message_id = ?",
+        (channel_id, message_id),
+    ).fetchone()
+    return row["signal_id"] if row is not None else None
+
+
+def insert_followup(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    message_id: int,
+    followup: FollowUp,
+    target_signal_id: int | None = None,
+    resolution_path: str | None = None,
+    instead_of_followup_id: int | None = None,
+) -> int:
+    """A message's own follow-up (`edit_seq` 0). `target_signal_id` /
+    `resolution_path` are the signal it replies to, when ingest could
+    resolve it (`relay_repo.resolve_reply_target`: `'reply'` or
+    `'relay-reply'`); NULL when it replies to nothing stored. The target
+    moves to the new signal when the call is replaced
+    (`relay_repo.record_replacement`). `instead_of_followup_id`: the held
+    follow-up about a signal whose channel is switched off that this one
+    stands in for, about the signal traded instead (final fix round 6,
+    R6-1; `relay_repo`)."""
+    if (target_signal_id is None) != (resolution_path is None):
+        raise ValueError("target_signal_id and resolution_path go together")
+    cursor = conn.execute(
+        "INSERT INTO followups (channel_id, message_id, op, parsed_json, reply_to_message_id, "
+        "target_signal_id, resolution_path, edit_seq, instead_of_followup_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+        (
+            channel_id,
+            message_id,
+            followup.op.value,
+            followup_to_json(followup),
+            followup.reply_to_message_id,
+            target_signal_id,
+            resolution_path,
+            instead_of_followup_id,
+        ),
+    )
+    return cursor.lastrowid
+
+
+def insert_edit_amendment(
+    conn: sqlite3.Connection,
+    *,
+    channel_id: int,
+    message_id: int,
+    followup: FollowUp,
+    target_signal_id: int,
+) -> int:
+    """Store an AMEND_* follow-up derived from an edit of signal message
+    `message_id`, as the next `edit_seq` under that message. Its target is
+    known exactly -- the edited signal -- so `target_signal_id` is set and
+    `resolution_path` is `'edit'`; Plan 3 need not resolve it by reply."""
+    (next_seq,) = conn.execute(
+        "SELECT COALESCE(MAX(edit_seq), 0) + 1 FROM followups "
+        "WHERE channel_id = ? AND message_id = ?",
+        (channel_id, message_id),
+    ).fetchone()
+    cursor = conn.execute(
+        "INSERT INTO followups (channel_id, message_id, op, parsed_json, reply_to_message_id, "
+        "target_signal_id, resolution_path, edit_seq) VALUES (?, ?, ?, ?, ?, ?, 'edit', ?)",
+        (
+            channel_id,
+            message_id,
+            followup.op.value,
+            followup_to_json(followup),
+            followup.reply_to_message_id,
+            target_signal_id,
+            next_seq,
+        ),
+    )
+    return cursor.lastrowid
+
+
+def update_followup_on_edit(
+    conn: sqlite3.Connection, *, channel_id: int, message_id: int, followup: FollowUp
+) -> None:
+    conn.execute(
+        "UPDATE followups SET op = ?, parsed_json = ?, reply_to_message_id = ? "
+        "WHERE channel_id = ? AND message_id = ? AND edit_seq = 0",
+        (
+            followup.op.value,
+            followup_to_json(followup),
+            followup.reply_to_message_id,
+            channel_id,
+            message_id,
+        ),
+    )
+
+
+def stored_followup(conn: sqlite3.Connection, followup_id: int) -> FollowUp | None:
+    """Follow-up `followup_id`'s instruction as stored, or None."""
+    row = conn.execute(
+        "SELECT channel_id, message_id, parsed_json FROM followups WHERE followup_id = ?",
+        (followup_id,),
+    ).fetchone()
+    if row is None or not row["parsed_json"]:
+        return None
+    data = json.loads(row["parsed_json"])
+    return FollowUp(
+        channel_id=row["channel_id"],
+        message_id=row["message_id"],
+        op=FollowUpOp(data["op"]),
+        posted_at_utc=datetime.fromisoformat(data["posted_at_utc"]),
+        reply_to_message_id=data.get("reply_to_message_id"),
+        price_hint=data.get("price_hint"),
+        tp_index_hint=data.get("tp_index_hint"),
+        raw=data.get("raw", ""),
+    )
+
+
+def restate_followup(conn: sqlite3.Connection, *, followup_id: int, followup: FollowUp) -> None:
+    """Give follow-up `followup_id` the instruction of `followup` -- another
+    post's, edited by its poster -- keeping its own message, reply and time:
+    the one standing in for that post's follow-up (final fix round 8, R8-2;
+    `edits_repo`)."""
+    row = conn.execute(
+        "SELECT parsed_json FROM followups WHERE followup_id = ?", (followup_id,)
+    ).fetchone()
+    stated = json.loads(followup_to_json(followup))
+    if row is not None and row["parsed_json"]:
+        own = json.loads(row["parsed_json"])
+        stated["posted_at_utc"] = own.get("posted_at_utc", stated["posted_at_utc"])
+        stated["reply_to_message_id"] = own.get("reply_to_message_id")
+    conn.execute(
+        "UPDATE followups SET op = ?, parsed_json = ? WHERE followup_id = ?",
+        (followup.op.value, json.dumps(stated), followup_id),
+    )
+
+
+def get_followup_id(conn: sqlite3.Connection, *, channel_id: int, message_id: int) -> int | None:
+    row = conn.execute(
+        "SELECT followup_id FROM followups "
+        "WHERE channel_id = ? AND message_id = ? AND edit_seq = 0",
+        (channel_id, message_id),
+    ).fetchone()
+    return row["followup_id"] if row is not None else None
+
+
+def increment_parse_failures(conn: sqlite3.Connection, *, channel_id: int) -> int:
+    """A parse_failed message: the channel's template may have changed.
+    Three in a row trips PAUSE_NEW (spec 6.2) -- Plan 3 reads this
+    counter and acts on it; this records it and returns the new count
+    (`messages_repo` raises TEMPLATE_CHANGED_SUSPECTED at three).
+    """
+    conn.execute(
+        "INSERT INTO channel_state (channel_id, consecutive_parse_failures) VALUES (?, 1) "
+        "ON CONFLICT(channel_id) DO UPDATE SET "
+        "consecutive_parse_failures = consecutive_parse_failures + 1",
+        (channel_id,),
+    )
+    (count,) = conn.execute(
+        "SELECT consecutive_parse_failures FROM channel_state WHERE channel_id = ?",
+        (channel_id,),
+    ).fetchone()
+    return int(count)
+
+
+def reset_parse_failures(conn: sqlite3.Connection, *, channel_id: int) -> None:
+    """A clean signal parse: the template is fine again."""
+    conn.execute(
+        "INSERT INTO channel_state (channel_id, consecutive_parse_failures) VALUES (?, 0) "
+        "ON CONFLICT(channel_id) DO UPDATE SET consecutive_parse_failures = 0",
+        (channel_id,),
+    )
