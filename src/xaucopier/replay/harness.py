@@ -31,11 +31,16 @@ class Decision:
     sl: float | None
     leg_indices: tuple[int, ...]
     prices: tuple[float, ...]
+    #: Each leg's broker comment. It is the one label a position carries at
+    #: the broker, so a change to its format is a change to a historical
+    #: decision and must show in the golden file.
+    comments: tuple[str, ...]
 
     def as_dict(self) -> dict:
         data = asdict(self)
         data["leg_indices"] = list(self.leg_indices)
         data["prices"] = list(self.prices)
+        data["comments"] = list(self.comments)
         return data
 
 
@@ -61,7 +66,7 @@ def replay(
         )
         if not result.ok:
             decision = Decision(fixture["message_id"], False, result.reason.value,
-                                0, None, None, None, (), ())
+                                0, None, None, None, (), (), ())
         else:
             plan = plan_entry(result.signal, account, spec, snapshot_for(result.signal), policy)
             decision = Decision(
@@ -74,6 +79,7 @@ def replay(
                 sl=plan.legs[0].sl if plan.legs else None,
                 leg_indices=tuple(leg.leg_index for leg in plan.legs),
                 prices=tuple(leg.tp for leg in plan.legs),
+                comments=tuple(leg.comment for leg in plan.legs),
             )
         if "expect" in fixture:
             want_accept = fixture["expect"] == "accept"
