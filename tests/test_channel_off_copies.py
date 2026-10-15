@@ -4240,7 +4240,7 @@ def test_the_vips_stand_in_edited_while_the_relay_was_off_gives_way_once_it_is_b
         "close_all" if op == "close_half" else "amend_sl"
     ]
 
-    _restart(conn, on=(VIP, RELAY), seconds=90)
+    _, raised = _restart(conn, on=(VIP, RELAY), seconds=90)
 
     assert _instructions(conn, 2) == [(1, op, 2)]
     if op == "amend_sl":
@@ -4251,6 +4251,7 @@ def test_the_vips_stand_in_edited_while_the_relay_was_off_gives_way_once_it_is_b
     assert _followup_rows(conn, 2) == [("acct-1", "SKIPPED"), ("acct-2", "SKIPPED")]
     (alert,) = [a for a in _alerts(conn) if a[1] == "FOLLOWUP_COPY_CHANGED"]
     assert alert[:5] == ("WARNING", "FOLLOWUP_COPY_CHANGED", V, FWD, 2), alert
+    assert _q(conn, "SELECT alert_id FROM alerts WHERE code = 'FOLLOWUP_COPY_CHANGED'")[0][0] in raised
     assert (
         f"it says '{says}', and message {RELAY_CLOSE} still says '{still}'. That channel is "
         "read again, so follow-up 1 acts on signal 2 in its place"
@@ -4272,10 +4273,11 @@ def test_the_vips_stand_in_edited_and_taken_while_the_relay_was_off_is_kept_and_
     )
     conn.commit()
 
-    _restart(conn, on=(VIP, RELAY), seconds=90)
+    _, raised = _restart(conn, on=(VIP, RELAY), seconds=90)
 
     assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
     assert _instructions(conn, 2) == [(2, "close_all", 1)]
+    assert _q(conn, "SELECT alert_id FROM alerts WHERE code = 'FOLLOWUP_COPY_CHANGED'")[0][0] in raised
     assert _followup_rows(conn, 2) == [("acct-1", "CLAIMED"), ("acct-2", "QUEUED")]
     (alert,) = [a for a in _alerts(conn) if a[1] == "FOLLOWUP_COPY_CHANGED"]
     assert alert[:5] == ("WARNING", "FOLLOWUP_COPY_CHANGED", V, FWD, 2), alert
@@ -4446,3 +4448,77 @@ def test_a_reply_withdrawn_before_the_start_never_keeps_the_forward_from_the_cal
     traded = 2 if switched else 1
 
     assert _instructions(conn, traded) == [(1, "close_half", 2)]
+
+
+def _the_vip_edits(conn, message_id: int, text: str, *, seconds: float, read=(V,)) -> None:  # noqa: F811
+    edits_repo.apply_edit(
+        conn, channel_cfg=VIP, message_id=message_id, text=text,
+        posted_at_utc=_at(72 if message_id == REP else 95), edit_date_utc=_at(seconds),
+        reply_to_message_id=VIP_COPY if message_id == REP else None, now_utc=_at(seconds),
+        accounts=ACCOUNTS, detected_by="event", read_channels=read,
+    )
+    conn.commit()
+
+
+def _undone(conn) -> list[tuple]:  # noqa: F811
+    """The alerts saying a start's merge of two of a channel's posts was undone."""
+    return [a for a in _alerts(conn) if "two posts of one channel are two instructions" in a[5]]
+
+
+def test_a_merge_undone_once_is_not_undone_again_by_another_edit(conn):  # noqa: F811
+    """`relay_repo.merge_undone` acts only while the forward is still kept
+    with the cancelled call: once the reply's edit gave the forward back to
+    signal 2, the reply edited again just says its new instruction -- one
+    WARNING, the forward acting once."""
+    _the_vips_forward_read_first_and_its_own_reply(conn)
+    _restart(conn, on=(VIP,), seconds=100)
+    _the_vip_edits(conn, REP, "Close all now", seconds=105)
+    assert len(_undone(conn)) == 1
+
+    _the_vip_edits(conn, REP, "Move SL to entry", seconds=106)
+
+    assert _instructions(conn, 2) == [(1, "close_half", 2), (2, "sl_to_be", 2)]
+    assert len(_undone(conn)) == 1
+
+
+def test_a_merge_is_not_undone_for_a_forward_withdrawn_or_where_the_channels_read_are_unknown(
+    conn,  # noqa: F811
+):
+    """`merge_undone` gives an instruction only to a follow-up that still
+    gives it: the VIP deleted its forward (kept with the cancelled call)
+    before editing its reply -- the reply's edit just changes the reply. And
+    never where the channels this watch reads are not known (None)."""
+    _the_vips_forward_read_first_and_its_own_reply(conn)
+    _restart(conn, on=(VIP,), seconds=100)
+    _the_vip_edits(conn, REP, "Close all now", seconds=105, read=None)
+    assert _instructions(conn, 2) == [(2, "close_all", 2)]
+    assert _undone(conn) == []
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=FWD, now_utc=_at(106), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+    _the_vip_edits(conn, REP, "Move SL to entry", seconds=107)
+
+    assert _instructions(conn, 2) == [(2, "sl_to_be", 2)]
+    assert _undone(conn) == []
+    assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
+
+
+def test_a_merge_is_not_undone_onto_a_call_no_longer_traded(conn):  # noqa: F811
+    """`merge_undone` needs the call traded still traded: the VIP deleted its
+    copy of the call (signal 2 withdrawn) before editing its reply -- the
+    forward stays with the cancelled call, and no alert says it acts."""
+    _the_vips_forward_read_first_and_its_own_reply(conn)
+    _restart(conn, on=(VIP,), seconds=100)
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=VIP_COPY, now_utc=_at(104), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+    _the_vip_edits(conn, REP, "Close all now", seconds=105)
+
+    assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
+    assert _undone(conn) == []

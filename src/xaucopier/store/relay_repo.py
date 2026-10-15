@@ -3576,9 +3576,12 @@ def merge_undone(
     different ones, the one kept with the switched-off call acts on the
     call traded too, beside the other: its target moved there, as
     `hand_back` moves one (final fix round 8). Only while its instructions
-    wait, on a channel this watch reads, its call still switched off, and
-    the other still acting on a signal traded. None, changing nothing,
-    otherwise."""
+    wait, its call is still switched off and the other's signal is still
+    traded, and where the channels this watch reads are known
+    (`read_channels`; the two posts' channel is one of them, as one was
+    just read). None, changing nothing, otherwise. (The other always still
+    acts: the edited one does, and a withdrawn one standing in has handed
+    the instruction back already, `hand_back`.)"""
     if read_channels is None:
         return None
     me = conn.execute("SELECT * FROM followups WHERE followup_id = ?", (followup_id,)).fetchone()
@@ -3601,11 +3604,9 @@ def merge_undone(
         about = signal_for_followup(conn, followup_id=held_id)
         signal_id = signal_for_followup(conn, followup_id=stand_in)
         if (
-            held["channel_id"] not in read_channels
-            or not counts.get("QUEUED")
+            not counts.get("QUEUED")
             or about is None
             or not switched_off(conn, _signal_row(conn, about))
-            or set(outbox.state_counts(conn, kind="FOLLOWUP", followup_id=stand_in)) <= {"SKIPPED"}
             or signal_id is None
             or not carries(conn, _signal_row(conn, signal_id))
             or not _says_other(conn, stand_in, held)
