@@ -16,6 +16,14 @@ class OrderKind(Enum):
 
 @dataclass(frozen=True, slots=True)
 class OrderIntent:
+    """One position's order.
+
+    `leg_index` is the position's own number within its plan, unique per
+    leg. `tp_index` is the index into `sig.tps` of the take profit it
+    targets. They are separate because several positions may target the
+    same TP (more positions than surviving TPs puts the extras on the
+    last one): two legs may share a `tp_index`, never a `leg_index`.
+    """
     account_id: str
     symbol: str
     side: Side
@@ -25,6 +33,7 @@ class OrderIntent:
     sl: float
     tp: float
     leg_index: int
+    tp_index: int
     magic: int
     comment: str
     deviation_points: int

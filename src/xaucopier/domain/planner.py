@@ -77,6 +77,9 @@ def plan_entry(
     # survive; here we only re-pair each survivor with its original position
     # in sig.tps, so leg_index (and the comment) names the real TP, not its
     # position in the filtered list.
+    #
+    # With one leg per surviving TP, a leg's leg_index and tp_index are the
+    # same number; they part once positions can outnumber the TPs.
     survived = set(surviving)
     surviving_indexed = tuple((i, tp) for i, tp in enumerate(sig.tps) if tp in survived)
 
@@ -110,6 +113,7 @@ def plan_entry(
             sl=round_price(sig.sl, spec),
             tp=round_price(tp, spec),
             leg_index=index,
+            tp_index=index,
             magic=account.magic_base,
             comment=_comment(sig, index),
             deviation_points=usd_to_points(pol.max_slippage_usd, spec),

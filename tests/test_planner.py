@@ -235,3 +235,19 @@ def test_sell_limit_at_near_edge_when_policy_says_so():
     plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4479.5, 4479.60), pol)
     assert plan.accepted
     assert plan.legs[0].price == 4480.0  # near edge for a sell is the low side
+
+
+# --- Plan 1b Task 1: a leg names the take profit it targets by tp_index,
+# the index into sig.tps, apart from its own leg_index. ---
+
+def test_every_leg_names_its_take_profit_by_index_into_sig_tps():
+    s = sig()
+    plan = plan_entry(s, ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
+    assert [leg.tp_index for leg in plan.legs] == [0, 1, 2, 3]
+    assert all(leg.tp == s.tps[leg.tp_index] for leg in plan.legs)
+
+def test_tp_index_is_the_original_position_when_earlier_tps_have_passed():
+    s = sig()
+    plan = plan_entry(s, ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
+    assert [leg.tp_index for leg in plan.legs] == [2, 3]
+    assert all(leg.tp == s.tps[leg.tp_index] for leg in plan.legs)

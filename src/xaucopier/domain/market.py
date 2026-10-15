@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -32,6 +33,9 @@ class AccountSpec:
     fixed_lot: float
     magic_base: int
     allow_live: bool = False
+    # How many positions one signal opens; None means one per surviving
+    # take profit. The config loader enforces 1..MAX_POSITIONS.
+    positions: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,12 +52,29 @@ class Policy:
     max_slippage_usd: float = 0.20
     pending_max_age_hours: int = 4
     pending_at: str = "favourable"
+    # The basket trailing stop (domain/trailing.py). trail_gap_usd is how far
+    # price must clear an odd-numbered TP before the stop moves to that TP.
+    trail_enabled: bool = True
+    trail_gap_usd: float = 2.00
 
     def __post_init__(self) -> None:
         if self.pending_at not in ("favourable", "near"):
             raise ValueError(
                 f"pending_at={self.pending_at!r} is not valid; "
                 'expected "favourable" or "near"'
+            )
+        # A quoted "false" is a non-empty string, so truthy: it would switch
+        # the trail on when the user wrote it off.
+        if not isinstance(self.trail_enabled, bool):
+            raise ValueError(
+                f"trail_enabled must be true or false (without quotes), "
+                f"got {self.trail_enabled!r}"
+            )
+        gap = self.trail_gap_usd
+        if (isinstance(gap, bool) or not isinstance(gap, (int, float))
+                or not math.isfinite(gap) or gap <= 0):
+            raise ValueError(
+                f"trail_gap_usd must be a positive distance in USD, got {gap!r}"
             )
 
     @classmethod
