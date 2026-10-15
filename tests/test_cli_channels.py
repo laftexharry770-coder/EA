@@ -46,7 +46,9 @@ from xaucopier.store import db, heartbeats, messages_repo
 
 REPO = Path(__file__).resolve().parents[1]
 REAL_CHANNELS = REPO / "config" / "channels.toml"
-SHIPPED = REAL_CHANNELS.read_bytes().decode("utf-8")
+#: Taken with LF line endings whatever the checkout wrote (core.autocrlf
+#: makes it CRLF on Windows); the CRLF tests build their own.
+SHIPPED = REAL_CHANNELS.read_bytes().decode("utf-8").replace("\r\n", "\n")
 ACCOUNTS = load_accounts(REPO / "config" / "accounts.toml")  # read, never written
 SIGNAL_TEXT: str = json.loads(
     (REPO / "tests" / "fixtures" / "messages" / "mmh_buy_4tp.json").read_text(encoding="utf-8")
