@@ -4522,3 +4522,25 @@ def test_a_merge_is_not_undone_onto_a_call_no_longer_traded(conn):  # noqa: F811
 
     assert relay_repo.signal_for_followup(conn, followup_id=1) == 1
     assert _undone(conn) == []
+
+
+def test_a_stand_in_withdrawn_after_its_merge_was_undone_hands_nothing_back(conn):  # noqa: F811
+    """`relay_repo.hand_back` gives back only an instruction still kept with
+    the cancelled call: once the reply's edit gave the VIP's forward back to
+    signal 2 (`merge_undone`), the reply deleted withdraws only its own
+    instruction -- the forward acts already, and the alert never says it
+    acts "in this one's place now"."""
+    _the_vips_forward_read_first_and_its_own_reply(conn)
+    _restart(conn, on=(VIP,), seconds=100)
+    _the_vip_edits(conn, REP, "Close all now", seconds=105)
+    assert _instructions(conn, 2) == [(1, "close_half", 2), (2, "close_all", 2)]
+
+    edits_repo.apply_deletion(
+        conn, channel_cfg=VIP, message_id=REP, now_utc=_at(106), accounts=ACCOUNTS,
+        detected_by="event", read_channels=(V,),
+    )
+    conn.commit()
+
+    assert _instructions(conn, 2) == [(1, "close_half", 2)]
+    (alert,) = [a for a in _alerts(conn) if a[1] == "FOLLOWUP_DELETED"]
+    assert "The same instruction still stands" not in alert[5], alert
