@@ -94,6 +94,21 @@ def _breakeven(side: Side, price_open: float, snap: MarketSnapshot,
     return round_price(price_open + side.sign * offset, spec)
 
 
+def _at_breakeven(side: Side, leg: OpenLeg, spec: SymbolSpec, pol: Policy) -> bool:
+    """Whether the leg's stop already locks in breakeven: at or past its own
+    fill plus be_buffer_usd (the round-turn cost): a stop-out there loses
+    nothing.
+
+    `_breakeven` adds the live spread, so a BE recomputed on every tick
+    would creep with each new spread high: one modify per leg per tick in a
+    news spike, ending dollars past breakeven. BE is therefore placed once,
+    with the spread at that moment, and never re-sent while this holds."""
+    if leg.current_sl <= 0.0:   # MT5's "no stop"
+        return False
+    line = round_price(leg.price_open + side.sign * pol.be_buffer_usd, spec)
+    return (round_price(leg.current_sl, spec) - line) * side.sign >= 0
+
+
 def target_stops(
     side: Side, tps: tuple[float, ...], legs: tuple[OpenLeg, ...],
     snap: MarketSnapshot, spec: SymbolSpec, pol: Policy,
@@ -104,7 +119,8 @@ def target_stops(
     BUY, ask for a SELL. Of the rungs that price has earned, each leg takes
     the tightest stop the broker will accept (on the right side of price,
     at least the minimum stop distance away), and moves only if that is
-    strictly tighter than its current stop.
+    strictly tighter than its current stop. A leg whose stop is already at
+    breakeven (`_at_breakeven`) does not take the BE rung again.
     """
     if not pol.trail_enabled:
         return ()
@@ -118,9 +134,14 @@ def target_stops(
     moves = []
     for leg in legs:
         best: tuple[float, str] | None = None
+        be_placed = _at_breakeven(side, leg, spec, pol)
         for rung in earned:
-            stop = (_breakeven(side, leg.price_open, snap, spec, pol) if rung.stop is None
-                    else round_price(rung.stop, spec))
+            if rung.stop is None:
+                if be_placed:
+                    continue
+                stop = _breakeven(side, leg.price_open, snap, spec, pol)
+            else:
+                stop = round_price(rung.stop, spec)
             distance = (price - stop) * side.sign   # positive: the right side of price
             if distance <= 0 or distance < min_dist:
                 continue

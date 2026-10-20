@@ -181,6 +181,63 @@ def test_breakeven_matches_the_channels_sl_to_be(side, price_open, snap):
 
 
 # ---------------------------------------------------------------------------
+# Breakeven is placed once. Its formula adds the live spread, so recomputing
+# it on every tick would creep the stop with each new spread high: one
+# modify per leg per tick in a news spike, ending dollars past breakeven.
+# A stop already at or past the leg's own fill + be_buffer_usd is at
+# breakeven, so BE is not sent again; the TP rungs still move it.
+# ---------------------------------------------------------------------------
+
+SPREAD_SPIKE = (0.10, 0.11, 0.12, 0.20, 0.50, 1.00, 2.00, 0.10)
+
+
+def _hold_price_through_the_spike(side, tps, leg, snap_at, price):
+    """Every tick at one price while the spread spikes and settles, feeding
+    each move back in as the current stop. Returns each tick's moves."""
+    per_tick = []
+    for spread in SPREAD_SPIKE:
+        moves = target_stops(side, tps, (leg,), snap_at(price, spread=spread), SPEC, POLICY)
+        for move in moves:
+            leg = OpenLeg(leg.position_ticket, leg.price_open, move.new_sl)
+        per_tick.append(moves)
+    return per_tick
+
+
+def test_a_widening_spread_does_not_ratchet_a_buys_breakeven():
+    # bid 4491.50 has earned BE but not TP1 (4492). The first tick places
+    # BE 4482.75; every later tick, however wide its spread, sends nothing.
+    per_tick = _hold_price_through_the_spike(Side.BUY, BUY_TPS, buy_leg(4470.0),
+                                             buy_snap, 4491.50)
+    assert per_tick == [(StopMove(TICKET, 4482.75, "BE"),)] + [()] * (len(SPREAD_SPIKE) - 1)
+
+
+def test_a_widening_spread_does_not_ratchet_a_sells_breakeven():
+    per_tick = _hold_price_through_the_spike(Side.SELL, SELL_TPS, sell_leg(4530.0),
+                                             sell_snap, 4508.50)
+    assert per_tick == [(StopMove(TICKET, 4517.25, "BE"),)] + [()] * (len(SPREAD_SPIKE) - 1)
+
+
+@pytest.mark.parametrize("side, spec, price_open, current_sl, expected", [
+    # BUY fill 4482.55, buffer 0.10: the stop is at breakeven from 4482.65 up.
+    (Side.BUY, SPEC, 4482.55, 4482.65, ()),
+    (Side.BUY, SPEC, 4482.55, 4482.64, (StopMove(TICKET, 4482.75, "BE"),)),
+    # SELL fill 4517.45: at breakeven from 4517.35 down.
+    (Side.SELL, SPEC, 4517.45, 4517.35, ()),
+    (Side.SELL, SPEC, 4517.45, 4517.36, (StopMove(TICKET, 4517.25, "BE"),)),
+    # A 3-digit feed draws the line on its own tick grid: 4482.553 + 0.10.
+    (Side.BUY, EXNESS, 4482.553, 4482.653, ()),
+    (Side.BUY, EXNESS, 4482.553, 4482.652, (StopMove(TICKET, 4482.753, "BE"),)),
+], ids=["buy at fill+buffer", "buy one tick short", "sell at fill-buffer",
+        "sell one tick short", "exness at fill+buffer", "exness one tick short"])
+def test_a_stop_at_or_past_fill_plus_buffer_is_already_at_breakeven(
+        side, spec, price_open, current_sl, expected):
+    tps = BUY_TPS if side is Side.BUY else SELL_TPS
+    snap = buy_snap(4490.00) if side is Side.BUY else sell_snap(4510.00)
+    leg = OpenLeg(TICKET, price_open, current_sl)
+    assert target_stops(side, tps, (leg,), snap, spec, POLICY) == expected
+
+
+# ---------------------------------------------------------------------------
 # The broker's minimum distance: gates.min_stop_distance_usd.
 # ---------------------------------------------------------------------------
 
