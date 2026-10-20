@@ -462,3 +462,230 @@ def test_amend_tp_moves_exactly_the_positions_the_planner_aimed_at_that_tp(posit
         else:
             assert result.intents == (), hint
             assert result.reason is RejectReason.AMBIGUOUS_TARGET, hint
+
+
+# --- Plan 1b Task 4: a follow-up may tighten the stop, never loosen it -----
+#
+# The worked example's basket, after the trail: BUY, TPs 4490/4495/4500/4505,
+# every position filled at 4482.55 (breakeven 4482.55 + 0.10 spread + 0.10
+# buffer = 4482.75). Price cleared TP1 + 2.00, so the TP1 position closed
+# and the stop of the other three moved to TP1, 4490.00. The SELL basket is
+# its mirror: TPs 4510/4505/4500/4495, fills 4517.45 (breakeven 4517.25),
+# trailed to TP1 = 4510.00. SPEC is 2-digit and min_dist = 3 x 0.10 = 0.30.
+
+BUY_TRAILED_TPS = (4495.0, 4500.0, 4505.0)       # TP2..TP4, still open
+SELL_TRAILED_TPS = (4505.0, 4500.0, 4495.0)
+
+
+def trailed(side=Side.BUY, sl=None, price_open=None):
+    """The three positions left open once the trail moved the stop to TP1."""
+    if side is Side.BUY:
+        tps, sl, price_open = BUY_TRAILED_TPS, sl or 4490.0, price_open or 4482.55
+    else:
+        tps, sl, price_open = SELL_TRAILED_TPS, sl or 4510.0, price_open or 4517.45
+    return tuple(
+        LegView(position_ticket=8001 + k, leg_index=k + 1, tp_index=k + 1, side=side,
+                volume=0.01, price_open=price_open, sl=sl, tp=tp, is_pending=False)
+        for k, tp in enumerate(tps)
+    )
+
+
+def one_leg(ticket, side, price_open, sl, tp, tp_index):
+    return LegView(position_ticket=ticket, leg_index=tp_index, tp_index=tp_index, side=side,
+                   volume=0.01, price_open=price_open, sl=sl, tp=tp, is_pending=False)
+
+
+def market(bid):
+    return MarketSnapshot(bid=bid, ask=round(bid + 0.10, 2), tick_time_utc=NOW,
+                          spread_usd=0.10, median_spread_usd=0.10, now_utc=NOW)
+
+
+BUY_PAST_TP1 = market(4492.50)     # bid past TP1 + gap, below TP2's midpoint rung
+SELL_PAST_TP1 = market(4507.40)    # ask 4507.50: past TP1 - gap, above the next rung
+
+
+def test_would_loosen_is_its_own_reject_reason():
+    # Persisted with the follow-up's outcome, so the string is pinned.
+    assert RejectReason.WOULD_LOOSEN.value == "would_loosen"
+
+
+def test_amend_sl_below_a_buy_basket_trailed_to_tp1_would_loosen():
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=4485.0),
+                         trailed(), SPEC, BUY_PAST_TP1, POLICY)
+    assert plan.intents == ()
+    assert plan.reason is RejectReason.WOULD_LOOSEN
+    (note,) = plan.notes
+    assert "4485.0" in note and "4490.0" in note
+
+
+def test_amend_sl_above_a_buy_basket_trailed_to_tp1_is_applied():
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=4491.50),
+                         trailed(), SPEC, BUY_PAST_TP1, POLICY)
+    assert plan.reason is None
+    assert [(i.position_ticket, i.sl, i.tp) for i in plan.intents] == [
+        (8001, 4491.5, 4495.0), (8002, 4491.5, 4500.0), (8003, 4491.5, 4505.0)]
+
+
+def test_amend_sl_above_a_sell_basket_trailed_to_tp1_would_loosen():
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=4515.0),
+                         trailed(Side.SELL), SPEC, SELL_PAST_TP1, POLICY)
+    assert plan.intents == ()
+    assert plan.reason is RejectReason.WOULD_LOOSEN
+    (note,) = plan.notes
+    assert "4515.0" in note and "4510.0" in note
+
+
+def test_amend_sl_below_a_sell_basket_trailed_to_tp1_is_applied():
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=4508.50),
+                         trailed(Side.SELL), SPEC, SELL_PAST_TP1, POLICY)
+    assert plan.reason is None
+    assert [(i.position_ticket, i.sl, i.tp) for i in plan.intents] == [
+        (8001, 4508.5, 4505.0), (8002, 4508.5, 4500.0), (8003, 4508.5, 4495.0)]
+
+
+def test_amend_sl_moves_only_the_buy_legs_it_tightens():
+    # Breakeven is per position: a market fill at 4482.55 sits at 4482.75,
+    # a pending fill at 4483.30 at 4483.50. "SL to 4483" tightens the first
+    # and would loosen the second, which keeps its stop.
+    legs_ = (one_leg(8101, Side.BUY, 4482.55, 4482.75, 4490.0, 0),
+             one_leg(8102, Side.BUY, 4483.30, 4483.50, 4495.0, 1))
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=4483.0),
+                         legs_, SPEC, market(4491.0), POLICY)
+    assert plan.reason is None
+    assert [(i.position_ticket, i.sl, i.tp) for i in plan.intents] == [(8101, 4483.0, 4490.0)]
+    (note,) = plan.notes
+    assert "4483.0" in note and "4483.5" in note
+
+
+def test_amend_sl_moves_only_the_sell_legs_it_tightens():
+    # SELL mirror: fills 4517.45 and 4516.70, breakevens 4517.25 and 4516.50.
+    # "SL to 4517" is lower than 4517.25 (tighter) and higher than 4516.50
+    # (looser).
+    legs_ = (one_leg(8201, Side.SELL, 4517.45, 4517.25, 4510.0, 0),
+             one_leg(8202, Side.SELL, 4516.70, 4516.50, 4505.0, 1))
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=4517.0),
+                         legs_, SPEC, market(4509.0), POLICY)
+    assert plan.reason is None
+    assert [(i.position_ticket, i.sl, i.tp) for i in plan.intents] == [(8201, 4517.0, 4510.0)]
+    (note,) = plan.notes
+    assert "4517.0" in note and "4516.5" in note
+
+
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+def test_amend_sl_names_every_distinct_stop_it_would_loosen(side):
+    if side is Side.BUY:
+        legs_ = (one_leg(8301, side, 4482.55, 4482.75, 4490.0, 0),
+                 one_leg(8302, side, 4483.30, 4483.50, 4495.0, 1))
+        new, snap = 4482.0, market(4491.0)
+    else:
+        legs_ = (one_leg(8301, side, 4517.45, 4517.25, 4510.0, 0),
+                 one_leg(8302, side, 4516.70, 4516.50, 4505.0, 1))
+        new, snap = 4518.0, market(4509.0)
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=new), legs_, SPEC, snap, POLICY)
+    assert plan.intents == ()
+    assert plan.reason is RejectReason.WOULD_LOOSEN
+    (note,) = plan.notes
+    assert all(str(p) in note for p in (new, legs_[0].sl, legs_[1].sl))
+
+
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+@pytest.mark.parametrize("noise", [0.0, 1e-7, -1e-7], ids=["exact", "above", "below"])
+def test_amend_sl_to_the_stop_already_in_place_is_not_applicable(side, noise):
+    # Nothing to move, nothing refused. The broker reports the stop as a
+    # float, so it is compared on the symbol's tick grid: a hair off the
+    # grid neither loosens nor tightens it.
+    stop = 4490.0 if side is Side.BUY else 4510.0
+    snap = BUY_PAST_TP1 if side is Side.BUY else SELL_PAST_TP1
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=stop),
+                         trailed(side, sl=stop + noise), SPEC, snap, POLICY)
+    assert plan.intents == ()
+    assert plan.reason is RejectReason.NOT_APPLICABLE
+    assert plan.notes
+
+
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+def test_amend_sl_level_with_one_leg_and_looser_than_another_would_loosen(side):
+    # Nothing tightens: one leg is already there, the other is refused.
+    if side is Side.BUY:
+        legs_ = (one_leg(8401, side, 4482.55, 4482.75, 4490.0, 0),
+                 one_leg(8402, side, 4483.30, 4483.50, 4495.0, 1))
+        new, snap = 4482.75, market(4491.0)
+    else:
+        legs_ = (one_leg(8401, side, 4517.45, 4517.25, 4510.0, 0),
+                 one_leg(8402, side, 4516.70, 4516.50, 4505.0, 1))
+        new, snap = 4517.25, market(4509.0)
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=new), legs_, SPEC, snap, POLICY)
+    assert plan.intents == ()
+    assert plan.reason is RejectReason.WOULD_LOOSEN
+
+
+@pytest.mark.parametrize(("side", "new"), [(Side.BUY, 4480.0), (Side.SELL, 4506.0)])
+def test_amend_sl_on_a_leg_with_no_stop_is_applied(side, new):
+    # MT5 reports a missing stop as 0.0. It is the loosest stop there is,
+    # though numerically below every SELL stop: any amend tightens it.
+    view = one_leg(8501, side, 4482.10 if side is Side.BUY else 4494.0, 0.0,
+                   4490.0 if side is Side.BUY else 4480.0, 0)
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=new), (view,), SPEC, SNAP, POLICY)
+    assert plan.reason is None
+    assert [(i.position_ticket, i.sl) for i in plan.intents] == [(8501, new)]
+
+
+def test_amend_sl_that_tightens_still_meets_the_geometry_checks():
+    # The guard runs before today's checks, not instead of them: 4493 is
+    # tighter than 4490 but above the bid.
+    plan = plan_followup(fu(FollowUpOp.AMEND_SL, price_hint=4493.0),
+                         trailed(), SPEC, BUY_PAST_TP1, POLICY)
+    assert plan.intents == ()
+    assert plan.reason is RejectReason.GEOMETRY_CONFLICT
+
+
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+def test_sl_to_be_after_the_trail_reached_tp1_is_not_applicable(side):
+    # Breakeven (4482.75 / 4517.25) is looser than TP1 (4490 / 4510): the
+    # normal case once the trail has passed TP1, so no error.
+    snap = BUY_PAST_TP1 if side is Side.BUY else SELL_PAST_TP1
+    plan = plan_followup(fu(FollowUpOp.SL_TO_BE), trailed(side), SPEC, snap, POLICY)
+    assert plan.intents == ()
+    assert plan.reason is RejectReason.NOT_APPLICABLE
+    (note,) = plan.notes
+    assert "3" in note
+
+
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+def test_sl_to_be_with_the_stop_already_at_breakeven_is_not_applicable(side):
+    if side is Side.BUY:
+        view, snap = one_leg(8601, side, 4482.55, 4482.75, 4495.0, 1), BUY_PAST_TP1
+    else:
+        view, snap = one_leg(8601, side, 4517.45, 4517.25, 4505.0, 1), SELL_PAST_TP1
+    plan = plan_followup(fu(FollowUpOp.SL_TO_BE), (view,), SPEC, snap, POLICY)
+    assert plan.intents == ()
+    assert plan.reason is RejectReason.NOT_APPLICABLE
+
+
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+def test_sl_to_be_moves_only_the_legs_still_looser_than_breakeven(side):
+    # One leg trailed to TP1; its sibling kept the signal's stop (the trail's
+    # modify for it failed). Only the sibling moves, to its own breakeven.
+    if side is Side.BUY:
+        legs_ = (one_leg(8701, side, 4482.55, 4490.0, 4495.0, 1),
+                 one_leg(8702, side, 4482.55, 4470.0, 4500.0, 2))
+        snap, be = BUY_PAST_TP1, 4482.75
+    else:
+        legs_ = (one_leg(8701, side, 4517.45, 4510.0, 4505.0, 1),
+                 one_leg(8702, side, 4517.45, 4530.0, 4500.0, 2))
+        snap, be = SELL_PAST_TP1, 4517.25
+    plan = plan_followup(fu(FollowUpOp.SL_TO_BE), legs_, SPEC, snap, POLICY)
+    assert plan.reason is None
+    assert [(i.position_ticket, i.sl, i.tp) for i in plan.intents] == [(8702, be, 4500.0)]
+
+
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
+def test_sl_to_be_on_a_leg_with_no_stop_moves_it_to_breakeven(side):
+    # 0.0 is MT5's "no stop", never a stop tighter than breakeven.
+    if side is Side.BUY:
+        view, be = one_leg(8801, side, 4482.10, 0.0, 4490.0, 0), 4482.30
+    else:
+        view, be = one_leg(8801, side, 4494.0, 0.0, 4480.0, 0), 4493.80
+    plan = plan_followup(fu(FollowUpOp.SL_TO_BE), (view,), SPEC, SNAP, POLICY)
+    assert plan.reason is None
+    assert [(i.position_ticket, i.sl) for i in plan.intents] == [(8801, be)]

@@ -60,6 +60,25 @@ def _breakeven_price(leg: LegView, snap: MarketSnapshot, pol: Policy, spec: Symb
     return round_price(raw, spec)
 
 
+def _compare_stop(side: Side, new: float, current_sl: float, spec: SymbolSpec) -> int:
+    """How moving the stop to `new` compares with the stop in place: 1 it
+    tightens, 0 it is already there, -1 it would loosen. A BUY's stop
+    tightens upwards, a SELL's downwards.
+
+    The broker's float is compared on the tick grid, so a hair of float
+    noise is neither. MT5 reports a missing stop as 0.0: numerically below
+    every SELL stop, but the loosest stop there is, so anything tightens it.
+    """
+    if current_sl <= 0.0:
+        return 1
+    diff = (new - round_price(current_sl, spec)) * side.sign
+    return (diff > 0) - (diff < 0)
+
+
+def _stops_in_place(legs: list[LegView], spec: SymbolSpec) -> str:
+    return ", ".join(str(sl) for sl in sorted({round_price(leg.sl, spec) for leg in legs}))
+
+
 def plan_followup(
     fu: FollowUp,
     legs: tuple[LegView, ...],
@@ -78,10 +97,17 @@ def plan_followup(
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing open for breakeven",))
         min_dist = min_stop_distance_usd(spec, snap, pol)
         intents = []
+        skipped_already = 0
         skipped_wrong_side = 0
         skipped_too_tight = 0
         for leg in open_legs:
             be = _breakeven_price(leg, snap, pol, spec)
+            # Never loosen: once the trail has passed TP1 the stop is
+            # tighter than breakeven, and moving it back would give away
+            # locked-in profit. That is the normal case, not an error.
+            if _compare_stop(leg.side, be, leg.sl, spec) <= 0:
+                skipped_already += 1
+                continue
             price = snap.bid if leg.side is Side.BUY else snap.ask
             # Refuse a stop that is already on the wrong side of the market.
             if leg.side is Side.BUY and be >= price:
@@ -97,10 +123,11 @@ def plan_followup(
             intents.append(ModifyIntent(account_id="", position_ticket=leg.position_ticket,
                                         sl=be, tp=leg.tp, leg_index=leg.leg_index))
         if not intents:
-            total = skipped_wrong_side + skipped_too_tight
+            total = skipped_already + skipped_wrong_side + skipped_too_tight
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, (
                 f"{total} leg(s) skipped for breakeven "
-                f"({skipped_wrong_side} wrong side, {skipped_too_tight} too tight)",
+                f"({skipped_already} already at or tighter than it, "
+                f"{skipped_wrong_side} wrong side, {skipped_too_tight} too tight)",
             ))
         return FollowUpPlan(tuple(intents))
 
@@ -184,6 +211,37 @@ def plan_followup(
                 ))
 
         new = round_price(fu.price_hint, spec)
+        notes: tuple[str, ...] = ()
+        if fu.op is FollowUpOp.AMEND_SL:
+            # Never loosen (spec amendment 2026-09-23): a channel "SL to ..."
+            # may tighten the stop, never loosen it. Each leg is judged
+            # against its OWN live stop -- breakeven is per position, so one
+            # amend can tighten one leg and loosen its sibling. The legs it
+            # tightens go on to today's checks; the rest keep their stop.
+            tighten, level, looser = [], [], []
+            for leg in targets:
+                change = _compare_stop(leg.side, new, leg.sl, spec)
+                if change > 0:
+                    tighten.append(leg)
+                elif change == 0:
+                    level.append(leg)
+                else:
+                    looser.append(leg)
+            if not tighten:
+                if looser:
+                    return FollowUpPlan((), RejectReason.WOULD_LOOSEN, (
+                        f"amended {looser[0].side.value} stop {new} would loosen the "
+                        f"stop in place ({_stops_in_place(looser, spec)}) on "
+                        f"{len(looser)} leg(s)",
+                    ))
+                return FollowUpPlan((), RejectReason.NOT_APPLICABLE, (
+                    f"amended stop {new} is already the stop on {len(level)} leg(s)",
+                ))
+            if looser:
+                notes = (f"{len(looser)} leg(s) kept the tighter stop in place "
+                         f"({_stops_in_place(looser, spec)}): amended stop {new} "
+                         "would loosen it",)
+            targets = tuple(tighten)
         min_dist = min_stop_distance_usd(spec, snap, pol)
         intents = []
         for leg in targets:
@@ -215,6 +273,6 @@ def plan_followup(
                                         (f"amended sell tp {new} is not below "
                                          f"price {price} and sl {leg.sl}",))
                 intents.append(ModifyIntent("", leg.position_ticket, leg.sl, new, leg.leg_index))
-        return FollowUpPlan(tuple(intents))
+        return FollowUpPlan(tuple(intents), notes=notes)
 
     return FollowUpPlan((), RejectReason.NOT_APPLICABLE, (f"unhandled op {fu.op}",))
