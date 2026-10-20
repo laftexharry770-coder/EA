@@ -35,12 +35,19 @@ class Decision:
     #: the broker, so a change to its format is a change to a historical
     #: decision and must show in the golden file.
     comments: tuple[str, ...]
+    #: Each leg's own order kind and entry price. entry_kind/entry_price
+    #: above describe only the first leg, and a plan's legs need not share
+    #: one entry (Plan 1b layered entry: some at market, some as limits).
+    kinds: tuple[str, ...]
+    entry_prices: tuple[float, ...]
 
     def as_dict(self) -> dict:
         data = asdict(self)
         data["leg_indices"] = list(self.leg_indices)
         data["prices"] = list(self.prices)
         data["comments"] = list(self.comments)
+        data["kinds"] = list(self.kinds)
+        data["entry_prices"] = list(self.entry_prices)
         return data
 
 
@@ -66,7 +73,7 @@ def replay(
         )
         if not result.ok:
             decision = Decision(fixture["message_id"], False, result.reason.value,
-                                0, None, None, None, (), (), ())
+                                0, None, None, None, (), (), (), (), ())
         else:
             plan = plan_entry(result.signal, account, spec, snapshot_for(result.signal), policy)
             decision = Decision(
@@ -80,6 +87,8 @@ def replay(
                 leg_indices=tuple(leg.leg_index for leg in plan.legs),
                 prices=tuple(leg.tp for leg in plan.legs),
                 comments=tuple(leg.comment for leg in plan.legs),
+                kinds=tuple(leg.kind.value for leg in plan.legs),
+                entry_prices=tuple(leg.price for leg in plan.legs),
             )
         if "expect" in fixture:
             want_accept = fixture["expect"] == "accept"
