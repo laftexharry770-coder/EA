@@ -23,6 +23,12 @@ positions x fixed_lot. Omitted, `positions` is None: one position per
 surviving take profit, the behaviour before Plan 1b. Set, it is a whole
 number from 1 to MAX_POSITIONS.
 
+`layered_entry` (Plan 1b, the user's amendment of 2026-09-25) opens half
+the positions now and rests the other half as limit orders across the
+entry zone. It defaults to true, with `positions` set or not; false keeps
+the single rule (all at market inside the zone, all as one limit outside
+it). It is a switch, so like `enabled` it must be a real TOML boolean.
+
 A key the loader does not know is refused by name (ruling P1). Ignoring
 it would be silent and could change the trade: a misspelled
 `positons = 4` would open one position per TP instead of four, and a
@@ -57,6 +63,10 @@ class AccountCfg:
     enabled: bool
     # None: one position per surviving take profit (the key is omitted).
     positions: int | None = None
+    # Half the positions open now, half rest as limit orders (the user's
+    # amendment of 2026-09-25). On by default, positions set or not
+    # (ruling P2); false keeps the single entry rule.
+    layered_entry: bool = True
 
 
 #: Every AccountCfg field is read from the TOML key of the same name, so
@@ -109,7 +119,7 @@ def _field(entry: dict[str, Any], key: str, index: int) -> Any:
 
 
 def _bool_field(account_id: str, key: str, value: Any) -> bool:
-    """A gate field's value, which must be a real boolean -- see the
+    """A gate or switch field's value, which must be a real boolean -- see the
     module docstring for why a quoted "false" must never load."""
     if not isinstance(value, bool):
         raise ConfigError(
@@ -202,6 +212,8 @@ def load_accounts(path: Path) -> tuple[AccountCfg, ...]:
                 allow_live=_bool_field(account_id, "allow_live", entry.get("allow_live", False)),
                 enabled=_bool_field(account_id, "enabled", _field(entry, "enabled", index)),
                 positions=_positions_field(account_id, entry.get("positions")),
+                layered_entry=_bool_field(account_id, "layered_entry",
+                                          entry.get("layered_entry", True)),
             )
         )
 

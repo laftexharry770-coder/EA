@@ -27,15 +27,15 @@
     ],
     "kinds": [
       "market",
+      "limit",
       "market",
-      "market",
-      "market"
+      "limit"
     ],
     "entry_prices": [
       4482.55,
+      4482.25,
       4482.55,
-      4482.55,
-      4482.55
+      4480.0
     ]
   }
 ]

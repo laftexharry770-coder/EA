@@ -214,6 +214,15 @@ def test_every_leg_carries_fixed_lot_shared_sl_and_magic():
     assert {leg.volume for leg in plan.legs} == {0.05}
     assert {leg.sl for leg in plan.legs} == {4470.0}
     assert {leg.magic for leg in plan.legs} == {77001}
+
+
+def test_under_the_single_rule_every_leg_shares_one_entry():
+    # Layered entry (the default, Task 2b) gives the legs of one plan
+    # different kinds and prices; layered_entry = false keeps one entry.
+    single = AccountSpec("ic_demo", "XAUUSD", fixed_lot=0.05, magic_base=77001,
+                         positions=6, layered_entry=False)
+    plan = plan_entry(buy(), single, SPEC, INSIDE, POLICY)
+    assert len(plan.legs) == 6
     assert {leg.kind for leg in plan.legs} == {plan.legs[0].kind}
     assert {leg.price for leg in plan.legs} == {4482.10}
 

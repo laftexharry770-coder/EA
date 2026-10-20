@@ -154,14 +154,66 @@ def test_every_account_cfg_field_is_a_key_the_loader_accepts(tmp_path: Path):
     """Each AccountCfg field is read from the TOML key of the same name, so
     a block that sets every one of them must load: no field can be added
     to AccountCfg without the loader accepting its key."""
-    every = _account(allow_live="false", positions="4")
+    every = _account(allow_live="false", positions="4", layered_entry="false")
     written = {line.split(" = ")[0] for line in every.splitlines()[1:]}
     assert written == {f.name for f in dataclasses.fields(AccountCfg)}
     (account,) = _load(tmp_path, every)
     assert account.positions == 4
+    assert account.layered_entry is False
 
 
 def test_a_points_key_is_still_refused_as_a_points_key(tmp_path: Path):
     # The loader's _points guard runs first and keeps its own message.
     with pytest.raises(ConfigError, match="_points"):
         _load(tmp_path, _account(sl_buffer_points="30"))
+
+
+# ---------------------------------------------------------------------------
+# layered_entry (Plan 1b Task 2b, the user's amendment of 2026-09-25): half
+# the positions open now, half rest as limit orders. It defaults to true
+# even when positions is unset (ruling P2); false keeps the single rule.
+# It is a switch, so it gets the same real-boolean guard as enabled and
+# allow_live: a quoted "false" is truthy and would leave it on.
+# ---------------------------------------------------------------------------
+
+def test_layered_entry_defaults_to_true_when_omitted(tmp_path: Path):
+    (account,) = _load(tmp_path, _account())
+    assert account.layered_entry is True
+
+
+def test_layered_entry_defaults_to_true_without_positions_too(tmp_path: Path):
+    # Ruling P2: the default does not wait for positions to be set.
+    (account,) = _load(tmp_path, _account())
+    assert account.positions is None and account.layered_entry is True
+
+
+def test_the_shipped_accounts_toml_loads_with_layered_entry_on():
+    accounts = load_accounts(REPO_ROOT / "config" / "accounts.toml")
+    assert accounts
+    assert all(account.layered_entry is True for account in accounts)
+
+
+def test_account_cfg_layered_entry_defaults_to_true():
+    cfg = AccountCfg(
+        account_id="a", broker="b", terminal_path="p", login=1, server="s",
+        symbol="XAUUSD", fixed_lot=0.01, magic_base=1, ordinal=1,
+        allow_live=False, enabled=True,
+    )
+    assert cfg.layered_entry is True
+
+
+@pytest.mark.parametrize("value", ["true", "false"])
+def test_layered_entry_real_booleans_load_as_booleans(tmp_path: Path, value: str):
+    (account,) = _load(tmp_path, _account(layered_entry=value))
+    assert account.layered_entry is (value == "true")
+
+
+@pytest.mark.parametrize("value", ['"false"', '"true"', "0", "1", '""'])
+def test_layered_entry_must_be_a_real_boolean(tmp_path: Path, value: str):
+    with pytest.raises(ConfigError, match=r"account 'a': layered_entry must be true or false"):
+        _load(tmp_path, _account(layered_entry=value))
+
+
+def test_a_misspelled_layered_entry_is_refused_naming_the_key(tmp_path: Path):
+    with pytest.raises(ConfigError, match=r"account 'a': unknown key 'layered'"):
+        _load(tmp_path, _account(layered="false"))

@@ -36,6 +36,19 @@ class AccountSpec:
     # How many positions one signal opens; None means one per surviving
     # take profit. The config loader enforces 1..MAX_POSITIONS.
     positions: int | None = None
+    # Half the positions open now and half rest as limit orders (the
+    # user's amendment of 2026-09-25); False keeps the single entry rule.
+    layered_entry: bool = True
+
+    def __post_init__(self) -> None:
+        # A quoted "false" is a non-empty string, so truthy: it would leave
+        # layered entry on when the user wrote it off. The loader refuses it
+        # too; this guards an AccountSpec built any other way.
+        if not isinstance(self.layered_entry, bool):
+            raise ValueError(
+                f"layered_entry must be true or false (without quotes), "
+                f"got {self.layered_entry!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
