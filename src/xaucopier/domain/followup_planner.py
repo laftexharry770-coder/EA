@@ -18,9 +18,19 @@ from xaucopier.domain.signal import FollowUp, FollowUpOp, Side
 
 @dataclass(frozen=True, slots=True)
 class LegView:
-    """Live broker truth for one leg."""
+    """Live broker truth for one leg.
+
+    `leg_index` is the position's own number within its plan, unique per
+    leg. `tp_index` is the index into `sig.tps` of the take profit it
+    targets; two legs may share it (see `OrderIntent`). Both are in the
+    broker comment `{base36}-{leg_index}t{tp_index}`, so whoever builds a
+    LegView from the broker reads the `t` part as well: a TP amend matches
+    on `tp_index`, never on `leg_index`. It has no default on purpose, so
+    a producer cannot forget it.
+    """
     position_ticket: int
     leg_index: int
+    tp_index: int
     side: Side
     volume: float
     price_open: float
@@ -151,10 +161,14 @@ def plan_followup(
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing open to amend",))
         # An SL amend reaches every open leg: one signal has one shared stop.
         # A TP amend does not -- each leg owns its own target, so the poster
-        # must say which one. "TP2 to 4550" names leg_index 1 (the hint is
-        # 1-based, leg_index is 0-based); a bare "tp to 4550" names nothing,
-        # and writing one price across a four-leg ladder is never what was
-        # meant, so it fails loudly instead.
+        # must say which one. "TP2 to 4550" names tp_index 1 (the hint is
+        # 1-based, tp_index is 0-based into sig.tps) and moves EVERY open
+        # position on that TP: with more positions than TPs the extras share
+        # the last one. It never names leg_index, which is only the
+        # position's ordinal: once TP1 has passed at entry, ordinal 0 targets
+        # TP2. A bare "tp to 4550" names nothing, and writing one price
+        # across a four-leg ladder is never what was meant, so it fails
+        # loudly instead.
         targets = open_legs
         if fu.op is FollowUpOp.AMEND_TP:
             if fu.tp_index_hint is None:
@@ -163,10 +177,10 @@ def plan_followup(
                     "flattens every target",
                 ))
             wanted = fu.tp_index_hint - 1
-            targets = tuple(leg for leg in open_legs if leg.leg_index == wanted)
+            targets = tuple(leg for leg in open_legs if leg.tp_index == wanted)
             if not targets:
                 return FollowUpPlan((), RejectReason.AMBIGUOUS_TARGET, (
-                    f"no open leg for TP{fu.tp_index_hint} (leg_index {wanted})",
+                    f"no open leg for TP{fu.tp_index_hint} (tp_index {wanted})",
                 ))
 
         new = round_price(fu.price_hint, spec)
