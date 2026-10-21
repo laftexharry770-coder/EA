@@ -397,14 +397,19 @@ then `.\xaucopier watch`).
   (exit code 5) and names the word it does not know. There is no `lot`
   setting; the lot is `fixed_lot`.
 
-**Each position has its own take profit, and closes there.** The examples
-use a real signal: BUY 4480–4485, stop loss 4470, take profits 4490, 4495,
-4500 and 4505.
+**Each position has its own take profit, and closes there.** The
+positions take the take profits in turn, the first position the first
+take profit, the second the second, and so on. With more positions than
+take profits, the extra ones go round again from the first take profit,
+the way your Target Trend EA shares its positions out. With fewer, they
+take the first ones. The examples use a real signal: BUY 4480–4485, stop
+loss 4470, take profits 4490, 4495, 4500 and 4505.
 
 | You set | The positions' take profits |
 |---|---|
 | `positions = 4` | 4490, 4495, 4500, 4505 (one each) |
-| `positions = 6` | 4490, 4495, 4500, 4505, 4505, 4505 (the extra ones go to the last) |
+| `positions = 6` | 4490, 4495, 4500, 4505, 4490, 4495 (one each, then round again from the first) |
+| `positions = 9` | 4490, 4495, 4500, 4505, 4490, 4495, 4500, 4505, 4490 (round twice, and one more) |
 | `positions = 2` | 4490, 4495 (the first two) |
 | `positions = 1` | 4490 |
 

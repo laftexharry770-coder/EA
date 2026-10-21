@@ -1,11 +1,13 @@
 # tests/test_distribute.py
 """Plan 1b Task 2: N positions spread over the surviving take profits.
 
-The user's rule (2026-09-23): each position carries its own TP and closes
-there. N == T is one per TP; N > T puts the extras on the LAST TP; N < T
-takes the FIRST N TPs. The distribution is over the SURVIVING TPs, never
-all of them: a position aimed at a TP price has already passed would close
-at once or be rejected.
+The user's rule: each position carries its own TP and closes there. N == T
+is one per TP; N < T takes the FIRST N TPs (2026-09-23). N > T CYCLES, like
+the "Split over enabled TPs" of the user's EA (amendment 2026-10-21, which
+replaced "extras on the last TP"): position i targets surviving[i mod T],
+so 6 positions on 4 TPs are TP1, TP2, TP3, TP4, TP1, TP2. The distribution
+is over the SURVIVING TPs, never all of them: a position aimed at a TP price
+has already passed would close at once or be rejected.
 """
 from datetime import datetime, timedelta, UTC
 
@@ -73,16 +75,28 @@ PAST_TP3 = snap(4501.0, 4501.10)      # only TP4 (4505) is ahead
 
 # --- distribute(): the pure rule -------------------------------------------
 
+TP1 = (0, 4490.0)
+TP2 = (1, 4495.0)
+TP3 = (2, 4500.0)
+TP4 = (3, 4505.0)
+
+
 @pytest.mark.parametrize(("n", "surviving", "expected"), [
     (None, ALL4, ALL4),
     (4, ALL4, ALL4),
-    (6, ALL4, ALL4 + ((3, 4505.0), (3, 4505.0))),
-    (2, ALL4, ((0, 4490.0), (1, 4495.0))),
-    (1, ALL4, ((0, 4490.0),)),
-    (3, TP1_PASSED, TP1_PASSED),
-    (5, ONLY_TP4, ((3, 4505.0),) * 5),
-], ids=["none-unchanged", "n4-of-4", "n6-extras-on-last", "n2-first-two",
-        "n1-first", "n3-tp1-passed", "n5-only-tp4"])
+    (5, ALL4, (TP1, TP2, TP3, TP4, TP1)),
+    (6, ALL4, (TP1, TP2, TP3, TP4, TP1, TP2)),
+    (9, ALL4, (TP1, TP2, TP3, TP4, TP1, TP2, TP3, TP4, TP1)),
+    (2, ALL4, (TP1, TP2)),
+    (1, ALL4, (TP1,)),
+    (3, TP1_PASSED, (TP2, TP3, TP4)),
+    (5, TP1_PASSED, (TP2, TP3, TP4, TP2, TP3)),
+    (6, TP1_PASSED, (TP2, TP3, TP4, TP2, TP3, TP4)),
+    (9, TP1_PASSED, (TP2, TP3, TP4) * 3),
+    (5, ONLY_TP4, (TP4,) * 5),
+], ids=["none-unchanged", "n4-of-4", "n5-cycles", "n6-cycles", "n9-cycles-twice",
+        "n2-first-two", "n1-first", "n3-tp1-passed", "n5-tp1-passed-cycles",
+        "n6-tp1-passed-cycles", "n9-tp1-passed-cycles", "n5-only-tp4"])
 def test_distribute_table(n, surviving, expected):
     assert distribute(n, surviving) == expected
 
@@ -93,9 +107,17 @@ def test_distribute_returns_a_tuple():
     assert isinstance(distribute(2, ALL4), tuple)
 
 
-def test_extras_go_on_the_last_surviving_tp_after_one_per_tp():
-    # TP1 passed, five positions: one each on TP2..TP4, the two extras on TP4.
-    assert distribute(5, TP1_PASSED) == TP1_PASSED + ((3, 4505.0), (3, 4505.0))
+def test_extras_cycle_from_the_first_surviving_tp():
+    # TP1 passed, five positions: one each on TP2..TP4, then the cycle
+    # starts again at TP2 -- never stacked on the last TP.
+    assert distribute(5, TP1_PASSED) == TP1_PASSED + (TP2, TP3)
+
+
+@pytest.mark.parametrize("n", range(1, 21))
+def test_position_i_targets_surviving_i_mod_t(n):
+    for surviving in (ALL4, TP1_PASSED, ONLY_TP4):
+        assert distribute(n, surviving) == tuple(
+            surviving[i % len(surviving)] for i in range(n))
 
 
 def test_fewer_positions_than_surviving_tps_take_the_first_ones():
@@ -124,13 +146,16 @@ def test_distribute_refuses_a_count_that_is_not_a_positive_whole_number(bad):
 @pytest.mark.parametrize(("n", "market", "expected_tps"), [
     (None, INSIDE, [4490.0, 4495.0, 4500.0, 4505.0]),
     (4, INSIDE, [4490.0, 4495.0, 4500.0, 4505.0]),
-    (6, INSIDE, [4490.0, 4495.0, 4500.0, 4505.0, 4505.0, 4505.0]),
+    (5, INSIDE, [4490.0, 4495.0, 4500.0, 4505.0, 4490.0]),
+    (6, INSIDE, [4490.0, 4495.0, 4500.0, 4505.0, 4490.0, 4495.0]),
+    (9, INSIDE, [4490.0, 4495.0, 4500.0, 4505.0] * 2 + [4490.0]),
     (2, INSIDE, [4490.0, 4495.0]),
     (1, INSIDE, [4490.0]),
     (3, PAST_TP1, [4495.0, 4500.0, 4505.0]),
+    (5, PAST_TP1, [4495.0, 4500.0, 4505.0, 4495.0, 4500.0]),
     (5, PAST_TP3, [4505.0] * 5),
-], ids=["none-unchanged", "n4-of-4", "n6-extras-on-last", "n2-first-two",
-        "n1-first", "n3-tp1-passed", "n5-only-tp4"])
+], ids=["none-unchanged", "n4-of-4", "n5-cycles", "n6-cycles", "n9-cycles-twice",
+        "n2-first-two", "n1-first", "n3-tp1-passed", "n5-tp1-passed-cycles", "n5-only-tp4"])
 def test_plan_entry_legs_follow_the_table(n, market, expected_tps):
     plan = plan_entry(buy(), acct(n), SPEC, market, POLICY)
     assert plan.accepted
@@ -140,10 +165,11 @@ def test_plan_entry_legs_follow_the_table(n, market, expected_tps):
 
 @pytest.mark.parametrize(("n", "market", "expected"), [
     (None, INSIDE, [0, 1, 2, 3]),
-    (6, INSIDE, [0, 1, 2, 3, 3, 3]),
+    (6, INSIDE, [0, 1, 2, 3, 0, 1]),
+    (9, INSIDE, [0, 1, 2, 3, 0, 1, 2, 3, 0]),
     (2, INSIDE, [0, 1]),
     (3, PAST_TP1, [1, 2, 3]),
-    (4, PAST_TP1, [1, 2, 3, 3]),
+    (4, PAST_TP1, [1, 2, 3, 1]),
     (5, PAST_TP3, [3, 3, 3, 3, 3]),
 ])
 def test_tp_index_is_the_index_into_the_original_sig_tps(n, market, expected):
@@ -155,9 +181,9 @@ def test_tp_index_is_the_index_into_the_original_sig_tps(n, market, expected):
 
 def test_a_passed_take_profit_never_gets_a_position():
     # Four positions with TP1 behind price: the one that would have gone to
-    # TP1 becomes an extra on the last surviving TP.
+    # TP1 cycles back to the first surviving TP, TP2.
     plan = plan_entry(buy(), acct(4), SPEC, PAST_TP1, POLICY)
-    assert [leg.tp for leg in plan.legs] == [4495.0, 4500.0, 4505.0, 4505.0]
+    assert [leg.tp for leg in plan.legs] == [4495.0, 4500.0, 4505.0, 4495.0]
     assert 4490.0 not in {leg.tp for leg in plan.legs}
 
 
@@ -165,7 +191,7 @@ def test_comment_names_the_leg_and_its_take_profit():
     plan = plan_entry(buy(), acct(6), SPEC, INSIDE, POLICY)
     assert [leg.comment for leg in plan.legs] == [
         f"{B36_4001}-0t0", f"{B36_4001}-1t1", f"{B36_4001}-2t2",
-        f"{B36_4001}-3t3", f"{B36_4001}-4t3", f"{B36_4001}-5t3",
+        f"{B36_4001}-3t3", f"{B36_4001}-4t0", f"{B36_4001}-5t1",
     ]
 
 
@@ -236,14 +262,14 @@ SELL_PAST_TP1 = snap(4474.0, 4474.10)   # TP1 (4475) is behind the bid
 @pytest.mark.parametrize(("n", "market", "expected_tps", "expected_tp_index"), [
     (None, SELL_INSIDE, [4475.0, 4470.0, 4465.0, 4460.0], [0, 1, 2, 3]),
     (4, SELL_INSIDE, [4475.0, 4470.0, 4465.0, 4460.0], [0, 1, 2, 3]),
-    (6, SELL_INSIDE, [4475.0, 4470.0, 4465.0, 4460.0, 4460.0, 4460.0],
-     [0, 1, 2, 3, 3, 3]),
+    (6, SELL_INSIDE, [4475.0, 4470.0, 4465.0, 4460.0, 4475.0, 4470.0],
+     [0, 1, 2, 3, 0, 1]),
     (2, SELL_INSIDE, [4475.0, 4470.0], [0, 1]),
     (1, SELL_INSIDE, [4475.0], [0]),
     (3, SELL_PAST_TP1, [4470.0, 4465.0, 4460.0], [1, 2, 3]),
-    (5, SELL_PAST_TP1, [4470.0, 4465.0, 4460.0, 4460.0, 4460.0], [1, 2, 3, 3, 3]),
-], ids=["none-unchanged", "n4-of-4", "n6-extras-on-last", "n2-first-two",
-        "n1-first", "n3-tp1-passed", "n5-tp1-passed"])
+    (5, SELL_PAST_TP1, [4470.0, 4465.0, 4460.0, 4470.0, 4465.0], [1, 2, 3, 1, 2]),
+], ids=["none-unchanged", "n4-of-4", "n6-cycles", "n2-first-two",
+        "n1-first", "n3-tp1-passed", "n5-tp1-passed-cycles"])
 def test_sell_mirror(n, market, expected_tps, expected_tp_index):
     s = sell()
     plan = plan_entry(s, acct(n), SPEC, market, POLICY)

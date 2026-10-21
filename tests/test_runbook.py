@@ -258,7 +258,8 @@ def test_the_runbook_explains_positions_lot_layered_entry_and_the_trail() -> Non
         "**`fixed_lot`** is the lot size of **each** position",
         "**What you risk is positions × lot.** 4 positions of 0.01 lot are 0.04 lot in total",
         "4 × 12.55 = $50.20",
-        "the extra ones go to the last",
+        # Amendment 2026-10-21: the extras cycle, like the user's EA.
+        "the extra ones go round again from the first take profit",
         "the first two",
         "It is on unless you switch it off, also while `positions` is left out.",
         "two wait at 4482.70 and 4480",
@@ -279,7 +280,7 @@ def test_the_runbook_explains_positions_lot_layered_entry_and_the_trail() -> Non
 def test_the_runbooks_take_profit_table_is_what_the_planner_does() -> None:
     rows = re.findall(r"^\| `positions = (\d+)` \| ([\d, ]+)", POSITIONS_SECTION,
                       flags=re.MULTILINE)
-    assert [n for n, _ in rows] == ["4", "6", "2", "1"]
+    assert [n for n, _ in rows] == ["4", "6", "9", "2", "1"]
     for n, documented in rows:
         planned = tuple(tp for _, tp in distribute(int(n), tuple(enumerate(REAL_TPS))))
         assert tuple(float(tp) for tp in documented.split(",")) == planned, n

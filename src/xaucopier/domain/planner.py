@@ -41,11 +41,14 @@ def distribute(
 
     `surviving` is `(tp_index, tp)` in TP order, where tp_index is the
     index into `sig.tps`; the result has one `(tp_index, tp)` per position.
-    The user's staggered rule (2026-09-23):
+    Position i targets `surviving[i mod T]`, like the "Split over enabled
+    TPs" of the user's EA (amendment 2026-10-21, which replaced "extras on
+    the last TP"):
 
     - `None` (positions not set): one position per surviving TP, unchanged.
-    - `N >= T`: one per TP, and the `N - T` extras on the LAST TP.
-    - `N < T`: the FIRST N TPs.
+    - `N < T`: the FIRST N TPs (the user's choice of 2026-09-23).
+    - `N >= T`: one per TP, then the extras start again from the first:
+      6 positions on 4 TPs are TP1, TP2, TP3, TP4, TP1, TP2.
 
     It is given the SURVIVING TPs, never all of them: a position aimed at a
     TP price has already passed would close at once or be rejected. With
@@ -61,9 +64,7 @@ def distribute(
         raise ValueError(f"positions must be a whole number of at least 1, got {n_positions!r}")
     if not surviving:
         return ()
-    if n_positions < len(surviving):
-        return tuple(surviving[:n_positions])
-    return tuple(surviving) + (surviving[-1],) * (n_positions - len(surviving))
+    return tuple(surviving[i % len(surviving)] for i in range(n_positions))
 
 
 def split_now_pending(

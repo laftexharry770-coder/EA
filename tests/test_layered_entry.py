@@ -222,10 +222,11 @@ ALL4 = ((0, 4490.0), (1, 4495.0), (2, 4500.0), (3, 4505.0))
     (3, ((True, 0, 4490.0), (False, 1, 4495.0), (True, 2, 4500.0))),
     (4, ((True, 0, 4490.0), (False, 1, 4495.0), (True, 2, 4500.0), (False, 3, 4505.0))),
     (5, ((True, 0, 4490.0), (False, 1, 4495.0), (True, 2, 4500.0), (False, 3, 4505.0),
-         (True, 3, 4505.0))),
-    # The amendment's N=6 row: NOW TP1, TP3, TP4; PENDING TP2, TP4, TP4.
+         (True, 0, 4490.0))),
+    # The amendment's N=6 row (2026-10-21, the TPs cycle): NOW TP1, TP3,
+    # TP1; PENDING TP2, TP4, TP2.
     (6, ((True, 0, 4490.0), (False, 1, 4495.0), (True, 2, 4500.0), (False, 3, 4505.0),
-         (True, 3, 4505.0), (False, 3, 4505.0))),
+         (True, 0, 4490.0), (False, 1, 4495.0))),
 ])
 def test_split_now_pending_alternates_in_tp_order(n, expected):
     assert split_now_pending(distribute(n, ALL4)) == expected
@@ -369,9 +370,9 @@ def test_positions_unset_with_tp1_passed_layers_the_three_survivors():
     (2, [(M, 4483.0, 0), (L, 4481.35, 1)]),                  # one pending: the middle
     (3, [(M, 4483.0, 0), (L, 4481.35, 1), (M, 4483.0, 2)]),
     (5, [(M, 4483.0, 0), (L, 4482.70, 1), (M, 4483.0, 2), (L, 4480.0, 3),
-         (M, 4483.0, 3)]),
+         (M, 4483.0, 0)]),
     (6, [(M, 4483.0, 0), (L, 4482.70, 1), (M, 4483.0, 2), (L, 4481.35, 3),
-         (M, 4483.0, 3), (L, 4480.0, 3)]),
+         (M, 4483.0, 0), (L, 4480.0, 1)]),
 ])
 def test_position_counts_inside_the_zone(n, expected):
     sig = buy()
@@ -385,9 +386,9 @@ def test_position_counts_inside_the_zone(n, expected):
     (2, [(M, 4486.0, 0), (L, 4482.50, 1)]),                  # the middle of the zone
     (3, [(M, 4486.0, 0), (L, 4482.50, 1), (M, 4486.0, 2)]),
     (5, [(M, 4486.0, 0), (L, 4485.0, 1), (M, 4486.0, 2), (L, 4480.0, 3),
-         (M, 4486.0, 3)]),
+         (M, 4486.0, 0)]),
     (6, [(M, 4486.0, 0), (L, 4485.0, 1), (M, 4486.0, 2), (L, 4482.50, 3),
-         (M, 4486.0, 3), (L, 4480.0, 3)]),
+         (M, 4486.0, 0), (L, 4480.0, 1)]),
 ])
 def test_position_counts_above_the_zone_within_the_budget(n, expected):
     sig = buy()
@@ -401,9 +402,9 @@ def test_position_counts_above_the_zone_within_the_budget(n, expected):
     (2, [(M, 4482.0, 0), (L, 4483.65, 1)]),
     (3, [(M, 4482.0, 0), (L, 4483.65, 1), (M, 4482.0, 2)]),
     (5, [(M, 4482.0, 0), (L, 4482.30, 1), (M, 4482.0, 2), (L, 4485.0, 3),
-         (M, 4482.0, 3)]),
+         (M, 4482.0, 0)]),
     (6, [(M, 4482.0, 0), (L, 4482.30, 1), (M, 4482.0, 2), (L, 4483.65, 3),
-         (M, 4482.0, 3), (L, 4485.0, 3)]),
+         (M, 4482.0, 0), (L, 4485.0, 1)]),
 ])
 def test_position_counts_inside_the_zone_sell(n, expected):
     sig = sell()
@@ -574,9 +575,9 @@ def test_a_runaway_past_tp2_is_not_rejected():
 def test_a_runaway_sell_is_not_rejected():
     sig = sell()
     plan = plan_entry(sig, acct(4), SPEC, at_bid(4469.0), POLICY)
-    # TP1 and TP2 are behind the bid: TP3, TP4 survive and N=4 puts the
-    # extras on TP4. NOW: limits at 4480; PENDING: 4480 and 4485.
-    assert shape(plan) == [(L, 4480.0, 2), (L, 4480.0, 3), (L, 4480.0, 3), (L, 4485.0, 3)]
+    # TP1 and TP2 are behind the bid: TP3, TP4 survive and N=4 cycles over
+    # them, TP3, TP4, TP3, TP4. NOW: limits at 4480; PENDING: 4480 and 4485.
+    assert shape(plan) == [(L, 4480.0, 2), (L, 4480.0, 3), (L, 4480.0, 2), (L, 4485.0, 3)]
     assert_every_leg_is_well_formed(plan, sig)
 
 
