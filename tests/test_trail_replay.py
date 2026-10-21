@@ -13,7 +13,8 @@ TP has one position, and as price climbs each one closes at its own TP
 while the stop of the rest steps up one TP behind the price: breakeven,
 then 4490, then 4495. No position ever holds the step-4 stop (TP3, 4500) on
 the default policy: step 4 is reached at TP4 itself, where the last
-position closes.
+position closes. With ladder_early_pips = [0, 0, 0, 20] step 4 comes 20
+pips ($2.00) before TP4, and the last position's stop does reach 4500.
 
 It runs with layered_entry false and true (ruling P3):
 
@@ -24,6 +25,9 @@ It runs with layered_entry false and true (ruling P3):
   open at market and two rest as limits, at 4482.70 and 4480. A limit fills
   at its own price once the ask comes down to it, so its breakeven differs;
   one still unfilled when the bid reaches TP1 is cancelled.
+
+positions = 6 is walked both ways too: the extras cycle onto TP1 and TP2,
+so two positions close at each of those and each keeps its own breakeven.
 
 The walk is what Plan 3's worker and the broker will do between them, for a
 BUY, at each price on the path (see _walk). The trail and the cancel rule
@@ -207,6 +211,23 @@ WORKED_EXAMPLE = (
 WORKED_EXAMPLE_ENDED = {0: ("tp", 4490.0), 1: ("tp", 4495.0), 2: ("tp", 4500.0),
                         3: ("stop", 4495.0)}
 
+# ladder_early_pips = [0, 0, 0, 20]: step 4 is reached 20 pips ($2.00)
+# before TP4, at 4503, so the last position's stop moves to TP3 while it is
+# still open, and a retrace closes it there.
+EARLY_STEP_4 = Policy(ladder_early_pips=(0, 0, 0, 20))
+EARLY_STEP_4_WALK = (
+    (4488.00, {0: 4470.00, 1: 4470.00, 2: 4470.00, 3: 4470.00}, ()),
+    (4490.00, {1: BE_4482_55, 2: BE_4482_55, 3: BE_4482_55}, ()),
+    (4495.00, {2: 4490.00, 3: 4490.00}, ()),
+    (4500.00, {3: 4495.00}, ()),
+    (4502.99, {3: 4495.00}, ()),
+    (4503.00, {3: 4500.00}, ()),        # 4505 - 20 x 0.10: the stop to TP3
+    (4499.00, {}, ()),                  # the retrace: stopped out at 4500
+)
+EARLY_STEP_4_ENDED = {0: ("tp", 4490.0), 1: ("tp", 4495.0), 2: ("tp", 4500.0),
+                      3: ("stop", 4500.0)}
+
+
 def test_the_single_entry_plan_is_four_market_positions_at_the_worked_example_fill():
     plan = _plan(layered=False, ask=4482.55)
     assert [leg.leg_index for leg in plan.legs] == [0, 1, 2, 3]
@@ -235,6 +256,17 @@ def test_the_single_entry_walk_goes_4_3_2_1_0_open_with_the_stop_one_tp_behind()
 def test_the_single_entry_walk_reproduces_the_worked_example():
     _check_walk(_plan(layered=False, ask=4482.55), WORKED_EXAMPLE, WORKED_EXAMPLE_ENDED)
     assert _open_counts(WORKED_EXAMPLE) == [4, 4, 3, 3, 2, 2, 1, 1, 0]
+
+
+def test_an_early_step_4_takes_the_last_stop_to_tp3():
+    _check_walk(_plan(layered=False, ask=4482.55), EARLY_STEP_4_WALK, EARLY_STEP_4_ENDED,
+                policy=EARLY_STEP_4)
+    steps, _ = _walk(_plan(layered=False, ask=4482.55),
+                     tuple(bid for bid, _, _ in EARLY_STEP_4_WALK), EARLY_STEP_4)
+    # BE -> 4490 -> 4495 -> 4500, the open count 4 -> 3 -> 2 -> 1 -> 0.
+    assert [open_.get(3) for _, open_, _ in steps] == [
+        4470.00, BE_4482_55, 4490.00, 4495.00, 4495.00, 4500.00, None]
+    assert [len(open_) for _, open_, _ in steps] == [4, 3, 2, 1, 1, 1, 0]
 
 
 # A spread spike at the TP2 step. At spread 2.00 the broker's minimum stop
@@ -325,3 +357,69 @@ def test_the_layered_walk(table, ended):
 
 def test_once_every_limit_fills_the_layered_walk_goes_4_3_2_1_0_open():
     assert _open_counts(BOTH_LIMITS_FILL)[2:] == [4, 4, 3, 2, 1, 0, 0]
+
+
+# ---------------------------------------------------------------------------
+# positions = 6: the TPs cycle, TP1, TP2, TP3, TP4, TP1, TP2, so legs 0 and
+# 4 close at TP1 and legs 1 and 5 at TP2, and the trail moves each of the
+# extras like any other position.
+# ---------------------------------------------------------------------------
+
+SIX_SINGLE_ENTRY = (
+    (4488.00, {0: 4470.00, 1: 4470.00, 2: 4470.00, 3: 4470.00, 4: 4470.00, 5: 4470.00}, ()),
+    # Legs 0 and 4 close at TP1; the other four go to breakeven.
+    (4490.00, {1: BE_4482_55, 2: BE_4482_55, 3: BE_4482_55, 5: BE_4482_55}, ()),
+    (4494.99, {1: BE_4482_55, 2: BE_4482_55, 3: BE_4482_55, 5: BE_4482_55}, ()),
+    # Legs 1 and 5 close at TP2; the TP3 and TP4 positions go to TP1.
+    (4495.00, {2: 4490.00, 3: 4490.00}, ()),
+    (4500.00, {3: 4495.00}, ()),
+    (4505.00, {}, ()),
+)
+SIX_SINGLE_ENTRY_ENDED = {0: ("tp", 4490.0), 1: ("tp", 4495.0), 2: ("tp", 4500.0),
+                          3: ("tp", 4505.0), 4: ("tp", 4490.0), 5: ("tp", 4495.0)}
+
+# Layered, at ask 4483: NOW legs 0, 2, 4 at market (TP1, TP3, TP1), PENDING
+# legs 1, 3, 5 as limits spread from 4482.70 down to 4480 (TP2, TP4, TP2):
+# 4482.70, the middle 4481.35, and 4480. Breakeven: 4483.10 for the market
+# legs, 4482.80 for leg 1, 4481.45 for leg 3, 4480.10 for leg 5.
+SIX_LAYERED = (
+    (4482.90, {0: 4470.00, 2: 4470.00, 4: 4470.00}, (1, 3, 5)),   # ask 4483: the plan
+    (4482.60, {0: 4470.00, 1: 4470.00, 2: 4470.00, 4: 4470.00}, (3, 5)),   # leg 1 fills
+    (4481.25, {0: 4470.00, 1: 4470.00, 2: 4470.00, 3: 4470.00, 4: 4470.00}, (5,)),  # leg 3
+    (4479.90, {0: 4470.00, 1: 4470.00, 2: 4470.00, 3: 4470.00, 4: 4470.00, 5: 4470.00},
+     ()),                                                                  # ask 4480: leg 5
+    # Legs 0 and 4 close at TP1; each of the rest goes to its OWN breakeven.
+    (4490.00, {1: 4482.80, 2: 4483.10, 3: 4481.45, 5: 4480.10}, ()),
+    (4495.00, {2: 4490.00, 3: 4490.00}, ()),        # legs 1 and 5 close at TP2
+    (4500.00, {3: 4495.00}, ()),                    # leg 2 closes at TP3
+    (4505.00, {}, ()),                              # leg 3 closes at TP4
+)
+SIX_LAYERED_ENDED = SIX_SINGLE_ENTRY_ENDED
+
+
+def test_six_positions_cycle_onto_tp1_and_tp2():
+    single = _plan(layered=False, ask=4482.55, positions=6)
+    assert [(leg.leg_index, leg.tp_index, leg.tp) for leg in single.legs] == [
+        (0, 0, 4490.0), (1, 1, 4495.0), (2, 2, 4500.0),
+        (3, 3, 4505.0), (4, 0, 4490.0), (5, 1, 4495.0),
+    ]
+    layered = _plan(layered=True, ask=4483.00, positions=6)
+    assert [(leg.leg_index, leg.kind, leg.price, leg.tp) for leg in layered.legs] == [
+        (0, OrderKind.MARKET, 4483.00, 4490.0),
+        (1, OrderKind.LIMIT, 4482.70, 4495.0),
+        (2, OrderKind.MARKET, 4483.00, 4500.0),
+        (3, OrderKind.LIMIT, 4481.35, 4505.0),
+        (4, OrderKind.MARKET, 4483.00, 4490.0),
+        (5, OrderKind.LIMIT, 4480.00, 4495.0),
+    ]
+
+
+def test_the_six_position_single_entry_walk():
+    _check_walk(_plan(layered=False, ask=4482.55, positions=6), SIX_SINGLE_ENTRY,
+                SIX_SINGLE_ENTRY_ENDED)
+    assert _open_counts(SIX_SINGLE_ENTRY) == [6, 4, 4, 2, 1, 0]
+
+
+def test_the_six_position_layered_walk():
+    _check_walk(_plan(layered=True, ask=4483.00, positions=6), SIX_LAYERED, SIX_LAYERED_ENDED)
+    assert _open_counts(SIX_LAYERED)[3:] == [6, 4, 2, 1, 0]
