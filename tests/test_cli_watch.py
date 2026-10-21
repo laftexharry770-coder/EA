@@ -413,6 +413,21 @@ def test_each_permanent_setup_problem_exits_5_before_touching_anything(
     assert "cannot start" in err and "exit code 5" in err
 
 
+def test_a_misspelled_account_setting_exits_5_naming_the_word(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The runbook promises it (Plan 1b, ruling P1): a misspelled setting in
+    accounts.toml is never ignored -- watch refuses to start, and names it."""
+    accounts = rig.config_dir / "accounts.toml"
+    accounts.write_text(accounts.read_text(encoding="utf-8") + "positons = 4\n",
+                        encoding="utf-8")
+
+    assert cli_main.main(rig.argv()) == exit_codes.EXIT_CONFIG_ERROR == 5
+    assert rig.built == [] and rig.lock.acquired == 0
+    err = capsys.readouterr().err
+    assert "cannot start" in err and "unknown key 'positons'" in err
+
+
 def test_a_missing_session_file_exits_5_and_says_to_run_setup_login(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

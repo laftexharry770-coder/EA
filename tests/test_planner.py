@@ -14,6 +14,12 @@ NOW = datetime(2026, 9, 5, 10, 45, tzinfo=UTC)
 SPEC = SymbolSpec("XAUUSD", 2, 0.01, 0.01, 0.01, 100.0, 0.01, 0, 0)
 EXNESS = SymbolSpec("XAUUSDm", 3, 0.001, 0.001, 0.01, 100.0, 0.01, 0, 0)
 ACCT = AccountSpec("ic_demo", "XAUUSD", fixed_lot=0.01, magic_base=77001)
+# Plan 1b ruling P2: layered entry is the default. The entry-kind tests
+# below describe the single rule (market inside or better than the zone,
+# one limit otherwise), which layered_entry = false keeps exactly; the
+# layered rule has its own tests in test_layered_entry.py.
+SINGLE_RULE = AccountSpec("ic_demo", "XAUUSD", fixed_lot=0.01, magic_base=77001,
+                          layered_entry=False)
 POLICY = Policy()
 
 # I2: the chase gate no longer runs on the pending path, so price far past
@@ -49,30 +55,30 @@ def test_every_leg_carries_the_shared_sl_and_fixed_lot():
     assert {leg.volume for leg in plan.legs} == {0.01}
 
 def test_market_when_price_inside_zone():
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
+    plan = plan_entry(sig(), SINGLE_RULE, SPEC, snap(4482.0, 4482.10), POLICY)
     assert all(leg.kind is OrderKind.MARKET for leg in plan.legs)
     assert plan.legs[0].price == 4482.10
 
 def test_market_when_price_better_than_zone():
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4478.0, 4478.10), POLICY)
+    plan = plan_entry(sig(), SINGLE_RULE, SPEC, snap(4478.0, 4478.10), POLICY)
     assert plan.legs[0].kind is OrderKind.MARKET
 
 def test_limit_at_favourable_edge_when_price_above_zone():
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4485.5, 4485.60), POLICY)
+    plan = plan_entry(sig(), SINGLE_RULE, SPEC, snap(4485.5, 4485.60), POLICY)
     assert all(leg.kind is OrderKind.LIMIT for leg in plan.legs)
     assert plan.legs[0].price == 4480.0  # favourable edge, not 4485
 
 def test_limit_at_near_edge_when_policy_says_so():
     pol = Policy(pending_at="near")
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4485.5, 4485.60), pol)
+    plan = plan_entry(sig(), SINGLE_RULE, SPEC, snap(4485.5, 4485.60), pol)
     assert plan.legs[0].price == 4485.0
 
 def test_pending_legs_carry_an_expiry():
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4485.5, 4485.60), POLICY)
+    plan = plan_entry(sig(), SINGLE_RULE, SPEC, snap(4485.5, 4485.60), POLICY)
     assert plan.legs[0].expires_at_utc is not None
 
 def test_market_legs_carry_no_expiry():
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
+    plan = plan_entry(sig(), SINGLE_RULE, SPEC, snap(4482.0, 4482.10), POLICY)
     assert plan.legs[0].expires_at_utc is None
 
 def test_passed_tps_are_dropped_as_legs():
@@ -90,21 +96,21 @@ def test_a_runaway_becomes_a_limit_at_the_favourable_edge():
     # there is nothing to chase: rejecting here killed the pending path that
     # spec 7.1 commits to. Price 11 USD past the zone must still rest an
     # order at 4480, not refuse the signal.
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
+    plan = plan_entry(sig(), SINGLE_RULE, SPEC, snap(4496.0, 4496.10), POLICY)
     assert plan.accepted
     assert plan.reason is None
     assert all(leg.kind is OrderKind.LIMIT for leg in plan.legs)
     assert {leg.price for leg in plan.legs} == {4480.0}
 
 def test_a_runaway_sell_becomes_a_limit_at_the_favourable_edge():
-    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4469.0, 4469.10), POLICY)
+    plan = plan_entry(sell_sig(), SINGLE_RULE, SPEC, snap(4469.0, 4469.10), POLICY)
     assert plan.accepted
     assert all(leg.kind is OrderKind.LIMIT for leg in plan.legs)
     assert {leg.price for leg in plan.legs} == {4485.0}
 
 def test_a_runaway_limit_still_carries_an_expiry():
     # The pending path's staleness bound is the expiry, not the chase gate.
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
+    plan = plan_entry(sig(), SINGLE_RULE, SPEC, snap(4496.0, 4496.10), POLICY)
     assert all(leg.expires_at_utc is not None for leg in plan.legs)
 
 def test_a_runaway_past_every_tp_is_still_rejected():
@@ -120,15 +126,17 @@ def test_a_runaway_through_the_stop_is_still_rejected():
     assert plan.reason is RejectReason.SL_BREACHED
 
 def test_market_entries_are_unaffected_by_the_move():
-    plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
+    plan = plan_entry(sig(), SINGLE_RULE, SPEC, snap(4482.0, 4482.10), POLICY)
     assert plan.accepted
     assert all(leg.kind is OrderKind.MARKET for leg in plan.legs)
 
 def test_leg_index_is_in_the_comment():
+    # Plan 1b: the suffix is "-{leg_index}t{tp_index}", so a position names
+    # both itself and its take profit at the broker.
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
     comments = [leg.comment for leg in plan.legs]
     assert len(set(comments)) == 4
-    assert comments[0].endswith("-0")
+    assert comments == ["335-0t0", "335-1t1", "335-2t2", "335-3t3"]
 
 def test_comment_fits_broker_limit():
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
@@ -146,7 +154,7 @@ def test_leg_index_survives_an_absurdly_large_message_id():
     plan = plan_entry(huge, ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
     assert plan.accepted
     for leg in plan.legs:
-        assert leg.comment.endswith(f"-{leg.leg_index}")
+        assert leg.comment.endswith(f"-{leg.leg_index}t{leg.tp_index}")
         assert len(leg.comment) <= 20
 
 def test_magic_is_constant_across_legs():
@@ -171,19 +179,22 @@ def test_wide_spread_is_rejected():
     assert not plan.accepted and plan.reason is RejectReason.SPREAD_WIDE
 
 
-# --- Item 1: leg_index must reflect the position in the original sig.tps,
-# not the position in the filtered/surviving list. ---
+# --- Item 1: a leg must name its real position in the original sig.tps, not
+# its position in the filtered/surviving list. Plan 1b moved that job from
+# leg_index (now the position's ordinal, 0..N-1) to tp_index, and the
+# comment carries both. ---
 
-def test_leg_index_reflects_original_tp_position_when_earlier_tps_have_passed():
+def test_tp_index_names_the_original_tp_when_earlier_tps_have_passed():
     # Price has run past TP1 and TP2; only TP3 and TP4 survive. Those legs
-    # must be labelled 2 and 3 (their real position in sig.tps), not 0 and 1
-    # (their position in the surviving subset) — reconciliation depends on
-    # the comment's leg index to tell legs of the same signal apart.
+    # target TP3 and TP4 (indexes 2 and 3 in sig.tps), not 0 and 1 (their
+    # position in the surviving subset) -- reconciliation reads the TP from
+    # the comment's "t" part. leg_index is the position's own number.
     plan = plan_entry(sig(), ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
     assert [leg.tp for leg in plan.legs] == [4500.0, 4505.0]
-    assert [leg.leg_index for leg in plan.legs] == [2, 3]
-    assert plan.legs[0].comment.endswith("-2")
-    assert plan.legs[1].comment.endswith("-3")
+    assert [leg.leg_index for leg in plan.legs] == [0, 1]
+    assert [leg.tp_index for leg in plan.legs] == [2, 3]
+    assert plan.legs[0].comment.endswith("-0t2")
+    assert plan.legs[1].comment.endswith("-1t3")
 
 def test_leg_index_is_unchanged_when_no_tp_has_passed():
     plan = plan_entry(sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
@@ -213,25 +224,41 @@ def test_policy_default_still_constructs():
 # the geometry gate's independently-derived side agrees with the keyword. ---
 
 def test_sell_all_legs_market_when_bid_inside_zone():
-    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
+    plan = plan_entry(sell_sig(), SINGLE_RULE, SPEC, snap(4482.0, 4482.10), POLICY)
     assert plan.accepted
     assert len(plan.legs) == 2
     assert all(leg.kind is OrderKind.MARKET for leg in plan.legs)
     assert {leg.sl for leg in plan.legs} == {4495.0}
 
 def test_sell_limit_at_favourable_high_edge_when_bid_below_zone():
-    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4479.5, 4479.60), POLICY)
+    plan = plan_entry(sell_sig(), SINGLE_RULE, SPEC, snap(4479.5, 4479.60), POLICY)
     assert plan.accepted
     assert all(leg.kind is OrderKind.LIMIT for leg in plan.legs)
     assert plan.legs[0].price == 4485.0  # favourable edge for a sell is the high side
 
 def test_sell_market_when_bid_above_zone():
-    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4490.0, 4490.10), POLICY)
+    plan = plan_entry(sell_sig(), SINGLE_RULE, SPEC, snap(4490.0, 4490.10), POLICY)
     assert plan.accepted
     assert all(leg.kind is OrderKind.MARKET for leg in plan.legs)
 
 def test_sell_limit_at_near_edge_when_policy_says_so():
     pol = Policy(pending_at="near")
-    plan = plan_entry(sell_sig(), ACCT, SPEC, snap(4479.5, 4479.60), pol)
+    plan = plan_entry(sell_sig(), SINGLE_RULE, SPEC, snap(4479.5, 4479.60), pol)
     assert plan.accepted
     assert plan.legs[0].price == 4480.0  # near edge for a sell is the low side
+
+
+# --- Plan 1b Task 1: a leg names the take profit it targets by tp_index,
+# the index into sig.tps, apart from its own leg_index. ---
+
+def test_every_leg_names_its_take_profit_by_index_into_sig_tps():
+    s = sig()
+    plan = plan_entry(s, ACCT, SPEC, snap(4482.0, 4482.10), POLICY)
+    assert [leg.tp_index for leg in plan.legs] == [0, 1, 2, 3]
+    assert all(leg.tp == s.tps[leg.tp_index] for leg in plan.legs)
+
+def test_tp_index_is_the_original_position_when_earlier_tps_have_passed():
+    s = sig()
+    plan = plan_entry(s, ACCT, SPEC, snap(4496.0, 4496.10), POLICY)
+    assert [leg.tp_index for leg in plan.legs] == [2, 3]
+    assert all(leg.tp == s.tps[leg.tp_index] for leg in plan.legs)

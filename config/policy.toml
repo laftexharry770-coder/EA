@@ -6,7 +6,17 @@ magnitude_band_pct       = 3.0
 chase_floor_usd          = 1.00
 chase_tp1_fraction       = 0.25
 stops_distance_spread_multiple = 3.0
-be_buffer_usd            = 0.10
+# Breakeven = the price each position was filled at, plus this many pips
+# (minus, for a sell). 1 pip = $0.10 on gold, on every broker, whether it
+# shows gold with 2 or 3 decimals. 1.0 is $0.10.
+be_buffer_pips           = 1.0
 max_slippage_usd         = 0.20
 pending_max_age_hours    = 4
 pending_at               = "favourable"
+# The trailing stop moves one step behind each take profit the price
+# reaches: at TP1 to breakeven, at TP2 to TP1, at TP3 to TP2, and so on.
+# Each step can happen some pips BEFORE its take profit instead: one number
+# per step, in order (TP1's step first). 0 means "when the take profit is
+# reached"; a step with no number is 0 too. [0, 0, 20] moves the stop to
+# TP2 20 pips ($2.00) before TP3. To use it, delete the "# " in front.
+# ladder_early_pips = [0, 0, 0, 0]

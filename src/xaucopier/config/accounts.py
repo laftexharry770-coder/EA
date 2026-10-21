@@ -16,14 +16,36 @@ which Python treats as *true*: loaded as-is it would switch the gate ON.
 The loader refuses anything that is not a bool, naming the field (final
 review F10). For the same reason `login`, like `ordinal` and
 `magic_base`, refuses `true`/`false` (bool is a subclass of int).
+
+`positions` (Plan 1b) is how many positions one signal opens on this
+account; `fixed_lot` is the lot of *each* position, so the exposure is
+positions x fixed_lot. Omitted, `positions` is None: one position per
+surviving take profit, the behaviour before Plan 1b. Set, it is a whole
+number from 1 to MAX_POSITIONS.
+
+`layered_entry` (Plan 1b, the user's amendment of 2026-09-25) opens half
+the positions now and rests the other half as limit orders across the
+entry zone. It defaults to true, with `positions` set or not; false keeps
+the single rule (all at market inside the zone, all as one limit outside
+it). It is a switch, so like `enabled` it must be a real TOML boolean.
+
+A key the loader does not know is refused by name (ruling P1). Ignoring
+it would be silent and could change the trade: a misspelled
+`positons = 4` would open one position per TP instead of four, and a
+`lot = 0.05` would trade `fixed_lot` instead.
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from xaucopier.config.loader import ConfigError, load_policy_dict
+
+#: The most positions one signal may open on one account: a sanity cap, so
+#: a typo like `positions = 100` cannot open a hundred positions.
+MAX_POSITIONS = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +61,54 @@ class AccountCfg:
     ordinal: int
     allow_live: bool
     enabled: bool
+    # None: one position per surviving take profit (the key is omitted).
+    positions: int | None = None
+    # Half the positions open now, half rest as limit orders (the user's
+    # amendment of 2026-09-25). On by default, positions set or not
+    # (ruling P2); false keeps the single entry rule.
+    layered_entry: bool = True
+
+
+#: Every AccountCfg field is read from the TOML key of the same name, so
+#: these are exactly the keys an [[accounts]] block may carry.
+_ACCOUNT_KEYS = tuple(f.name for f in dataclasses.fields(AccountCfg))
+
+#: Keys a user may reach for to set the lot; each is refused with a
+#: pointer to `fixed_lot`, which is the lot per position.
+_LOT_KEYS = frozenset({"lot", "lots", "lot_size"})
+
+
+def _refuse_unknown_keys(entry: dict[str, Any], index: int) -> None:
+    """Raise ConfigError naming the first key in `entry` the loader does not
+    know -- see the module docstring for why one is never ignored."""
+    for key in entry:
+        if key in _ACCOUNT_KEYS:
+            continue
+        account_id = entry.get("account_id")
+        where = f"account {account_id!r}" if isinstance(account_id, str) else f"accounts[{index}]"
+        if key in _LOT_KEYS:
+            hint = "the lot is set with fixed_lot (the lot per position)"
+        else:
+            hint = "check its spelling; an account takes " + ", ".join(_ACCOUNT_KEYS)
+        raise ConfigError(f"{where}: unknown key {key!r} -- {hint}")
+
+
+def _positions_field(account_id: str, value: Any) -> int | None:
+    """`positions`, or None when the key is omitted (TOML has no null).
+    bool is excluded explicitly: `positions = true` must not load as 1."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(
+            f"account {account_id!r}: positions must be a whole number from 1 to "
+            f"{MAX_POSITIONS}, got {value!r}"
+        )
+    if not 1 <= value <= MAX_POSITIONS:
+        raise ConfigError(
+            f"account {account_id!r}: positions = {value} is out of range -- "
+            f"it must be from 1 to {MAX_POSITIONS}"
+        )
+    return value
 
 
 def _field(entry: dict[str, Any], key: str, index: int) -> Any:
@@ -49,7 +119,7 @@ def _field(entry: dict[str, Any], key: str, index: int) -> Any:
 
 
 def _bool_field(account_id: str, key: str, value: Any) -> bool:
-    """A gate field's value, which must be a real boolean -- see the
+    """A gate or switch field's value, which must be a real boolean -- see the
     module docstring for why a quoted "false" must never load."""
     if not isinstance(value, bool):
         raise ConfigError(
@@ -70,6 +140,9 @@ def load_accounts(path: Path) -> tuple[AccountCfg, ...]:
     seen_account_ids: dict[str, Any] = {}
 
     for index, entry in enumerate(raw_accounts):
+        # First, so a misspelled required key is named as what the user
+        # wrote, not reported as the correct key gone missing.
+        _refuse_unknown_keys(entry, index)
         account_id = _field(entry, "account_id", index)
 
         # ordinal is explicit and operator-assigned, never derived from
@@ -138,6 +211,9 @@ def load_accounts(path: Path) -> tuple[AccountCfg, ...]:
                 ordinal=ordinal,
                 allow_live=_bool_field(account_id, "allow_live", entry.get("allow_live", False)),
                 enabled=_bool_field(account_id, "enabled", _field(entry, "enabled", index)),
+                positions=_positions_field(account_id, entry.get("positions")),
+                layered_entry=_bool_field(account_id, "layered_entry",
+                                          entry.get("layered_entry", True)),
             )
         )
 

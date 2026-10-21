@@ -1,6 +1,27 @@
 import pytest
 from pathlib import Path
 from xaucopier.config.loader import load_policy_dict, ConfigError
+from xaucopier.domain.market import Policy
+
+SHIPPED_POLICY = Path(__file__).resolve().parents[1] / "config" / "policy.toml"
+
+
+def test_the_shipped_policy_builds_a_policy_with_the_buffer_in_pips():
+    # Amendment 2026-10-21: the buffer is 1 pip ($0.10 on gold), the old
+    # USD buffer and ladder gap are gone, and every ladder step fires on hit.
+    data = load_policy_dict(SHIPPED_POLICY)
+    assert "be_buffer_usd" not in data and "trail_gap_usd" not in data
+    policy = Policy.from_dict(data)
+    assert policy.be_buffer_pips == 1.0
+    assert policy.ladder_early_pips == ()
+
+
+def test_the_shipped_policys_early_pips_example_loads_once_switched_on(tmp_path: Path):
+    shipped = SHIPPED_POLICY.read_text(encoding="utf-8")
+    assert "\n# ladder_early_pips = [0, 0, 0, 0]" in shipped
+    p = tmp_path / "policy.toml"
+    p.write_text(shipped.replace("\n# ladder_early_pips", "\nladder_early_pips"), encoding="utf-8")
+    assert Policy.from_dict(load_policy_dict(p)).ladder_early_pips == (0, 0, 0, 0)
 
 def test_loads_known_keys(tmp_path: Path):
     p = tmp_path / "policy.toml"

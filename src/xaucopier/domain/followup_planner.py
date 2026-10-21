@@ -14,13 +14,24 @@ from xaucopier.domain.intent import CancelIntent, CloseIntent, ModifyIntent
 from xaucopier.domain.market import MarketSnapshot, Policy
 from xaucopier.domain.money import SymbolSpec, round_price
 from xaucopier.domain.signal import FollowUp, FollowUpOp, Side
+from xaucopier.domain.trailing import breakeven
 
 
 @dataclass(frozen=True, slots=True)
 class LegView:
-    """Live broker truth for one leg."""
+    """Live broker truth for one leg.
+
+    `leg_index` is the position's own number within its plan, unique per
+    leg. `tp_index` is the index into `sig.tps` of the take profit it
+    targets; two legs may share it (see `OrderIntent`). Both are in the
+    broker comment `{base36}-{leg_index}t{tp_index}`, so whoever builds a
+    LegView from the broker reads the `t` part as well: a TP amend matches
+    on `tp_index`, never on `leg_index`. It has no default on purpose, so
+    a producer cannot forget it.
+    """
     position_ticket: int
     leg_index: int
+    tp_index: int
     side: Side
     volume: float
     price_open: float
@@ -39,15 +50,23 @@ class FollowUpPlan:
     notes: tuple[str, ...] = ()
 
 
-def _breakeven_price(leg: LegView, snap: MarketSnapshot, pol: Policy, spec: SymbolSpec) -> float:
-    """Breakeven is the leg's OWN fill plus costs, never the signal's quoted
-    entry — each broker filled somewhere different."""
-    # be_buffer_usd is expected to absorb round-turn commission until Plan 3
-    # models commission properly from broker-supplied per-lot/contract data;
-    # see the "explicitly out of scope" note in the task-9 review.
-    offset = snap.spread_usd + pol.be_buffer_usd
-    raw = leg.price_open + offset if leg.side is Side.BUY else leg.price_open - offset
-    return round_price(raw, spec)
+def _compare_stop(side: Side, new: float, current_sl: float, spec: SymbolSpec) -> int:
+    """How moving the stop to `new` compares with the stop in place: 1 it
+    tightens, 0 it is already there, -1 it would loosen. A BUY's stop
+    tightens upwards, a SELL's downwards.
+
+    The broker's float is compared on the tick grid, so a hair of float
+    noise is neither. MT5 reports a missing stop as 0.0: numerically below
+    every SELL stop, but the loosest stop there is, so anything tightens it.
+    """
+    if current_sl <= 0.0:
+        return 1
+    diff = (new - round_price(current_sl, spec)) * side.sign
+    return (diff > 0) - (diff < 0)
+
+
+def _stops_in_place(legs: list[LegView], spec: SymbolSpec) -> str:
+    return ", ".join(str(sl) for sl in sorted({round_price(leg.sl, spec) for leg in legs}))
 
 
 def plan_followup(
@@ -56,7 +75,15 @@ def plan_followup(
     spec: SymbolSpec,
     snap: MarketSnapshot,
     pol: Policy,
+    *,
+    tps: tuple[float, ...],
 ) -> FollowUpPlan:
+    """`tps` are the take profits of the signal the follow-up resolved to,
+    as posted (sig.tps, the poster's numbering), the same ones the trail is
+    given. "SL to BE" needs TP1, tps[0]: breakeven never goes past it. It
+    has no default on purpose, so a caller cannot forget it."""
+    if not tps:
+        raise ValueError("plan_followup needs the signal's take profits (sig.tps)")
     open_legs = tuple(leg for leg in legs if not leg.is_pending)
     pending_legs = tuple(leg for leg in legs if leg.is_pending)
 
@@ -68,10 +95,20 @@ def plan_followup(
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing open for breakeven",))
         min_dist = min_stop_distance_usd(spec, snap, pol)
         intents = []
+        skipped_already = 0
         skipped_wrong_side = 0
         skipped_too_tight = 0
         for leg in open_legs:
-            be = _breakeven_price(leg, snap, pol, spec)
+            # The trail's own formula: the leg's OWN fill, never the
+            # signal's quoted entry (each broker filled somewhere else),
+            # plus the buffer in pips, never past TP1.
+            be = breakeven(leg.side, leg.price_open, tps[0], spec, pol)
+            # Never loosen: once the trail has passed TP1 the stop is
+            # tighter than breakeven, and moving it back would give away
+            # locked-in profit. That is the normal case, not an error.
+            if _compare_stop(leg.side, be, leg.sl, spec) <= 0:
+                skipped_already += 1
+                continue
             price = snap.bid if leg.side is Side.BUY else snap.ask
             # Refuse a stop that is already on the wrong side of the market.
             if leg.side is Side.BUY and be >= price:
@@ -87,10 +124,11 @@ def plan_followup(
             intents.append(ModifyIntent(account_id="", position_ticket=leg.position_ticket,
                                         sl=be, tp=leg.tp, leg_index=leg.leg_index))
         if not intents:
-            total = skipped_wrong_side + skipped_too_tight
+            total = skipped_already + skipped_wrong_side + skipped_too_tight
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, (
                 f"{total} leg(s) skipped for breakeven "
-                f"({skipped_wrong_side} wrong side, {skipped_too_tight} too tight)",
+                f"({skipped_already} already at or tighter than it, "
+                f"{skipped_wrong_side} wrong side, {skipped_too_tight} too tight)",
             ))
         return FollowUpPlan(tuple(intents))
 
@@ -151,10 +189,14 @@ def plan_followup(
             return FollowUpPlan((), RejectReason.NOT_APPLICABLE, ("nothing open to amend",))
         # An SL amend reaches every open leg: one signal has one shared stop.
         # A TP amend does not -- each leg owns its own target, so the poster
-        # must say which one. "TP2 to 4550" names leg_index 1 (the hint is
-        # 1-based, leg_index is 0-based); a bare "tp to 4550" names nothing,
-        # and writing one price across a four-leg ladder is never what was
-        # meant, so it fails loudly instead.
+        # must say which one. "TP2 to 4550" names tp_index 1 (the hint is
+        # 1-based, tp_index is 0-based into sig.tps) and moves EVERY open
+        # position on that TP: with more positions than TPs the extras cycle
+        # over the TPs again, so one TP can have several. It never names
+        # leg_index, which is only the position's ordinal: once TP1 has
+        # passed at entry, ordinal 0 targets TP2. A bare "tp to 4550" names
+        # nothing, and writing one price across a four-leg ladder is never
+        # what was meant, so it fails loudly instead.
         targets = open_legs
         if fu.op is FollowUpOp.AMEND_TP:
             if fu.tp_index_hint is None:
@@ -163,13 +205,44 @@ def plan_followup(
                     "flattens every target",
                 ))
             wanted = fu.tp_index_hint - 1
-            targets = tuple(leg for leg in open_legs if leg.leg_index == wanted)
+            targets = tuple(leg for leg in open_legs if leg.tp_index == wanted)
             if not targets:
                 return FollowUpPlan((), RejectReason.AMBIGUOUS_TARGET, (
-                    f"no open leg for TP{fu.tp_index_hint} (leg_index {wanted})",
+                    f"no open leg for TP{fu.tp_index_hint} (tp_index {wanted})",
                 ))
 
         new = round_price(fu.price_hint, spec)
+        notes: tuple[str, ...] = ()
+        if fu.op is FollowUpOp.AMEND_SL:
+            # Never loosen (spec amendment 2026-09-23): a channel "SL to ..."
+            # may tighten the stop, never loosen it. Each leg is judged
+            # against its OWN live stop -- breakeven is per position, so one
+            # amend can tighten one leg and loosen its sibling. The legs it
+            # tightens go on to today's checks; the rest keep their stop.
+            tighten, level, looser = [], [], []
+            for leg in targets:
+                change = _compare_stop(leg.side, new, leg.sl, spec)
+                if change > 0:
+                    tighten.append(leg)
+                elif change == 0:
+                    level.append(leg)
+                else:
+                    looser.append(leg)
+            if not tighten:
+                if looser:
+                    return FollowUpPlan((), RejectReason.WOULD_LOOSEN, (
+                        f"amended {looser[0].side.value} stop {new} would loosen the "
+                        f"stop in place ({_stops_in_place(looser, spec)}) on "
+                        f"{len(looser)} leg(s)",
+                    ))
+                return FollowUpPlan((), RejectReason.NOT_APPLICABLE, (
+                    f"amended stop {new} is already the stop on {len(level)} leg(s)",
+                ))
+            if looser:
+                notes = (f"{len(looser)} leg(s) kept the tighter stop in place "
+                         f"({_stops_in_place(looser, spec)}): amended stop {new} "
+                         "would loosen it",)
+            targets = tuple(tighten)
         min_dist = min_stop_distance_usd(spec, snap, pol)
         intents = []
         for leg in targets:
@@ -201,6 +274,6 @@ def plan_followup(
                                         (f"amended sell tp {new} is not below "
                                          f"price {price} and sl {leg.sl}",))
                 intents.append(ModifyIntent("", leg.position_ticket, leg.sl, new, leg.leg_index))
-        return FollowUpPlan(tuple(intents))
+        return FollowUpPlan(tuple(intents), notes=notes)
 
     return FollowUpPlan((), RejectReason.NOT_APPLICABLE, (f"unhandled op {fu.op}",))

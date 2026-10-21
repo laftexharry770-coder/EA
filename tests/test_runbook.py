@@ -3,11 +3,23 @@ the exit codes, and the commands to type. These tests fail if the two
 drift apart."""
 from __future__ import annotations
 
+import dataclasses
+import json
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import xaucopier.cli.main as cli_main
 from xaucopier.cli import exit_codes
+from xaucopier.config.loader import load_policy_dict
+from xaucopier.domain.errors import RejectReason
+from xaucopier.domain.followup_planner import LegView, plan_followup
+from xaucopier.domain.market import AccountSpec, MarketSnapshot, Policy
+from xaucopier.domain.money import SymbolSpec
+from xaucopier.domain.planner import distribute, plan_entry
+from xaucopier.domain.signal import FollowUp, FollowUpOp, Side
+from xaucopier.domain.trailing import OpenLeg, breakeven, target_stops
+from xaucopier.parsing.channel_mmh import parse
 
 RUNBOOK = (Path(__file__).resolve().parents[1] / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
 
@@ -214,3 +226,260 @@ def test_the_runbook_says_a_change_to_an_instruction_not_carried_out_is_reported
         "it was not carried out, and what it\n  says now: if you applied it by hand, review "
         "what you did." in RUNBOOK
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 1b Task 5: "Choosing how many positions and what lot size". Its two
+# tables are worked on the real signal (BUY 4480-4485, SL 4470, TPs 4490 /
+# 4495 / 4500 / 4505), and are checked here against the code that will
+# trade it.
+# ---------------------------------------------------------------------------
+
+POSITIONS_SECTION = RUNBOOK.split("## Choosing how many positions and what lot size", 1)[-1] \
+    .split("\n## ", 1)[0]
+REAL_TPS = (4490.0, 4495.0, 4500.0, 4505.0)
+GOLD = SymbolSpec("XAUUSD", 2, 0.01, 0.01, 0.01, 100.0, 0.01, 0, 0)
+
+
+def _real_signal():
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json")
+                         .read_text(encoding="utf-8"))
+    result = parse(fixture["text"], channel_id=fixture["channel_id"],
+                   message_id=fixture["message_id"],
+                   posted_at_utc=datetime.fromisoformat(fixture["posted_at_utc"]))
+    assert result.ok and result.signal.tps == REAL_TPS, result
+    return result.signal
+
+
+def test_the_runbook_explains_positions_lot_layered_entry_and_the_trail() -> None:
+    assert "## Choosing how many positions and what lot size" in RUNBOOK
+    flat = " ".join(POSITIONS_SECTION.split())
+    for phrase in (
+        "This version does not place trades yet.",
+        "**`fixed_lot`** is the lot size of **each** position",
+        "**What you risk is positions × lot.** 4 positions of 0.01 lot are 0.04 lot in total",
+        "4 × 12.55 = $50.20",
+        # Amendment 2026-10-21: the extras cycle, like the user's EA.
+        "the extra ones go round again from the first take profit",
+        "the first two",
+        "It is on unless you switch it off, also while `positions` is left out.",
+        "two wait at 4482.70 and 4480",
+        "On this signal that is a price above 4486.25: at 4486 two still buy at once, "
+        "at 4487.50 none do.",
+        "cancelled when the price reaches the first take profit, or 4 hours after the signal",
+        "is **not placed** at all",
+        '"not placed: price already past TP1"',
+        "delete the `# ` in front of `layered_entry = false`",
+        "It **only ever moves in your favour**.",
+        # Amendment 2026-10-21: the EA's ladder, the buffer in pips, a pip
+        # fixed at $0.10, and the early steps -- in plain words.
+        "**the stop loss moves one step behind each take profit the price reaches.**",
+        "When the price reaches TP2, the stop loss moves to TP1. At TP3 it moves to TP2, "
+        "at TP4 to TP3, and so on",
+        "the price that position was bought at, plus 1 pip ($0.10). For a sell, the price "
+        "it was sold at, minus 1 pip.",
+        "**1 pip is $0.10 on gold, on every broker.**",
+        "a pip here is $0.10 on both",
+        "`be_buffer_pips = 1.0` in `config\\policy.toml`: 1 pip, $0.10. 2.0 would be $0.20.",
+        "a position bought less than 1 pip below TP1 gets TP1 itself",
+        '"20 pips early" means the step happens when the price is 20 pips ($2.00) short '
+        "of its take profit, instead of at it.",
+        "`# ladder_early_pips = [0, 0, 0, 0]`",
+        "0 means \"when the take profit is reached\", and a step with no number is 0 too.",
+        "delete the `# ` at the start of that line, change the numbers and save",
+        "A stop loss is never put at or past a position's own take profit.",
+        'A channel message like "move SL to …" is followed only when it moves the stop '
+        "loss in your favour. One that would move it back is not followed.",
+        "There is no `lot` setting; the lot is `fixed_lot`.",
+    ):
+        assert phrase in flat, phrase
+    # The old ladder is gone from the page.
+    for gone in ("$2 past", "halfway", "plus the spread"):
+        assert gone not in flat, gone
+
+
+def test_the_runbooks_take_profit_table_is_what_the_planner_does() -> None:
+    rows = re.findall(r"^\| `positions = (\d+)` \| ([\d, ]+)", POSITIONS_SECTION,
+                      flags=re.MULTILINE)
+    assert [n for n, _ in rows] == ["4", "6", "9", "2", "1"]
+    for n, documented in rows:
+        planned = tuple(tp for _, tp in distribute(int(n), tuple(enumerate(REAL_TPS))))
+        assert tuple(float(tp) for tp in documented.split(",")) == planned, n
+
+
+def test_the_runbooks_layered_entry_examples_are_what_the_planner_does() -> None:
+    """Each position's (order kind, entry price) when the real signal is
+    planned with 4 positions at the ask the runbook names."""
+    signal = _real_signal()
+
+    def entries(ask: float, layered: bool = True) -> list[tuple[str, float]]:
+        account = AccountSpec("ic_demo", "XAUUSD", fixed_lot=0.01, magic_base=77001,
+                              positions=4, layered_entry=layered)
+        at = signal.posted_at_utc + timedelta(seconds=5)
+        snap = MarketSnapshot(bid=round(ask - 0.10, 2), ask=ask, tick_time_utc=at,
+                              spread_usd=0.10, median_spread_usd=0.10, now_utc=at)
+        plan = plan_entry(signal, account, GOLD, snap, Policy())
+        assert plan.accepted, plan
+        return [(leg.kind.value, leg.price) for leg in plan.legs]
+
+    # "with the price at 4483 ... two buy at once at 4483 (take profits 4490
+    # and 4500) and two wait at 4482.70 and 4480 (take profits 4495 and 4505)"
+    assert entries(4483.00) == [("market", 4483.0), ("limit", 4482.7),
+                                ("market", 4483.0), ("limit", 4480.0)]
+    # "below the whole zone ... all the positions open at once"
+    assert entries(4479.00) == [("market", 4479.0)] * 4
+    # "a price above 4486.25: at 4486 two still buy at once, at 4487.50 none
+    # do", and the waiting half then spreads over the whole zone, 4485-4480.
+    for ask in (4486.00, 4486.25):
+        assert [kind for kind, _ in entries(ask)] == ["market", "limit", "market", "limit"], ask
+    for ask in (4486.26, 4487.50):
+        assert entries(ask) == [("limit", 4485.0), ("limit", 4485.0),
+                                ("limit", 4485.0), ("limit", 4480.0)], ask
+    # Switched off: "at once while the price is in the zone or better,
+    # otherwise as limit orders at the zone's best edge (the bottom, for a buy)"
+    assert entries(4483.00, layered=False) == [("market", 4483.0)] * 4
+    assert entries(4479.00, layered=False) == [("market", 4479.0)] * 4
+    assert entries(4487.50, layered=False) == [("limit", 4480.0)] * 4
+
+
+# ---------------------------------------------------------------------------
+# Plan 1b Task 6 (spec amendment 2026-10-21): the trailing stop is the
+# user's EA's ladder -- TP1 reached: breakeven, the fill + 1 pip; TPk
+# reached: TP(k-1). Every example the runbook gives is checked here.
+# ---------------------------------------------------------------------------
+
+TRAIL_NOW = datetime(2026, 9, 5, 10, 46, tzinfo=UTC)
+SHIPPED_POLICY = Path(__file__).resolve().parents[1] / "config" / "policy.toml"
+
+
+def _bid(bid: float, spread: float = 0.10) -> MarketSnapshot:
+    return MarketSnapshot(bid=bid, ask=round(bid + spread, 2), tick_time_utc=TRAIL_NOW,
+                          spread_usd=spread, median_spread_usd=0.10, now_utc=TRAIL_NOW)
+
+
+def _trail(leg: OpenLeg, bids, policy: Policy = Policy(), spec: SymbolSpec = GOLD) -> OpenLeg:
+    """Each bid in turn, with every move fed back in as the stop in place."""
+    for bid in bids:
+        for move in target_stops(Side.BUY, REAL_TPS, (leg,), _bid(bid), spec, policy):
+            leg = dataclasses.replace(leg, current_sl=move.new_sl)
+    return leg
+
+
+def test_the_runbooks_trailing_table_is_what_the_trail_does() -> None:
+    """Row by row, the stop of the last position (TP4, bought at 4482.55)
+    as the trail moves it, and how many positions are still open."""
+    rows = re.findall(r"^\| (\d{4}\.\d{2})[^|]*\| [^|\d]*(\d{4}\.\d{2})[^|]*\| (\d)\b",
+                      POSITIONS_SECTION, flags=re.MULTILINE)
+    assert [price for price, _, _ in rows] == ["4490.00", "4495.00", "4500.00"]
+    leg = OpenLeg(position_ticket=1, price_open=4482.55, current_sl=4470.0, tp=4505.0)
+    for price, stop, still_open in rows:
+        bid = float(price)
+        leg = _trail(leg, (bid,))
+        assert leg.current_sl == float(stop), price
+        assert int(still_open) == sum(tp > bid for tp in REAL_TPS), price
+    # "If it falls back instead, the stop loss stays at 4495.00."
+    assert _trail(leg, (4497.0, 4492.0, 4490.0)).current_sl == 4495.0
+
+
+def test_the_runbooks_steps_go_on_one_take_profit_behind() -> None:
+    # "At TP3 it moves to TP2, at TP4 to TP3, and so on for as many take
+    # profits as the signal has": on five TPs, TP5 moves the stop to TP4.
+    five = REAL_TPS + (4510.0,)
+    leg = OpenLeg(position_ticket=1, price_open=4482.55, current_sl=4500.0, tp=0.0)
+    moves = target_stops(Side.BUY, five, (leg,), _bid(4510.0), GOLD, Policy())
+    assert [(move.new_sl, move.rung) for move in moves] == [(4505.0, "TP4")]
+    # And on the real signal, TP4 moves a stop still at TP2 to TP3.
+    leg = OpenLeg(position_ticket=1, price_open=4482.55, current_sl=4495.0, tp=0.0)
+    assert _trail(leg, (4505.0,)).current_sl == 4500.0
+
+
+def test_the_runbooks_breakeven_examples_are_what_the_trail_does() -> None:
+    # "plus 1 pip ($0.10)": bought at 4482.55, breakeven 4482.65.
+    assert breakeven(Side.BUY, 4482.55, 4490.0, GOLD, Policy()) == 4482.65
+    # "For a sell, the price it was sold at, minus 1 pip."
+    assert breakeven(Side.SELL, 4517.45, 4510.0, GOLD, Policy()) == 4517.35
+    # "A waiting order that filled at 4480 gets 4480.10."
+    leg = OpenLeg(position_ticket=1, price_open=4480.0, current_sl=4470.0, tp=4505.0)
+    assert _trail(leg, (4490.0,)).current_sl == 4480.10
+    # "2.0 would be $0.20."
+    assert breakeven(Side.BUY, 4482.55, 4490.0, GOLD, Policy(be_buffer_pips=2.0)) == 4482.75
+    # "a position bought less than 1 pip below TP1 gets TP1 itself"
+    assert breakeven(Side.BUY, 4489.95, 4490.0, GOLD, Policy()) == 4490.0
+
+
+def test_the_runbooks_pip_is_ten_cents_on_a_two_and_a_three_decimal_broker() -> None:
+    three_decimals = SymbolSpec("XAUUSDm", 3, 0.001, 0.001, 0.01, 100.0, 0.01, 0, 0)
+    assert breakeven(Side.BUY, 4482.55, 4490.0, GOLD, Policy()) == 4482.65
+    assert breakeven(Side.BUY, 4482.553, 4490.0, three_decimals, Policy()) == 4482.653
+    early = Policy(ladder_early_pips=(0, 0, 20))
+    for spec in (GOLD, three_decimals):
+        leg = OpenLeg(position_ticket=1, price_open=4482.55, current_sl=4490.0, tp=4505.0)
+        assert _trail(leg, (4497.99,), early, spec).current_sl == 4490.0, spec.name
+        assert _trail(leg, (4498.0,), early, spec).current_sl == 4495.0, spec.name
+
+
+def test_the_runbooks_settings_are_the_shipped_policy_file() -> None:
+    shipped = SHIPPED_POLICY.read_text(encoding="utf-8")
+    assert "\n# ladder_early_pips = [0, 0, 0, 0]" in shipped
+    policy = Policy.from_dict(load_policy_dict(SHIPPED_POLICY))
+    # "`be_buffer_pips = 1.0` ... 1 pip, $0.10" and "While the line is left
+    # out, every step happens at its take profit."
+    assert policy.be_buffer_pips == 1.0
+    assert policy.ladder_early_pips == ()
+
+
+def test_the_runbooks_early_step_example_is_what_the_trail_does() -> None:
+    """`ladder_early_pips = [0, 0, 20]` "moves the stop loss to TP2 at
+    4498.00 on the signal above, 20 pips before TP3, instead of at
+    4500.00"; the TP4 step, with no number, still waits for 4505."""
+    early = Policy.from_dict({"ladder_early_pips": [0, 0, 20]})
+    leg = OpenLeg(position_ticket=1, price_open=4482.55, current_sl=4470.0, tp=4505.0)
+    leg = _trail(leg, (4490.0, 4495.0), early)
+    assert leg.current_sl == 4490.0
+    assert _trail(leg, (4497.99,), early).current_sl == 4490.0
+    leg = _trail(leg, (4498.0,), early)
+    assert leg.current_sl == 4495.0
+    # Left out, the same step waits for TP3 itself.
+    on_hit = OpenLeg(position_ticket=1, price_open=4482.55, current_sl=4490.0, tp=4505.0)
+    assert _trail(on_hit, (4498.0, 4499.99)).current_sl == 4490.0
+    assert _trail(on_hit, (4500.0,)).current_sl == 4495.0
+    # "a step with no number is 0 too": TP4's step is at 4505.
+    assert _trail(leg, (4504.99,), early).current_sl == 4495.0
+    assert _trail(leg, (4505.0,), early).current_sl == 4500.0
+
+
+def test_the_runbooks_broker_refusal_and_own_take_profit_rules() -> None:
+    # "the stop goes to the best step the broker does accept, and on to the
+    # better one as soon as the broker accepts that": at TP2 with a spread
+    # of 2.00 the broker needs 6.00, TP1 is 5.00 away, so breakeven first.
+    leg = OpenLeg(position_ticket=1, price_open=4482.55, current_sl=4470.0, tp=4505.0)
+    moves = target_stops(Side.BUY, REAL_TPS, (leg,), _bid(4495.0, spread=2.00), GOLD, Policy())
+    assert [(move.new_sl, move.rung) for move in moves] == [(4482.65, "BE")]
+    leg = dataclasses.replace(leg, current_sl=4482.65)
+    assert _trail(leg, (4495.0,)).current_sl == 4490.0
+    # "A stop loss is never put at or past a position's own take profit":
+    # the TP2 position, still open at 4500, gets TP1, not its own 4495.
+    tp2 = OpenLeg(position_ticket=2, price_open=4482.55, current_sl=4482.65, tp=4495.0)
+    assert _trail(tp2, (4500.0,)).current_sl == 4490.0
+
+
+def test_the_runbooks_move_sl_rule_is_what_the_follow_up_planner_does() -> None:
+    """At the trailing table's last row the bid is 4500 and the last
+    position's stop is 4495. "SL to 4490" would move it back; "SL to 4497"
+    moves it in the user's favour."""
+    now = datetime(2026, 9, 5, 10, 50, tzinfo=UTC)
+    snap = MarketSnapshot(bid=4500.0, ask=4500.10, tick_time_utc=now,
+                          spread_usd=0.10, median_spread_usd=0.10, now_utc=now)
+    last = LegView(position_ticket=1, leg_index=3, tp_index=3, side=Side.BUY, volume=0.01,
+                   price_open=4482.55, sl=4495.0, tp=4505.0, is_pending=False)
+
+    def move_sl_to(price: float):
+        follow_up = FollowUp(channel_id=-1001111111111, message_id=4002,
+                             op=FollowUpOp.AMEND_SL, posted_at_utc=now,
+                             reply_to_message_id=4001, price_hint=price)
+        return plan_followup(follow_up, (last,), GOLD, snap, Policy(), tps=REAL_TPS)
+
+    back = move_sl_to(4490.0)
+    assert back.intents == () and back.reason is RejectReason.WOULD_LOOSEN
+    favour = move_sl_to(4497.0)
+    assert favour.reason is None and [intent.sl for intent in favour.intents] == [4497.0]

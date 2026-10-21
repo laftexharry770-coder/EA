@@ -22,3 +22,4 @@ class RejectReason(str, Enum):
     NOT_APPLICABLE = "not_applicable"
     AMBIGUOUS_TARGET = "ambiguous_target"
     PENDING_ONLY = "pending_only"
+    WOULD_LOOSEN = "would_loosen"

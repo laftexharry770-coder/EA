@@ -6,7 +6,14 @@ terminal_path = "C:\\MT5\\bot-icmarkets\\terminal64.exe"
 login         = 53027243
 server        = "ICMarketsKE-Demo"
 symbol        = "XAUUSD"
+# fixed_lot is the lot size of EACH position: a signal opens positions x
+# fixed_lot in total (4 positions of 0.01 = 0.04 lots). docs/RUNBOOK.md,
+# "Choosing how many positions and what lot size", explains both settings.
 fixed_lot     = 0.01
+# positions = 4   # how many positions to open per signal
+#                 # (left out: one position per take profit)
+# layered_entry = false   # left out, it is on: half the positions open at
+#                         # once, half wait as limit orders in the entry zone
 magic_base    = 77001
 ordinal       = 1
 allow_live    = false

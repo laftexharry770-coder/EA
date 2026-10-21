@@ -3,6 +3,8 @@
 Gold is quoted to 2 decimals on FxPro/ICMarkets/FBS and 3 on Exness. Every
 threshold in this system is a USD float; usd_to_points is the single point
 of conversion, and it needs the SymbolSpec to know which feed it is on.
+The two policy settings in pips (be_buffer_pips, ladder_early_pips) are
+turned into USD with the fixed market.PIP_USD, never with a feed's point.
 """
 from __future__ import annotations
 

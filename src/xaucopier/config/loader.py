@@ -24,7 +24,9 @@ def _assert_no_points_keys(node: Any, trail: str = "") -> None:
     Gold is 2-digit on FxPro/ICMarkets/FBS and 3-digit on Exness, so a
     threshold expressed in points means a 10x different distance depending
     on the broker. Every threshold in this system is USD; the conversion
-    lives in money.usd_to_points and nowhere else.
+    lives in money.usd_to_points and nowhere else. The two exceptions are
+    in pips, be_buffer_pips and ladder_early_pips, at the fixed
+    market.PIP_USD of $0.10 a pip, never derived from the broker's point.
     """
     if isinstance(node, dict):
         for key, value in node.items():
