@@ -3,11 +3,22 @@ the exit codes, and the commands to type. These tests fail if the two
 drift apart."""
 from __future__ import annotations
 
+import dataclasses
+import json
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import xaucopier.cli.main as cli_main
 from xaucopier.cli import exit_codes
+from xaucopier.domain.errors import RejectReason
+from xaucopier.domain.followup_planner import LegView, plan_followup
+from xaucopier.domain.market import AccountSpec, MarketSnapshot, Policy
+from xaucopier.domain.money import SymbolSpec
+from xaucopier.domain.planner import distribute, plan_entry
+from xaucopier.domain.signal import FollowUp, FollowUpOp, Side
+from xaucopier.domain.trailing import OpenLeg, target_stops
+from xaucopier.parsing.channel_mmh import parse
 
 RUNBOOK = (Path(__file__).resolve().parents[1] / "docs" / "RUNBOOK.md").read_text(encoding="utf-8")
 
@@ -214,3 +225,137 @@ def test_the_runbook_says_a_change_to_an_instruction_not_carried_out_is_reported
         "it was not carried out, and what it\n  says now: if you applied it by hand, review "
         "what you did." in RUNBOOK
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 1b Task 5: "Choosing how many positions and what lot size". Its two
+# tables are worked on the real signal (BUY 4480-4485, SL 4470, TPs 4490 /
+# 4495 / 4500 / 4505), and are checked here against the code that will
+# trade it.
+# ---------------------------------------------------------------------------
+
+POSITIONS_SECTION = RUNBOOK.split("## Choosing how many positions and what lot size", 1)[-1] \
+    .split("\n## ", 1)[0]
+REAL_TPS = (4490.0, 4495.0, 4500.0, 4505.0)
+GOLD = SymbolSpec("XAUUSD", 2, 0.01, 0.01, 0.01, 100.0, 0.01, 0, 0)
+
+
+def _real_signal():
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json")
+                         .read_text(encoding="utf-8"))
+    result = parse(fixture["text"], channel_id=fixture["channel_id"],
+                   message_id=fixture["message_id"],
+                   posted_at_utc=datetime.fromisoformat(fixture["posted_at_utc"]))
+    assert result.ok and result.signal.tps == REAL_TPS, result
+    return result.signal
+
+
+def test_the_runbook_explains_positions_lot_layered_entry_and_the_trail() -> None:
+    assert "## Choosing how many positions and what lot size" in RUNBOOK
+    flat = " ".join(POSITIONS_SECTION.split())
+    for phrase in (
+        "This version does not place trades yet.",
+        "**`fixed_lot`** is the lot size of **each** position",
+        "**What you risk is positions × lot.** 4 positions of 0.01 lot are 0.04 lot in total",
+        "4 × 12.55 = $50.20",
+        "the extra ones go to the last",
+        "the first two",
+        "It is on unless you switch it off, also while `positions` is left out.",
+        "two wait at 4482.70 and 4480",
+        "On this signal that is a price above 4486.25: at 4486 two still buy at once, "
+        "at 4487.50 none do.",
+        "cancelled when the price reaches the first take profit, or 4 hours after the signal",
+        "is **not placed** at all",
+        '"not placed: price already past TP1"',
+        "delete the `# ` in front of `layered_entry = false`",
+        "It **only ever moves in your favour**.",
+        'A channel message like "move SL to …" is followed only when it moves the stop '
+        "loss in your favour. One that would move it back is not followed.",
+        "There is no `lot` setting; the lot is `fixed_lot`.",
+    ):
+        assert phrase in flat, phrase
+
+
+def test_the_runbooks_take_profit_table_is_what_the_planner_does() -> None:
+    rows = re.findall(r"^\| `positions = (\d+)` \| ([\d, ]+)", POSITIONS_SECTION,
+                      flags=re.MULTILINE)
+    assert [n for n, _ in rows] == ["4", "6", "2", "1"]
+    for n, documented in rows:
+        planned = tuple(tp for _, tp in distribute(int(n), tuple(enumerate(REAL_TPS))))
+        assert tuple(float(tp) for tp in documented.split(",")) == planned, n
+
+
+def test_the_runbooks_layered_entry_examples_are_what_the_planner_does() -> None:
+    """Each position's (order kind, entry price) when the real signal is
+    planned with 4 positions at the ask the runbook names."""
+    signal = _real_signal()
+
+    def entries(ask: float, layered: bool = True) -> list[tuple[str, float]]:
+        account = AccountSpec("ic_demo", "XAUUSD", fixed_lot=0.01, magic_base=77001,
+                              positions=4, layered_entry=layered)
+        at = signal.posted_at_utc + timedelta(seconds=5)
+        snap = MarketSnapshot(bid=round(ask - 0.10, 2), ask=ask, tick_time_utc=at,
+                              spread_usd=0.10, median_spread_usd=0.10, now_utc=at)
+        plan = plan_entry(signal, account, GOLD, snap, Policy())
+        assert plan.accepted, plan
+        return [(leg.kind.value, leg.price) for leg in plan.legs]
+
+    # "with the price at 4483 ... two buy at once at 4483 (take profits 4490
+    # and 4500) and two wait at 4482.70 and 4480 (take profits 4495 and 4505)"
+    assert entries(4483.00) == [("market", 4483.0), ("limit", 4482.7),
+                                ("market", 4483.0), ("limit", 4480.0)]
+    # "below the whole zone ... all the positions open at once"
+    assert entries(4479.00) == [("market", 4479.0)] * 4
+    # "a price above 4486.25: at 4486 two still buy at once, at 4487.50 none
+    # do", and the waiting half then spreads over the whole zone, 4485-4480.
+    for ask in (4486.00, 4486.25):
+        assert [kind for kind, _ in entries(ask)] == ["market", "limit", "market", "limit"], ask
+    for ask in (4486.26, 4487.50):
+        assert entries(ask) == [("limit", 4485.0), ("limit", 4485.0),
+                                ("limit", 4485.0), ("limit", 4480.0)], ask
+    # Switched off: "at once while the price is in the zone or better,
+    # otherwise as limit orders at the zone's best edge (the bottom, for a buy)"
+    assert entries(4483.00, layered=False) == [("market", 4483.0)] * 4
+    assert entries(4479.00, layered=False) == [("market", 4479.0)] * 4
+    assert entries(4487.50, layered=False) == [("limit", 4480.0)] * 4
+
+
+def test_the_runbooks_trailing_table_is_what_the_trail_does() -> None:
+    """Row by row, the stop of the last position (TP4, bought at 4482.55)
+    as the trail moves it, and how many positions are still open."""
+    rows = re.findall(r"^\| (\d{4}\.\d{2})[^|]*\| [^|\d]*(\d{4}\.\d{2})[^|]*\| (\d)\b",
+                      POSITIONS_SECTION, flags=re.MULTILINE)
+    assert [price for price, _, _ in rows] == [
+        "4490.00", "4492.00", "4495.00", "4497.50", "4500.00", "4502.00"]
+    now = datetime(2026, 9, 5, 10, 46, tzinfo=UTC)
+    leg = OpenLeg(position_ticket=1, price_open=4482.55, current_sl=4470.0)
+    for price, stop, still_open in rows:
+        bid = float(price)
+        snap = MarketSnapshot(bid=bid, ask=round(bid + 0.10, 2), tick_time_utc=now,
+                              spread_usd=0.10, median_spread_usd=0.10, now_utc=now)
+        for move in target_stops(Side.BUY, REAL_TPS, (leg,), snap, GOLD, Policy()):
+            leg = dataclasses.replace(leg, current_sl=move.new_sl)
+        assert leg.current_sl == float(stop), price
+        assert int(still_open) == sum(tp > bid for tp in REAL_TPS), price
+
+
+def test_the_runbooks_move_sl_rule_is_what_the_follow_up_planner_does() -> None:
+    """At the trailing table's last row the bid is 4502 and the last
+    position's stop is 4500. "SL to 4495" would move it back; "SL to 4501"
+    moves it in the user's favour."""
+    now = datetime(2026, 9, 5, 10, 50, tzinfo=UTC)
+    snap = MarketSnapshot(bid=4502.0, ask=4502.10, tick_time_utc=now,
+                          spread_usd=0.10, median_spread_usd=0.10, now_utc=now)
+    last = LegView(position_ticket=1, leg_index=3, tp_index=3, side=Side.BUY, volume=0.01,
+                   price_open=4482.55, sl=4500.0, tp=4505.0, is_pending=False)
+
+    def move_sl_to(price: float):
+        follow_up = FollowUp(channel_id=-1001111111111, message_id=4002,
+                             op=FollowUpOp.AMEND_SL, posted_at_utc=now,
+                             reply_to_message_id=4001, price_hint=price)
+        return plan_followup(follow_up, (last,), GOLD, snap, Policy())
+
+    back = move_sl_to(4495.0)
+    assert back.intents == () and back.reason is RejectReason.WOULD_LOOSEN
+    favour = move_sl_to(4501.0)
+    assert favour.reason is None and [intent.sl for intent in favour.intents] == [4501.0]

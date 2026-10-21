@@ -371,6 +371,103 @@ until you run `.\xaucopier resolve-channels` for it (step 3).
 > `status` shows a **TEMPLATE_CHANGED_SUSPECTED** alert. If you add such a
 > channel, tell whoever looks after xaucopier.
 
+## Choosing how many positions and what lot size
+
+This version does not place trades yet. These settings decide how each
+signal will be traded once a version that trades is installed. Until then
+they change nothing, but `watch` already checks them when it starts.
+
+Both are in `config\accounts.toml`, in your account's block. Open it with
+Notepad, make the change, save it, and restart `watch` (**Ctrl+C**, **Y**,
+then `.\xaucopier watch`).
+
+- **`fixed_lot`** is the lot size of **each** position, for example
+  `fixed_lot = 0.01`.
+- **`positions`** is how many positions one signal opens, from 1 to 20.
+  The file has the line `# positions = 4`: to use it, delete the `# ` at
+  the start of that line and save. While it is left out, a signal opens
+  one position per take profit.
+- **What you risk is positions × lot.** 4 positions of 0.01 lot are 0.04
+  lot in total, the same as one trade of 0.04 lot. With gold's usual
+  contract (100 ounces per lot), each 0.01 lot makes or loses about $1 for
+  every $1 the price moves. So on the signal below, 4 positions of 0.01
+  lot bought at 4482.55 lose about 4 × 12.55 = $50.20 if they all hit the
+  stop loss at 4470.
+- **A misspelled setting is never ignored:** `watch` refuses to start
+  (exit code 5) and names the word it does not know. There is no `lot`
+  setting; the lot is `fixed_lot`.
+
+**Each position has its own take profit, and closes there.** The examples
+use a real signal: BUY 4480–4485, stop loss 4470, take profits 4490, 4495,
+4500 and 4505.
+
+| You set | The positions' take profits |
+|---|---|
+| `positions = 4` | 4490, 4495, 4500, 4505 (one each) |
+| `positions = 6` | 4490, 4495, 4500, 4505, 4505, 4505 (the extra ones go to the last) |
+| `positions = 2` | 4490, 4495 (the first two) |
+| `positions = 1` | 4490 |
+
+**Layered entry: half now, half waiting.** It is on unless you switch it
+off, also while `positions` is left out.
+
+- Half the positions open at once. With an odd number the extra one opens
+  at once, so a single position always does.
+- The other half wait as **limit orders**: orders that buy only if the
+  price comes down to them (for a sell: that sell only if the price comes
+  up to them). They are spread over the part of the entry zone that is
+  better than the price now. For example, with the price at 4483 and 4
+  positions, two buy at once at 4483 (take profits 4490 and 4500) and two
+  wait at 4482.70 and 4480 (take profits 4495 and 4505).
+- If the price is already below the whole zone (above it, for a sell), all
+  the positions open at once.
+- If the price has already run above the zone (below it, for a sell) by
+  more than $1.00, and by more than a quarter of the way from the zone to
+  the first take profit, the "at once" half waits at the zone's top edge
+  (bottom, for a sell) instead, and the other half waits spread over the
+  whole zone. On this signal that is a price above 4486.25: at 4486 two
+  still buy at once, at 4487.50 none do.
+- A waiting order that has not filled is **cancelled when the price reaches
+  the first take profit, or 4 hours after the signal**, whichever comes
+  first.
+- So a signal that arrives when the price has already reached its first
+  take profit is **not placed** at all, rather than placing orders only to
+  cancel them straight away. The version that trades will say
+  "not placed: price already past TP1".
+- To switch it off, delete the `# ` in front of `layered_entry = false`.
+  Then all the positions open together: at once while the price is in the
+  zone or better, otherwise as limit orders at the zone's best edge (the
+  bottom, for a buy).
+
+**The trailing stop.** Once a trade is in profit, the stop loss of every
+open position moves up behind the price (down, for a sell) in steps, so
+profit already made is kept. It **only ever moves in your favour**. On the
+signal above, with 4 positions all bought at 4482.55 (layered entry
+switched off) and a spread of 0.10:
+
+| When the price reaches | The stop loss moves to | Positions still open |
+|---|---|---|
+| 4490.00, TP1 | 4482.75, breakeven: the price paid, plus the spread, plus 10 cents | 3: the first closed at its take profit |
+| 4492.00, $2 past TP1 | 4490.00 | 3 |
+| 4495.00, TP2 | stays at 4490.00 | 2 |
+| 4497.50, halfway from TP2 to TP3 | 4495.00 | 2 |
+| 4500.00, TP3 | stays at 4495.00 | 1 |
+| 4502.00, $2 past TP3 | 4500.00 | 1 |
+
+If the price goes on to 4505 (TP4), the last position closes there. If it
+falls back instead, the stop loss stays at 4500.00, and the last position
+closes there with its profit kept.
+
+- With more take profits the steps go on the same way: halfway from TP4 to
+  TP5, then $2 past TP5, and so on. The last take profit has no step: the
+  last positions close there.
+- Each position's breakeven is its own. A waiting order that filled at
+  4480 gets 4480.20.
+- If the broker would refuse a stop that close to the price, the stop goes
+  to the best step the broker does accept.
+- A channel message like "move SL to …" is followed only when it moves the
+  stop loss in your favour. One that would move it back is not followed.
+
 ## What the exit codes mean
 
 When a command cannot do what you asked, its last line is its exit code,

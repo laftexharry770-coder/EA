@@ -217,3 +217,22 @@ def test_layered_entry_must_be_a_real_boolean(tmp_path: Path, value: str):
 def test_a_misspelled_layered_entry_is_refused_naming_the_key(tmp_path: Path):
     with pytest.raises(ConfigError, match=r"account 'a': unknown key 'layered'"):
         _load(tmp_path, _account(layered="false"))
+
+
+# ---------------------------------------------------------------------------
+# The shipped file's commented examples (Task 5)
+# ---------------------------------------------------------------------------
+
+def test_the_shipped_examples_load_once_uncommented(tmp_path: Path):
+    """The user switches an example on by deleting its leading "# ". Since a
+    key the loader does not know stops the program (ruling P1), an example
+    that drifted from the real key name would do exactly that."""
+    lines = (REPO_ROOT / "config" / "accounts.toml").read_text(encoding="utf-8").splitlines()
+    examples = ("# positions = 4 ", "# layered_entry = false ")
+    for example in examples:
+        assert sum(line.startswith(example) for line in lines) == 1, example
+    uncommented = "\n".join(line.removeprefix("# ") if line.startswith(examples) else line
+                            for line in lines)
+    (account,) = _load(tmp_path, uncommented)
+    assert account.positions == 4
+    assert account.layered_entry is False
