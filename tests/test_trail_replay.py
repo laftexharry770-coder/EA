@@ -1,25 +1,29 @@
-"""The end-to-end acceptance test of Plan 1b (Task 5): the real signal,
-planned with positions = 4, filled, and walked up the trailing ladder.
+"""The end-to-end acceptance test of Plan 1b (Tasks 5 and 6): the real
+signal, planned, filled, and walked up the trailing ladder.
 
 The real fixture (tests/fixtures/messages/mmh_buy_4tp.json) is a BUY, zone
 4480-4485, SL 4470, TPs 4490 / 4495 / 4500 / 4505. The spread is 0.10 at
-every step, and be_buffer_usd 0.10 and the trail gap 2.00 are the policy
-defaults, so a position's breakeven is its own fill + 0.20.
+every step unless a step says otherwise, so the broker's minimum stop
+distance is 3 x 0.10 = 0.30.
 
-It runs twice (ruling P3):
+The ladder is the user's EA's (spec amendment 2026-10-21): TP1 reached
+moves a position's stop to its breakeven, its OWN fill + 1 pip ($0.10);
+TPk reached moves it to TP(k-1). With positions = 4 the TPs cycle, so every
+TP has one position, and as price climbs each one closes at its own TP
+while the stop of the rest steps up one TP behind the price: breakeven,
+then 4490, then 4495. No position ever holds the step-4 stop (TP3, 4500) on
+the default policy: step 4 is reached at TP4 itself, where the last
+position closes.
 
-- layered_entry = false: all four positions fill at market at 4482.55, the
-  worked example's fill, and the walk reproduces the worked example of the
-  approved design row for row -- breakeven 4482.75 at 4490, 4490 at 4492,
-  4495 at 4497.50, 4500 at 4502, nothing looser on the retrace to 4495 --
-  while the positions close at their own TPs, 4 -> 3 -> 2 -> 1 open.
+It runs with layered_entry false and true (ruling P3):
+
+- layered_entry = false: every position fills at market at 4482.55, the
+  worked example's fill, so every breakeven is 4482.65; the walk reproduces
+  the amendment's worked example row for row.
 - layered_entry = true, planned at the amendment's ask 4483: two positions
   open at market and two rest as limits, at 4482.70 and 4480. A limit fills
   at its own price once the ask comes down to it, so its breakeven differs;
   one still unfilled when the bid reaches TP1 is cancelled.
-
-A third walk spikes the spread at a trigger: the stop waits where the
-broker accepts it.
 
 The walk is what Plan 3's worker and the broker will do between them, for a
 BUY, at each price on the path (see _walk). The trail and the cancel rule
@@ -45,7 +49,7 @@ from xaucopier.parsing.channel_mmh import parse
 
 FIXTURE = Path(__file__).parent / "fixtures" / "messages" / "mmh_buy_4tp.json"
 SPEC = SymbolSpec("XAUUSD", 2, 0.01, 0.01, 0.01, 100.0, 0.01, 0, 0)
-POLICY = Policy()   # be_buffer_usd 0.10, trail_gap_usd 2.00, trail on
+POLICY = Policy()   # be_buffer_pips 1.0, every step on hit, trail on
 SPREAD = 0.10       # so the minimum stop distance is 3 x 0.10 = 0.30
 TICKET_BASE = 9000  # a position's ticket is TICKET_BASE + its leg_index
 
@@ -72,16 +76,16 @@ def _tick(step: float | tuple[float, float]) -> tuple[float, float]:
     return step if isinstance(step, tuple) else (step, SPREAD)
 
 
-def _plan(layered: bool, ask: float) -> Plan:
+def _plan(layered: bool, ask: float, positions: int = 4) -> Plan:
     account = AccountSpec("ic_demo", "XAUUSD", fixed_lot=0.01, magic_base=77001,
-                          positions=4, layered_entry=layered)
+                          positions=positions, layered_entry=layered)
     at = SIGNAL.posted_at_utc + timedelta(seconds=5)
     plan = plan_entry(SIGNAL, account, SPEC, _market(round(ask - SPREAD, 2), at), POLICY)
     assert plan.accepted, plan
     return plan
 
 
-def _walk(plan: Plan, path: tuple[float | tuple[float, float], ...]):
+def _walk(plan: Plan, path: tuple[float | tuple[float, float], ...], policy: Policy = POLICY):
     """Walk the bid along `path`, one minute a step, and return one
     `(step, {leg_index: stop} of the open positions, leg_indices of the
     limits still resting)` per step, and how each leg ended. A step is a
@@ -96,11 +100,12 @@ def _walk(plan: Plan, path: tuple[float | tuple[float, float], ...]):
        so (price at TP1, or the order's expiry);
     3. the broker closes a position at its TP once the bid has reached it;
     4. the trail moves the stops target_stops returns -- and every move
-       must tighten the stop, which this asserts;
+       must tighten the stop and stay strictly below the position's own
+       TP, which this asserts;
     5. the broker closes a position at its stop once the bid has fallen to
        it.
 
-    Stop-outs come after the trail so that the retrace is the worked
+    Stop-outs come after the trail so that a retrace is the worked
     example's last row: the worker sees that tick, maybe before it learns
     the broker has closed the position, and must not loosen the stop. On a
     rising step no stop can be hit, so the order changes nothing else.
@@ -108,7 +113,7 @@ def _walk(plan: Plan, path: tuple[float | tuple[float, float], ...]):
     assert SIGNAL.side is Side.BUY
     legs = {leg.leg_index: leg for leg in plan.legs}
     resting = {i for i, leg in legs.items() if leg.kind is OrderKind.LIMIT}
-    open_ = {i: OpenLeg(TICKET_BASE + i, leg.price, leg.sl)
+    open_ = {i: OpenLeg(TICKET_BASE + i, leg.price, leg.sl, leg.tp)
              for i, leg in legs.items() if leg.kind is OrderKind.MARKET}
     ended: dict[int, tuple[str, float | None]] = {}
     steps = []
@@ -118,7 +123,7 @@ def _walk(plan: Plan, path: tuple[float | tuple[float, float], ...]):
         for i in sorted(resting):
             if snap.ask <= legs[i].price:
                 resting.discard(i)
-                open_[i] = OpenLeg(TICKET_BASE + i, legs[i].price, legs[i].sl)
+                open_[i] = OpenLeg(TICKET_BASE + i, legs[i].price, legs[i].sl, legs[i].tp)
         for i in sorted(resting):
             if pending_should_cancel(SIGNAL.side, SIGNAL.tps, snap.bid, snap.ask,
                                      snap.now_utc, legs[i].expires_at_utc):
@@ -129,11 +134,13 @@ def _walk(plan: Plan, path: tuple[float | tuple[float, float], ...]):
                 del open_[i]
                 ended[i] = ("tp", legs[i].tp)
         for move in target_stops(SIGNAL.side, SIGNAL.tps, tuple(open_.values()),
-                                 snap, SPEC, POLICY):
+                                 snap, SPEC, policy):
             i = move.position_ticket - TICKET_BASE
             assert move.new_sl > open_[i].current_sl, (
                 f"bid {bid}: leg {i}'s stop would loosen from "
                 f"{open_[i].current_sl} to {move.new_sl}")
+            assert move.new_sl < legs[i].tp, (
+                f"bid {bid}: leg {i}'s stop {move.new_sl} is not below its TP {legs[i].tp}")
             open_[i] = dataclasses.replace(open_[i], current_sl=move.new_sl)
         for i in sorted(open_):
             if snap.bid <= open_[i].current_sl:
@@ -144,38 +151,61 @@ def _walk(plan: Plan, path: tuple[float | tuple[float, float], ...]):
     return steps, ended
 
 
-def _check_walk(plan, table, ended):
-    got_steps, got_ended = _walk(plan, tuple(step for step, _, _ in table))
+def _check_walk(plan, table, ended, policy=POLICY):
+    got_steps, got_ended = _walk(plan, tuple(step for step, _, _ in table), policy)
     for got, want in zip(got_steps, table, strict=True):
         assert got == want
     assert got_ended == ended
 
 
+def _open_counts(table):
+    return [len(open_) for _, open_, _ in table]
+
+
 # ---------------------------------------------------------------------------
-# layered_entry = false: the worked example, exactly.
+# layered_entry = false, positions = 4: one position per TP, all four bought
+# at 4482.55, so every breakeven is 4482.55 + 1 pip = 4482.65.
 # ---------------------------------------------------------------------------
 
-# The plan's path, 4488 -> 4490 -> 4492 -> 4497.50 -> 4502 -> back to 4495,
-# with the worked example's rows just short of each trigger in between.
+BE_4482_55 = 4482.65   # 4482.55 + be_buffer_pips 1.0 x $0.10; no spread term
+
+# The brief's path, 4488 -> 4490 -> 4495 -> 4500 -> 4505, then a retrace.
 # (bid, open positions afterwards: leg -> its stop, limits still resting)
-SINGLE_ENTRY_WALK = (
+UP_THE_LADDER = (
     (4488.00, {0: 4470.00, 1: 4470.00, 2: 4470.00, 3: 4470.00}, ()),
-    (4489.99, {0: 4470.00, 1: 4470.00, 2: 4470.00, 3: 4470.00}, ()),
-    # Leg 0 closes at TP1; the rest go to breakeven, 4482.55 + 0.20.
-    (4490.00, {1: 4482.75, 2: 4482.75, 3: 4482.75}, ()),
-    (4491.99, {1: 4482.75, 2: 4482.75, 3: 4482.75}, ()),
-    (4492.00, {1: 4490.00, 2: 4490.00, 3: 4490.00}, ()),   # TP1 + gap
-    (4497.49, {2: 4490.00, 3: 4490.00}, ()),               # leg 1 closes at TP2
-    (4497.50, {2: 4495.00, 3: 4495.00}, ()),               # midpoint(TP2, TP3)
-    (4501.99, {3: 4495.00}, ()),                           # leg 2 closes at TP3
-    (4502.00, {3: 4500.00}, ()),                           # TP3 + gap
-    # The retrace: the trail leaves 4500 alone (it never loosens), and the
-    # broker then closes the last position at that stop, TP3 locked in.
+    # TP1: leg 0 closes there; step 1 moves the rest to breakeven.
+    (4490.00, {1: BE_4482_55, 2: BE_4482_55, 3: BE_4482_55}, ()),
+    # TP2: leg 1 closes there; step 2 moves the rest to TP1.
+    (4495.00, {2: 4490.00, 3: 4490.00}, ()),
+    # TP3: leg 2 closes there; step 3 moves the last one to TP2.
+    (4500.00, {3: 4495.00}, ()),
+    # TP4: the last position closes at its own TP, before any step-4 stop.
+    (4505.00, {}, ()),
+    # The retrace finds nothing left open.
     (4495.00, {}, ()),
 )
-SINGLE_ENTRY_ENDED = {0: ("tp", 4490.0), 1: ("tp", 4495.0), 2: ("tp", 4500.0),
-                      3: ("stop", 4500.0)}
+UP_THE_LADDER_ENDED = {0: ("tp", 4490.0), 1: ("tp", 4495.0), 2: ("tp", 4500.0),
+                       3: ("tp", 4505.0)}
 
+# The amendment's worked example, row for row, for the TP4 position (leg 3)
+# while the other three close at their TPs: 4489.99 nothing, 4490 BE,
+# 4494.99 BE, 4495 TP1, 4499.99 TP1, 4500 TP2, 4504.99 TP2, then the retrace
+# to 4492 leaves it at TP2 -- and the broker closes it there.
+WORKED_EXAMPLE = (
+    (4488.00, {0: 4470.00, 1: 4470.00, 2: 4470.00, 3: 4470.00}, ()),
+    (4489.99, {0: 4470.00, 1: 4470.00, 2: 4470.00, 3: 4470.00}, ()),
+    (4490.00, {1: BE_4482_55, 2: BE_4482_55, 3: BE_4482_55}, ()),
+    (4494.99, {1: BE_4482_55, 2: BE_4482_55, 3: BE_4482_55}, ()),
+    (4495.00, {2: 4490.00, 3: 4490.00}, ()),
+    (4499.99, {2: 4490.00, 3: 4490.00}, ()),
+    (4500.00, {3: 4495.00}, ()),
+    (4504.99, {3: 4495.00}, ()),
+    # The retrace: the trail leaves 4495 alone (it never loosens), and the
+    # broker then closes the last position at that stop, TP2 locked in.
+    (4492.00, {}, ()),
+)
+WORKED_EXAMPLE_ENDED = {0: ("tp", 4490.0), 1: ("tp", 4495.0), 2: ("tp", 4500.0),
+                        3: ("stop", 4495.0)}
 
 def test_the_single_entry_plan_is_four_market_positions_at_the_worked_example_fill():
     plan = _plan(layered=False, ask=4482.55)
@@ -183,46 +213,52 @@ def test_the_single_entry_plan_is_four_market_positions_at_the_worked_example_fi
     assert {leg.kind for leg in plan.legs} == {OrderKind.MARKET}
     assert {leg.price for leg in plan.legs} == {4482.55}
     assert {leg.sl for leg in plan.legs} == {4470.0}
+    # Four positions on four TPs: the cycle gives one each.
     assert [leg.tp for leg in plan.legs] == [4490.0, 4495.0, 4500.0, 4505.0]
     assert {leg.volume for leg in plan.legs} == {0.01}   # fixed_lot, per position
 
 
-def test_the_single_entry_walk_reproduces_the_worked_example():
-    _check_walk(_plan(layered=False, ask=4482.55), SINGLE_ENTRY_WALK, SINGLE_ENTRY_ENDED)
+def test_the_single_entry_walk_up_the_ladder():
+    _check_walk(_plan(layered=False, ask=4482.55), UP_THE_LADDER, UP_THE_LADDER_ENDED)
 
 
-def test_the_single_entry_walk_goes_4_3_2_1_open_with_the_stop_ratcheting_up():
+def test_the_single_entry_walk_goes_4_3_2_1_0_open_with_the_stop_one_tp_behind():
     steps, _ = _walk(_plan(layered=False, ask=4482.55),
-                     tuple(bid for bid, _, _ in SINGLE_ENTRY_WALK))
-    assert [len(open_) for _, open_, _ in steps] == [4, 4, 3, 3, 3, 2, 2, 1, 1, 0]
-    # The last position's stop at every step: SL, BE, TP1, TP2, TP3.
+                     tuple(bid for bid, _, _ in UP_THE_LADDER))
+    assert [len(open_) for _, open_, _ in steps] == [4, 3, 2, 1, 0, 0]
+    # The last position's stop at every step: SL, BE, TP1, TP2, then closed
+    # at TP4.
     assert [open_.get(3) for _, open_, _ in steps] == [
-        4470.00, 4470.00, 4482.75, 4482.75, 4490.00,
-        4490.00, 4495.00, 4495.00, 4500.00, None,
-    ]
+        4470.00, BE_4482_55, 4490.00, 4495.00, None, None]
 
 
-# A spread spike at the TP1 + gap trigger. At spread 1.00 the broker's
-# minimum stop distance is 3 x 1.00 = 3.00, so TP1, 2.00 below the bid, is
-# not a stop the broker accepts, and the stop waits at breakeven until the
-# spread settles. Nor is breakeven re-sent at the wider spread (ruling
-# T3-I1): 4482.55 + 1.00 + 0.10 = 4483.65 would creep up with every spike.
+def test_the_single_entry_walk_reproduces_the_worked_example():
+    _check_walk(_plan(layered=False, ask=4482.55), WORKED_EXAMPLE, WORKED_EXAMPLE_ENDED)
+    assert _open_counts(WORKED_EXAMPLE) == [4, 4, 3, 3, 2, 2, 1, 1, 0]
+
+
+# A spread spike at the TP2 step. At spread 2.00 the broker's minimum stop
+# distance is 3 x 2.00 = 6.00, so TP1, 5.00 below the bid, is not a stop the
+# broker accepts. The step falls through to breakeven, which is already in
+# place (it has no spread term, so it is not re-sent either), and the stop
+# waits there until the spread settles.
 SPREAD_SPIKE_WALK = (
-    (4490.00, {1: 4482.75, 2: 4482.75, 3: 4482.75}, ()),
-    ((4492.00, 1.00), {1: 4482.75, 2: 4482.75, 3: 4482.75}, ()),
-    (4492.00, {1: 4490.00, 2: 4490.00, 3: 4490.00}, ()),   # spread 0.10 again
+    (4490.00, {1: BE_4482_55, 2: BE_4482_55, 3: BE_4482_55}, ()),
+    ((4495.00, 2.00), {2: BE_4482_55, 3: BE_4482_55}, ()),   # leg 1 closes at TP2
+    (4495.00, {2: 4490.00, 3: 4490.00}, ()),                  # spread 0.10 again
 )
 
 
 def test_a_spread_spike_holds_the_stop_where_the_broker_accepts_it():
-    _check_walk(_plan(layered=False, ask=4482.55), SPREAD_SPIKE_WALK, {0: ("tp", 4490.0)})
+    _check_walk(_plan(layered=False, ask=4482.55), SPREAD_SPIKE_WALK,
+                {0: ("tp", 4490.0), 1: ("tp", 4495.0)})
 
 
 # ---------------------------------------------------------------------------
 # layered_entry = true, from the amendment's ask 4483: NOW legs 0 and 2 at
 # market 4483 (TP1, TP3), PENDING leg 1 at 4482.70 (TP2) and leg 3 at 4480
-# (TP4). Breakeven: 4483.20 for legs 0 and 2, 4482.90 for leg 1, 4480.20
-# for leg 3.
+# (TP4). Breakeven, each its own fill + 1 pip: 4483.10 for legs 0 and 2,
+# 4482.80 for leg 1, 4480.10 for leg 3.
 # ---------------------------------------------------------------------------
 
 # Both walks start at the planning price, ask 4483: the market legs are
@@ -230,36 +266,38 @@ def test_a_spread_spike_holds_the_stop_where_the_broker_accepts_it():
 AT_THE_PLAN = (4482.90, {0: 4470.00, 2: 4470.00}, (1, 3))
 
 # Price dips through both limits first, so all four positions are open
-# when the walk starts up the ladder.
+# when the walk starts up the ladder: 4488 -> 4490 -> 4495 -> 4500 -> 4505,
+# then a retrace.
 BOTH_LIMITS_FILL = (
     AT_THE_PLAN,
     (4482.60, {0: 4470.00, 1: 4470.00, 2: 4470.00}, (3,)),   # ask 4482.70: leg 1 fills
     (4479.90, {0: 4470.00, 1: 4470.00, 2: 4470.00, 3: 4470.00}, ()),  # ask 4480: leg 3
     (4488.00, {0: 4470.00, 1: 4470.00, 2: 4470.00, 3: 4470.00}, ()),
     # Leg 0 closes at TP1; each of the rest goes to its OWN breakeven.
-    (4490.00, {1: 4482.90, 2: 4483.20, 3: 4480.20}, ()),
-    (4492.00, {1: 4490.00, 2: 4490.00, 3: 4490.00}, ()),
-    (4497.50, {2: 4495.00, 3: 4495.00}, ()),                 # leg 1 closes at TP2
-    (4502.00, {3: 4500.00}, ()),                             # leg 2 closes at TP3
-    (4495.00, {}, ()),                                       # stopped out at 4500
+    (4490.00, {1: 4482.80, 2: 4483.10, 3: 4480.10}, ()),
+    (4495.00, {2: 4490.00, 3: 4490.00}, ()),                 # leg 1 closes at TP2
+    (4500.00, {3: 4495.00}, ()),                             # leg 2 closes at TP3
+    (4505.00, {}, ()),                                       # leg 3 closes at TP4
+    (4495.00, {}, ()),
 )
 BOTH_LIMITS_FILL_ENDED = {0: ("tp", 4490.0), 1: ("tp", 4495.0), 2: ("tp", 4500.0),
-                          3: ("stop", 4500.0)}
+                          3: ("tp", 4505.0)}
 
 # Price dips only to the first limit; the second is still resting when the
-# bid reaches TP1, and is cancelled there -- not one tick before.
+# bid reaches TP1, and is cancelled there -- not one tick before. Then a
+# retrace short of TP3 leaves leg 2's stop at TP1, where it is stopped out.
 ONE_LIMIT_FILLS = (
     AT_THE_PLAN,
     (4482.60, {0: 4470.00, 1: 4470.00, 2: 4470.00}, (3,)),   # ask 4482.70: leg 1 fills
     (4488.00, {0: 4470.00, 1: 4470.00, 2: 4470.00}, (3,)),
     (4489.99, {0: 4470.00, 1: 4470.00, 2: 4470.00}, (3,)),   # TP1 - 0.01: still resting
-    (4490.00, {1: 4482.90, 2: 4483.20}, ()),                 # leg 3 cancelled, leg 0 at TP1
-    (4492.00, {1: 4490.00, 2: 4490.00}, ()),
-    (4497.50, {2: 4495.00}, ()),                             # leg 1 closes at TP2
-    (4502.00, {}, ()),                                       # leg 2 closes at TP3
-    (4495.00, {}, ()),
+    (4490.00, {1: 4482.80, 2: 4483.10}, ()),                 # leg 3 cancelled, leg 0 at TP1
+    (4495.00, {2: 4490.00}, ()),                             # leg 1 closes at TP2
+    (4499.99, {2: 4490.00}, ()),
+    (4492.00, {2: 4490.00}, ()),                             # the retrace: never loosens
+    (4489.00, {}, ()),                                       # stopped out at 4490
 )
-ONE_LIMIT_FILLS_ENDED = {0: ("tp", 4490.0), 1: ("tp", 4495.0), 2: ("tp", 4500.0),
+ONE_LIMIT_FILLS_ENDED = {0: ("tp", 4490.0), 1: ("tp", 4495.0), 2: ("stop", 4490.0),
                          3: ("cancelled", None)}
 
 
@@ -283,3 +321,7 @@ def test_the_layered_plan_is_the_amendments_row_at_ask_4483():
 ])
 def test_the_layered_walk(table, ended):
     _check_walk(_plan(layered=True, ask=4483.00), table, ended)
+
+
+def test_once_every_limit_fills_the_layered_walk_goes_4_3_2_1_0_open():
+    assert _open_counts(BOTH_LIMITS_FILL)[2:] == [4, 4, 3, 2, 1, 0, 0]

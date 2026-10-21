@@ -446,30 +446,56 @@ off, also while `positions` is left out.
 
 **The trailing stop.** Once a trade is in profit, the stop loss of every
 open position moves up behind the price (down, for a sell) in steps, so
-profit already made is kept. It **only ever moves in your favour**. On the
-signal above, with 4 positions all bought at 4482.55 (layered entry
+profit already made is kept. It **only ever moves in your favour**. It
+works like your Target Trend EA: **the stop loss moves one step behind
+each take profit the price reaches.**
+
+- When the price reaches TP1, the stop loss moves to **breakeven**: the
+  price that position was bought at, plus 1 pip ($0.10). For a sell, the
+  price it was sold at, minus 1 pip.
+- When the price reaches TP2, the stop loss moves to TP1. At TP3 it moves
+  to TP2, at TP4 to TP3, and so on for as many take profits as the signal
+  has.
+
+On the signal above, with 4 positions all bought at 4482.55 (layered entry
 switched off) and a spread of 0.10:
 
 | When the price reaches | The stop loss moves to | Positions still open |
 |---|---|---|
-| 4490.00, TP1 | 4482.75, breakeven: the price paid, plus the spread, plus 10 cents | 3: the first closed at its take profit |
-| 4492.00, $2 past TP1 | 4490.00 | 3 |
-| 4495.00, TP2 | stays at 4490.00 | 2 |
-| 4497.50, halfway from TP2 to TP3 | 4495.00 | 2 |
-| 4500.00, TP3 | stays at 4495.00 | 1 |
-| 4502.00, $2 past TP3 | 4500.00 | 1 |
+| 4490.00, TP1 | 4482.65, breakeven: the price paid, plus 1 pip (10 cents) | 3: the first closed at its take profit |
+| 4495.00, TP2 | 4490.00, TP1 | 2 |
+| 4500.00, TP3 | 4495.00, TP2 | 1 |
 
 If the price goes on to 4505 (TP4), the last position closes there. If it
-falls back instead, the stop loss stays at 4500.00, and the last position
+falls back instead, the stop loss stays at 4495.00, and the last position
 closes there with its profit kept.
 
-- With more take profits the steps go on the same way: halfway from TP4 to
-  TP5, then $2 past TP5, and so on. The last take profit has no step: the
-  last positions close there.
+- **1 pip is $0.10 on gold, on every broker.** Some brokers show gold with
+  2 decimals (4482.55) and some with 3 (4482.553); a pip here is $0.10 on
+  both. (Some MT5 tools work a pip out from the decimals, and then a pip
+  on a 3-decimal broker is only $0.01, ten times too small. This program
+  never does.)
+- **The breakeven buffer** is `be_buffer_pips = 1.0` in
+  `config\policy.toml`: 1 pip, $0.10. 2.0 would be $0.20. Breakeven never
+  goes past TP1: a position bought less than 1 pip below TP1 gets TP1
+  itself.
 - Each position's breakeven is its own. A waiting order that filled at
-  4480 gets 4480.20.
+  4480 gets 4480.10.
+- **A step can happen early: `ladder_early_pips`.** "20 pips early" means
+  the step happens when the price is 20 pips ($2.00) short of its take
+  profit, instead of at it. `config\policy.toml` has the line
+  `# ladder_early_pips = [0, 0, 0, 0]`: one number for each step, in
+  order: the first is the breakeven step at TP1, the second the step at
+  TP2, then TP3, TP4. 0 means "when the take profit is reached", and a step
+  with no number is 0 too. To use it, delete the `# ` at the start of that
+  line, change the numbers and save. For example
+  `ladder_early_pips = [0, 0, 20]` moves the stop loss to TP2 at 4498.00 on
+  the signal above, 20 pips before TP3, instead of at 4500.00. While the
+  line is left out, every step happens at its take profit.
 - If the broker would refuse a stop that close to the price, the stop goes
-  to the best step the broker does accept.
+  to the best step the broker does accept, and on to the better one as
+  soon as the broker accepts that. A stop loss is never put at or past a
+  position's own take profit.
 - A channel message like "move SL to …" is followed only when it moves the
   stop loss in your favour. One that would move it back is not followed.
 

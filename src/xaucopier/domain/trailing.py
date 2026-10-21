@@ -1,29 +1,41 @@
-"""The basket trailing stop: the approved ladder, and each open leg's target.
+"""The trailing stop ladder, like the user's Target Trend EA, and each open
+leg's target stop.
 
 Pure: no I/O, no clock, no randomness. The worker calls `target_stops` on
 each tick and sends a modify only for the moves it returns; the stop in
 place at the broker is the trail's only memory, which is why a move is
 emitted only when it tightens that stop.
 
-All distances are USD. The ladder never sees a point or a pip: gold is
-quoted at 2 digits on some feeds and 3 on others, and a distance in points
-is ten times wrong on one of them.
+The ladder (spec amendment 2026-10-21; the EA's TV_ManageStopLadder) runs
+per position, on the signal's own take profits in the poster's numbering:
+
+- step 1: once TP1 is reached, the stop moves to breakeven;
+- step k (k = 2..T): once TPk is reached, the stop moves to TP(k-1).
+
+A step is reached at its TP, or `ladder_early_pips[k-1]` pips before it.
+The highest reached step whose stop is placeable wins; one that is not
+falls through to the next lower step.
+
+Every price and distance here is USD. The only pips are the policy's two
+settings, converted with the fixed PIP_USD and never with the broker's
+point: gold is quoted at 2 digits on some feeds and 3 on others, and a
+distance in points is ten times wrong on one of them.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from xaucopier.domain.gates import min_stop_distance_usd
-from xaucopier.domain.market import MarketSnapshot, Policy
+from xaucopier.domain.market import PIP_USD, MarketSnapshot, Policy
 from xaucopier.domain.money import SymbolSpec, round_price
 from xaucopier.domain.signal import Side
 
 
 @dataclass(frozen=True, slots=True)
 class Rung:
-    trigger: float          # price at which this rung is earned
-    stop: float | None      # new stop price; None means breakeven, computed per position
-    label: str              # "BE", "TP1", "TP2", ... for logs and alerts
+    trigger: float          # the price at which this step is reached
+    stop: float | None      # the stop it moves to; None means breakeven, computed per position
+    label: str              # "BE", "TP1", "TP2", ...: the stop's name, for logs and alerts
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +43,7 @@ class OpenLeg:
     position_ticket: int
     price_open: float       # this position's own fill
     current_sl: float       # as the broker reports it; 0.0 is MT5's "no stop"
+    tp: float               # this position's own take profit; 0.0 is MT5's "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,27 +58,43 @@ def _strictly_monotonic(side: Side, tps: tuple[float, ...]) -> bool:
     return all((later - earlier) * side.sign > 0 for earlier, later in zip(tps, tps[1:]))
 
 
-def ladder(side: Side, tps: tuple[float, ...], gap_usd: float) -> tuple[Rung, ...]:
-    """The user's ladder, in the poster's TP numbering.
+def ladder(side: Side, tps: tuple[float, ...],
+           early_usd: tuple[float, ...] = ()) -> tuple[Rung, ...]:
+    """The EA's ladder, in the poster's TP numbering: step 1 moves the stop
+    to breakeven at TP1, step k to TP(k-1) at TPk.
 
-    BE is earned at TP1. Then for n = 1 .. T-1 the stop moves to TPn once
-    price is `gap_usd` past TPn (n odd) or halfway to TP(n+1) (n even). The
-    last TP has no rung: the last positions close there.
+    `early_usd[k-1]` is how far before TPk step k is reached, in USD (for a
+    SELL, that far above it); a missing entry is 0, on hit. target_stops
+    converts the policy's pips with PIP_USD.
 
     TPs that are not strictly monotonic in the trade's direction make the
     ladder ill-defined, so the answer is no ladder at all, never a guess.
     """
     if not tps or not _strictly_monotonic(side, tps):
         return ()
-    rungs = [Rung(trigger=tps[0], stop=None, label="BE")]
-    for n in range(1, len(tps)):
-        tp_n, tp_next = tps[n - 1], tps[n]
-        if n % 2 == 1:
-            trigger = tp_n + side.sign * gap_usd
-        else:
-            trigger = (tp_n + tp_next) / 2.0
-        rungs.append(Rung(trigger=trigger, stop=tp_n, label=f"TP{n}"))
+    rungs = []
+    for k, tp in enumerate(tps, start=1):
+        early = early_usd[k - 1] if k <= len(early_usd) else 0.0
+        stop, label = (None, "BE") if k == 1 else (tps[k - 2], f"TP{k - 1}")
+        rungs.append(Rung(trigger=tp - side.sign * early, stop=stop, label=label))
     return tuple(rungs)
+
+
+def breakeven(side: Side, price_open: float, tp1: float,
+              spec: SymbolSpec, pol: Policy) -> float:
+    """A position's breakeven, like the EA's TV_Be: its OWN fill plus
+    be_buffer_pips x PIP_USD for a BUY (minus, for a SELL), never past TP1.
+
+    The one formula for the trail and for the channel's "SL to BE"
+    (followup_planner calls this). There is no spread term: a BUY fills at
+    the ask and its stop triggers on the bid, so fill + buffer already locks
+    the buffer in; a SELL mirrors this. Because it does not move with the
+    spread, a breakeven once placed is never re-sent in a spread spike.
+    Commission is not modelled; the buffer is what a stop-out there keeps.
+    """
+    be = price_open + side.sign * pol.be_buffer_pips * PIP_USD
+    be = min(be, tp1) if side is Side.BUY else max(be, tp1)
+    return round_price(be, spec)
 
 
 def _reached(side: Side, price: float, level: float) -> bool:
@@ -86,27 +115,13 @@ def _tightens(side: Side, stop: float, current_sl: float, spec: SymbolSpec) -> b
     return _tighter(side, stop, round_price(current_sl, spec))
 
 
-def _breakeven(side: Side, price_open: float, snap: MarketSnapshot,
-               spec: SymbolSpec, pol: Policy) -> float:
-    """This leg's own fill plus costs, the same formula as the channel's
-    "SL to BE" (followup_planner._breakeven_price; a test pins the two)."""
-    offset = snap.spread_usd + pol.be_buffer_usd
-    return round_price(price_open + side.sign * offset, spec)
-
-
-def _at_breakeven(side: Side, leg: OpenLeg, spec: SymbolSpec, pol: Policy) -> bool:
-    """Whether the leg's stop already locks in breakeven: at or past its own
-    fill plus be_buffer_usd (the round-turn cost): a stop-out there loses
-    nothing.
-
-    `_breakeven` adds the live spread, so a BE recomputed on every tick
-    would creep with each new spread high: one modify per leg per tick in a
-    news spike, ending dollars past breakeven. BE is therefore placed once,
-    with the spread at that moment, and never re-sent while this holds."""
-    if leg.current_sl <= 0.0:   # MT5's "no stop"
-        return False
-    line = round_price(leg.price_open + side.sign * pol.be_buffer_usd, spec)
-    return (round_price(leg.current_sl, spec) - line) * side.sign >= 0
+def _behind_own_tp(side: Side, stop: float, tp: float, spec: SymbolSpec) -> bool:
+    """Strictly behind the position's own take profit: below it for a BUY,
+    above it for a SELL. A stop at or past it is never set (the EA's
+    TV_StopOk). A position with no take profit (0.0) has no such limit."""
+    if tp <= 0.0:
+        return True
+    return _tighter(side, round_price(tp, spec), stop)
 
 
 def target_stops(
@@ -115,39 +130,38 @@ def target_stops(
 ) -> tuple[StopMove, ...]:
     """The stop each open leg should move to now, for the legs that need one.
 
+    `tps` are the signal's take profits as posted (sig.tps), all of them.
     The reference price is the one the position would exit at: bid for a
-    BUY, ask for a SELL. Of the rungs that price has earned, each leg takes
-    the tightest stop the broker will accept (on the right side of price,
-    at least the minimum stop distance away), and moves only if that is
-    strictly tighter than its current stop. A leg whose stop is already at
-    breakeven (`_at_breakeven`) does not take the BE rung again.
+    BUY, ask for a SELL. For each leg the reached steps are tried from the
+    highest down, and the first whose stop is placeable is taken:
+
+    - at least the broker's minimum stop distance from that price, on the
+      right side of it (gates.min_stop_distance_usd, the one formula);
+    - strictly tighter than the leg's current stop, so it never loosens;
+    - strictly behind the leg's own take profit.
     """
     if not pol.trail_enabled:
         return ()
-    rungs = ladder(side, tps, pol.trail_gap_usd)
+    early_usd = tuple(pips * PIP_USD for pips in pol.ladder_early_pips)
+    rungs = ladder(side, tps, early_usd)
     price = snap.bid if side is Side.BUY else snap.ask
-    earned = tuple(r for r in rungs if _reached(side, price, round_price(r.trigger, spec)))
-    if not earned:
+    reached = tuple(r for r in rungs if _reached(side, price, round_price(r.trigger, spec)))
+    if not reached:
         return ()
     min_dist = min_stop_distance_usd(spec, snap, pol)
 
     moves = []
     for leg in legs:
-        best: tuple[float, str] | None = None
-        be_placed = _at_breakeven(side, leg, spec, pol)
-        for rung in earned:
+        for rung in reversed(reached):   # the best placeable step first
             if rung.stop is None:
-                if be_placed:
-                    continue
-                stop = _breakeven(side, leg.price_open, snap, spec, pol)
+                stop = breakeven(side, leg.price_open, tps[0], spec, pol)
             else:
                 stop = round_price(rung.stop, spec)
             distance = (price - stop) * side.sign   # positive: the right side of price
-            if distance <= 0 or distance < min_dist:
-                continue
-            if best is None or _tighter(side, stop, best[0]):
-                best = (stop, rung.label)
-        if best is not None and _tightens(side, best[0], leg.current_sl, spec):
-            moves.append(StopMove(position_ticket=leg.position_ticket,
-                                  new_sl=best[0], rung=best[1]))
+            if (distance > 0 and distance >= min_dist
+                    and _tightens(side, stop, leg.current_sl, spec)
+                    and _behind_own_tp(side, stop, leg.tp, spec)):
+                moves.append(StopMove(position_ticket=leg.position_ticket,
+                                      new_sl=stop, rung=rung.label))
+                break
     return tuple(moves)

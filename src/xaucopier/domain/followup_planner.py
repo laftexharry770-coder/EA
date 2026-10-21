@@ -14,6 +14,7 @@ from xaucopier.domain.intent import CancelIntent, CloseIntent, ModifyIntent
 from xaucopier.domain.market import MarketSnapshot, Policy
 from xaucopier.domain.money import SymbolSpec, round_price
 from xaucopier.domain.signal import FollowUp, FollowUpOp, Side
+from xaucopier.domain.trailing import breakeven
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,17 +50,6 @@ class FollowUpPlan:
     notes: tuple[str, ...] = ()
 
 
-def _breakeven_price(leg: LegView, snap: MarketSnapshot, pol: Policy, spec: SymbolSpec) -> float:
-    """Breakeven is the leg's OWN fill plus costs, never the signal's quoted
-    entry — each broker filled somewhere different."""
-    # be_buffer_usd is expected to absorb round-turn commission until Plan 3
-    # models commission properly from broker-supplied per-lot/contract data;
-    # see the "explicitly out of scope" note in the task-9 review.
-    offset = snap.spread_usd + pol.be_buffer_usd
-    raw = leg.price_open + offset if leg.side is Side.BUY else leg.price_open - offset
-    return round_price(raw, spec)
-
-
 def _compare_stop(side: Side, new: float, current_sl: float, spec: SymbolSpec) -> int:
     """How moving the stop to `new` compares with the stop in place: 1 it
     tightens, 0 it is already there, -1 it would loosen. A BUY's stop
@@ -85,7 +75,15 @@ def plan_followup(
     spec: SymbolSpec,
     snap: MarketSnapshot,
     pol: Policy,
+    *,
+    tps: tuple[float, ...],
 ) -> FollowUpPlan:
+    """`tps` are the take profits of the signal the follow-up resolved to,
+    as posted (sig.tps, the poster's numbering), the same ones the trail is
+    given. "SL to BE" needs TP1, tps[0]: breakeven never goes past it. It
+    has no default on purpose, so a caller cannot forget it."""
+    if not tps:
+        raise ValueError("plan_followup needs the signal's take profits (sig.tps)")
     open_legs = tuple(leg for leg in legs if not leg.is_pending)
     pending_legs = tuple(leg for leg in legs if leg.is_pending)
 
@@ -101,7 +99,10 @@ def plan_followup(
         skipped_wrong_side = 0
         skipped_too_tight = 0
         for leg in open_legs:
-            be = _breakeven_price(leg, snap, pol, spec)
+            # The trail's own formula: the leg's OWN fill, never the
+            # signal's quoted entry (each broker filled somewhere else),
+            # plus the buffer in pips, never past TP1.
+            be = breakeven(leg.side, leg.price_open, tps[0], spec, pol)
             # Never loosen: once the trail has passed TP1 the stop is
             # tighter than breakeven, and moving it back would give away
             # locked-in profit. That is the normal case, not an error.
@@ -190,12 +191,12 @@ def plan_followup(
         # A TP amend does not -- each leg owns its own target, so the poster
         # must say which one. "TP2 to 4550" names tp_index 1 (the hint is
         # 1-based, tp_index is 0-based into sig.tps) and moves EVERY open
-        # position on that TP: with more positions than TPs the extras share
-        # the last one. It never names leg_index, which is only the
-        # position's ordinal: once TP1 has passed at entry, ordinal 0 targets
-        # TP2. A bare "tp to 4550" names nothing, and writing one price
-        # across a four-leg ladder is never what was meant, so it fails
-        # loudly instead.
+        # position on that TP: with more positions than TPs the extras cycle
+        # over the TPs again, so one TP can have several. It never names
+        # leg_index, which is only the position's ordinal: once TP1 has
+        # passed at entry, ordinal 0 targets TP2. A bare "tp to 4550" names
+        # nothing, and writing one price across a four-leg ladder is never
+        # what was meant, so it fails loudly instead.
         targets = open_legs
         if fu.op is FollowUpOp.AMEND_TP:
             if fu.tp_index_hint is None:
