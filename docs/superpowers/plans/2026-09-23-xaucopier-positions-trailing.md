@@ -14,6 +14,12 @@
 
 ## Approved design (user decisions, 2026-09-23 — verbatim intent, do not relitigate)
 
+> **Superseded in part on 2026-10-21 (Task 6).** The user asked for their own EA's behaviour, and the spec amendment "AMENDMENT 2026-10-21" replaces three things below:
+> - the ladder and its worked example;
+> - "N > T: extras on the last TP", which now cycles;
+> - the breakeven formula, which is now fill ± buffer in pips (1 pip = $0.10), with no spread term and capped at TP1.
+> Everything else below still holds.
+
 - **Positions and lot, per account.** `positions = N` (new) and `fixed_lot` (existing; it already means *lot per position*). Omitted `positions` means one position per TP — today's behaviour.
 - **Staggered exits.** Each position carries its own TP and closes there.
   - `N == T` (T = surviving TPs): one position per TP.
@@ -71,6 +77,7 @@ Real signal: BUY, zone 4480–4485, SL 4470, TPs 4490 / 4495 / 4500 / 4505. One 
   - Once with `layered_entry = true`: the pending legs fill at their own limit prices once the scripted path reaches them, so their breakeven differs; the path starts at the worked example's ask 4483. Assert each leg's stop and the open count at every step, and that nothing ever loosens.
   - Pending legs still unfilled when the path reaches TP1 are cancelled (`pending_should_cancel`).
 - **P4, minimum distance.** "Minimum distance" everywhere in Task 2b and Task 3 is `gates.min_stop_distance_usd(spec, snap, pol)` = max(stops_level_usd, 3 x spread). The amendment's worked table (0.30) is spread 0.10 with stops_level_usd ≤ 0.30. Never a second formula.
+- **P6, pips (user decision 2026-10-21).** The Global Constraint "all distances are USD floats" now has exactly two exceptions: `be_buffer_pips` and `ladder_early_pips`. Both are converted with the fixed constant `PIP_USD = 0.10` and never with the broker's point or digits. Inside `domain/` every computed price and distance stays in USD.
 - **P5, task order.** The tasks run in the order 1, 2, 2b, 3, 4, 5. Task 2b builds on Task 2's `distribute()`. Task 3 and Task 4 need only Task 1. Task 5 needs all of them.
 
 ---
@@ -257,6 +264,64 @@ Reuse `gates.min_stop_distance_usd`; do not duplicate the formula.
 - **`tests/test_trail_replay.py`** — the end-to-end acceptance test. Take the real fixture signal, plan it with `positions = 4`, simulate fills, then walk a scripted bid path (4488 → 4490 → 4492 → 4497.50 → 4502 → back to 4495). At each step, apply `target_stops` and close any position whose TP was reached. Assert the stops and the open-position count match the worked example: 4 → 3 → 2 → 1 open, stops BE → 4490 → 4495 → 4500, and no loosening on the retrace.
 - `config/accounts.toml`: add a **commented** example (`# positions = 4   # how many positions to open per signal`) next to `fixed_lot`, with a comment that `fixed_lot` is the lot size **per position**. Leave `positions` unset, so behaviour does not change until the user chooses.
 - `docs/RUNBOOK.md`: a short plain-English section, "Choosing how many positions and what lot size", explaining the two settings, the staggered rule, what the trailing stop does (the worked example as a plain table), and that total exposure is positions × lot.
+
+---
+
+### Task 6: Like the user's EA: cyclic TPs, pips, and the EA's stop ladder (user amendment 2026-10-21)
+
+The binding rules and the new worked example are in `docs/superpowers/specs/2026-09-23-xaucopier-positions-trailing-amendment.md`, section "AMENDMENT 2026-10-21". **Read it first.** It supersedes, everywhere in this plan:
+- the "Approved design" ladder and its worked example;
+- the N > T "extras on the last TP" rule;
+- the spread term in breakeven.
+
+You may read the user's EA as a reference, but never edit it: `C:/Users/Herbert/AppData/Roaming/MetaQuotes/Terminal/D0E8209F77C8CF37AD8BF550E51FF075/MQL5/Experts/Target Trend EA.mq5`.
+
+**Changes:**
+- **`domain/planner.py` `distribute()`:** position i → `surviving[i % T]`. N ≤ T is unchanged. Update every test and table that encodes "extras on the last TP", including Task 2's table (6 positions on 4 TPs → 4490, 4495, 4500, 4505, 4490, 4495), the layered N = 6 rows, and the RUNBOOK's staggered table.
+- **`domain/market.py`:**
+  - Add a module constant `PIP_USD = 0.10`, documented as fixed: never derived from digits or point.
+  - `Policy.be_buffer_usd` becomes `be_buffer_pips: float = 1.0`: finite, ≥ 0, not a bool.
+  - Remove `trail_gap_usd`.
+  - Add `ladder_early_pips: tuple[float, ...] = ()`: entry k-1 is step k's early distance in pips; missing entries are 0; each one finite, ≥ 0 and not a bool; a TOML list becomes a tuple.
+  - `Policy.from_dict` must REFUSE the retired keys `be_buffer_usd` and `trail_gap_usd` with an error that names the replacement (`be_buffer_pips`), and says the old ladder gap is gone. Silently ignoring a stale key would change the user's buffer. Other unknown keys keep today's behaviour.
+- **`config/policy.toml`:** `be_buffer_pips = 1.0` (with a comment: 1 pip = $0.10 on gold, on every broker), plus a commented `# ladder_early_pips = [0, 0, 0, 0]` with a plain explanation.
+- **Breakeven, ONE formula:** `fill ± be_buffer_pips × PIP_USD`, capped at TP1, with no spread term. Share it between `domain/trailing.py` and `followup_planner`'s SL_TO_BE (make the follow-up use the same function; delete the duplicate). Update the follow-up tests' expected breakeven values, deriving them from the rule, never pasting them from output.
+- **`domain/trailing.py`:** replace the ladder with the amendment's EA ladder:
+  - step 1: TP1 reached → BE; step k: TPk reached → TP(k-1);
+  - early triggers in pips; the best placeable step first, then fall through;
+  - placeable = min distance (`gates.min_stop_distance_usd`), strictly tighter, and strictly behind the position's own TP. So `OpenLeg` needs the position's TP; add `tp: float` to it;
+  - never loosens; bid for a BUY, ask for a SELL; `round_price` on every price; `trail_enabled = False` → `()`; non-monotonic TPs → `()`.
+  - Remove `_at_breakeven` and the T3-I1 special case if the new fixed BE (no spread) makes them unnecessary. Keep a test that a spread spike causes no repeated modify.
+- **Tests (write first):**
+  - every row of the amendment's worked example, plus its SELL mirror;
+  - the early-pips row (0, 0, 20) → 4495 at 4498;
+  - a step not placeable (min distance) falls through to the next lower step;
+  - a stop never set at or past the position's own TP;
+  - a 3-digit SymbolSpec gives the same USD levels (the 10x trap test), and the buffer is the same $0.10 on 2-digit and 3-digit specs;
+  - the 5-TP alternation is gone: step 5 → TP4;
+  - the retired-key refusals;
+  - cyclic distribution for N = 5, 6 and 9 on 4 TPs, and with TP1 passed.
+- **`tests/test_trail_replay.py`:** rewrite both walks (layered_entry false and true) for the new ladder:
+  - positions = 4, so with cycling every TP has one position;
+  - path 4488 → 4490 → 4495 → 4500 → 4505, then a retrace;
+  - assert the stops BE(each leg's own) → 4490 → 4495 → 4500, the open count 4 → 3 → 2 → 1 → 0, and no loosening.
+  Also add a positions = 6 walk, so the cycled TP1/TP2 extras are checked.
+- **`docs/RUNBOOK.md`:** rewrite the trailing table and the staggered table in plain English for a non-technical user:
+  - the stop moves one step behind each TP;
+  - breakeven is your entry plus 1 pip ($0.10);
+  - what "N pips early" means and how to set it;
+  - 1 pip = $0.10 on every broker.
+  Its examples must be checked by tests against the code, as Task 5's are.
+- **Mutants to kill:**
+  - distribute stacks extras on the last TP again;
+  - a step k stop set to TPk instead of TP(k-1);
+  - early pips ignored, or applied in USD;
+  - BE including the spread again;
+  - BE not capped at TP1;
+  - the own-TP check removed;
+  - a fall-through not tried;
+  - PIP_USD derived from the spec's digits;
+  - the trail loosening on a retrace.
 
 ---
 
